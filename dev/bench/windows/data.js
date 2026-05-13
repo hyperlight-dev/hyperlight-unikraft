@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778632695597,
+  "lastUpdate": 1778638439413,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -77,6 +77,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 895,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 673,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "35c26ff2795d7979a5cebe3e375f1a9ffe3f3d91",
+          "message": "Merge pull request #19 from hyperlight-dev/ci-unique-umbrella-names\n\nci: unique umbrella job names for branch protection",
+          "timestamp": "2026-05-12T19:02:58-07:00",
+          "tree_id": "d7b95839b5252be7839ded84bb7134660843ecde",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/35c26ff2795d7979a5cebe3e375f1a9ffe3f3d91"
+        },
+        "date": 1778638437070,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 281,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 983,
             "unit": "ms"
           },
           {
