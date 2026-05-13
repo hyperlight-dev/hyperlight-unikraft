@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778639947168,
+  "lastUpdate": 1778688691251,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -175,6 +175,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot (disk)",
             "value": 673,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "094c5cfc6fd2320b0553e2351d69af1d44060d75",
+          "message": "Merge pull request #14 from hyperlight-dev/cpiovfs-upstream\n\nfeat: switch all examples to cpiovfs (zero-copy initrd)",
+          "timestamp": "2026-05-13T08:59:35-07:00",
+          "tree_id": "993e735eb879c7716fa702ab3fe6ba83b20fa833",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/094c5cfc6fd2320b0553e2351d69af1d44060d75"
+        },
+        "date": 1778688687400,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 248,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 757,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
             "unit": "MiB"
           }
         ]
