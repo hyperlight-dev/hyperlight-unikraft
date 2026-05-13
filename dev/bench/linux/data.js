@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778638222811,
+  "lastUpdate": 1778639715664,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -111,6 +111,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/35c26ff2795d7979a5cebe3e375f1a9ffe3f3d91"
         },
         "date": 1778638222340,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 100,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 648,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6e0b38e7a86402d1faf1e8cbaf25b7ad0dbd4400",
+          "message": "Merge pull request #20 from hyperlight-dev/fix/exit-code-and-sleep",
+          "timestamp": "2026-05-12T19:29:44-07:00",
+          "tree_id": "2c5e4d43d025969b85cdd9686736d86daa8618df",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/6e0b38e7a86402d1faf1e8cbaf25b7ad0dbd4400"
+        },
+        "date": 1778639715227,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
