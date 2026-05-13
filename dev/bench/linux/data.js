@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778688462724,
+  "lastUpdate": 1778708977979,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -219,6 +219,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot (disk)",
             "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8affbccb1f7a2f9aa0c8e0aea08c82f76b45bbe5",
+          "message": "Merge pull request #22 from hyperlight-dev/fix/surrogate-default-library\n\npyhl: default surrogate process pool to 1 for library callers",
+          "timestamp": "2026-05-13T14:44:15-07:00",
+          "tree_id": "7bdde64eb3438306fa8d7e2f9c1ec1a8bcf3cf85",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/8affbccb1f7a2f9aa0c8e0aea08c82f76b45bbe5"
+        },
+        "date": 1778708977453,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 100,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 384,
             "unit": "MiB"
           }
         ]
