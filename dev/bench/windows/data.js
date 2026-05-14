@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778709230979,
+  "lastUpdate": 1778770750865,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -253,6 +253,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 1508,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f3c3ce4d9c8a4f2b84b70211d756bc252f654722",
+          "message": "Merge pull request #24 from hyperlight-dev/fix/surrogate-default-binary",
+          "timestamp": "2026-05-14T07:49:49-07:00",
+          "tree_id": "dcc8e0350a9945167c1c989628b8ab71ff0f108e",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/f3c3ce4d9c8a4f2b84b70211d756bc252f654722"
+        },
+        "date": 1778770749066,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 215,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 634,
             "unit": "ms"
           },
           {
