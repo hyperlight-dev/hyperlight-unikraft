@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778770750865,
+  "lastUpdate": 1778773245006,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -307,6 +307,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot (disk)",
             "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5f424bb8ff74e28dcab69f460ecf3d0fc9b9cec9",
+          "message": "Merge pull request #23 from hyperlight-dev/networking",
+          "timestamp": "2026-05-14T08:28:19-07:00",
+          "tree_id": "0afd973595b686896917c8bb59b367bb191d0bfd",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/5f424bb8ff74e28dcab69f460ecf3d0fc9b9cec9"
+        },
+        "date": 1778773240748,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 260,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 817,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 393,
             "unit": "MiB"
           }
         ]
