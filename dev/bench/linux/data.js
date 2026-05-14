@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778795633730,
+  "lastUpdate": 1778800251252,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -375,6 +375,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/0eb9887fbccf338208efe37101b04e7ffa204424"
         },
         "date": 1778795633429,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 100,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ad90d23b0f2ea03d1729eea75b42cee0ad4b74c3",
+          "message": "Merge pull request #26 from hyperlight-dev/port-allowlist\n\nhost: add --port flag for inbound listen-port allowlist",
+          "timestamp": "2026-05-14T16:05:10-07:00",
+          "tree_id": "c4d91dff579c84b2d0c1e50e425f5a632fdc3877",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/ad90d23b0f2ea03d1729eea75b42cee0ad4b74c3"
+        },
+        "date": 1778800250942,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
