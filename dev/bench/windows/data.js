@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778773245006,
+  "lastUpdate": 1778795828900,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -341,6 +341,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 817,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 393,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0eb9887fbccf338208efe37101b04e7ffa204424",
+          "message": "Merge pull request #25 from hyperlight-dev/blocklist\n\nnet: add BlockList network policy variant",
+          "timestamp": "2026-05-14T14:48:11-07:00",
+          "tree_id": "543c399476d0f2c4f6e19e1a8c83f72622c75593",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/0eb9887fbccf338208efe37101b04e7ffa204424"
+        },
+        "date": 1778795827023,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 271,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 850,
             "unit": "ms"
           },
           {
