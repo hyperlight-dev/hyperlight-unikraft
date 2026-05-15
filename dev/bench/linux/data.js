@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778813443999,
+  "lastUpdate": 1778814951409,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -473,6 +473,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 80,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "79b32ae4a58b63d89f3b62c2994056a8993b9ff4",
+          "message": "Merge pull request #30 from hyperlight-dev/ci-skip-checks\n\nci: run all required checks on every PR",
+          "timestamp": "2026-05-14T20:08:21-07:00",
+          "tree_id": "4cacf8590a3daa945b1858165e0662636622eae6",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/79b32ae4a58b63d89f3b62c2994056a8993b9ff4"
+        },
+        "date": 1778814951025,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 100,
             "unit": "ms"
           },
           {
