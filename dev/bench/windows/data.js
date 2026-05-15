@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778855058090,
+  "lastUpdate": 1778885615706,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -791,6 +791,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot (disk)",
             "value": 393,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a4831d753415543e53a56645fabd1bca652952fe",
+          "message": "Merge pull request #53 from hyperlight-dev/fix/pyhl-docker-fallback\n\nfeat: OCI registry API fallback for pyhl setup",
+          "timestamp": "2026-05-15T15:44:00-07:00",
+          "tree_id": "7d460d140a576d9d0ac642e8a990ab22a618d589",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/a4831d753415543e53a56645fabd1bca652952fe"
+        },
+        "date": 1778885613321,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 255,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 829,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
             "unit": "MiB"
           }
         ]
