@@ -304,22 +304,47 @@ impl BlockList {
     }
 }
 
+fn dns_resolvers() -> &'static HashSet<IpAddr> {
+    static RESOLVERS: std::sync::OnceLock<HashSet<IpAddr>> = std::sync::OnceLock::new();
+    RESOLVERS.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            let mut set = HashSet::new();
+            if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
+                for line in contents.lines() {
+                    let line = line.trim();
+                    if let Some(rest) = line.strip_prefix("nameserver") {
+                        if let Some(ip_str) = rest.split_whitespace().next() {
+                            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                                set.insert(ip);
+                            }
+                        }
+                    }
+                }
+            }
+            set
+        }
+        #[cfg(not(unix))]
+        {
+            HashSet::new()
+        }
+    })
+}
+
 impl NetworkPolicy {
     fn check(&self, addr: &std::net::SocketAddr) -> Result<()> {
         match self {
             NetworkPolicy::AllowAll => Ok(()),
             NetworkPolicy::AllowList(al) => {
-                if addr.port() == 53 || al.is_allowed(&addr.ip()) {
+                if al.is_allowed(&addr.ip())
+                    || (addr.port() == 53 && dns_resolvers().contains(&addr.ip()))
+                {
                     Ok(())
                 } else {
                     Err(anyhow!("network policy denies connection to {}", addr))
                 }
             }
             NetworkPolicy::BlockList(bl) => {
-                // DNS (port 53) is always allowed so the guest can resolve names.
-                if addr.port() == 53 {
-                    return Ok(());
-                }
                 if bl.is_blocked(&addr.ip()) {
                     Err(anyhow!("network policy denies connection to {}", addr))
                 } else {
@@ -767,6 +792,41 @@ impl FsSandbox {
         let mut out = resolved_ancestor;
         for name in tail.into_iter().rev() {
             out.push(name);
+            // Walk the symlink chain (with hop limit) to catch escapes
+            // through dangling or chained symlinks.
+            const MAX_SYMLINK_HOPS: usize = 40;
+            let mut cursor = out.clone();
+            for _ in 0..MAX_SYMLINK_HOPS {
+                let Ok(meta) = std::fs::symlink_metadata(&cursor) else {
+                    break;
+                };
+                if !meta.file_type().is_symlink() {
+                    break;
+                }
+                let target = std::fs::read_link(&cursor)?;
+                let abs = if target.is_absolute() {
+                    target
+                } else {
+                    cursor.parent().unwrap_or(&self.root).join(&target)
+                };
+                let mut norm = std::path::PathBuf::new();
+                for c in abs.components() {
+                    match c {
+                        std::path::Component::ParentDir => {
+                            norm.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        c => norm.push(c),
+                    }
+                }
+                if !norm.starts_with(&self.root) {
+                    return Err(anyhow!(
+                        "symlink target escapes mount root: {:?}",
+                        guest_path
+                    ));
+                }
+                cursor = norm;
+            }
         }
         Ok(out)
     }
@@ -2488,6 +2548,84 @@ mod tests {
         assert!(err.contains("escapes mount root"), "{err}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rejects_dangling_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let root = tmpdir("dangling-escape");
+        let outside = tmpdir("dangling-escape-out");
+        symlink(outside.join("nonexistent"), root.join("bad_link")).unwrap();
+        let fs_sb = FsSandbox::new(&root).unwrap();
+        let err = fs_sb.resolve("bad_link").unwrap_err().to_string();
+        assert!(
+            err.contains("escapes mount root"),
+            "expected escape error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_allows_valid_internal_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = tmpdir("valid-internal");
+        fs::write(root.join("real_file.txt"), "hello").unwrap();
+        symlink(root.join("real_file.txt"), root.join("good_link")).unwrap();
+        let fs_sb = FsSandbox::new(&root).unwrap();
+        let resolved = fs_sb.resolve("good_link").unwrap();
+        assert!(
+            resolved.starts_with(&root),
+            "expected path under root, got: {resolved:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_allows_dangling_symlink_inside_root() {
+        use std::os::unix::fs::symlink;
+        let root = tmpdir("dangling-inside");
+        symlink(root.join("future_file.txt"), root.join("ok_link")).unwrap();
+        let fs_sb = FsSandbox::new(&root).unwrap();
+        let resolved = fs_sb.resolve("ok_link").unwrap();
+        assert!(
+            resolved.starts_with(&root),
+            "expected path under root, got: {resolved:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rejects_symlink_chain_escape() {
+        use std::os::unix::fs::symlink;
+        let root = tmpdir("chain-escape");
+        let outside = tmpdir("chain-outside");
+        symlink(&outside, root.join("link_b")).unwrap();
+        symlink(root.join("link_b"), root.join("link_a")).unwrap();
+        let fs_sb = FsSandbox::new(&root).unwrap();
+        let err = fs_sb.resolve("link_a").unwrap_err().to_string();
+        assert!(
+            err.contains("escapes mount root"),
+            "expected escape error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rejects_chained_dangling_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let root = tmpdir("chain-dangling");
+        let outside = tmpdir("chain-dangling-out");
+        // link_b -> dangling path outside root
+        symlink(outside.join("nonexistent"), root.join("link_b")).unwrap();
+        // link_a -> link_b (which is under root, but chains outside)
+        symlink(root.join("link_b"), root.join("link_a")).unwrap();
+        let fs_sb = FsSandbox::new(&root).unwrap();
+        let err = fs_sb.resolve("link_a").unwrap_err().to_string();
+        assert!(
+            err.contains("escapes mount root"),
+            "expected escape error, got: {err}"
+        );
+    }
+
     #[test]
     fn resolve_allows_paths_under_the_root() {
         let root = tmpdir("allow");
@@ -2625,6 +2763,50 @@ mod tests {
     }
 
     #[test]
+    fn test_port53_arbitrary_ip_blocked() {
+        // RFC5737 TEST-NET-2 address — guaranteed not in /etc/resolv.conf.
+        let al = AllowList::from_hosts(&["198.51.100.1"]).unwrap();
+        let policy = NetworkPolicy::AllowList(al);
+        let addr: std::net::SocketAddr = "198.51.100.99:53".parse().unwrap();
+        assert!(
+            policy.check(&addr).is_err(),
+            "port 53 to a non-resolver IP must be denied"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_port53_real_resolver_allowed() {
+        let resolvers = dns_resolvers();
+        if resolvers.is_empty() {
+            eprintln!("skipping: no resolvers found in /etc/resolv.conf");
+            return;
+        }
+        let resolver_ip = *resolvers.iter().next().unwrap();
+        // Allowlist uses a TEST-NET IP that won't match the resolver.
+        let al = AllowList::from_hosts(&["198.51.100.1"]).unwrap();
+        let policy = NetworkPolicy::AllowList(al);
+        let addr = std::net::SocketAddr::new(resolver_ip, 53);
+        assert!(
+            policy.check(&addr).is_ok(),
+            "port 53 to a configured resolver ({}) must be allowed",
+            resolver_ip
+        );
+    }
+
+    #[test]
+    fn test_port53_blocklist_enforced() {
+        // RFC5737 TEST-NET-1 address — blocklist always wins.
+        let bl = BlockList::from_hosts(&["192.0.2.1"]).unwrap();
+        let policy = NetworkPolicy::BlockList(bl);
+        let addr: std::net::SocketAddr = "192.0.2.1:53".parse().unwrap();
+        assert!(
+            policy.check(&addr).is_err(),
+            "blocklisted IP must be denied even on port 53"
+        );
+    }
+
+    #[test]
     fn allowlist_resolves_hostnames() {
         let al = AllowList::from_hosts(&["localhost"]).unwrap();
         assert!(
@@ -2656,11 +2838,15 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_blocklist_allows_dns() {
-        let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
+    fn network_policy_blocklist_denies_blocked_ip_on_port53() {
+        // RFC5737 TEST-NET-3 — blocklist always wins over DNS exemption.
+        let bl = BlockList::from_hosts(&["203.0.113.1"]).unwrap();
         let policy = NetworkPolicy::BlockList(bl);
-        let addr: std::net::SocketAddr = "1.2.3.4:53".parse().unwrap();
-        assert!(policy.check(&addr).is_ok());
+        let addr: std::net::SocketAddr = "203.0.113.1:53".parse().unwrap();
+        assert!(
+            policy.check(&addr).is_err(),
+            "blocked IP must be denied even on port 53"
+        );
     }
 
     #[test]
