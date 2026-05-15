@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 [lib]
 name = "hyperlight_unikraft"
 path = "src/lib.rs"
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["lib"]
 
 [[bin]]
 name = "hyperlight-unikraft"

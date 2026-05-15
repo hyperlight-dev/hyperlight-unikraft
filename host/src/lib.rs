@@ -55,7 +55,6 @@
 //! `normalize_fs_error` rewrites host-OS-specific error wording so
 //! the cross-platform Unikraft guest classifies errors uniformly.
 
-pub mod ffi;
 pub mod pyhl;
 pub mod stderr_capture;
 
