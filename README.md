@@ -49,7 +49,7 @@ This project enables running Linux applications (Python, Node.js, Go, Rust, C/C+
 
 ### Key Features
 
-- **No host function calls** - The Unikraft kernel runs entirely within the VM
+- **Thin, opt-in host surface** — by default, the guest has no access to the host filesystem, network, or any host functions. When you enable features like `--mount`, `--net`, or `--enable-tools`, a single `__dispatch` JSON-RPC bridge is registered as the only guest→host channel. See [HOST_FUNCTIONS.md](HOST_FUNCTIONS.md) for the full list of dispatchable operations
 - **Identity-mapped memory** - Simplified memory layout (vaddr == paddr)
 - **Generic cmdline mechanism** - Pass arguments to any application via `-- arg1 arg2 ...`
 - **Fast cold start** - Hyperlight's lightweight design enables millisecond startup times
@@ -273,16 +273,28 @@ hyperlight-unikraft kernel --initrd node.cpio --memory 512Mi -- /app/server.js -
 hyperlight-unikraft [OPTIONS] <KERNEL> [-- <APP_ARGS>...]
 
 Arguments:
-  <KERNEL>       Path to the Unikraft kernel binary
-  <APP_ARGS>...  Arguments passed to the application (after --)
+  <KERNEL>              Path to the Unikraft kernel binary
+  <APP_ARGS>...         Arguments passed to the application (after --)
 
 Options:
-  -m, --memory <MEMORY>  Memory allocation [default: 512Mi]
-      --stack <STACK>    Stack size [default: 8Mi]
-      --initrd <CPIO>    Path to initrd/rootfs CPIO archive
-  -q, --quiet            Suppress kernel output
-  -h, --help             Print help
-  -V, --version          Print version
+      --initrd <CPIO>          Path to initrd/rootfs CPIO archive
+  -m, --memory <MEMORY>        Memory allocation (e.g., 256Mi, 512Mi, 1Gi) [default: 512Mi]
+      --stack <STACK>          Stack size (e.g., 8Mi) [default: 8Mi]
+  -q, --quiet                  Quiet mode — suppress host-side status messages
+      --enable-tools           Enable tool dispatch via __dispatch host function
+      --mount <HOST[:GUEST]>   Preopen a host directory for the guest's sandboxed filesystem
+                               (repeatable; default guest path: /host)
+      --net                    Enable guest networking (off by default)
+      --net-allow <HOST_OR_IP> Restrict networking to listed hosts/IPs (implies --net; repeatable;
+                               conflicts with --net-block)
+      --net-block <HOST_OR_IP> Block listed hosts/IPs, allow everything else (implies --net;
+                               repeatable; conflicts with --net-allow)
+      --port <PORT>            Allow guest to bind (listen) on this port (implies --net; repeatable)
+      --repeat <N>             Run the application N additional times via snapshot/restore [default: 0]
+  -e, --exec <CODE>            Inline code snippet — interpreter invoked with -c <CODE>
+                               (conflicts with positional -- <APP_ARGS>)
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 ## Project Structure
