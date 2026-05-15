@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778830154501,
+  "lastUpdate": 1778851281733,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -693,6 +693,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 100,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "110b50d3ddd1f7c65cf37dd9bc23df10d1f4f9e2",
+          "message": "Merge pull request #39 from hyperlight-dev/fix/networking-dns\n\nfix: accept unimplemented socket options, bump 0.3.0",
+          "timestamp": "2026-05-15T06:15:38-07:00",
+          "tree_id": "492a2b0476f2b82eb36f097e305d5300b300b1c3",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/110b50d3ddd1f7c65cf37dd9bc23df10d1f4f9e2"
+        },
+        "date": 1778851280853,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 10,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 80,
             "unit": "ms"
           },
           {
