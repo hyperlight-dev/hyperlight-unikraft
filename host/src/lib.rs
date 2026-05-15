@@ -767,34 +767,40 @@ impl FsSandbox {
         let mut out = resolved_ancestor;
         for name in tail.into_iter().rev() {
             out.push(name);
-            // Catch symlinks in the non-existing tail — including dangling ones.
-            if let Ok(meta) = std::fs::symlink_metadata(&out) {
-                if meta.file_type().is_symlink() {
-                    let target = std::fs::read_link(&out)?;
-                    let abs = if target.is_absolute() {
-                        target
-                    } else {
-                        out.parent().unwrap_or(&self.root).join(&target)
-                    };
-                    // Normalise the absolute target (resolve .. etc) without
-                    // touching the filesystem, then check the prefix.
-                    let mut norm = std::path::PathBuf::new();
-                    for c in abs.components() {
-                        match c {
-                            std::path::Component::ParentDir => {
-                                norm.pop();
-                            }
-                            std::path::Component::CurDir => {}
-                            c => norm.push(c),
+            // Walk the symlink chain (with hop limit) to catch escapes
+            // through dangling or chained symlinks.
+            const MAX_SYMLINK_HOPS: usize = 40;
+            let mut cursor = out.clone();
+            for _ in 0..MAX_SYMLINK_HOPS {
+                let Ok(meta) = std::fs::symlink_metadata(&cursor) else {
+                    break;
+                };
+                if !meta.file_type().is_symlink() {
+                    break;
+                }
+                let target = std::fs::read_link(&cursor)?;
+                let abs = if target.is_absolute() {
+                    target
+                } else {
+                    cursor.parent().unwrap_or(&self.root).join(&target)
+                };
+                let mut norm = std::path::PathBuf::new();
+                for c in abs.components() {
+                    match c {
+                        std::path::Component::ParentDir => {
+                            norm.pop();
                         }
-                    }
-                    if !norm.starts_with(&self.root) {
-                        return Err(anyhow!(
-                            "symlink target escapes mount root: {:?}",
-                            guest_path
-                        ));
+                        std::path::Component::CurDir => {}
+                        c => norm.push(c),
                     }
                 }
+                if !norm.starts_with(&self.root) {
+                    return Err(anyhow!(
+                        "symlink target escapes mount root: {:?}",
+                        guest_path
+                    ));
+                }
+                cursor = norm;
             }
         }
         Ok(out)
@@ -2519,11 +2525,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_dangling_symlink_escape() {
+    fn resolve_rejects_dangling_symlink_escape() {
         use std::os::unix::fs::symlink;
         let root = tmpdir("dangling-escape");
-        // Create a dangling symlink whose target is outside root.
-        symlink("/tmp/nonexistent-outside-root", root.join("bad_link")).unwrap();
+        let outside = tmpdir("dangling-escape-out");
+        symlink(outside.join("nonexistent"), root.join("bad_link")).unwrap();
         let fs_sb = FsSandbox::new(&root).unwrap();
         let err = fs_sb.resolve("bad_link").unwrap_err().to_string();
         assert!(
@@ -2534,14 +2540,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_valid_internal_symlink() {
+    fn resolve_allows_valid_internal_symlink() {
         use std::os::unix::fs::symlink;
         let root = tmpdir("valid-internal");
         fs::write(root.join("real_file.txt"), "hello").unwrap();
         symlink(root.join("real_file.txt"), root.join("good_link")).unwrap();
         let fs_sb = FsSandbox::new(&root).unwrap();
         let resolved = fs_sb.resolve("good_link").unwrap();
-        // The symlink target is inside root, so resolve should succeed.
         assert!(
             resolved.starts_with(&root),
             "expected path under root, got: {resolved:?}"
@@ -2550,14 +2555,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_dangling_symlink_inside_root() {
+    fn resolve_allows_dangling_symlink_inside_root() {
         use std::os::unix::fs::symlink;
         let root = tmpdir("dangling-inside");
-        // Dangling symlink whose target is inside root (just doesn't exist yet).
         symlink(root.join("future_file.txt"), root.join("ok_link")).unwrap();
         let fs_sb = FsSandbox::new(&root).unwrap();
-        // This should be allowed — the target is within root even though it
-        // doesn't exist yet.
         let resolved = fs_sb.resolve("ok_link").unwrap();
         assert!(
             resolved.starts_with(&root),
@@ -2567,17 +2569,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_symlink_chain_escape() {
+    fn resolve_rejects_symlink_chain_escape() {
         use std::os::unix::fs::symlink;
         let root = tmpdir("chain-escape");
         let outside = tmpdir("chain-outside");
-        // symlink B -> outside (dangling or not, target is outside root)
         symlink(&outside, root.join("link_b")).unwrap();
-        // symlink A -> link_b
         symlink(root.join("link_b"), root.join("link_a")).unwrap();
         let fs_sb = FsSandbox::new(&root).unwrap();
-        // Resolving link_a should fail because it chains through link_b
-        // which points outside root.
+        let err = fs_sb.resolve("link_a").unwrap_err().to_string();
+        assert!(
+            err.contains("escapes mount root"),
+            "expected escape error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rejects_chained_dangling_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let root = tmpdir("chain-dangling");
+        let outside = tmpdir("chain-dangling-out");
+        // link_b -> dangling path outside root
+        symlink(outside.join("nonexistent"), root.join("link_b")).unwrap();
+        // link_a -> link_b (which is under root, but chains outside)
+        symlink(root.join("link_b"), root.join("link_a")).unwrap();
+        let fs_sb = FsSandbox::new(&root).unwrap();
         let err = fs_sb.resolve("link_a").unwrap_err().to_string();
         assert!(
             err.contains("escapes mount root"),
