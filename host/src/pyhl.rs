@@ -406,25 +406,21 @@ pub fn ghcr_image_ref(repo: &str, tag: Option<&str>) -> String {
     format!("{}:{}", repo, tag.unwrap_or("latest"))
 }
 
-/// Pull a single file out of an OCI image hosted on GHCR. Uses whichever
-/// of `docker` / `podman` is on `$PATH`. The published images are
-/// FROM-scratch with a single payload file at a known path (`/kernel`
-/// or `/initrd.cpio`), so this is a straightforward
-/// `pull → create → cp → rm` dance.
-///
-/// Returns `Err` if neither container tool is available — callers that
-/// want a pure-library alternative should use
-/// [`InstallSource::LocalDir`] or [`InstallSource::Explicit`] instead.
+/// Pull a single file out of an OCI image hosted on GHCR. Tries
+/// `docker` / `podman` first; if neither is on `$PATH`, falls back to
+/// the OCI registry HTTP API (no container runtime needed).
 pub fn extract_from_ghcr(image: &str, src_path_in_image: &str, dst: &Path) -> Result<()> {
-    use std::process::Command;
+    match find_on_path(&["docker", "podman"]) {
+        Some(tool) => extract_via_docker(tool, image, src_path_in_image, dst),
+        None => {
+            eprintln!("pyhl:   docker/podman not found, pulling via OCI registry API");
+            extract_via_oci_api(image, src_path_in_image, dst)
+        }
+    }
+}
 
-    let tool = find_on_path(&["docker", "podman"]).ok_or_else(|| {
-        anyhow!(
-            "need `docker` or `podman` on $PATH to pull the pyhl image from GHCR.\n\
-             alternatives: install one of them, or use `pyhl setup --from <local-dir>` \
-             (library callers: InstallSource::LocalDir / ::Explicit)."
-        )
-    })?;
+fn extract_via_docker(tool: &str, image: &str, src_path_in_image: &str, dst: &Path) -> Result<()> {
+    use std::process::Command;
 
     let run = |cmd: &mut Command, label: &str| -> Result<std::process::Output> {
         let out = cmd
@@ -451,7 +447,6 @@ pub fn extract_from_ghcr(image: &str, src_path_in_image: &str, dst: &Path) -> Re
         "create",
     )?;
 
-    // Guard so the tmp container is removed even if `cp` fails.
     let _cleanup = GhcrCleanup {
         tool: tool.to_string(),
         cname: cname.clone(),
@@ -468,6 +463,92 @@ pub fn extract_from_ghcr(image: &str, src_path_in_image: &str, dst: &Path) -> Re
     )?;
 
     Ok(())
+}
+
+/// Pull a single file from a GHCR OCI image using the registry HTTP API.
+/// No container runtime required.
+fn extract_via_oci_api(image: &str, src_path_in_image: &str, dst: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    let (repo, tag) = parse_image_ref(image)?;
+
+    eprintln!("pyhl:   pull {image} (via OCI API)");
+
+    let token_url = format!("https://ghcr.io/token?scope=repository:{repo}:pull");
+    let token_body: serde_json::Value = serde_json::from_slice(
+        &ureq::get(&token_url)
+            .call()
+            .with_context(|| format!("fetch GHCR auth token for {repo}"))?
+            .into_body()
+            .read_to_vec()?,
+    )?;
+    let token = token_body["token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("GHCR token response missing 'token' field"))?;
+
+    let manifest_url = format!("https://ghcr.io/v2/{repo}/manifests/{tag}");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &ureq::get(&manifest_url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .header(
+                "Accept",
+                "application/vnd.oci.image.manifest.v1+json,\
+                 application/vnd.docker.distribution.manifest.v2+json",
+            )
+            .call()
+            .with_context(|| format!("fetch manifest for {repo}:{tag}"))?
+            .into_body()
+            .read_to_vec()?,
+    )?;
+
+    let digest = manifest["layers"]
+        .as_array()
+        .and_then(|layers| layers.first())
+        .and_then(|l| l["digest"].as_str())
+        .ok_or_else(|| anyhow!("manifest has no layers for {repo}:{tag}"))?;
+
+    let blob_url = format!("https://ghcr.io/v2/{repo}/blobs/{digest}");
+    let body = ureq::get(&blob_url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .call()
+        .with_context(|| format!("fetch blob {digest}"))?
+        .into_body()
+        .with_config()
+        .limit(512 * 1024 * 1024)
+        .read_to_vec()?;
+
+    let target_name = src_path_in_image.trim_start_matches('/');
+    let gz = GzDecoder::new(body.as_slice());
+    let mut archive = Archive::new(gz);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        if path
+            .to_str()
+            .is_some_and(|p| p.trim_start_matches("./") == target_name)
+        {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out = std::fs::File::create(dst)?;
+            std::io::copy(&mut entry, &mut out)?;
+            return Ok(());
+        }
+    }
+
+    bail!("file '{target_name}' not found in OCI layer for {repo}:{tag}")
+}
+
+/// Parse "ghcr.io/org/repo:tag" into ("org/repo", "tag").
+fn parse_image_ref(image: &str) -> Result<(&str, &str)> {
+    let without_registry = image
+        .strip_prefix("ghcr.io/")
+        .ok_or_else(|| anyhow!("expected ghcr.io/ prefix in image ref: {image}"))?;
+    match without_registry.rsplit_once(':') {
+        Some((repo, tag)) => Ok((repo, tag)),
+        None => Ok((without_registry, "latest")),
+    }
 }
 
 struct GhcrCleanup {
