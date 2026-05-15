@@ -44,6 +44,19 @@ COPY --from=driver-build /src/hl_pydriver /bin/hl_pydriver
 
 # Stage 4: pack CPIO.
 FROM alpine:3.20 AS cpio
-RUN apk add --no-cache cpio findutils
+RUN apk add --no-cache cpio findutils ca-certificates
 COPY --from=rootfs / /rootfs/
+
+# DNS configuration for glibc's getaddrinfo
+RUN mkdir -p /rootfs/etc && \
+    echo "nameserver 8.8.8.8" > /rootfs/etc/resolv.conf && \
+    echo "nameserver 8.8.4.4" >> /rootfs/etc/resolv.conf && \
+    echo "hosts: files dns" > /rootfs/etc/nsswitch.conf && \
+    echo "127.0.0.1 localhost" > /rootfs/etc/hosts
+
+# CA certificates for TLS
+RUN mkdir -p /rootfs/etc/ssl/certs /rootfs/usr/lib/ssl && \
+    cp /etc/ssl/certs/ca-certificates.crt /rootfs/etc/ssl/certs/ && \
+    ln -sf /etc/ssl/certs/ca-certificates.crt /rootfs/usr/lib/ssl/cert.pem
+
 RUN cd /rootfs && find . | cpio -o -H newc > /output.cpio 2>/dev/null

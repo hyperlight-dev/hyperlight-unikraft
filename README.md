@@ -54,6 +54,13 @@ This project enables running Linux applications (Python, Node.js, Go, Rust, C/C+
 - **Generic cmdline mechanism** - Pass arguments to any application via `-- arg1 arg2 ...`
 - **Fast cold start** - Hyperlight's lightweight design enables millisecond startup times
 
+### Benchmarks
+
+Performance and density benchmarks run on every push to `main` and on PRs. Historical trends are available at:
+
+- [Linux benchmarks](https://hyperlight-dev.github.io/hyperlight-unikraft/dev/bench/linux/)
+- [Windows benchmarks](https://hyperlight-dev.github.io/hyperlight-unikraft/dev/bench/windows/)
+
 ## Prerequisites
 
 Common on both Linux and Windows:

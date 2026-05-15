@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     // expose host directories via the guest's hostfs.
     let mounts: &[Preopen] = &[];
 
-    let mut rt = pyhl::Runtime::new(&home, mounts)?;
+    let mut rt = pyhl::Runtime::new(&home, mounts, None, None)?;
 
     eprintln!("-- first run (hermetic from loaded snapshot) --");
     let t1 = rt.run_code(&code)?;

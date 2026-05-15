@@ -65,8 +65,10 @@ use hyperlight_host::sandbox::snapshot::Snapshot;
 use hyperlight_host::sandbox::uninitialized::GuestEnvironment;
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::{GuestBinary, HostFunctions, MultiUseSandbox, UninitializedSandbox};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -152,10 +154,212 @@ impl Preopen {
     }
 }
 
-// Guest VA for the initrd mapped via map_file_cow.
-// Computed dynamically in new_with_file_initrd to be after the
-// primary shared memory region, page-aligned.
-// Falls back to 2 GiB if the sandbox config doesn't have heap info.
+// ---------------------------------------------------------------------------
+// Network policy
+// ---------------------------------------------------------------------------
+
+/// Controls which network destinations a guest sandbox can reach.
+///
+/// By default, networking is **disabled** (no `net_*` tools are registered).
+/// Callers must opt in via [`SandboxBuilder::network`] or the `--net` CLI flag.
+#[derive(Clone, Debug)]
+pub enum NetworkPolicy {
+    /// All outbound connections are allowed (no filtering).
+    AllowAll,
+    /// Only connections to the listed destinations are permitted.
+    AllowList(AllowList),
+    /// All connections are allowed *except* to the listed destinations.
+    BlockList(BlockList),
+}
+
+/// A set of allowed network destinations.
+///
+/// Stores both literal IPs and hostnames. At check time, hostnames are
+/// re-resolved so the policy tracks DNS changes (CDN rotation, etc.).
+#[derive(Clone, Debug)]
+pub struct AllowList {
+    allowed_ips: HashSet<IpAddr>,
+    hostnames: Vec<String>,
+}
+
+impl AllowList {
+    /// Build an allowlist from a mixed set of hostnames and IP literals.
+    ///
+    /// Hostnames are verified to be resolvable at construction time
+    /// (fail-closed). At check time they are re-resolved so CDN/anycast
+    /// rotation doesn't cause false denials.
+    pub fn from_hosts(entries: &[impl AsRef<str>]) -> Result<Self> {
+        use std::net::ToSocketAddrs;
+        let mut allowed_ips = HashSet::new();
+        let mut hostnames = Vec::new();
+        for entry in entries {
+            let entry = entry.as_ref();
+            if let Ok(ip) = entry.parse::<IpAddr>() {
+                allowed_ips.insert(ip);
+            } else {
+                let addrs = (entry, 0u16)
+                    .to_socket_addrs()
+                    .map_err(|e| anyhow!("resolve {:?}: {}", entry, e))?;
+                let mut found = false;
+                for sa in addrs {
+                    allowed_ips.insert(sa.ip());
+                    found = true;
+                }
+                if !found {
+                    return Err(anyhow!("hostname {:?} resolved to zero addresses", entry));
+                }
+                hostnames.push(entry.to_string());
+            }
+        }
+        Ok(Self {
+            allowed_ips,
+            hostnames,
+        })
+    }
+
+    fn is_allowed(&self, ip: &IpAddr) -> bool {
+        if self.allowed_ips.contains(ip) {
+            return true;
+        }
+        // Re-resolve hostnames to catch CDN/anycast IP rotation.
+        use std::net::ToSocketAddrs;
+        for host in &self.hostnames {
+            if let Ok(addrs) = (host.as_str(), 0u16).to_socket_addrs() {
+                for sa in addrs {
+                    if &sa.ip() == ip {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// A set of blocked network destinations.
+///
+/// Like [`AllowList`], stores both literal IPs and hostnames. At check
+/// time, hostnames are re-resolved so the policy tracks DNS changes.
+#[derive(Clone, Debug)]
+pub struct BlockList {
+    blocked_ips: HashSet<IpAddr>,
+    hostnames: Vec<String>,
+}
+
+impl BlockList {
+    /// Build a blocklist from a mixed set of hostnames and IP literals.
+    ///
+    /// Hostnames are verified to be resolvable at construction time
+    /// (fail-closed). At check time they are re-resolved so CDN/anycast
+    /// rotation doesn't cause false passes.
+    pub fn from_hosts(entries: &[impl AsRef<str>]) -> Result<Self> {
+        use std::net::ToSocketAddrs;
+        let mut blocked_ips = HashSet::new();
+        let mut hostnames = Vec::new();
+        for entry in entries {
+            let entry = entry.as_ref();
+            if let Ok(ip) = entry.parse::<IpAddr>() {
+                blocked_ips.insert(ip);
+            } else {
+                let addrs = (entry, 0u16)
+                    .to_socket_addrs()
+                    .map_err(|e| anyhow!("resolve {:?}: {}", entry, e))?;
+                let mut found = false;
+                for sa in addrs {
+                    blocked_ips.insert(sa.ip());
+                    found = true;
+                }
+                if !found {
+                    return Err(anyhow!("hostname {:?} resolved to zero addresses", entry));
+                }
+                hostnames.push(entry.to_string());
+            }
+        }
+        Ok(Self {
+            blocked_ips,
+            hostnames,
+        })
+    }
+
+    fn is_blocked(&self, ip: &IpAddr) -> bool {
+        if self.blocked_ips.contains(ip) {
+            return true;
+        }
+        use std::net::ToSocketAddrs;
+        for host in &self.hostnames {
+            if let Ok(addrs) = (host.as_str(), 0u16).to_socket_addrs() {
+                for sa in addrs {
+                    if &sa.ip() == ip {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+impl NetworkPolicy {
+    fn check(&self, addr: &std::net::SocketAddr) -> Result<()> {
+        match self {
+            NetworkPolicy::AllowAll => Ok(()),
+            NetworkPolicy::AllowList(al) => {
+                if addr.port() == 53 || al.is_allowed(&addr.ip()) {
+                    Ok(())
+                } else {
+                    Err(anyhow!("network policy denies connection to {}", addr))
+                }
+            }
+            NetworkPolicy::BlockList(bl) => {
+                // DNS (port 53) is always allowed so the guest can resolve names.
+                if addr.port() == 53 {
+                    return Ok(());
+                }
+                if bl.is_blocked(&addr.ip()) {
+                    Err(anyhow!("network policy denies connection to {}", addr))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Listen-port allowlist (inbound)
+// ---------------------------------------------------------------------------
+
+/// Controls which ports a guest may bind to for inbound connections.
+///
+/// Orthogonal to [`NetworkPolicy`] (which governs *outbound* destinations).
+/// Without a `ListenPorts` allowlist, `net_bind` / `net_listen` /
+/// `net_accept` are still registered but `net_bind` rejects every call.
+#[derive(Clone, Debug)]
+pub struct ListenPorts {
+    ports: HashSet<u16>,
+}
+
+impl ListenPorts {
+    /// Create from an iterator of port numbers.
+    pub fn from_ports(ports: impl IntoIterator<Item = u16>) -> Self {
+        Self {
+            ports: ports.into_iter().collect(),
+        }
+    }
+
+    /// Returns `Ok(())` if `port` is in the allowlist.
+    fn check(&self, port: u16) -> Result<()> {
+        if self.ports.contains(&port) {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "Permission denied: port {} not in listen allowlist ({:?})",
+                port,
+                self.ports
+            ))
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -791,6 +995,383 @@ fn build_tools(
     Ok(Some(registry))
 }
 
+/// Register internal tools (`__hl_exit`, `__hl_sleep`) on a tool registry.
+/// These are plumbing used by the guest driver (`hl_pydriver.c`) and are
+/// always present regardless of user-supplied tools or preopens.
+///
+/// Networking tools are only registered when a [`NetworkPolicy`] is provided.
+fn register_internal_tools(
+    tools: &mut ToolRegistry,
+    exit_code: &Arc<AtomicI32>,
+    network: Option<&NetworkPolicy>,
+    listen_ports: Option<&ListenPorts>,
+) {
+    let ec = exit_code.clone();
+    tools.register("__hl_exit", move |args| {
+        let code = args["code"].as_i64().unwrap_or(1) as i32;
+        ec.store(code, Ordering::Relaxed);
+        Ok(serde_json::json!({}))
+    });
+    tools.register("__hl_sleep", |args| {
+        let ns = args["ns"].as_u64().unwrap_or(0);
+        if ns > 0 {
+            std::thread::sleep(std::time::Duration::from_nanos(ns));
+        }
+        Ok(serde_json::json!({}))
+    });
+    if let Some(policy) = network {
+        register_net_tools(tools, policy, listen_ports);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-proxied networking (hostsock)
+// ---------------------------------------------------------------------------
+
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::net::SocketAddr;
+use std::sync::Mutex;
+
+enum HostSocket {
+    Socket(Socket),
+}
+
+struct SocketTable {
+    sockets: HashMap<u32, HostSocket>,
+    next_id: u32,
+}
+
+impl SocketTable {
+    fn new() -> Self {
+        Self {
+            sockets: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    fn insert(&mut self, sock: HostSocket) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.sockets.insert(id, sock);
+        id
+    }
+
+    fn get(&self, fd: u32) -> Result<&HostSocket> {
+        self.sockets
+            .get(&fd)
+            .ok_or_else(|| anyhow!("bad_fd: {}", fd))
+    }
+
+    fn get_socket(&self, fd: u32) -> Result<&Socket> {
+        match self.get(fd)? {
+            HostSocket::Socket(s) => Ok(s),
+        }
+    }
+
+    fn remove(&mut self, fd: u32) -> Result<()> {
+        self.sockets
+            .remove(&fd)
+            .map(|_| ())
+            .ok_or_else(|| anyhow!("bad_fd: {}", fd))
+    }
+}
+
+fn parse_sockaddr(args: &serde_json::Value) -> Result<SocketAddr> {
+    let addr_str = args["addr"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing 'addr'"))?;
+    let port = args["port"].as_u64().unwrap_or(0) as u16;
+    let ip: std::net::IpAddr = addr_str.parse().map_err(|e| anyhow!("bad addr: {}", e))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn sockaddr_to_json(addr: SocketAddr) -> serde_json::Value {
+    let family: i32 = match addr {
+        SocketAddr::V4(_) => 2,
+        SocketAddr::V6(_) => 10,
+    };
+    serde_json::json!({
+        "family": family,
+        "addr": addr.ip().to_string(),
+        "port": addr.port(),
+    })
+}
+
+fn register_net_tools(
+    tools: &mut ToolRegistry,
+    policy: &NetworkPolicy,
+    listen_ports: Option<&ListenPorts>,
+) {
+    use base64::Engine;
+    use serde_json::json;
+
+    let table = Arc::new(Mutex::new(SocketTable::new()));
+    let policy = Arc::new(policy.clone());
+
+    // net_socket
+    let t = table.clone();
+    tools.register("net_socket", move |args| {
+        let family = args["family"].as_i64().unwrap_or(2) as i32; // AF_INET=2
+        let sock_type = args["type"].as_i64().unwrap_or(1) as i32; // SOCK_STREAM=1
+        let protocol = args["protocol"].as_i64().unwrap_or(0) as i32;
+
+        let domain = match family {
+            2 => Domain::IPV4,
+            10 => Domain::IPV6,
+            _ => return Err(anyhow!("InvalidInput: unsupported family {}", family)),
+        };
+        let stype = match sock_type {
+            1 => Type::STREAM,
+            2 => Type::DGRAM,
+            _ => return Err(anyhow!("InvalidInput: unsupported type {}", sock_type)),
+        };
+        let proto = if protocol == 0 {
+            None
+        } else {
+            Some(Protocol::from(protocol))
+        };
+        let sock = Socket::new(domain, stype, proto)?;
+        let fd = t.lock().unwrap().insert(HostSocket::Socket(sock));
+        Ok(json!({ "fd": fd }))
+    });
+
+    // net_connect
+    let t = table.clone();
+    let pol = policy.clone();
+    tools.register("net_connect", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let addr = parse_sockaddr(&args)?;
+        pol.check(&addr)?;
+        let sa: SockAddr = addr.into();
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        sock.connect(&sa)?;
+        Ok(json!({}))
+    });
+
+    // net_bind — gated by listen-port allowlist
+    let t = table.clone();
+    let lp = listen_ports.cloned().map(Arc::new);
+    tools.register("net_bind", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let addr = parse_sockaddr(&args)?;
+        match lp.as_ref() {
+            Some(ports) => ports.check(addr.port())?,
+            None => return Err(anyhow!("Permission denied: no --port specified for bind")),
+        }
+        let sa: SockAddr = addr.into();
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        sock.bind(&sa)?;
+        Ok(json!({}))
+    });
+
+    // net_listen
+    let t = table.clone();
+    tools.register("net_listen", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let backlog = args["backlog"].as_i64().unwrap_or(128) as i32;
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        sock.listen(backlog)?;
+        Ok(json!({}))
+    });
+
+    // net_accept
+    let t = table.clone();
+    tools.register("net_accept", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let (new_sock, peer) = {
+            let tbl = t.lock().unwrap();
+            let sock = tbl.get_socket(fd)?;
+            sock.accept()?
+        };
+        let peer_addr: Option<SocketAddr> = peer.as_socket();
+        let new_fd = t.lock().unwrap().insert(HostSocket::Socket(new_sock));
+        let mut resp = json!({ "fd": new_fd });
+        if let Some(pa) = peer_addr {
+            resp["addr"] = json!(pa.ip().to_string());
+            resp["port"] = json!(pa.port());
+        }
+        Ok(resp)
+    });
+
+    // net_send
+    let t = table.clone();
+    tools.register("net_send", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let data_b64 = args["data"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing 'data'"))?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .map_err(|e| anyhow!("base64 decode: {}", e))?;
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        let sent = sock.send(&data)?;
+        Ok(json!({ "sent": sent }))
+    });
+
+    // net_sendto
+    let t = table.clone();
+    let pol = policy.clone();
+    tools.register("net_sendto", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let data_b64 = args["data"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing 'data'"))?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .map_err(|e| anyhow!("base64 decode: {}", e))?;
+        let addr = parse_sockaddr(&args)?;
+        pol.check(&addr)?;
+        let sa: SockAddr = addr.into();
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        let sent = sock.send_to(&data, &sa)?;
+        Ok(json!({ "sent": sent }))
+    });
+
+    // net_recv (alias for net_recvfrom with no addr returned for stream)
+    let t = table.clone();
+    tools.register("net_recv", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let len = args["len"].as_u64().unwrap_or(4096) as usize;
+        let mut buf = vec![std::mem::MaybeUninit::uninit(); len.min(65536)];
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        let n = sock.recv(&mut buf)?;
+        let data: Vec<u8> = buf[..n]
+            .iter()
+            .map(|b| unsafe { b.assume_init() })
+            .collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        Ok(json!({ "data": encoded, "len": n }))
+    });
+
+    // net_recvfrom
+    let t = table.clone();
+    tools.register("net_recvfrom", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let len = args["len"].as_u64().unwrap_or(4096) as usize;
+        let mut buf = vec![0u8; len.min(65536)];
+
+        let buf_init =
+            unsafe { &mut *(buf.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) };
+
+        let (n, peer) = {
+            let tbl = t.lock().unwrap();
+            let sock = tbl.get_socket(fd)?;
+            sock.recv_from(buf_init)?
+        };
+        buf.truncate(n);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+        let mut resp = json!({ "data": encoded, "len": n });
+        if let Some(pa) = peer.as_socket() {
+            resp["addr"] = json!(pa.ip().to_string());
+            resp["port"] = json!(pa.port());
+        }
+        Ok(resp)
+    });
+
+    // net_close
+    let t = table.clone();
+    tools.register("net_close", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        t.lock().unwrap().remove(fd)?;
+        Ok(json!({}))
+    });
+
+    // net_shutdown
+    let t = table.clone();
+    tools.register("net_shutdown", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let how = args["how"].as_i64().unwrap_or(2) as i32;
+        let shutdown = match how {
+            0 => std::net::Shutdown::Read,
+            1 => std::net::Shutdown::Write,
+            _ => std::net::Shutdown::Both,
+        };
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        sock.shutdown(shutdown)?;
+        Ok(json!({}))
+    });
+
+    // net_setsockopt
+    let t = table.clone();
+    tools.register("net_setsockopt", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let level = args["level"].as_i64().unwrap_or(0) as i32;
+        let optname = args["optname"].as_i64().unwrap_or(0) as i32;
+        let value = args["value"].as_i64().unwrap_or(0) as i32;
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        // SOL_SOCKET=1, SO_REUSEADDR=2
+        if level == 1 && optname == 2 {
+            sock.set_reuse_address(value != 0)?;
+        }
+        // SOL_SOCKET=1, SO_KEEPALIVE=9
+        if level == 1 && optname == 9 {
+            sock.set_keepalive(value != 0)?;
+        }
+        // IPPROTO_TCP=6, TCP_NODELAY=1
+        if level == 6 && optname == 1 {
+            sock.set_nodelay(value != 0)?;
+        }
+        Ok(json!({}))
+    });
+
+    // net_getsockopt
+    let t = table.clone();
+    tools.register("net_getsockopt", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let level = args["level"].as_i64().unwrap_or(0) as i32;
+        let optname = args["optname"].as_i64().unwrap_or(0) as i32;
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        let val: i32 = if level == 1 && optname == 3 {
+            // SOL_SOCKET + SO_TYPE — all our sockets are SOCK_STREAM
+            1
+        } else if level == 1 && optname == 2 {
+            sock.reuse_address()? as i32
+        } else if level == 6 && optname == 1 {
+            sock.nodelay()? as i32
+        } else {
+            0
+        };
+        Ok(json!({ "value": val }))
+    });
+
+    // net_getpeername
+    let t = table.clone();
+    tools.register("net_getpeername", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        let peer = sock.peer_addr()?;
+        if let Some(addr) = peer.as_socket() {
+            Ok(sockaddr_to_json(addr))
+        } else {
+            Ok(json!({ "addr": "0.0.0.0", "port": 0 }))
+        }
+    });
+
+    // net_getsockname
+    let t = table.clone();
+    tools.register("net_getsockname", move |args| {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let tbl = t.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        let local = sock.local_addr()?;
+        if let Some(addr) = local.as_socket() {
+            Ok(sockaddr_to_json(addr))
+        } else {
+            Ok(json!({ "addr": "0.0.0.0", "port": 0 }))
+        }
+    });
+}
+
 /// Routes incoming fs_* tool calls to the matching `FsSandbox` by
 /// matching the guest-supplied path against each preopen's guest path.
 #[derive(Clone)]
@@ -1041,6 +1622,7 @@ pub struct Sandbox {
     /// Snapshot restore unmaps all non-snapshot regions.
     file_mapping_path: Option<std::path::PathBuf>,
     file_mapping_base: u64,
+    exit_code: Arc<AtomicI32>,
 }
 
 /// Where the initrd comes from — either a file (zero-copy `map_file_cow`)
@@ -1071,6 +1653,8 @@ pub struct SandboxBuilder {
     heap_size: Option<u64>,
     stack_size: Option<u64>,
     preopens: Vec<Preopen>,
+    network: Option<NetworkPolicy>,
+    listen_ports: Option<ListenPorts>,
     tools: ToolRegistry,
     has_tools: bool,
 }
@@ -1126,6 +1710,26 @@ impl SandboxBuilder {
         self
     }
 
+    /// Enable guest networking with the given policy.
+    ///
+    /// Without this call, no `net_*` tools are registered and the guest
+    /// has no network access.
+    pub fn network(mut self, policy: NetworkPolicy) -> Self {
+        self.network = Some(policy);
+        self
+    }
+
+    /// Allow the guest to bind to the given ports for inbound connections.
+    ///
+    /// Requires [`network`](Self::network) to also be set — without a
+    /// network policy the net tools are not registered at all. When net
+    /// tools *are* registered but no `listen_ports` is set, `net_bind`
+    /// rejects every call (outbound-only mode).
+    pub fn listen_ports(mut self, ports: ListenPorts) -> Self {
+        self.listen_ports = Some(ports);
+        self
+    }
+
     /// Register a host function callable from the guest via `__dispatch`.
     pub fn tool<F>(mut self, name: &str, handler: F) -> Self
     where
@@ -1147,6 +1751,8 @@ impl SandboxBuilder {
         } else {
             None
         };
+        let net = self.network.as_ref();
+        let lp = self.listen_ports.as_ref();
         match self.initrd {
             Some(InitrdSource::File(path)) => Sandbox::evolve_mapped(
                 &self.kernel,
@@ -1155,6 +1761,8 @@ impl SandboxBuilder {
                 config,
                 tools,
                 &self.preopens,
+                net,
+                lp,
             ),
             Some(InitrdSource::Bytes(bytes)) => Sandbox::evolve_inline(
                 &self.kernel,
@@ -1163,6 +1771,8 @@ impl SandboxBuilder {
                 config,
                 tools,
                 &self.preopens,
+                net,
+                lp,
             ),
             None => Sandbox::evolve_mapped(
                 &self.kernel,
@@ -1171,6 +1781,8 @@ impl SandboxBuilder {
                 config,
                 tools,
                 &self.preopens,
+                net,
+                lp,
             ),
         }
     }
@@ -1187,12 +1799,15 @@ impl Sandbox {
             heap_size: None,
             stack_size: None,
             preopens: Vec::new(),
+            network: None,
+            listen_ports: None,
             tools: ToolRegistry::new(),
             has_tools: false,
         }
     }
 
     /// Low-level: boot with an in-memory initrd buffer. Prefer the builder.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn evolve_inline(
         kernel_path: &Path,
         initrd: Option<&[u8]>,
@@ -1200,6 +1815,8 @@ impl Sandbox {
         config: VmConfig,
         tools: Option<ToolRegistry>,
         preopens: &[Preopen],
+        network: Option<&NetworkPolicy>,
+        listen_ports: Option<&ListenPorts>,
     ) -> Result<Self> {
         if !kernel_path.exists() {
             return Err(anyhow!("Kernel not found: {:?}", kernel_path));
@@ -1213,20 +1830,20 @@ impl Sandbox {
 
         let mut usbox = UninitializedSandbox::new(env, Some(config.sandbox_config()))?;
 
-        let tools = build_tools(tools, preopens)?;
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
+        register_internal_tools(&mut tools, &exit_code, network, listen_ports);
+        let tools = Arc::new(tools);
+        let tools_ref = tools.clone();
+        usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
+            tools_ref.dispatch(&payload)
+        })?;
 
-        if let Some(tools) = tools {
-            let tools = Arc::new(tools);
-            let tools_ref = tools.clone();
-            usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
-                tools_ref.dispatch(&payload)
-            })?;
-        }
-
-        Self::finish_evolve(usbox, None, 0)
+        Self::finish_evolve(usbox, None, 0, exit_code)
     }
 
     /// Low-level: boot with a zero-copy mapped initrd file. Prefer the builder.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn evolve_mapped(
         kernel_path: &Path,
         initrd_path: Option<&Path>,
@@ -1234,6 +1851,8 @@ impl Sandbox {
         config: VmConfig,
         tools: Option<ToolRegistry>,
         preopens: &[Preopen],
+        network: Option<&NetworkPolicy>,
+        listen_ports: Option<&ListenPorts>,
     ) -> Result<Self> {
         if !kernel_path.exists() {
             return Err(anyhow!("Kernel not found: {:?}", kernel_path));
@@ -1263,24 +1882,28 @@ impl Sandbox {
             usbox.map_file_cow(path, INITRD_MAP_BASE, Some("initrd"))?;
         }
 
-        let tools = build_tools(tools, preopens)?;
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
+        register_internal_tools(&mut tools, &exit_code, network, listen_ports);
+        let tools = Arc::new(tools);
+        let tools_ref = tools.clone();
+        usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
+            tools_ref.dispatch(&payload)
+        })?;
 
-        // Register tool dispatch if needed
-        if let Some(tools) = tools {
-            let tools = Arc::new(tools);
-            let tools_ref = tools.clone();
-            usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
-                tools_ref.dispatch(&payload)
-            })?;
-        }
-
-        Self::finish_evolve(usbox, initrd_path.map(|p| p.to_path_buf()), INITRD_MAP_BASE)
+        Self::finish_evolve(
+            usbox,
+            initrd_path.map(|p| p.to_path_buf()),
+            INITRD_MAP_BASE,
+            exit_code,
+        )
     }
 
     fn finish_evolve(
         usbox: UninitializedSandbox,
         file_mapping_path: Option<std::path::PathBuf>,
         file_mapping_base: u64,
+        exit_code: Arc<AtomicI32>,
     ) -> Result<Self> {
         let mut inner = usbox.evolve()?;
         let snapshot = inner.snapshot().ok();
@@ -1289,6 +1912,7 @@ impl Sandbox {
             snapshot,
             file_mapping_path,
             file_mapping_base,
+            exit_code,
         })
     }
 
@@ -1339,6 +1963,18 @@ impl Sandbox {
         Ok(self.inner.call(func_name, args)?)
     }
 
+    /// Read the exit code reported by the guest via `__hl_exit`.
+    /// Defaults to 0 (success) if the guest never called it.
+    pub fn last_exit_code(&self) -> i32 {
+        self.exit_code.load(Ordering::Relaxed)
+    }
+
+    /// Reset the stored exit code to 0. Call before each guest
+    /// invocation so a previous non-zero code doesn't leak.
+    pub fn reset_exit_code(&self) {
+        self.exit_code.store(0, Ordering::Relaxed);
+    }
+
     /// Take a new snapshot of the current guest state.
     ///
     /// Useful for the "snapshot after one-time warm-up" pattern: call
@@ -1387,7 +2023,7 @@ impl Sandbox {
     /// a 2.5 GB snapshot — enough to double the whole `pyhl run` wall
     /// time on simple scripts.
     pub fn from_snapshot_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::from_snapshot_file_with(path, &[])
+        Self::from_snapshot_file_full(path, &[], None, None, None)
     }
 
     /// Load a previously-persisted snapshot and register a
@@ -1402,32 +2038,79 @@ impl Sandbox {
     /// fixed at setup time because it lives in the snapshot's memory
     /// image.
     pub fn from_snapshot_file_with<P: AsRef<Path>>(path: P, preopens: &[Preopen]) -> Result<Self> {
+        Self::from_snapshot_file_full(path, preopens, None, None, None)
+    }
+
+    /// Load a snapshot with an initrd file re-mapped at the standard
+    /// guest VA (0xC000_0000). Required when the snapshot was taken
+    /// from a cpiovfs-backed guest whose VFS nodes point into the
+    /// initrd region.
+    pub fn from_snapshot_file_with_initrd<P: AsRef<Path>, I: AsRef<Path>>(
+        path: P,
+        preopens: &[Preopen],
+        initrd: I,
+    ) -> Result<Self> {
+        Self::from_snapshot_file_full(
+            path,
+            preopens,
+            Some(initrd.as_ref().to_path_buf()),
+            None,
+            None,
+        )
+    }
+
+    /// Load a snapshot with full configuration: preopens, initrd,
+    /// network policy, and listen-port allowlist.
+    pub fn from_snapshot_file_configured<P: AsRef<Path>>(
+        path: P,
+        preopens: &[Preopen],
+        initrd: Option<&Path>,
+        network: Option<&NetworkPolicy>,
+        listen_ports: Option<&ListenPorts>,
+    ) -> Result<Self> {
+        Self::from_snapshot_file_full(
+            path,
+            preopens,
+            initrd.map(|p| p.to_path_buf()),
+            network,
+            listen_ports,
+        )
+    }
+
+    fn from_snapshot_file_full<P: AsRef<Path>>(
+        path: P,
+        preopens: &[Preopen],
+        initrd: Option<std::path::PathBuf>,
+        network: Option<&NetworkPolicy>,
+        listen_ports: Option<&ListenPorts>,
+    ) -> Result<Self> {
         let loaded = Snapshot::from_file_unchecked(path.as_ref())?;
         let arc = Arc::new(loaded);
 
-        let mut host_funcs = HostFunctions::default();
-        if !preopens.is_empty() {
-            if let Some(tools) = build_tools(None, preopens)? {
-                let tools = Arc::new(tools);
-                let tools_ref = tools.clone();
-                host_funcs
-                    .register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
-                        tools_ref.dispatch(&payload)
-                    })?;
-            }
-        } else {
-            host_funcs.register_host_function("__dispatch", |_payload: Vec<u8>| -> Vec<u8> {
-                Vec::new()
-            })?;
-        }
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let mut tools = build_tools(None, preopens)?.unwrap_or_default();
+        register_internal_tools(&mut tools, &exit_code, network, listen_ports);
+        let tools = Arc::new(tools);
+        let tools_ref = tools.clone();
 
-        let inner = MultiUseSandbox::from_snapshot(arc.clone(), host_funcs, None)?;
+        let mut host_funcs = HostFunctions::default();
+        host_funcs.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
+            tools_ref.dispatch(&payload)
+        })?;
+
+        let mut inner = MultiUseSandbox::from_snapshot(arc.clone(), host_funcs, None)?;
+
+        const INITRD_MAP_BASE: u64 = 0xC000_0000;
+        if let Some(ref initrd_path) = initrd {
+            inner.map_file_cow(initrd_path, INITRD_MAP_BASE, Some("initrd"))?;
+        }
 
         Ok(Self {
             inner,
             snapshot: Some(arc),
-            file_mapping_path: None,
-            file_mapping_base: 0,
+            file_mapping_path: initrd,
+            file_mapping_base: INITRD_MAP_BASE,
+            exit_code,
         })
     }
 }
@@ -1444,7 +2127,7 @@ pub fn run_vm(
     app_args: &[String],
     config: VmConfig,
 ) -> Result<()> {
-    let _ = Sandbox::evolve_inline(kernel_path, initrd, app_args, config, None, &[])?;
+    let _ = Sandbox::evolve_inline(kernel_path, initrd, app_args, config, None, &[], None, None)?;
     Ok(())
 }
 
@@ -1456,7 +2139,16 @@ pub fn run_vm_with_tools(
     config: VmConfig,
     tools: ToolRegistry,
 ) -> Result<()> {
-    let _ = Sandbox::evolve_inline(kernel_path, initrd, app_args, config, Some(tools), &[])?;
+    let _ = Sandbox::evolve_inline(
+        kernel_path,
+        initrd,
+        app_args,
+        config,
+        Some(tools),
+        &[],
+        None,
+        None,
+    )?;
     Ok(())
 }
 
@@ -1469,7 +2161,16 @@ pub fn run_vm_with_preopens(
     config: VmConfig,
     preopens: &[Preopen],
 ) -> Result<()> {
-    let _ = Sandbox::evolve_inline(kernel_path, initrd, app_args, config, None, preopens)?;
+    let _ = Sandbox::evolve_inline(
+        kernel_path,
+        initrd,
+        app_args,
+        config,
+        None,
+        preopens,
+        None,
+        None,
+    )?;
     Ok(())
 }
 
@@ -1496,7 +2197,8 @@ pub fn run_vm_capture_output(
 
     // Phase 1: evolve — boots the kernel and takes a post-init snapshot.
     // No application output happens here.
-    let mut sandbox = Sandbox::evolve_inline(kernel_path, initrd, app_args, config, None, &[])?;
+    let mut sandbox =
+        Sandbox::evolve_inline(kernel_path, initrd, app_args, config, None, &[], None, None)?;
     let setup_time = setup_start.elapsed();
 
     // Redirect stderr to a temp file before the call phase
@@ -1889,5 +2591,203 @@ mod tests {
         let resp = reg.dispatch(r);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.contains("\"text\":\"hi\""), "{s}");
+    }
+
+    // -- NetworkPolicy tests --------------------------------------------------
+
+    #[test]
+    fn network_policy_allow_all_permits_any() {
+        let policy = NetworkPolicy::AllowAll;
+        let addr: std::net::SocketAddr = "1.2.3.4:443".parse().unwrap();
+        assert!(policy.check(&addr).is_ok());
+    }
+
+    #[test]
+    fn network_policy_allowlist_permits_listed_ip() {
+        let al = AllowList::from_hosts(&["1.2.3.4"]).unwrap();
+        let policy = NetworkPolicy::AllowList(al);
+        let addr: std::net::SocketAddr = "1.2.3.4:443".parse().unwrap();
+        assert!(policy.check(&addr).is_ok());
+    }
+
+    #[test]
+    fn network_policy_allowlist_denies_unlisted_ip() {
+        let al = AllowList::from_hosts(&["1.2.3.4"]).unwrap();
+        let policy = NetworkPolicy::AllowList(al);
+        let addr: std::net::SocketAddr = "5.6.7.8:80".parse().unwrap();
+        let err = policy.check(&addr).unwrap_err();
+        assert!(err.to_string().contains("network policy denies"), "{err}");
+    }
+
+    #[test]
+    fn allowlist_resolves_hostnames() {
+        let al = AllowList::from_hosts(&["localhost"]).unwrap();
+        assert!(
+            al.is_allowed(&"127.0.0.1".parse().unwrap()) || al.is_allowed(&"::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn allowlist_rejects_unresolvable_hostname() {
+        let result = AllowList::from_hosts(&["this.host.definitely.does.not.exist.example"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn network_policy_blocklist_permits_unlisted_ip() {
+        let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
+        let policy = NetworkPolicy::BlockList(bl);
+        let addr: std::net::SocketAddr = "5.6.7.8:443".parse().unwrap();
+        assert!(policy.check(&addr).is_ok());
+    }
+
+    #[test]
+    fn network_policy_blocklist_denies_listed_ip() {
+        let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
+        let policy = NetworkPolicy::BlockList(bl);
+        let addr: std::net::SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let err = policy.check(&addr).unwrap_err();
+        assert!(err.to_string().contains("network policy denies"), "{err}");
+    }
+
+    #[test]
+    fn network_policy_blocklist_allows_dns() {
+        let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
+        let policy = NetworkPolicy::BlockList(bl);
+        let addr: std::net::SocketAddr = "1.2.3.4:53".parse().unwrap();
+        assert!(policy.check(&addr).is_ok());
+    }
+
+    #[test]
+    fn blocklist_resolves_hostnames() {
+        let bl = BlockList::from_hosts(&["localhost"]).unwrap();
+        assert!(
+            bl.is_blocked(&"127.0.0.1".parse().unwrap()) || bl.is_blocked(&"::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn blocklist_rejects_unresolvable_hostname() {
+        let result = BlockList::from_hosts(&["this.host.definitely.does.not.exist.example"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn net_tools_registered_with_blocklist() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
+        register_internal_tools(
+            &mut tools,
+            &exit_code,
+            Some(&NetworkPolicy::BlockList(bl)),
+            None,
+        );
+        let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"fd\""), "net_socket should work: {s}");
+    }
+
+    #[test]
+    fn net_tools_not_registered_without_policy() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        register_internal_tools(&mut tools, &exit_code, None, None);
+        let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"error\""), "net_socket should not exist: {s}");
+    }
+
+    #[test]
+    fn net_tools_registered_with_allow_all() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        register_internal_tools(&mut tools, &exit_code, Some(&NetworkPolicy::AllowAll), None);
+        let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"fd\""), "net_socket should work: {s}");
+    }
+
+    // -- ListenPorts tests -----------------------------------------------------
+
+    #[test]
+    fn listen_ports_permits_listed_port() {
+        let lp = ListenPorts::from_ports([8080]);
+        assert!(lp.check(8080).is_ok());
+    }
+
+    #[test]
+    fn listen_ports_denies_unlisted_port() {
+        let lp = ListenPorts::from_ports([8080]);
+        let err = lp.check(9090).unwrap_err();
+        assert!(err.to_string().contains("Permission denied"), "{err}");
+    }
+
+    #[test]
+    fn net_bind_denied_without_listen_ports() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        register_internal_tools(&mut tools, &exit_code, Some(&NetworkPolicy::AllowAll), None);
+        // Create a socket first
+        let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"fd\""), "net_socket should work: {s}");
+        // Try to bind — should fail because no listen_ports
+        let req = br#"{"name":"net_bind","args":{"fd":0,"addr":"127.0.0.1","port":8080}}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"error\""), "net_bind should be denied: {s}");
+        assert!(s.contains("no --port"), "{s}");
+    }
+
+    #[test]
+    fn net_bind_allowed_with_matching_port() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let lp = ListenPorts::from_ports([8080]);
+        register_internal_tools(
+            &mut tools,
+            &exit_code,
+            Some(&NetworkPolicy::AllowAll),
+            Some(&lp),
+        );
+        let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"fd\""), "net_socket should work: {s}");
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let fd = v["result"]["fd"].as_u64().unwrap();
+        let req =
+            format!(r#"{{"name":"net_bind","args":{{"fd":{fd},"addr":"127.0.0.1","port":8080}}}}"#);
+        let resp = tools.dispatch(req.as_bytes());
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(!s.contains("\"error\""), "net_bind should succeed: {s}");
+    }
+
+    #[test]
+    fn net_bind_denied_with_wrong_port() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let lp = ListenPorts::from_ports([8080]);
+        register_internal_tools(
+            &mut tools,
+            &exit_code,
+            Some(&NetworkPolicy::AllowAll),
+            Some(&lp),
+        );
+        let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
+        let resp = tools.dispatch(req);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let fd = v["result"]["fd"].as_u64().unwrap();
+        let req =
+            format!(r#"{{"name":"net_bind","args":{{"fd":{fd},"addr":"127.0.0.1","port":9090}}}}"#);
+        let resp = tools.dispatch(req.as_bytes());
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"error\""), "net_bind should be denied: {s}");
+        assert!(s.contains("Permission denied"), "{s}");
     }
 }

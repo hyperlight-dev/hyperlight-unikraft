@@ -23,10 +23,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use hyperlight_unikraft::pyhl::{
-    copy_replace, discover_source_artifacts, extract_from_ghcr, GHCR_INITRD_IMAGE,
-    GHCR_KERNEL_IMAGE,
+    copy_replace, discover_source_artifacts, extract_from_ghcr, ghcr_image_ref, GHCR_INITRD_REPO,
+    GHCR_KERNEL_REPO,
 };
-use hyperlight_unikraft::{Preopen, Sandbox};
+use hyperlight_unikraft::{AllowList, BlockList, ListenPorts, NetworkPolicy, Preopen, Sandbox};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -35,6 +35,35 @@ use std::time::Instant;
 /// path is `/host` when omitted.
 fn parse_mount(spec: &str) -> Result<Preopen> {
     Preopen::parse_cli(spec).map_err(|e| anyhow!("invalid --mount {:?}: {}", spec, e))
+}
+
+fn build_network_policy(
+    net: bool,
+    net_allow: &[String],
+    net_block: &[String],
+    has_ports: bool,
+) -> Result<Option<NetworkPolicy>> {
+    if !net_allow.is_empty() {
+        Ok(Some(NetworkPolicy::AllowList(AllowList::from_hosts(
+            net_allow,
+        )?)))
+    } else if !net_block.is_empty() {
+        Ok(Some(NetworkPolicy::BlockList(BlockList::from_hosts(
+            net_block,
+        )?)))
+    } else if net || has_ports {
+        Ok(Some(NetworkPolicy::AllowAll))
+    } else {
+        Ok(None)
+    }
+}
+
+fn build_listen_ports(ports: &[u16]) -> Option<ListenPorts> {
+    if ports.is_empty() {
+        None
+    } else {
+        Some(ListenPorts::from_ports(ports.iter().copied()))
+    }
 }
 
 /// Keep in sync with `py_initialize_once` in examples/python-agent-driver/
@@ -128,8 +157,13 @@ struct SetupArgs {
     ///
     /// Without --from, pyhl pulls the pre-published image from GHCR (requires
     /// docker or podman on $PATH).
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", conflicts_with = "tag")]
     from: Option<PathBuf>,
+
+    /// Pin a specific GHCR release tag (e.g., "v0.3.1") instead of
+    /// pulling :latest. Ignored when --from is used.
+    #[arg(long, value_name = "TAG", conflicts_with = "from")]
+    tag: Option<String>,
 
     /// Overwrite an existing installed image without prompting.
     #[arg(long)]
@@ -145,6 +179,34 @@ struct SetupArgs {
     /// given to `setup`.
     #[arg(long = "mount", value_name = "HOST[:GUEST]")]
     mounts: Vec<String>,
+
+    /// Enable guest networking.
+    #[arg(long)]
+    net: bool,
+
+    /// Restrict guest networking to the listed hosts/IPs.
+    /// Implies --net. Repeatable.
+    #[arg(
+        long = "net-allow",
+        value_name = "HOST_OR_IP",
+        conflicts_with = "net_block"
+    )]
+    net_allow: Vec<String>,
+
+    /// Block the listed hosts/IPs; all other destinations are allowed.
+    /// Implies --net. Repeatable.
+    #[arg(
+        long = "net-block",
+        value_name = "HOST_OR_IP",
+        conflicts_with = "net_allow"
+    )]
+    net_block: Vec<String>,
+
+    /// Allow the guest to bind (listen) on the given port. Implies --net.
+    /// Without this flag, `net_bind` is rejected (outbound-only).
+    /// Repeatable: `--port 8080 --port 3000`.
+    #[arg(long, value_name = "PORT")]
+    port: Vec<u16>,
 }
 
 #[derive(Args)]
@@ -171,6 +233,34 @@ struct RunArgs {
     /// remappable per-run.
     #[arg(long = "mount", value_name = "HOST[:GUEST]")]
     mounts: Vec<String>,
+
+    /// Enable guest networking.
+    #[arg(long)]
+    net: bool,
+
+    /// Restrict guest networking to the listed hosts/IPs.
+    /// Implies --net. Repeatable.
+    #[arg(
+        long = "net-allow",
+        value_name = "HOST_OR_IP",
+        conflicts_with = "net_block"
+    )]
+    net_allow: Vec<String>,
+
+    /// Block the listed hosts/IPs; all other destinations are allowed.
+    /// Implies --net. Repeatable.
+    #[arg(
+        long = "net-block",
+        value_name = "HOST_OR_IP",
+        conflicts_with = "net_allow"
+    )]
+    net_block: Vec<String>,
+
+    /// Allow the guest to bind (listen) on the given port. Implies --net.
+    /// Without this flag, `net_bind` is rejected (outbound-only).
+    /// Repeatable: `--port 8080 --port 3000`.
+    #[arg(long, value_name = "PORT")]
+    port: Vec<u16>,
 
     /// Print evolve/warmup/per-run timing to stderr. Off by default so the
     /// user's script output is clean.
@@ -288,15 +378,18 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
             // No --from: pull from GHCR. Uses docker or podman under the hood
             // because that's the standard OCI client everyone has and avoids
             // linking an oci-distribution client into pyhl.
+            let tag = args.tag.as_deref();
+            let kernel_image = ghcr_image_ref(GHCR_KERNEL_REPO, tag);
+            let initrd_image = ghcr_image_ref(GHCR_INITRD_REPO, tag);
             eprintln!("pyhl: downloading image from GHCR…");
             let tmp = home.join(".pyhl.download");
             fs::create_dir_all(&tmp)?;
             let kernel_path = tmp.join("kernel");
             let initrd_path = tmp.join("initrd.cpio");
-            extract_from_ghcr(GHCR_KERNEL_IMAGE, "/kernel", &kernel_path)?;
-            extract_from_ghcr(GHCR_INITRD_IMAGE, "/initrd.cpio", &initrd_path)?;
+            extract_from_ghcr(&kernel_image, "/kernel", &kernel_path)?;
+            extract_from_ghcr(&initrd_image, "/initrd.cpio", &initrd_path)?;
             (
-                format!("{GHCR_KERNEL_IMAGE} + {GHCR_INITRD_IMAGE}"),
+                format!("{kernel_image} + {initrd_image}"),
                 kernel_path,
                 initrd_path,
             )
@@ -329,6 +422,13 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         .iter()
         .map(|m| parse_mount(m))
         .collect::<Result<_>>()?;
+    let listen_ports = build_listen_ports(&args.port);
+    let network = build_network_policy(
+        args.net,
+        &args.net_allow,
+        &args.net_block,
+        listen_ports.is_some(),
+    )?;
 
     eprintln!("pyhl: warming up Python and persisting snapshot…");
     let t_warm = Instant::now();
@@ -338,6 +438,12 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
             .heap_size(3 * 512 * 1024 * 1024);
         for p in &setup_preopens {
             builder = builder.preopen(p.clone());
+        }
+        if let Some(ref policy) = network {
+            builder = builder.network(policy.clone());
+        }
+        if let Some(ref lp) = listen_ports {
+            builder = builder.listen_ports(lp.clone());
         }
         let mut sbox = builder.build()?;
         sbox.restore()?;
@@ -463,13 +569,29 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         .iter()
         .map(|m| parse_mount(m))
         .collect::<Result<_>>()?;
+    let listen_ports = build_listen_ports(&args.port);
+    let network = build_network_policy(
+        args.net,
+        &args.net_allow,
+        &args.net_block,
+        listen_ports.is_some(),
+    )?;
+
+    let initrd = home.join(INITRD_FILE);
 
     let t_load = Instant::now();
-    let mut sandbox = if run_preopens.is_empty() {
-        Sandbox::from_snapshot_file(&snapshot)?
+    let initrd_ref = if initrd.is_file() {
+        Some(initrd.as_path())
     } else {
-        Sandbox::from_snapshot_file_with(&snapshot, &run_preopens)?
+        None
     };
+    let mut sandbox = Sandbox::from_snapshot_file_configured(
+        &snapshot,
+        &run_preopens,
+        initrd_ref,
+        network.as_ref(),
+        listen_ports.as_ref(),
+    )?;
     if args.verbose {
         eprintln!(
             "[pyhl] load_snapshot={:.1}ms",
@@ -504,13 +626,18 @@ fn cmd_run(args: RunArgs) -> Result<()> {
             full
         };
 
+        sandbox.reset_exit_code();
         let t_call = Instant::now();
         let _: () = sandbox.call_named("run", payload)?;
         let call_ms = t_call.elapsed().as_secs_f64() * 1000.0;
+        let exit_code = sandbox.last_exit_code();
         if args.verbose {
             eprintln!(
-                "[pyhl] run {i}/{total} restore={restore_ms:.1}ms call={call_ms:.1}ms (hermetic)"
+                "[pyhl] run {i}/{total} restore={restore_ms:.1}ms call={call_ms:.1}ms exit={exit_code} (hermetic)"
             );
+        }
+        if exit_code != 0 {
+            std::process::exit(exit_code);
         }
     }
 
@@ -572,20 +699,7 @@ fn fresh_seed() -> u128 {
 // -- main ---------------------------------------------------------------------
 
 fn main() -> Result<()> {
-    // On Windows, hyperlight's surrogate-process manager pre-spawns
-    // HYPERLIGHT_INITIAL_SURROGATES Windows processes (default 512)
-    // the first time any sandbox is created. At ~7ms per CreateProcessA
-    // that's ~3.5s of amortised cost we pay on every `pyhl run`. Since
-    // pyhl is a short-lived single-sandbox CLI, pinning the initial
-    // count at 1 drops that to ~7ms. Caller can override by setting
-    // the env var explicitly before invoking pyhl.
-    if std::env::var_os("HYPERLIGHT_INITIAL_SURROGATES").is_none() {
-        // Safety: main() runs single-threaded on entry; set_var is safe here.
-        unsafe {
-            std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", "1");
-        }
-    }
-
+    hyperlight_unikraft::pyhl::default_surrogate_count();
     let cli = Cli::parse();
     match cli.cmd {
         Command::Setup(args) => cmd_setup(args),

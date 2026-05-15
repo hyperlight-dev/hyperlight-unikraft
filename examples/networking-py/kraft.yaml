@@ -1,6 +1,5 @@
-# Shell (BusyBox) on Hyperlight - kraft configuration
 specification: '0.6'
-name: shell-hyperlight
+name: networking-py-hyperlight
 
 unikraft:
   source: https://github.com/unikraft/unikraft.git
@@ -11,9 +10,9 @@ unikraft:
     CONFIG_PAGING: 'n'
     CONFIG_LIBUKVMEM: 'n'
     CONFIG_LIBUKINTCTLR_HYPERLIGHT: 'y'
-    CONFIG_HYPERLIGHT_MAX_GUEST_LOG_LEVEL: 0
+    CONFIG_HYPERLIGHT_MAX_GUEST_LOG_LEVEL: 4
 
-    # Suppress all kernel logging (compile-time filtering)
+    # Suppress all kernel logging
     CONFIG_LIBUKPRINT_KLVL_CRIT: 'y'
     CONFIG_LIBUKPRINT_PRINT_TIME: 'n'
     CONFIG_LIBUKPRINT_PRINT_SRCNAME: 'n'
@@ -23,27 +22,27 @@ unikraft:
     CONFIG_OPTIMIZE_SIZE: 'y'
     CONFIG_OPTIMIZE_PIE: 'y'
 
-    # VFS and initrd support - cpiovfs for zero-copy mount from CPIO
+    # VFS and initrd support - cpiovfs for zero-copy mount
     CONFIG_LIBVFSCORE: 'y'
     CONFIG_LIBVFSCORE_AUTOMOUNT_CI: 'y'
     CONFIG_LIBVFSCORE_AUTOMOUNT_CI_CUSTOM: 'y'
     CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_MP: '/'
     CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_DRIVER: 'cpiovfs'
-    CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_UKOPTS_IFINITRD0: 'y'
     CONFIG_LIBCPIOVFS: 'y'
     CONFIG_LIBUKCPIO: 'y'
 
-    # ELF loader - execute /bin/sh, script/command passed via cmdline
+    # ELF loader - execute Python binary
     CONFIG_APPELFLOADER: 'y'
     CONFIG_APPELFLOADER_VFSEXEC: 'y'
     CONFIG_APPELFLOADER_CUSTOMAPPNAME: 'n'
     CONFIG_APPELFLOADER_VFSEXEC_ENVPATH: 'n'
-    CONFIG_APPELFLOADER_VFSEXEC_PATH: '/bin/sh'
+    CONFIG_APPELFLOADER_VFSEXEC_PATH: '/usr/local/bin/python3'
     CONFIG_APPELFLOADER_VFSEXEC_EXECBIT: 'n'
-    CONFIG_LIBPOSIX_ENVIRON_ENVP0: 'PATH=/bin:/usr/bin'
+    CONFIG_LIBPOSIX_ENVIRON_ENVP0: 'PATH=/usr/local/bin:/usr/bin:/bin'
+    CONFIG_LIBPOSIX_ENVIRON_ENVP1: 'LD_LIBRARY_PATH=/usr/local/lib'
     CONFIG_LIBELF: 'y'
 
-    # Random number support (required by ELF loader for ASLR)
+    # Random number support (required for Python)
     CONFIG_LIBUKRANDOM_CMDLINE_SEED: 'y'
     CONFIG_LIBUKRANDOM_GETRANDOM: 'y'
 
@@ -51,17 +50,25 @@ unikraft:
     CONFIG_LIBUKBOOT_MAINTHREAD: 'y'
     CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL: 'y'
     CONFIG_LIBPOSIX_PROCESS_MULTITHREADING: 'y'
-    CONFIG_LIBPOSIX_PROCESS_SIGNAL: 'y'
     CONFIG_LIBPOSIX_FUTEX: 'y'
 
-    # Multiprocess support (vfork + execve for BusyBox applets)
-    CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS: 'y'
-    CONFIG_APPELFLOADER_MULTIPROCESS: 'y'
-
-    # MPI provides per-CPU structures; mmap needed by musl mallocng
+    # MPI + mmap
     CONFIG_LIBUKMPI: 'y'
     CONFIG_LIBUKMMAP: 'y'
 
+    # devfs + /dev/hcall (required for host-proxied networking)
+    CONFIG_LIBDEVFS: 'y'
+    CONFIG_LIBDEVFS_AUTOMOUNT: 'y'
+    CONFIG_HYPERLIGHT_HCALL: 'y'
+
+    # Networking: host-proxied sockets
+    CONFIG_LIBPOSIX_SOCKET: 'y'
+    CONFIG_LIBHOSTSOCK: 'y'
+
+    # FD infrastructure (required by posix-socket)
+    CONFIG_LIBPOSIX_FDIO: 'y'
+    CONFIG_LIBPOSIX_FDTAB: 'y'
+    CONFIG_LIBUKFILE: 'y'
 
 libraries:
   app-elfloader:

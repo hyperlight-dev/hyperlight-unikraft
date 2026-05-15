@@ -22,18 +22,15 @@ unikraft:
     CONFIG_OPTIMIZE_SIZE: 'y'
     CONFIG_OPTIMIZE_PIE: 'y'
 
-    # VFS and initrd support - cpiovfs for zero-copy mount, ramfs for /tmp
+    # VFS and initrd support - cpiovfs for zero-copy mount
     CONFIG_LIBVFSCORE: 'y'
     CONFIG_LIBVFSCORE_AUTOMOUNT_CI: 'y'
     CONFIG_LIBVFSCORE_AUTOMOUNT_CI_CUSTOM: 'y'
-    CONFIG_LIBCPIOVFS: 'y'
-    CONFIG_LIBRAMFS: 'y'
     CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_MP: '/'
     CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_DRIVER: 'cpiovfs'
-    CONFIG_LIBVFSCORE_AUTOMOUNT_CI1_MP: '/tmp'
-    CONFIG_LIBVFSCORE_AUTOMOUNT_CI1_DRIVER: 'ramfs'
-    CONFIG_LIBVFSCORE_AUTOMOUNT_CI2_MP: '/root'
-    CONFIG_LIBVFSCORE_AUTOMOUNT_CI2_DRIVER: 'ramfs'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_UKOPTS_IFINITRD0: 'y'
+    CONFIG_LIBCPIOVFS: 'y'
+    CONFIG_LIBUKCPIO: 'y'
 
     # ELF loader - execute PowerShell binary
     CONFIG_APPELFLOADER: 'y'

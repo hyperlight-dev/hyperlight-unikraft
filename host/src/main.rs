@@ -8,7 +8,9 @@
 
 use anyhow::Result;
 use clap::Parser;
-use hyperlight_unikraft::{parse_memory, Preopen, Sandbox};
+use hyperlight_unikraft::{
+    parse_memory, AllowList, BlockList, ListenPorts, NetworkPolicy, Preopen, Sandbox,
+};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -56,6 +58,37 @@ struct Args {
     /// (`/bin`, `/dev`, `/proc`, `/sys`, `/usr`, `/`).
     #[arg(long, value_name = "HOST[:GUEST]")]
     mount: Vec<String>,
+
+    /// Enable guest networking. Without this flag, the guest has no
+    /// network access.
+    #[arg(long)]
+    net: bool,
+
+    /// Restrict guest networking to the listed hosts/IPs.
+    /// Implies --net. Hostnames are resolved at sandbox creation time.
+    /// Repeatable: `--net-allow api.github.com --net-allow 10.0.0.1`.
+    #[arg(
+        long = "net-allow",
+        value_name = "HOST_OR_IP",
+        conflicts_with = "net_block"
+    )]
+    net_allow: Vec<String>,
+
+    /// Block the listed hosts/IPs; all other destinations are allowed.
+    /// Implies --net. Hostnames are resolved at sandbox creation time.
+    /// Repeatable: `--net-block evil.com --net-block 10.0.0.1`.
+    #[arg(
+        long = "net-block",
+        value_name = "HOST_OR_IP",
+        conflicts_with = "net_allow"
+    )]
+    net_block: Vec<String>,
+
+    /// Allow the guest to bind (listen) on the given port. Implies --net.
+    /// Without this flag, `net_bind` is rejected (outbound-only).
+    /// Repeatable: `--port 8080 --port 3000`.
+    #[arg(long, value_name = "PORT")]
+    port: Vec<u16>,
 
     /// Run the application N additional times via snapshot/restore + call.
     /// The first run always happens. --repeat=2 means 3 total runs.
@@ -152,6 +185,27 @@ fn main() -> Result<()> {
         None => args.app_args.clone(),
     };
 
+    let has_ports = !args.port.is_empty();
+    let network = if !args.net_allow.is_empty() {
+        Some(NetworkPolicy::AllowList(AllowList::from_hosts(
+            &args.net_allow,
+        )?))
+    } else if !args.net_block.is_empty() {
+        Some(NetworkPolicy::BlockList(BlockList::from_hosts(
+            &args.net_block,
+        )?))
+    } else if args.net || has_ports {
+        Some(NetworkPolicy::AllowAll)
+    } else {
+        None
+    };
+
+    let listen_ports = if has_ports {
+        Some(ListenPorts::from_ports(args.port.iter().copied()))
+    } else {
+        None
+    };
+
     let mut builder = Sandbox::builder(&args.kernel)
         .args(app_args)
         .heap_size(heap_size)
@@ -161,6 +215,12 @@ fn main() -> Result<()> {
     }
     for p in preopens {
         builder = builder.preopen(p);
+    }
+    if let Some(policy) = network {
+        builder = builder.network(policy);
+    }
+    if let Some(ports) = listen_ports {
+        builder = builder.listen_ports(ports);
     }
     if args.enable_tools {
         builder = builder.tool("echo", Ok);

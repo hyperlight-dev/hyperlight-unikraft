@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
     paths:
       - 'examples/**'
       - 'runtimes/**'
@@ -48,6 +49,12 @@ jobs:
             -f runtimes/${{ matrix.runtime }}.Dockerfile \
             -t $IMAGE runtimes/
           docker push $IMAGE
+          # Also tag with the release version when triggered by a git tag
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION_TAG=${{ env.IMAGE_BASE }}/${{ matrix.runtime }}-base:${{ github.ref_name }}
+            docker tag $IMAGE $VERSION_TAG
+            docker push $VERSION_TAG
+          fi
 
   # Build and publish kernels for each example
   publish-kernels:
@@ -88,11 +95,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.1'
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host -> target
+
+      - name: Cache kraft-hyperlight
+        id: kraft-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/kraft-hyperlight
+          key: kraft-hyperlight-linux-${{ hashFiles('.github/workflows/publish-examples.yml') }}
+
       - name: Install tools
         run: |
-          # Install kraft-hyperlight
-          git clone --branch hyperlight-platform --depth 1 https://github.com/danbugs/kraftkit.git /tmp/kraftkit
-          cd /tmp/kraftkit && go build -o /usr/local/bin/kraft-hyperlight ./cmd/kraft
+          # Install kraft-hyperlight (if not cached)
+          if [ ! -f /usr/local/bin/kraft-hyperlight ]; then
+            git clone --branch hyperlight-platform --depth 1 https://github.com/danbugs/kraftkit.git /tmp/kraftkit
+            cd /tmp/kraftkit && go build -o /usr/local/bin/kraft-hyperlight ./cmd/kraft
+          fi
           # Install hyperlight-unikraft
           cd ${{ github.workspace }}/host && cargo build --release
           sudo cp target/release/hyperlight-unikraft /usr/local/bin/
@@ -103,11 +128,14 @@ jobs:
           kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64 || true
           # Fallback: manual source clone + build
           if [ ! -f ".unikraft/build/${{ matrix.example.kernel }}" ]; then
-            UK_BRANCH=$(grep 'version:' kraft.yaml | head -1 | awk '{print $2}')
+            UK_SOURCE=$(awk '/^unikraft:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            UK_BRANCH=$(awk '/^unikraft:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
+            ELF_SOURCE=$(awk '/app-elfloader:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            ELF_BRANCH=$(awk '/app-elfloader:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
             mkdir -p .unikraft/apps .unikraft/libs
             rm -rf .unikraft/unikraft .unikraft/apps/elfloader
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/unikraft.git .unikraft/unikraft
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/app-elfloader.git .unikraft/apps/elfloader
+            git clone --branch "$UK_BRANCH" --depth 1 "$UK_SOURCE" .unikraft/unikraft
+            git clone --branch "$ELF_BRANCH" --depth 1 "$ELF_SOURCE" .unikraft/apps/elfloader
             git clone --branch staging --depth 1 https://github.com/unikraft/lib-libelf.git .unikraft/libs/libelf
             rm -rf .unikraft/build
             kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64
@@ -131,6 +159,11 @@ jobs:
           DEOF
           docker build -f /tmp/Dockerfile.kernel -t $IMAGE .
           docker push $IMAGE
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION_TAG=${{ env.IMAGE_BASE }}/${{ matrix.example.name }}-kernel:${{ github.ref_name }}
+            docker tag $IMAGE $VERSION_TAG
+            docker push $VERSION_TAG
+          fi
 
   # Publish the python-agent-driver rootfs CPIO as its own image so
   # `pyhl setup` can pull the initrd (and kernel, above) from GHCR
@@ -184,3 +217,8 @@ jobs:
           DEOF
           docker build -f /tmp/Dockerfile.initrd -t $IMAGE .
           docker push $IMAGE
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION_TAG=${{ env.IMAGE_BASE }}/python-agent-driver-initrd:${{ github.ref_name }}
+            docker tag $IMAGE $VERSION_TAG
+            docker push $VERSION_TAG
+          fi

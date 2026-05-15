@@ -25,12 +25,14 @@
 //! // One-time install (no-op if already present).
 //! pyhl::install(&pyhl::InstallOptions {
 //!     home,
-//!     source: pyhl::InstallSource::Ghcr,
+//!     source: pyhl::InstallSource::Ghcr { tag: None }, // None = :latest
 //!     mounts: &[],
+//!     network: None,
+//!     listen_ports: None,
 //!     force: false,
 //! })?;
 //!
-//! let mut rt = pyhl::Runtime::new(home, &[Preopen::new("./share", "/host")?])?;
+//! let mut rt = pyhl::Runtime::new(home, &[Preopen::new("./share", "/host")?], None, None)?;
 //! rt.run_code("print('hello from rust')")?;
 //! rt.run_code("print('hermetic second call')")?;  // fresh __main__ each time
 //! # Ok(())
@@ -45,6 +47,24 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::{Preopen, Sandbox};
+
+/// Default Hyperlight's surrogate-process pool to 1 on Windows.
+///
+/// The surrogate-process manager pre-spawns `HYPERLIGHT_INITIAL_SURROGATES`
+/// Windows processes (default 512) the first time any sandbox is created.
+/// At ~7 ms per `CreateProcessA` that is ~3.5 s of latency that library
+/// callers would pay on the very first sandbox. Pinning the default to 1
+/// drops that to ~7 ms. Callers (or the embedding binary) can still
+/// override by setting the env var before calling into `pyhl`.
+pub fn default_surrogate_count() {
+    if std::env::var_os("HYPERLIGHT_INITIAL_SURROGATES").is_none() {
+        // Safety: must be called before any sandbox is created and
+        // before additional threads are spawned.
+        unsafe {
+            std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", "1");
+        }
+    }
+}
 
 /// Standard file names inside an image home.
 pub const KERNEL_FILE: &str = "kernel";
@@ -69,6 +89,14 @@ pub struct InstallOptions<'a> {
     /// during warmup). `Runtime::new` only remaps the host side.
     pub mounts: &'a [Preopen],
 
+    /// Network policy. `None` disables networking; `Some(policy)`
+    /// enables `net_*` tools with the given restrictions.
+    pub network: Option<&'a crate::NetworkPolicy>,
+
+    /// Ports the guest may bind to for inbound connections.
+    /// `None` means outbound-only (when networking is enabled).
+    pub listen_ports: Option<&'a crate::ListenPorts>,
+
     /// Overwrite an existing install.
     pub force: bool,
 }
@@ -76,8 +104,9 @@ pub struct InstallOptions<'a> {
 /// Where `install` pulls its kernel and CPIO from.
 #[derive(Debug)]
 pub enum InstallSource<'a> {
-    /// Pull the default published image from GHCR via docker/podman.
-    Ghcr,
+    /// Pull the published image from GHCR via docker/podman.
+    /// `tag`: `None` pulls `:latest`; `Some("v0.3.1")` pins a release.
+    Ghcr { tag: Option<&'a str> },
     /// Copy from a local python-agent-driver build tree.
     LocalDir(&'a Path),
     /// Explicit files — useful for custom image pipelines.
@@ -104,6 +133,7 @@ pub struct InstallReport {
 /// are local file copies. See [`InstallSource`] for each variant's
 /// semantics.
 pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
+    default_surrogate_count();
     let home = opts.home.to_path_buf();
     let dst_kernel = home.join(KERNEL_FILE);
     let dst_initrd = home.join(INITRD_FILE);
@@ -135,18 +165,16 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
             kernel.to_path_buf(),
             initrd.to_path_buf(),
         ),
-        InstallSource::Ghcr => {
+        InstallSource::Ghcr { tag } => {
+            let kernel_image = ghcr_image_ref(GHCR_KERNEL_REPO, *tag);
+            let initrd_image = ghcr_image_ref(GHCR_INITRD_REPO, *tag);
             let scratch = home.join(".pyhl.download");
             fs::create_dir_all(&scratch)?;
             let k = scratch.join("kernel");
             let i = scratch.join("initrd.cpio");
-            extract_from_ghcr(GHCR_KERNEL_IMAGE, "/kernel", &k)?;
-            extract_from_ghcr(GHCR_INITRD_IMAGE, "/initrd.cpio", &i)?;
-            (
-                format!("ghcr: {GHCR_KERNEL_IMAGE} + {GHCR_INITRD_IMAGE}"),
-                k,
-                i,
-            )
+            extract_from_ghcr(&kernel_image, "/kernel", &k)?;
+            extract_from_ghcr(&initrd_image, "/initrd.cpio", &i)?;
+            (format!("ghcr: {kernel_image} + {initrd_image}"), k, i)
         }
     };
 
@@ -163,6 +191,12 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
             .heap_size(3 * 512 * 1024 * 1024);
         for p in opts.mounts {
             builder = builder.preopen(p.clone());
+        }
+        if let Some(policy) = opts.network {
+            builder = builder.network(policy.clone());
+        }
+        if let Some(lp) = opts.listen_ports {
+            builder = builder.listen_ports(lp.clone());
         }
         let mut sbox = builder.build()?;
         sbox.restore()?;
@@ -197,6 +231,7 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
 pub struct RunTiming {
     pub restore_ms: f64,
     pub call_ms: f64,
+    pub exit_code: i32,
 }
 
 /// A pyhl runtime backed by a warmed-up snapshot. Cheap to keep around;
@@ -213,8 +248,16 @@ impl Runtime {
     /// Open a runtime against an existing install. Looks for
     /// `{home}/snapshot.hls` and mmap-loads it. `mounts` specify host
     /// directories to expose under the guest paths that were baked in
-    /// at `install` time.
-    pub fn new(home: &Path, mounts: &[Preopen]) -> Result<Self> {
+    /// at `install` time. `network` enables guest networking with the
+    /// given policy (`None` = disabled). `listen_ports` controls which
+    /// ports the guest may bind to (`None` = outbound-only).
+    pub fn new(
+        home: &Path,
+        mounts: &[Preopen],
+        network: Option<&crate::NetworkPolicy>,
+        listen_ports: Option<&crate::ListenPorts>,
+    ) -> Result<Self> {
+        default_surrogate_count();
         let snap = home.join(SNAPSHOT_FILE);
         if !snap.is_file() {
             bail!(
@@ -222,11 +265,19 @@ impl Runtime {
                 snap.display()
             );
         }
-        let sandbox = if mounts.is_empty() {
-            Sandbox::from_snapshot_file(&snap)?
+        let initrd = home.join(INITRD_FILE);
+        let initrd_ref = if initrd.is_file() {
+            Some(initrd.as_path())
         } else {
-            Sandbox::from_snapshot_file_with(&snap, mounts)?
+            None
         };
+        let sandbox = Sandbox::from_snapshot_file_configured(
+            &snap,
+            mounts,
+            initrd_ref,
+            network,
+            listen_ports,
+        )?;
         Ok(Self {
             sandbox,
             first_run: true,
@@ -244,10 +295,12 @@ impl Runtime {
             t.restore_ms = tr.elapsed().as_secs_f64() * 1000.0;
         }
         self.first_run = false;
+        self.sandbox.reset_exit_code();
 
         let tc = Instant::now();
         let _: () = self.sandbox.call_named("run", code.to_string())?;
         t.call_ms = tc.elapsed().as_secs_f64() * 1000.0;
+        t.exit_code = self.sandbox.last_exit_code();
         Ok(t)
     }
 
@@ -340,13 +393,18 @@ pub fn discover_source_artifacts(dir: &Path) -> Result<(PathBuf, PathBuf)> {
 // through InstallSource::Ghcr.
 // ---------------------------------------------------------------------------
 
-/// OCI image references published by `.github/workflows/publish-examples.yml`.
-/// Both images are FROM-scratch payloads: kernel image has a single /kernel,
-/// initrd image has a single /initrd.cpio.
-pub const GHCR_KERNEL_IMAGE: &str =
-    "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-agent-driver-kernel:latest";
-pub const GHCR_INITRD_IMAGE: &str =
-    "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-agent-driver-initrd:latest";
+/// GHCR repository base (without tag) for the kernel image.
+pub const GHCR_KERNEL_REPO: &str =
+    "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-agent-driver-kernel";
+/// GHCR repository base (without tag) for the initrd image.
+pub const GHCR_INITRD_REPO: &str =
+    "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-agent-driver-initrd";
+
+/// Build a full OCI image reference from a repo base and an optional tag.
+/// `None` resolves to `:latest`.
+pub fn ghcr_image_ref(repo: &str, tag: Option<&str>) -> String {
+    format!("{}:{}", repo, tag.unwrap_or("latest"))
+}
 
 /// Pull a single file out of an OCI image hosted on GHCR. Uses whichever
 /// of `docker` / `podman` is on `$PATH`. The published images are

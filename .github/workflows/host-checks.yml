@@ -4,9 +4,6 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
-    paths:
-      - 'host/**'
-      - '.github/workflows/host-checks.yml'
   push:
     branches: [main]
     paths:
@@ -36,6 +33,10 @@ jobs:
         working-directory: host
     steps:
       - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host -> target
 
       - name: Install Rust components for pinned toolchain
         # The repo pins 1.89.0 via rust-toolchain.toml at the repo root.
@@ -74,18 +75,16 @@ jobs:
           RUST_BACKTRACE: '1'
         run: cargo test --all-targets --locked
 
-  all-checks-passed:
+  host-checks-passed:
     if: always()
     needs: [checks]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - run: |
-          results=("${{ needs.checks.result }}")
-          for r in "${results[@]}"; do
-            if [[ "$r" != "success" && "$r" != "skipped" ]]; then
-              echo "Job failed with result: $r"
-              exit 1
-            fi
-          done
+          r="${{ needs.checks.result }}"
+          if [[ "$r" != "success" ]]; then
+            echo "FAIL: checks = $r"
+            exit 1
+          fi
           echo "All checks passed"

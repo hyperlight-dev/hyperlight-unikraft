@@ -4,11 +4,6 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
-    paths:
-      - 'examples/**'
-      - 'runtimes/**'
-      - 'host/**'
-      - '.github/workflows/test-examples.yml'
   push:
     branches: [main]
     paths:
@@ -65,18 +60,27 @@ jobs:
           - python-agent
           - python-agent-driver
           - powershell
+          - networking-py
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Go (for kraft-hyperlight)
-        run: |
-          curl -sL https://go.dev/dl/go1.25.1.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
-          echo "/usr/local/go/bin" >> $GITHUB_PATH
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.1'
+          cache: false
 
       - name: Install just
         uses: extractions/setup-just@v2
 
+      - name: Cache kraft-hyperlight
+        id: kraft-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/kraft-hyperlight
+          key: kraft-hyperlight-linux-${{ hashFiles('.github/workflows/test-examples.yml') }}
+
       - name: Build kraft-hyperlight
+        if: steps.kraft-cache.outputs.cache-hit != 'true'
         run: |
           git clone --branch hyperlight-platform --depth 1 \
               https://github.com/danbugs/kraftkit.git /tmp/kraftkit
@@ -104,17 +108,20 @@ jobs:
         working-directory: examples/${{ matrix.example }}
         run: |
           kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64 || true
-          # Fallback: kraft's source-resolution path is flaky (it sometimes
-          # probes + finds the repo but skips the pull and leaves
-          # .unikraft/unikraft empty — see memory/feedback_kraft_clean_rebuild).
-          # Manually clone the components and rebuild with --no-fetch/--no-update.
-          if [ ! -d ".unikraft/unikraft" ] || [ -z "$(ls -A .unikraft/unikraft 2>/dev/null)" ]; then
-            echo "::warning::kraft didn't clone unikraft sources; cloning manually"
-            UK_BRANCH=$(grep -E '^  version:' kraft.yaml | head -1 | awk '{print $2}')
+          # Fallback: kraft's source-resolution is flaky — it can partially
+          # clone (e.g. unikraft but not libelf) or leave dirs empty. Check
+          # for the actual kernel output; if missing, nuke everything and
+          # clone + build from scratch.
+          if ! ls .unikraft/build/*_hyperlight-x86_64 >/dev/null 2>&1; then
+            echo "::warning::kraft build produced no kernel; cloning manually and rebuilding"
+            UK_SOURCE=$(awk '/^unikraft:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            UK_BRANCH=$(awk '/^unikraft:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
+            ELF_SOURCE=$(awk '/app-elfloader:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            ELF_BRANCH=$(awk '/app-elfloader:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
             mkdir -p .unikraft/apps .unikraft/libs
             rm -rf .unikraft/unikraft .unikraft/apps/elfloader .unikraft/libs/libelf .unikraft/build
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/unikraft.git .unikraft/unikraft
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/app-elfloader.git .unikraft/apps/elfloader
+            git clone --branch "$UK_BRANCH" --depth 1 "$UK_SOURCE" .unikraft/unikraft
+            git clone --branch "$ELF_BRANCH" --depth 1 "$ELF_SOURCE" .unikraft/apps/elfloader
             git clone --branch staging --depth 1 https://github.com/unikraft/lib-libelf.git .unikraft/libs/libelf
             kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64
           fi
@@ -221,8 +228,20 @@ jobs:
             memory: "1Gi"
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
+          - example: networking-py
+            memory: "512Mi"
+            args: "--net -- /urllib_get.py"
+            expect: "SUCCESS: urllib GET worked!"
+          - example: networking-py
+            memory: "512Mi"
+            args: "--port 8080 -- /echo_server_test.py"
+            expect: "SUCCESS: bind\\+listen on port 8080 allowed"
     steps:
       - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host -> target
 
       - name: Enable KVM permissions (no-op if device absent)
         run: |
@@ -285,13 +304,16 @@ jobs:
         run: |
           just rootfs
           kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64 || true
-          if [ ! -d ".unikraft/unikraft" ] || [ -z "$(ls -A .unikraft/unikraft 2>/dev/null)" ]; then
-            echo "::warning::kraft didn't clone unikraft sources; cloning manually"
-            UK_BRANCH=$(grep -E '^  version:' kraft.yaml | head -1 | awk '{print $2}')
+          if ! ls .unikraft/build/*_hyperlight-x86_64 >/dev/null 2>&1; then
+            echo "::warning::kraft build produced no kernel; cloning manually and rebuilding"
+            UK_SOURCE=$(awk '/^unikraft:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            UK_BRANCH=$(awk '/^unikraft:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
+            ELF_SOURCE=$(awk '/app-elfloader:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            ELF_BRANCH=$(awk '/app-elfloader:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
             mkdir -p .unikraft/apps .unikraft/libs
             rm -rf .unikraft/unikraft .unikraft/apps/elfloader .unikraft/libs/libelf .unikraft/build
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/unikraft.git .unikraft/unikraft
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/app-elfloader.git .unikraft/apps/elfloader
+            git clone --branch "$UK_BRANCH" --depth 1 "$UK_SOURCE" .unikraft/unikraft
+            git clone --branch "$ELF_BRANCH" --depth 1 "$ELF_SOURCE" .unikraft/apps/elfloader
             git clone --branch staging --depth 1 https://github.com/unikraft/lib-libelf.git .unikraft/libs/libelf
             kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64
           fi
@@ -384,18 +406,27 @@ jobs:
           - python-agent
           - python-agent-driver
           - powershell
+          - networking-py
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Go (for kraft-hyperlight)
-        run: |
-          curl -sL https://go.dev/dl/go1.25.1.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
-          echo "/usr/local/go/bin" >> $GITHUB_PATH
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.1'
+          cache: false
 
       - name: Install just
         uses: extractions/setup-just@v2
 
+      - name: Cache kraft-hyperlight
+        id: kraft-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/kraft-hyperlight
+          key: kraft-hyperlight-linux-${{ hashFiles('.github/workflows/test-examples.yml') }}
+
       - name: Build kraft-hyperlight
+        if: steps.kraft-cache.outputs.cache-hit != 'true'
         run: |
           git clone --branch hyperlight-platform --depth 1 \
               https://github.com/danbugs/kraftkit.git /tmp/kraftkit
@@ -419,12 +450,16 @@ jobs:
         run: |
           just rootfs
           kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64 || true
-          if [ ! -d ".unikraft/unikraft" ] || [ -z "$(ls -A .unikraft/unikraft 2>/dev/null)" ]; then
-            UK_BRANCH=$(grep -E '^  version:' kraft.yaml | head -1 | awk '{print $2}')
+          if ! ls .unikraft/build/*_hyperlight-x86_64 >/dev/null 2>&1; then
+            echo "::warning::kraft build produced no kernel; cloning manually and rebuilding"
+            UK_SOURCE=$(awk '/^unikraft:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            UK_BRANCH=$(awk '/^unikraft:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
+            ELF_SOURCE=$(awk '/app-elfloader:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            ELF_BRANCH=$(awk '/app-elfloader:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
             mkdir -p .unikraft/apps .unikraft/libs
             rm -rf .unikraft/unikraft .unikraft/apps/elfloader .unikraft/libs/libelf .unikraft/build
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/unikraft.git .unikraft/unikraft
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/app-elfloader.git .unikraft/apps/elfloader
+            git clone --branch "$UK_BRANCH" --depth 1 "$UK_SOURCE" .unikraft/unikraft
+            git clone --branch "$ELF_BRANCH" --depth 1 "$ELF_SOURCE" .unikraft/apps/elfloader
             git clone --branch staging --depth 1 https://github.com/unikraft/lib-libelf.git .unikraft/libs/libelf
             kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64
           fi
@@ -529,20 +564,40 @@ jobs:
             memory: "1Gi"
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
+          - example: networking-py
+            memory: "512Mi"
+            args: "--net -- /urllib_get.py"
+            expect: "SUCCESS: urllib GET worked!"
+          - example: networking-py
+            memory: "512Mi"
+            args: "--port 8080 -- /echo_server_test.py"
+            expect: "SUCCESS: bind\\+listen on port 8080 allowed"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install hyperlight-unikraft host binaries
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host -> target
+
+      - name: Ensure surrogate build consistency
         shell: pwsh
         run: |
-          cargo install --git https://github.com/${{ github.repository }} `
-            --branch ${{ github.head_ref || github.ref_name }} `
-            hyperlight-unikraft-host `
-            --bin hyperlight-unikraft `
-            --bin multifn-test `
-            --bin pydriver-run `
-            --bin pyhl `
-            --locked --force
+          $hlsExe = "host\target\release\build\hyperlight-host-*\out\..\..\hls\x86_64-pc-windows-msvc\release\hyperlight_surrogate.exe"
+          if (-not (Resolve-Path $hlsExe -ErrorAction SilentlyContinue)) {
+            Write-Host "Surrogate missing — clearing hyperlight-host fingerprints to force rebuild"
+            Get-ChildItem "host\target\release\.fingerprint" -Filter "hyperlight-host-*" -Directory -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force
+          }
+
+      - name: Build host binaries
+        shell: pwsh
+        run: |
+          cd host
+          cargo build --release --bin hyperlight-unikraft --bin multifn-test --bin pydriver-run --bin pyhl
+          Copy-Item target\release\hyperlight-unikraft.exe $env:USERPROFILE\.cargo\bin\ -Force
+          Copy-Item target\release\multifn-test.exe $env:USERPROFILE\.cargo\bin\ -Force
+          Copy-Item target\release\pydriver-run.exe $env:USERPROFILE\.cargo\bin\ -Force
+          Copy-Item target\release\pyhl.exe $env:USERPROFILE\.cargo\bin\ -Force
 
       - name: Download prebuilt image
         uses: actions/download-artifact@v4
@@ -636,6 +691,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host -> target
+
+      - name: Ensure surrogate build consistency (Windows only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hlsExe = "host\target\release\build\hyperlight-host-*\out\..\..\hls\x86_64-pc-windows-msvc\release\hyperlight_surrogate.exe"
+          if (-not (Resolve-Path $hlsExe -ErrorAction SilentlyContinue)) {
+            Write-Host "Surrogate missing — clearing hyperlight-host fingerprints to force rebuild"
+            Get-ChildItem "host\target\release\.fingerprint" -Filter "hyperlight-host-*" -Directory -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force
+          }
+
       # Linux needs /dev/kvm access to run the guest.
       - name: Enable KVM permissions (Linux only)
         if: runner.os == 'Linux'
@@ -657,14 +727,20 @@ jobs:
             echo "::warning::/dev/kvm is not available; pyhl test skipped"
           fi
 
-      - name: Install pyhl
+      - name: Install pyhl (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd host
+          cargo build --release --bin pyhl
+          sudo cp target/release/pyhl /usr/local/bin/
+
+      - name: Install pyhl (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cargo install --git https://github.com/${{ github.repository }} `
-            --branch ${{ github.head_ref || github.ref_name }} `
-            hyperlight-unikraft-host `
-            --bin pyhl `
-            --locked --force
+          cd host
+          cargo build --release --bin pyhl
+          Copy-Item target\release\pyhl.exe $env:USERPROFILE\.cargo\bin\ -Force
 
       - name: Download prebuilt python-agent-driver image
         uses: actions/download-artifact@v4
@@ -744,18 +820,32 @@ jobs:
             exit 1
           }
 
-  all-checks-passed:
+  test-examples-passed:
     if: always()
     needs: [build-example, runtime-test, package-images-for-windows, runtime-test-windows, pyhl-snapshot-test]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - run: |
-          results=("${{ needs.build-example.result }}" "${{ needs.runtime-test.result }}" "${{ needs.package-images-for-windows.result }}" "${{ needs.runtime-test-windows.result }}" "${{ needs.pyhl-snapshot-test.result }}")
-          for r in "${results[@]}"; do
-            if [[ "$r" != "success" && "$r" != "skipped" ]]; then
-              echo "Job failed with result: $r"
-              exit 1
+          # Every job must succeed. "skipped" means a dependency failed
+          # and the job never ran — that must fail the gate, not sneak
+          # through as green.
+          declare -A results=(
+            [build-example]="${{ needs.build-example.result }}"
+            [runtime-test]="${{ needs.runtime-test.result }}"
+            [package-images-for-windows]="${{ needs.package-images-for-windows.result }}"
+            [runtime-test-windows]="${{ needs.runtime-test-windows.result }}"
+            [pyhl-snapshot-test]="${{ needs.pyhl-snapshot-test.result }}"
+          )
+          failed=0
+          for job in "${!results[@]}"; do
+            r="${results[$job]}"
+            if [[ "$r" != "success" ]]; then
+              echo "FAIL: $job = $r"
+              failed=1
             fi
           done
+          if [[ "$failed" -eq 1 ]]; then
+            exit 1
+          fi
           echo "All checks passed"

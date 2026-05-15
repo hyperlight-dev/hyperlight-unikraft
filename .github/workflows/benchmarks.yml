@@ -4,9 +4,6 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
-    paths:
-      - 'host/**'
-      - '.github/workflows/benchmarks.yml'
   push:
     branches: [main]
     paths:
@@ -40,15 +37,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Go (for kraft-hyperlight)
-        run: |
-          curl -sL https://go.dev/dl/go1.25.1.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
-          echo "/usr/local/go/bin" >> $GITHUB_PATH
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.1'
+          cache: false
 
       - name: Install just
         uses: extractions/setup-just@v2
 
+      - name: Cache kraft-hyperlight
+        id: kraft-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/kraft-hyperlight
+          key: kraft-hyperlight-linux-${{ hashFiles('.github/workflows/benchmarks.yml') }}
+
       - name: Build kraft-hyperlight
+        if: steps.kraft-cache.outputs.cache-hit != 'true'
         run: |
           git clone --branch hyperlight-platform --depth 1 \
               https://github.com/danbugs/kraftkit.git /tmp/kraftkit
@@ -73,11 +78,14 @@ jobs:
           kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64 || true
           if [ ! -d ".unikraft/unikraft" ] || [ -z "$(ls -A .unikraft/unikraft 2>/dev/null)" ]; then
             echo "::warning::kraft didn't clone unikraft sources; cloning manually"
-            UK_BRANCH=$(grep -E '^  version:' kraft.yaml | head -1 | awk '{print $2}')
+            UK_SOURCE=$(awk '/^unikraft:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            UK_BRANCH=$(awk '/^unikraft:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
+            ELF_SOURCE=$(awk '/app-elfloader:/{f=1} f && /source:/{print $2; exit}' kraft.yaml)
+            ELF_BRANCH=$(awk '/app-elfloader:/{f=1} f && /version:/{print $2; exit}' kraft.yaml)
             mkdir -p .unikraft/apps .unikraft/libs
             rm -rf .unikraft/unikraft .unikraft/apps/elfloader .unikraft/libs/libelf .unikraft/build
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/unikraft.git .unikraft/unikraft
-            git clone --branch $UK_BRANCH --depth 1 https://github.com/unikraft/app-elfloader.git .unikraft/apps/elfloader
+            git clone --branch "$UK_BRANCH" --depth 1 "$UK_SOURCE" .unikraft/unikraft
+            git clone --branch "$ELF_BRANCH" --depth 1 "$ELF_SOURCE" .unikraft/apps/elfloader
             git clone --branch staging --depth 1 https://github.com/unikraft/lib-libelf.git .unikraft/libs/libelf
             kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64
           fi
@@ -109,11 +117,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     permissions:
-      contents: read
+      contents: write
       packages: read
+      pull-requests: write
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host -> target
 
       - name: Enable KVM permissions
         run: |
@@ -186,6 +199,7 @@ jobs:
           echo "| Runs   | $n |"
           echo ""
           echo "::notice::hello_world: median=${median}ms avg=${avg}ms min=${min}ms max=${max}ms"
+          echo "{\"name\":\"hello_world (median)\",\"unit\":\"ms\",\"value\":$median}" >> /tmp/bench-results.jsonl
 
       - name: "Perf: pandas (10 runs)"
         if: steps.kvm_check.outputs.available == 'true'
@@ -221,6 +235,7 @@ jobs:
           echo "| Runs   | $n |"
           echo ""
           echo "::notice::pandas: median=${median}ms avg=${avg}ms min=${min}ms max=${max}ms"
+          echo "{\"name\":\"pandas (median)\",\"unit\":\"ms\",\"value\":$median}" >> /tmp/bench-results.jsonl
 
       - name: "Density: concurrent VMs (5 VMs)"
         if: steps.kvm_check.outputs.available == 'true'
@@ -253,6 +268,7 @@ jobs:
             echo "| Total Private_Dirty | $((total_private / 1024)) MB |"
             echo ""
             echo "::notice::density: ${count} VMs, per_vm=${per_vm}MB private_dirty"
+            echo "{\"name\":\"density (per VM)\",\"unit\":\"MB\",\"value\":$per_vm}" >> /tmp/bench-results.jsonl
           else
             echo "::warning::no VMs were alive long enough to measure"
           fi
@@ -270,28 +286,65 @@ jobs:
           echo "| Disk usage | ${disk} MiB |"
           echo ""
           echo "::notice::snapshot: apparent=${apparent}MiB disk=${disk}MiB"
+          echo "{\"name\":\"snapshot (disk)\",\"unit\":\"MiB\",\"value\":$disk}" >> /tmp/bench-results.jsonl
+
+      - name: Collect benchmark results
+        if: steps.kvm_check.outputs.available == 'true'
+        run: |
+          if [ -f /tmp/bench-results.jsonl ]; then
+            jq -s '.' /tmp/bench-results.jsonl > /tmp/bench-results.json
+          else
+            echo "[]" > /tmp/bench-results.json
+          fi
+          cat /tmp/bench-results.json
+
+      - name: Store benchmark results
+        if: steps.kvm_check.outputs.available == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Linux Benchmarks
+          tool: customSmallerIsBetter
+          output-file-path: /tmp/bench-results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          benchmark-data-dir-path: dev/bench/linux
+          auto-push: ${{ github.event_name == 'push' }}
+          comment-always: true
+          alert-threshold: '130%'
 
   # ------------------------------------------------------------------
   # Performance + density on Windows
   # ------------------------------------------------------------------
   bench-windows:
     runs-on: windows-latest
-    needs: build-image
+    needs: [build-image, bench-linux]
     permissions:
-      contents: read
+      contents: write
       packages: read
+      pull-requests: write
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host -> target
+
+      - name: Ensure surrogate build consistency
+        shell: pwsh
+        run: |
+          $hlsExe = "host\target\release\build\hyperlight-host-*\out\..\..\hls\x86_64-pc-windows-msvc\release\hyperlight_surrogate.exe"
+          if (-not (Resolve-Path $hlsExe -ErrorAction SilentlyContinue)) {
+            Write-Host "Surrogate missing — clearing hyperlight-host fingerprints to force rebuild"
+            Get-ChildItem "host\target\release\.fingerprint" -Filter "hyperlight-host-*" -Directory -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force
+          }
+
       - name: Install pyhl
         shell: pwsh
         run: |
-          cargo install --git https://github.com/${{ github.repository }} `
-            --branch ${{ github.head_ref || github.ref_name }} `
-            hyperlight-unikraft-host `
-            --bin pyhl `
-            --locked --force
+          cd host
+          cargo build --release --bin pyhl
+          Copy-Item target\release\pyhl.exe $env:USERPROFILE\.cargo\bin\ -Force
 
       - name: Download prebuilt image
         uses: actions/download-artifact@v4
@@ -339,6 +392,7 @@ jobs:
           Write-Host "| Runs   | $n |"
           Write-Host ""
           Write-Host "::notice::hello_world: median=${median}ms avg=${avg}ms min=${min}ms max=${max}ms"
+          @{name="hello_world (median)"; unit="ms"; value=$median} | ConvertTo-Json -Compress | Out-File -Append bench-results.jsonl -Encoding ascii
 
       - name: "Perf: pandas (10 runs)"
         shell: pwsh
@@ -374,6 +428,7 @@ jobs:
           Write-Host "| Runs   | $n |"
           Write-Host ""
           Write-Host "::notice::pandas: median=${median}ms avg=${avg}ms min=${min}ms max=${max}ms"
+          @{name="pandas (median)"; unit="ms"; value=$median} | ConvertTo-Json -Compress | Out-File -Append bench-results.jsonl -Encoding ascii
 
       - name: "Density: concurrent VMs (5 VMs)"
         shell: pwsh
@@ -407,6 +462,7 @@ jobs:
             Write-Host "| Total Private | ${totalPrivate} MB |"
             Write-Host ""
             Write-Host "::notice::density: ${count} VMs, per_vm=${perVM}MB private"
+            @{name="density (per VM)"; unit="MB"; value=$perVM} | ConvertTo-Json -Compress | Out-File -Append bench-results.jsonl -Encoding ascii
           } else {
             Write-Host "::warning::no VMs were alive long enough to measure"
           }
@@ -444,19 +500,53 @@ jobs:
           Write-Host "| Disk usage | ${diskMiB} MiB |"
           Write-Host ""
           Write-Host "::notice::snapshot: apparent=${apparentMiB}MiB disk=${diskMiB}MiB"
+          @{name="snapshot (disk)"; unit="MiB"; value=$diskMiB} | ConvertTo-Json -Compress | Out-File -Append bench-results.jsonl -Encoding ascii
 
-  all-checks-passed:
+      - name: Collect benchmark results
+        shell: pwsh
+        run: |
+          if (Test-Path bench-results.jsonl) {
+            $lines = Get-Content bench-results.jsonl
+            $json = "[" + ($lines -join ",") + "]"
+            $json | Out-File bench-results.json -Encoding ascii
+          } else {
+            "[]" | Out-File bench-results.json -Encoding ascii
+          }
+          Get-Content bench-results.json
+
+      - name: Store benchmark results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Windows Benchmarks
+          tool: customSmallerIsBetter
+          output-file-path: bench-results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          benchmark-data-dir-path: dev/bench/windows
+          auto-push: ${{ github.event_name == 'push' }}
+          comment-always: true
+          alert-threshold: '130%'
+
+  benchmarks-passed:
     if: always()
     needs: [build-image, bench-linux, bench-windows]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - run: |
-          results=("${{ needs.build-image.result }}" "${{ needs.bench-linux.result }}" "${{ needs.bench-windows.result }}")
-          for r in "${results[@]}"; do
-            if [[ "$r" != "success" && "$r" != "skipped" ]]; then
-              echo "Job failed with result: $r"
-              exit 1
+          declare -A results=(
+            [build-image]="${{ needs.build-image.result }}"
+            [bench-linux]="${{ needs.bench-linux.result }}"
+            [bench-windows]="${{ needs.bench-windows.result }}"
+          )
+          failed=0
+          for job in "${!results[@]}"; do
+            r="${results[$job]}"
+            if [[ "$r" != "success" ]]; then
+              echo "FAIL: $job = $r"
+              failed=1
             fi
           done
+          if [[ "$failed" -eq 1 ]]; then
+            exit 1
+          fi
           echo "All checks passed"
