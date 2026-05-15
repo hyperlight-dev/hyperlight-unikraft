@@ -1098,12 +1098,12 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 
 enum HostSocket {
-    Socket(Socket),
+    Socket(Socket, i32),
 }
 
 struct SocketTable {
-    sockets: HashMap<u32, HostSocket>,
-    next_id: u32,
+    sockets: HashMap<u64, HostSocket>,
+    next_id: u64,
 }
 
 impl SocketTable {
@@ -1114,26 +1114,32 @@ impl SocketTable {
         }
     }
 
-    fn insert(&mut self, sock: HostSocket) -> u32 {
+    fn insert(&mut self, sock: HostSocket) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.sockets.insert(id, sock);
         id
     }
 
-    fn get(&self, fd: u32) -> Result<&HostSocket> {
+    fn get(&self, fd: u64) -> Result<&HostSocket> {
         self.sockets
             .get(&fd)
             .ok_or_else(|| anyhow!("bad_fd: {}", fd))
     }
 
-    fn get_socket(&self, fd: u32) -> Result<&Socket> {
+    fn get_socket(&self, fd: u64) -> Result<&Socket> {
         match self.get(fd)? {
-            HostSocket::Socket(s) => Ok(s),
+            HostSocket::Socket(s, _) => Ok(s),
         }
     }
 
-    fn remove(&mut self, fd: u32) -> Result<()> {
+    fn get_sock_type(&self, fd: u64) -> Result<i32> {
+        match self.get(fd)? {
+            HostSocket::Socket(_, t) => Ok(*t),
+        }
+    }
+
+    fn remove(&mut self, fd: u64) -> Result<()> {
         self.sockets
             .remove(&fd)
             .map(|_| ())
@@ -1196,7 +1202,10 @@ fn register_net_tools(
             Some(Protocol::from(protocol))
         };
         let sock = Socket::new(domain, stype, proto)?;
-        let fd = t.lock().unwrap().insert(HostSocket::Socket(sock));
+        let fd = t
+            .lock()
+            .unwrap()
+            .insert(HostSocket::Socket(sock, sock_type));
         Ok(json!({ "fd": fd }))
     });
 
@@ -1204,7 +1213,7 @@ fn register_net_tools(
     let t = table.clone();
     let pol = policy.clone();
     tools.register("net_connect", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let addr = parse_sockaddr(&args)?;
         pol.check(&addr)?;
         let sa: SockAddr = addr.into();
@@ -1218,7 +1227,7 @@ fn register_net_tools(
     let t = table.clone();
     let lp = listen_ports.cloned().map(Arc::new);
     tools.register("net_bind", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let addr = parse_sockaddr(&args)?;
         match lp.as_ref() {
             Some(ports) => ports.check(addr.port())?,
@@ -1234,7 +1243,7 @@ fn register_net_tools(
     // net_listen
     let t = table.clone();
     tools.register("net_listen", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let backlog = args["backlog"].as_i64().unwrap_or(128) as i32;
         let tbl = t.lock().unwrap();
         let sock = tbl.get_socket(fd)?;
@@ -1245,14 +1254,19 @@ fn register_net_tools(
     // net_accept
     let t = table.clone();
     tools.register("net_accept", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
-        let (new_sock, peer) = {
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+        let (new_sock, peer, parent_type) = {
             let tbl = t.lock().unwrap();
             let sock = tbl.get_socket(fd)?;
-            sock.accept()?
+            let (s, p) = sock.accept()?;
+            let st = tbl.get_sock_type(fd)?;
+            (s, p, st)
         };
         let peer_addr: Option<SocketAddr> = peer.as_socket();
-        let new_fd = t.lock().unwrap().insert(HostSocket::Socket(new_sock));
+        let new_fd = t
+            .lock()
+            .unwrap()
+            .insert(HostSocket::Socket(new_sock, parent_type));
         let mut resp = json!({ "fd": new_fd });
         if let Some(pa) = peer_addr {
             resp["addr"] = json!(pa.ip().to_string());
@@ -1264,7 +1278,7 @@ fn register_net_tools(
     // net_send
     let t = table.clone();
     tools.register("net_send", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let data_b64 = args["data"]
             .as_str()
             .ok_or_else(|| anyhow!("missing 'data'"))?;
@@ -1281,7 +1295,7 @@ fn register_net_tools(
     let t = table.clone();
     let pol = policy.clone();
     tools.register("net_sendto", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let data_b64 = args["data"]
             .as_str()
             .ok_or_else(|| anyhow!("missing 'data'"))?;
@@ -1300,7 +1314,7 @@ fn register_net_tools(
     // net_recv (alias for net_recvfrom with no addr returned for stream)
     let t = table.clone();
     tools.register("net_recv", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let len = args["len"].as_u64().unwrap_or(4096) as usize;
         let mut buf = vec![std::mem::MaybeUninit::uninit(); len.min(65536)];
         let tbl = t.lock().unwrap();
@@ -1317,7 +1331,7 @@ fn register_net_tools(
     // net_recvfrom
     let t = table.clone();
     tools.register("net_recvfrom", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let len = args["len"].as_u64().unwrap_or(4096) as usize;
         let mut buf = vec![0u8; len.min(65536)];
 
@@ -1342,7 +1356,7 @@ fn register_net_tools(
     // net_close
     let t = table.clone();
     tools.register("net_close", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         t.lock().unwrap().remove(fd)?;
         Ok(json!({}))
     });
@@ -1350,7 +1364,7 @@ fn register_net_tools(
     // net_shutdown
     let t = table.clone();
     tools.register("net_shutdown", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let how = args["how"].as_i64().unwrap_or(2) as i32;
         let shutdown = match how {
             0 => std::net::Shutdown::Read,
@@ -1366,7 +1380,7 @@ fn register_net_tools(
     // net_setsockopt
     let t = table.clone();
     tools.register("net_setsockopt", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let level = args["level"].as_i64().unwrap_or(0) as i32;
         let optname = args["optname"].as_i64().unwrap_or(0) as i32;
         let value = args["value"].as_i64().unwrap_or(0) as i32;
@@ -1390,14 +1404,14 @@ fn register_net_tools(
     // net_getsockopt
     let t = table.clone();
     tools.register("net_getsockopt", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let level = args["level"].as_i64().unwrap_or(0) as i32;
         let optname = args["optname"].as_i64().unwrap_or(0) as i32;
         let tbl = t.lock().unwrap();
         let sock = tbl.get_socket(fd)?;
         let val: i32 = if level == 1 && optname == 3 {
-            // SOL_SOCKET + SO_TYPE — all our sockets are SOCK_STREAM
-            1
+            // SOL_SOCKET + SO_TYPE — return the actual socket type
+            tbl.get_sock_type(fd)?
         } else if level == 1 && optname == 2 {
             sock.reuse_address()? as i32
         } else if level == 6 && optname == 1 {
@@ -1411,7 +1425,7 @@ fn register_net_tools(
     // net_getpeername
     let t = table.clone();
     tools.register("net_getpeername", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let tbl = t.lock().unwrap();
         let sock = tbl.get_socket(fd)?;
         let peer = sock.peer_addr()?;
@@ -1425,7 +1439,7 @@ fn register_net_tools(
     // net_getsockname
     let t = table.clone();
     tools.register("net_getsockname", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))? as u32;
+        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let tbl = t.lock().unwrap();
         let sock = tbl.get_socket(fd)?;
         let local = sock.local_addr()?;
@@ -2267,7 +2281,11 @@ pub fn run_vm_capture_output(
     let setup_time = setup_start.elapsed();
 
     // Redirect stderr to a temp file before the call phase
-    let capture_file = std::env::temp_dir().join(format!("hl-capture-{}", std::process::id()));
+    let capture_file = std::env::temp_dir().join(format!(
+        "hl-capture-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     let capture = stderr_capture::Capture::redirect_to_file(&capture_file)?;
 
     // Phase 2: restore + call — application runs and produces output
@@ -2986,14 +3004,11 @@ mod tests {
 
     #[test]
     fn test_fs_read_bytes_capped() {
-        // Request a huge len (well above MAX_FS_READ) on a small file.
-        // Without the cap this would try to allocate terabytes and OOM.
         let root = tmpdir("readcap");
         fs::write(root.join("small.bin"), b"hello").unwrap();
         let mut reg = ToolRegistry::new();
         FsSandbox::new(&root).unwrap().register(&mut reg);
 
-        // Ask for 1 TiB — the cap should silently clamp to MAX_FS_READ.
         let req = br#"{"name":"fs_read_bytes","args":{"path":"small.bin","len":1099511627776}}"#;
         let resp = reg.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
@@ -3003,14 +3018,8 @@ mod tests {
 
     #[test]
     fn test_sleep_capped() {
-        // Verify the cap constant and that sleeping with a huge value
-        // completes quickly (the cap brings it down to 60 s max, but we
-        // pass 0 to keep the test instant — the important thing is
-        // confirming the cap constant exists and has the right value).
         assert_eq!(MAX_SLEEP_NS, 60_000_000_000);
 
-        // Dispatch a sleep with ns=0 through the real handler to confirm
-        // the code path works.
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
         register_internal_tools(&mut tools, &exit_code, None, None);
@@ -3019,5 +3028,28 @@ mod tests {
         let resp = tools.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(!s.contains("\"error\""), "sleep(0) should succeed: {s}");
+    }
+
+    #[test]
+    fn net_getsockopt_returns_correct_type_for_dgram() {
+        let mut reg = ToolRegistry::new();
+        let policy = NetworkPolicy::AllowAll;
+        register_net_tools(&mut reg, &policy, None);
+
+        let req = br#"{"name":"net_socket","args":{"family":2,"type":2}}"#;
+        let resp = std::str::from_utf8(&reg.dispatch(req)).unwrap().to_string();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let fd = v["result"]["fd"].as_u64().unwrap();
+
+        let req =
+            format!(r#"{{"name":"net_getsockopt","args":{{"fd":{fd},"level":1,"optname":3}}}}"#);
+        let resp = std::str::from_utf8(&reg.dispatch(req.as_bytes()))
+            .unwrap()
+            .to_string();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            v["result"]["value"], 2,
+            "SO_TYPE should return 2 (DGRAM), got: {resp}"
+        );
     }
 }
