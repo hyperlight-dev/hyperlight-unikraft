@@ -2334,7 +2334,7 @@ mod tests {
         fs::write(root.join("etc/passwd"), "fake").unwrap();
         let fs_sb = FsSandbox::new(&root).unwrap();
         let resolved = fs_sb.resolve("/etc/passwd").unwrap();
-        assert_eq!(resolved, root.join("etc/passwd"));
+        assert_eq!(resolved, fs_sb.root().join("etc").join("passwd"));
     }
 
     #[cfg(unix)]
@@ -2447,7 +2447,7 @@ mod tests {
         let root = tmpdir("allow");
         let fs = FsSandbox::new(&root).unwrap();
         let resolved = fs.resolve("subdir/file.txt").unwrap();
-        assert!(resolved.starts_with(&root), "{resolved:?}");
+        assert!(resolved.starts_with(fs.root()), "{resolved:?}");
     }
 
     #[test]
