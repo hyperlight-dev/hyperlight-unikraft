@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778825567921,
+  "lastUpdate": 1778826879668,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -551,6 +551,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/f5eb506b21439cec6f1a3afb1bc0a60ce5a99978"
         },
         "date": 1778825566971,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2ad29b819efcc215d02d71f31f286442b85dfc18",
+          "message": "Merge pull request #35 from hyperlight-dev/fix/bugs\n\nfix: correct SO_TYPE for DGRAM sockets, stderr race, socket ID wrap",
+          "timestamp": "2026-05-14T23:28:40-07:00",
+          "tree_id": "eae7e2d65b960044e94b3854106038119a4297ae",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/2ad29b819efcc215d02d71f31f286442b85dfc18"
+        },
+        "date": 1778826879051,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
