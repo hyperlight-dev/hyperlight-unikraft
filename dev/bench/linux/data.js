@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778827711926,
+  "lastUpdate": 1778830154501,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -639,6 +639,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/0dbf1121a7b0bf29c7f655c3aed3373c15aa2a8d"
         },
         "date": 1778827711101,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 100,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cb048d7cd8a6fb283d5dd0584c0b3c2d0d104b2c",
+          "message": "Merge pull request #38 from hyperlight-dev/release/0.2.0\n\nchore: bump version to 0.2.0",
+          "timestamp": "2026-05-15T00:23:35-07:00",
+          "tree_id": "940824eb31ed2288f9e9674e3a01bc68e82b4b00",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/cb048d7cd8a6fb283d5dd0584c0b3c2d0d104b2c"
+        },
+        "date": 1778830154059,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
