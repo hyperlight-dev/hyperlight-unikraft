@@ -91,6 +91,12 @@ const PAGE_SIZE: usize = 4096;
 /// Reject these early on the host before we even boot the guest.
 const RESERVED_GUEST_MOUNTPOINTS: &[&str] = &["/", "/bin", "/dev", "/proc", "/sys", "/usr"];
 
+/// Cap for `fs_read_bytes` allocation to prevent guest-controlled OOM (16 MiB).
+const MAX_FS_READ: u64 = 16 * 1024 * 1024;
+
+/// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
+const MAX_SLEEP_NS: u64 = 60_000_000_000;
+
 /// A preopened host directory exposed to the guest.
 ///
 /// Semantics mirror Wasmtime's `preopened_dir`: `host_dir` is canonicalised
@@ -888,7 +894,7 @@ impl FsSandbox {
                 .as_str()
                 .ok_or_else(|| anyhow!("fs_read_bytes: missing 'path'"))?;
             let offset = args["offset"].as_u64().unwrap_or(0);
-            let want = args["len"].as_u64().unwrap_or(65536);
+            let want = args["len"].as_u64().unwrap_or(65536).min(MAX_FS_READ);
             let target = s.resolve(path)?;
             let mut f = std::fs::File::open(&target)
                 .map_err(|e| anyhow!("fs_read_bytes {:?}: {}", path, e))?;
@@ -1013,7 +1019,7 @@ fn register_internal_tools(
         Ok(serde_json::json!({}))
     });
     tools.register("__hl_sleep", |args| {
-        let ns = args["ns"].as_u64().unwrap_or(0);
+        let ns = args["ns"].as_u64().unwrap_or(0).min(MAX_SLEEP_NS);
         if ns > 0 {
             std::thread::sleep(std::time::Duration::from_nanos(ns));
         }
@@ -1492,7 +1498,7 @@ impl FsRouter {
                 .as_str()
                 .ok_or_else(|| anyhow!("fs_read_bytes: missing 'path'"))?;
             let offset = args["offset"].as_u64().unwrap_or(0);
-            let want = args["len"].as_u64().unwrap_or(65536);
+            let want = args["len"].as_u64().unwrap_or(65536).min(MAX_FS_READ);
             let (fs, rel) = r.route(path)?;
             let target = fs.resolve(rel)?;
             let mut f = std::fs::File::open(&target)
@@ -2789,5 +2795,44 @@ mod tests {
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.contains("\"error\""), "net_bind should be denied: {s}");
         assert!(s.contains("Permission denied"), "{s}");
+    }
+
+    // -- Resource-limit tests ---------------------------------------------------
+
+    #[test]
+    fn test_fs_read_bytes_capped() {
+        // Request a huge len (well above MAX_FS_READ) on a small file.
+        // Without the cap this would try to allocate terabytes and OOM.
+        let root = tmpdir("readcap");
+        fs::write(root.join("small.bin"), b"hello").unwrap();
+        let mut reg = ToolRegistry::new();
+        FsSandbox::new(&root).unwrap().register(&mut reg);
+
+        // Ask for 1 TiB — the cap should silently clamp to MAX_FS_READ.
+        let req = br#"{"name":"fs_read_bytes","args":{"path":"small.bin","len":1099511627776}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(!s.contains("\"error\""), "should succeed: {s}");
+        assert!(s.contains("\"bytes_read\":5"), "{s}");
+    }
+
+    #[test]
+    fn test_sleep_capped() {
+        // Verify the cap constant and that sleeping with a huge value
+        // completes quickly (the cap brings it down to 60 s max, but we
+        // pass 0 to keep the test instant — the important thing is
+        // confirming the cap constant exists and has the right value).
+        assert_eq!(MAX_SLEEP_NS, 60_000_000_000);
+
+        // Dispatch a sleep with ns=0 through the real handler to confirm
+        // the code path works.
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        register_internal_tools(&mut tools, &exit_code, None, None);
+
+        let req = br#"{"name":"__hl_sleep","args":{"ns":0}}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(!s.contains("\"error\""), "sleep(0) should succeed: {s}");
     }
 }
