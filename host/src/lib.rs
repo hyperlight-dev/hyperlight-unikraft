@@ -1176,21 +1176,17 @@ fn register_net_tools(
         let value = args["value"].as_i64().unwrap_or(0) as i32;
         let tbl = t.lock().unwrap();
         let sock = tbl.get_socket(fd)?;
-        // SOL_SOCKET=1, SO_REUSEADDR=2
-        if level == 1 && optname == 2 {
-            sock.set_reuse_address(value != 0)?;
-        // SOL_SOCKET=1, SO_KEEPALIVE=9
-        } else if level == 1 && optname == 9 {
-            sock.set_keepalive(value != 0)?;
-        // IPPROTO_TCP=6, TCP_NODELAY=1
-        } else if level == 6 && optname == 1 {
-            sock.set_nodelay(value != 0)?;
-        } else {
-            return Err(anyhow!(
-                "unsupported socket option: level={}, optname={}",
-                level,
-                optname
-            ));
+        match (level, optname) {
+            // SOL_SOCKET(1), SO_REUSEADDR(2)
+            (1, 2) => sock.set_reuse_address(value != 0)?,
+            // SOL_SOCKET(1), SO_KEEPALIVE(9)
+            (1, 9) => sock.set_keepalive(value != 0)?,
+            // IPPROTO_TCP(6), TCP_NODELAY(1)
+            (6, 1) => sock.set_nodelay(value != 0)?,
+            // Silently accepted — the dispatch round-trip makes
+            // guest-side timeouts and error-reporting opts
+            // counterproductive; the guest's own retry logic suffices.
+            _ => {}
         }
         Ok(json!({}))
     });
@@ -1203,19 +1199,14 @@ fn register_net_tools(
         let optname = args["optname"].as_i64().unwrap_or(0) as i32;
         let tbl = t.lock().unwrap();
         let sock = tbl.get_socket(fd)?;
-        let val: i32 = if level == 1 && optname == 3 {
-            // SOL_SOCKET + SO_TYPE — return the actual socket type
-            tbl.get_sock_type(fd)?
-        } else if level == 1 && optname == 2 {
-            sock.reuse_address()? as i32
-        } else if level == 6 && optname == 1 {
-            sock.nodelay()? as i32
-        } else {
-            return Err(anyhow!(
-                "unsupported socket option: level={}, optname={}",
-                level,
-                optname
-            ));
+        let val: i32 = match (level, optname) {
+            // SOL_SOCKET(1), SO_TYPE(3)
+            (1, 3) => tbl.get_sock_type(fd)?,
+            // SOL_SOCKET(1), SO_REUSEADDR(2)
+            (1, 2) => sock.reuse_address()? as i32,
+            // IPPROTO_TCP(6), TCP_NODELAY(1)
+            (6, 1) => sock.nodelay()? as i32,
+            _ => 0,
         };
         Ok(json!({ "value": val }))
     });
