@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778815193573,
+  "lastUpdate": 1778825754746,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -517,6 +517,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 708,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 393,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f5eb506b21439cec6f1a3afb1bc0a60ce5a99978",
+          "message": "chore: remove unused FFI module and C header (#36)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-14T23:06:18-07:00",
+          "tree_id": "3f6386d1895e50fcb623bade4cabf1845dc323b5",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/f5eb506b21439cec6f1a3afb1bc0a60ce5a99978"
+        },
+        "date": 1778825752296,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 221,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 697,
             "unit": "ms"
           },
           {
