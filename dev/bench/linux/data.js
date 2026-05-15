@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778851281733,
+  "lastUpdate": 1778854839489,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -732,6 +732,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "hello_world (median)",
             "value": 10,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 80,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0bcbd386ce5a00c8a3f6a594bfc5eca267db6da0",
+          "message": "Merge pull request #40 from hyperlight-dev/fix/windows-dns-resolvers\n\nfix: AllowList DNS exemption for guest-hardcoded resolvers",
+          "timestamp": "2026-05-15T07:14:14-07:00",
+          "tree_id": "d4f5216b78bd1290091df3a1117f1a4a86580f7a",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/0bcbd386ce5a00c8a3f6a594bfc5eca267db6da0"
+        },
+        "date": 1778854838605,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
             "unit": "ms"
           },
           {
