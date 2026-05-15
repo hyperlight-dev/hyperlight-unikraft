@@ -197,7 +197,7 @@ fn execute_in_sandbox(
     debug!("script: {:?}", script_path);
 
     let cpio_start = std::time::Instant::now();
-    let modified_rootfs = inject_script_into_rootfs(rootfs, &script_path)?;
+    let (modified_rootfs, _rootfs_tmpdir) = inject_script_into_rootfs(rootfs, &script_path)?;
     if timing {
         info!("  cpio inject: {:?}", cpio_start.elapsed());
     }
@@ -228,7 +228,7 @@ fn execute_in_sandbox(
     Ok(vm_output.output)
 }
 
-fn inject_script_into_rootfs(original_rootfs: &Path, script_path: &Path) -> Result<PathBuf> {
+fn inject_script_into_rootfs(original_rootfs: &Path, script_path: &Path) -> Result<(PathBuf, tempfile::TempDir)> {
     let temp_dir = tempfile::tempdir()?;
     let extract_dir = temp_dir.path().join("rootfs");
     let new_cpio = temp_dir.path().join("rootfs_with_script.cpio");
@@ -270,11 +270,7 @@ fn inject_script_into_rootfs(original_rootfs: &Path, script_path: &Path) -> Resu
         anyhow::bail!("cpio create failed");
     }
 
-    // Leak tempdir so file persists
-    let path = new_cpio.clone();
-    std::mem::forget(temp_dir);
-
-    Ok(path)
+    Ok((new_cpio, temp_dir))
 }
 
 fn extract_pptx_from_output(output: &str) -> Result<Vec<u8>> {

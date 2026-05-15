@@ -830,216 +830,6 @@ impl FsSandbox {
         }
         Ok(out)
     }
-
-    /// Register all FS tool handlers on `registry`:
-    ///
-    /// - `fs_read` / `fs_write` — UTF-8 text read/write (whole-file).
-    /// - `fs_read_bytes` / `fs_write_bytes` — binary read/write with
-    ///   optional offset/length/append, base64-encoded payloads.
-    /// - `fs_list` — directory enumeration as `{name, is_dir, is_file, is_symlink}`.
-    /// - `fs_stat` — size + file/dir metadata.
-    /// - `fs_mkdir` / `fs_unlink` — create/remove directory or file.
-    /// - `fs_truncate` — set file length.
-    ///
-    /// Every handler resolves its `path` argument under [`root`](Self::root)
-    /// via `FsSandbox::resolve`, which rejects `..` escapes, absolute
-    /// paths that climb outside the root, and symlinks pointing outside.
-    ///
-    /// The handlers call through `std::fs`, which behaves differently on
-    /// Linux and Windows — `normalize_fs_error` smooths out the error
-    /// wording before responses go back to the guest, so the Unikraft
-    /// guest's substring-matching classifier works on both hosts.
-    pub fn register(self, registry: &mut ToolRegistry) {
-        use serde_json::json;
-
-        let s = self.clone();
-        registry.register("fs_read", move |args| {
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_read: missing 'path'"))?;
-            let target = s.resolve(path)?;
-            let text = std::fs::read_to_string(&target)
-                .map_err(|e| anyhow!("fs_read {:?}: {}", path, e))?;
-            Ok(json!({ "text": text }))
-        });
-
-        let s = self.clone();
-        registry.register("fs_write", move |args| {
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_write: missing 'path'"))?;
-            let text = args["text"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_write: missing 'text'"))?;
-            let append = args["append"].as_bool().unwrap_or(false);
-            let target = s.resolve(path)?;
-            // Create parent dirs? No — guest must fs_mkdir explicitly.
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(!append)
-                .append(append)
-                .open(&target)
-                .map_err(|e| anyhow!("fs_write {:?}: {}", path, e))?;
-            f.write_all(text.as_bytes())
-                .map_err(|e| anyhow!("fs_write {:?}: {}", path, e))?;
-            Ok(json!({ "bytes_written": text.len() }))
-        });
-
-        let s = self.clone();
-        registry.register("fs_list", move |args| {
-            let path = args["path"].as_str().unwrap_or("");
-            let target = s.resolve(path)?;
-            let mut entries = Vec::new();
-            for entry in
-                std::fs::read_dir(&target).map_err(|e| anyhow!("fs_list {:?}: {}", path, e))?
-            {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let ft = entry.file_type()?;
-                entries.push(json!({
-                    "name": name,
-                    "is_dir": ft.is_dir(),
-                    "is_file": ft.is_file(),
-                    "is_symlink": ft.is_symlink(),
-                }));
-            }
-            Ok(json!({ "entries": entries }))
-        });
-
-        let s = self.clone();
-        registry.register("fs_stat", move |args| {
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_stat: missing 'path'"))?;
-            let target = s.resolve(path)?;
-            let md =
-                std::fs::metadata(&target).map_err(|e| anyhow!("fs_stat {:?}: {}", path, e))?;
-            Ok(json!({
-                "size": md.len(),
-                "is_dir": md.is_dir(),
-                "is_file": md.is_file(),
-            }))
-        });
-
-        let s = self.clone();
-        registry.register("fs_mkdir", move |args| {
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_mkdir: missing 'path'"))?;
-            let parents = args["parents"].as_bool().unwrap_or(false);
-            let target = s.resolve(path)?;
-            if parents {
-                std::fs::create_dir_all(&target)
-            } else {
-                std::fs::create_dir(&target)
-            }
-            .map_err(|e| anyhow!("fs_mkdir {:?}: {}", path, e))?;
-            Ok(json!({}))
-        });
-
-        // fs_read_bytes / fs_write_bytes — binary variants for the Phase B
-        // transparent POSIX shim. Bytes are base64-encoded in the JSON
-        // payload so arbitrary binary content round-trips intact.
-        //
-        // fs_read_bytes args: { path, offset?, len? } → { data: "<base64>", eof: bool }
-        // fs_write_bytes args: { path, data: "<base64>", offset?, append? } → { bytes_written }
-        let s = self.clone();
-        registry.register("fs_read_bytes", move |args| {
-            use base64::Engine;
-            use std::io::{Read, Seek, SeekFrom};
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_read_bytes: missing 'path'"))?;
-            let offset = args["offset"].as_u64().unwrap_or(0);
-            let want = args["len"].as_u64().unwrap_or(65536).min(MAX_FS_READ);
-            let target = s.resolve(path)?;
-            let mut f = std::fs::File::open(&target)
-                .map_err(|e| anyhow!("fs_read_bytes {:?}: {}", path, e))?;
-            if offset > 0 {
-                f.seek(SeekFrom::Start(offset))
-                    .map_err(|e| anyhow!("fs_read_bytes seek {:?}: {}", path, e))?;
-            }
-            let mut buf = vec![0u8; want as usize];
-            let n = f
-                .read(&mut buf)
-                .map_err(|e| anyhow!("fs_read_bytes {:?}: {}", path, e))?;
-            buf.truncate(n);
-            let eof = n < want as usize;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
-            Ok(json!({ "data": encoded, "eof": eof, "bytes_read": n }))
-        });
-
-        let s = self.clone();
-        registry.register("fs_write_bytes", move |args| {
-            use base64::Engine;
-            use std::io::{Seek, SeekFrom, Write};
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_write_bytes: missing 'path'"))?;
-            let data_b64 = args["data"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_write_bytes: missing 'data'"))?;
-            let data = base64::engine::general_purpose::STANDARD
-                .decode(data_b64)
-                .map_err(|e| anyhow!("fs_write_bytes: bad base64: {}", e))?;
-            let offset = args["offset"].as_u64();
-            let append = args["append"].as_bool().unwrap_or(false);
-            let target = s.resolve(path)?;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(offset.is_none() && !append)
-                .append(append)
-                .open(&target)
-                .map_err(|e| anyhow!("fs_write_bytes {:?}: {}", path, e))?;
-            if let Some(off) = offset {
-                if !append {
-                    f.seek(SeekFrom::Start(off))
-                        .map_err(|e| anyhow!("fs_write_bytes seek {:?}: {}", path, e))?;
-                }
-            }
-            f.write_all(&data)
-                .map_err(|e| anyhow!("fs_write_bytes {:?}: {}", path, e))?;
-            Ok(json!({ "bytes_written": data.len() }))
-        });
-
-        let s = self.clone();
-        registry.register("fs_truncate", move |args| {
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_truncate: missing 'path'"))?;
-            let length = args["length"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("fs_truncate: missing 'length'"))?;
-            let target = s.resolve(path)?;
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&target)
-                .map_err(|e| anyhow!("fs_truncate {:?}: {}", path, e))?;
-            f.set_len(length)
-                .map_err(|e| anyhow!("fs_truncate {:?}: {}", path, e))?;
-            Ok(json!({}))
-        });
-
-        let s = self.clone();
-        registry.register("fs_unlink", move |args| {
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("fs_unlink: missing 'path'"))?;
-            let target = s.resolve(path)?;
-            let md =
-                std::fs::metadata(&target).map_err(|e| anyhow!("fs_unlink {:?}: {}", path, e))?;
-            if md.is_dir() {
-                std::fs::remove_dir(&target)
-            } else {
-                std::fs::remove_file(&target)
-            }
-            .map_err(|e| anyhow!("fs_unlink {:?}: {}", path, e))?;
-            Ok(json!({}))
-        });
-    }
 }
 
 /// Internal helper: assemble the final tool registry from caller-supplied
@@ -1389,14 +1179,18 @@ fn register_net_tools(
         // SOL_SOCKET=1, SO_REUSEADDR=2
         if level == 1 && optname == 2 {
             sock.set_reuse_address(value != 0)?;
-        }
         // SOL_SOCKET=1, SO_KEEPALIVE=9
-        if level == 1 && optname == 9 {
+        } else if level == 1 && optname == 9 {
             sock.set_keepalive(value != 0)?;
-        }
         // IPPROTO_TCP=6, TCP_NODELAY=1
-        if level == 6 && optname == 1 {
+        } else if level == 6 && optname == 1 {
             sock.set_nodelay(value != 0)?;
+        } else {
+            return Err(anyhow!(
+                "unsupported socket option: level={}, optname={}",
+                level,
+                optname
+            ));
         }
         Ok(json!({}))
     });
@@ -1417,7 +1211,11 @@ fn register_net_tools(
         } else if level == 6 && optname == 1 {
             sock.nodelay()? as i32
         } else {
-            0
+            return Err(anyhow!(
+                "unsupported socket option: level={}, optname={}",
+                level,
+                optname
+            ));
         };
         Ok(json!({ "value": val }))
     });
@@ -2657,10 +2455,11 @@ mod tests {
         // End-to-end through the tool registry: the error surface the
         // guest actually sees.
         let root = tmpdir("dispatch");
+        let preopens = vec![Preopen::new(&root, "/host").unwrap()];
         let mut reg = ToolRegistry::new();
-        FsSandbox::new(&root).unwrap().register(&mut reg);
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
 
-        let req = br#"{"name":"fs_read","args":{"path":"../outside.txt"}}"#;
+        let req = br#"{"name":"fs_read","args":{"path":"/host/../outside.txt"}}"#;
         let resp = reg.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.contains("\"error\""), "{s}");
@@ -2740,15 +2539,16 @@ mod tests {
     #[test]
     fn fs_write_then_read_roundtrip() {
         let root = tmpdir("roundtrip");
+        let preopens = vec![Preopen::new(&root, "/host").unwrap()];
         let mut reg = ToolRegistry::new();
-        FsSandbox::new(&root).unwrap().register(&mut reg);
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
 
-        let w = br#"{"name":"fs_write","args":{"path":"hello.txt","text":"hi"}}"#;
+        let w = br#"{"name":"fs_write","args":{"path":"/host/hello.txt","text":"hi"}}"#;
         let resp = reg.dispatch(w);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.contains("\"bytes_written\":2"), "{s}");
 
-        let r = br#"{"name":"fs_read","args":{"path":"hello.txt"}}"#;
+        let r = br#"{"name":"fs_read","args":{"path":"/host/hello.txt"}}"#;
         let resp = reg.dispatch(r);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.contains("\"text\":\"hi\""), "{s}");
@@ -3006,10 +2806,12 @@ mod tests {
     fn test_fs_read_bytes_capped() {
         let root = tmpdir("readcap");
         fs::write(root.join("small.bin"), b"hello").unwrap();
+        let preopens = vec![Preopen::new(&root, "/host").unwrap()];
         let mut reg = ToolRegistry::new();
-        FsSandbox::new(&root).unwrap().register(&mut reg);
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
 
-        let req = br#"{"name":"fs_read_bytes","args":{"path":"small.bin","len":1099511627776}}"#;
+        let req =
+            br#"{"name":"fs_read_bytes","args":{"path":"/host/small.bin","len":1099511627776}}"#;
         let resp = reg.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(!s.contains("\"error\""), "should succeed: {s}");
