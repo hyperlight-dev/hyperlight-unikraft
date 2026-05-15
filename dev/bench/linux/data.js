@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778826879668,
+  "lastUpdate": 1778827711926,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -605,6 +605,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0dbf1121a7b0bf29c7f655c3aed3373c15aa2a8d",
+          "message": "Merge pull request #37 from hyperlight-dev/fix/cleanup\n\nrefactor: remove dead code, fix silent socket option no-ops, fix tempdir leak",
+          "timestamp": "2026-05-14T23:42:56-07:00",
+          "tree_id": "1b1a1851a0782cbe570b97e3934006bec632665d",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/0dbf1121a7b0bf29c7f655c3aed3373c15aa2a8d"
+        },
+        "date": 1778827711101,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 100,
             "unit": "ms"
           },
           {
