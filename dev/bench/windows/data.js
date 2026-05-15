@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778800445594,
+  "lastUpdate": 1778813695207,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -429,6 +429,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 740,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 393,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a13793a31db41579acf72f6a85ff263aefa322c2",
+          "message": "Merge pull request #28 from hyperlight-dev/ghcr-tagged-pulls\n\nSupport pinned GHCR image tags and release workflow",
+          "timestamp": "2026-05-14T19:43:58-07:00",
+          "tree_id": "97d7bc0b7913c8ae030ad405f1b3a46f914634bd",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/a13793a31db41579acf72f6a85ff263aefa322c2"
+        },
+        "date": 1778813645534,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 217,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 646,
             "unit": "ms"
           },
           {
