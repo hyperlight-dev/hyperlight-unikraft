@@ -304,12 +304,25 @@ impl BlockList {
     }
 }
 
+/// DNS resolver IPs that the AllowList exempts on port 53.
+///
+/// Includes the host's configured resolvers (from `/etc/resolv.conf` on
+/// Unix, `ipconfig /all` on Windows) **plus** well-known public DNS
+/// servers (Google, Cloudflare) that the guest may hardcode in its own
+/// `/etc/resolv.conf`.
 fn dns_resolvers() -> &'static HashSet<IpAddr> {
     static RESOLVERS: std::sync::OnceLock<HashSet<IpAddr>> = std::sync::OnceLock::new();
     RESOLVERS.get_or_init(|| {
+        let mut set = HashSet::new();
+        // Well-known public DNS that the guest's initrd may hardcode.
+        for ip in [
+            "8.8.8.8", "8.8.4.4", // Google
+            "1.1.1.1", "1.0.0.1", // Cloudflare
+        ] {
+            set.insert(ip.parse::<IpAddr>().unwrap());
+        }
         #[cfg(unix)]
         {
-            let mut set = HashSet::new();
             if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
                 for line in contents.lines() {
                     let line = line.trim();
@@ -322,12 +335,31 @@ fn dns_resolvers() -> &'static HashSet<IpAddr> {
                     }
                 }
             }
-            set
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            HashSet::new()
+            if let Ok(output) = std::process::Command::new("ipconfig").arg("/all").output() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let mut in_dns_block = false;
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("DNS Servers") {
+                        in_dns_block = true;
+                        let value = rest.trim_start_matches(['.', ' ', ':']);
+                        if let Ok(ip) = value.parse::<IpAddr>() {
+                            set.insert(ip);
+                        }
+                    } else if in_dns_block {
+                        if let Ok(ip) = trimmed.parse::<IpAddr>() {
+                            set.insert(ip);
+                        } else {
+                            in_dns_block = false;
+                        }
+                    }
+                }
+            }
         }
+        set
     })
 }
 
@@ -2572,34 +2604,43 @@ mod tests {
     }
 
     #[test]
-    fn test_port53_arbitrary_ip_blocked() {
-        // RFC5737 TEST-NET-2 address — guaranteed not in /etc/resolv.conf.
+    fn allowlist_permits_dns_to_well_known_resolvers() {
+        // AllowList exempts port 53 to well-known public DNS and host
+        // resolvers so the guest's hardcoded nameservers (8.8.8.8 etc.)
+        // work even when the host uses different resolvers.
+        let al = AllowList::from_hosts(&["198.51.100.1"]).unwrap();
+        let policy = NetworkPolicy::AllowList(al);
+        for ip in ["8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"] {
+            let addr: std::net::SocketAddr = ip.parse().unwrap();
+            assert!(
+                policy.check(&addr).is_ok(),
+                "AllowList must permit DNS (port 53) to well-known resolver {}",
+                ip
+            );
+        }
+    }
+
+    #[test]
+    fn allowlist_denies_port53_to_arbitrary_ip() {
+        // Port 53 is NOT a blanket bypass — only known DNS resolvers
+        // are exempted. RFC5737 TEST-NET addresses are never resolvers.
         let al = AllowList::from_hosts(&["198.51.100.1"]).unwrap();
         let policy = NetworkPolicy::AllowList(al);
         let addr: std::net::SocketAddr = "198.51.100.99:53".parse().unwrap();
         assert!(
             policy.check(&addr).is_err(),
-            "port 53 to a non-resolver IP must be denied"
+            "port 53 to an unknown IP must still be denied"
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn test_port53_real_resolver_allowed() {
-        let resolvers = dns_resolvers();
-        if resolvers.is_empty() {
-            eprintln!("skipping: no resolvers found in /etc/resolv.conf");
-            return;
-        }
-        let resolver_ip = *resolvers.iter().next().unwrap();
-        // Allowlist uses a TEST-NET IP that won't match the resolver.
+    fn allowlist_denies_non_dns_to_unlisted_ip() {
         let al = AllowList::from_hosts(&["198.51.100.1"]).unwrap();
         let policy = NetworkPolicy::AllowList(al);
-        let addr = std::net::SocketAddr::new(resolver_ip, 53);
+        let addr: std::net::SocketAddr = "198.51.100.99:443".parse().unwrap();
         assert!(
-            policy.check(&addr).is_ok(),
-            "port 53 to a configured resolver ({}) must be allowed",
-            resolver_ip
+            policy.check(&addr).is_err(),
+            "AllowList must deny non-DNS traffic to unlisted IPs"
         );
     }
 
@@ -2655,6 +2696,17 @@ mod tests {
         assert!(
             policy.check(&addr).is_err(),
             "blocked IP must be denied even on port 53"
+        );
+    }
+
+    #[test]
+    fn blocklist_permits_dns_to_non_blocked_ip() {
+        let bl = BlockList::from_hosts(&["203.0.113.1"]).unwrap();
+        let policy = NetworkPolicy::BlockList(bl);
+        let addr: std::net::SocketAddr = "8.8.8.8:53".parse().unwrap();
+        assert!(
+            policy.check(&addr).is_ok(),
+            "BlockList must allow DNS to non-blocked IPs"
         );
     }
 
