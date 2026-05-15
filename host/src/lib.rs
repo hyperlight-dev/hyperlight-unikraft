@@ -304,20 +304,50 @@ impl BlockList {
     }
 }
 
+/// Parse `/etc/resolv.conf` and return the set of nameserver IPs.
+///
+/// On non-Unix platforms this returns an empty set (DNS goes through the
+/// system resolver and never needs a raw port-53 exemption).
+fn parse_resolv_conf() -> HashSet<IpAddr> {
+    #[cfg(unix)]
+    {
+        let mut resolvers = HashSet::new();
+        if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
+            for line in contents.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("nameserver") {
+                    if let Some(ip_str) = rest.split_whitespace().next() {
+                        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                            resolvers.insert(ip);
+                        }
+                    }
+                }
+            }
+        }
+        resolvers
+    }
+    #[cfg(not(unix))]
+    {
+        HashSet::new()
+    }
+}
+
 impl NetworkPolicy {
     fn check(&self, addr: &std::net::SocketAddr) -> Result<()> {
         match self {
             NetworkPolicy::AllowAll => Ok(()),
             NetworkPolicy::AllowList(al) => {
-                if addr.port() == 53 || al.is_allowed(&addr.ip()) {
+                if (addr.port() == 53 && parse_resolv_conf().contains(&addr.ip()))
+                    || al.is_allowed(&addr.ip())
+                {
                     Ok(())
                 } else {
                     Err(anyhow!("network policy denies connection to {}", addr))
                 }
             }
             NetworkPolicy::BlockList(bl) => {
-                // DNS (port 53) is always allowed so the guest can resolve names.
-                if addr.port() == 53 {
+                // Allow DNS (port 53) only to configured resolver IPs.
+                if addr.port() == 53 && parse_resolv_conf().contains(&addr.ip()) {
                     return Ok(());
                 }
                 if bl.is_blocked(&addr.ip()) {
@@ -2625,6 +2655,54 @@ mod tests {
     }
 
     #[test]
+    fn test_port53_arbitrary_ip_blocked() {
+        // Only 1.1.1.1 is in the allowlist — 8.8.8.8:53 must be denied
+        // because 8.8.8.8 is (almost certainly) not in /etc/resolv.conf.
+        let al = AllowList::from_hosts(&["1.1.1.1"]).unwrap();
+        let policy = NetworkPolicy::AllowList(al);
+        let addr: std::net::SocketAddr = "8.8.8.8:53".parse().unwrap();
+        assert!(
+            policy.check(&addr).is_err(),
+            "port 53 to a non-resolver IP must be denied"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_port53_real_resolver_allowed() {
+        // Grab the first resolver from /etc/resolv.conf and verify port
+        // 53 to that IP is allowed even when the IP is not in the
+        // AllowList itself.
+        let resolvers = parse_resolv_conf();
+        if resolvers.is_empty() {
+            eprintln!("skipping: no resolvers found in /etc/resolv.conf");
+            return;
+        }
+        let resolver_ip = *resolvers.iter().next().unwrap();
+        let al = AllowList::from_hosts(&["1.1.1.1"]).unwrap();
+        let policy = NetworkPolicy::AllowList(al);
+        let addr = std::net::SocketAddr::new(resolver_ip, 53);
+        assert!(
+            policy.check(&addr).is_ok(),
+            "port 53 to a configured resolver ({}) must be allowed",
+            resolver_ip
+        );
+    }
+
+    #[test]
+    fn test_port53_blocklist_enforced() {
+        // Even on port 53, a blocklisted IP must be denied — unless it
+        // happens to be a real resolver. Use a bogus IP to be safe.
+        let bl = BlockList::from_hosts(&["192.0.2.1"]).unwrap();
+        let policy = NetworkPolicy::BlockList(bl);
+        let addr: std::net::SocketAddr = "192.0.2.1:53".parse().unwrap();
+        assert!(
+            policy.check(&addr).is_err(),
+            "blocklisted IP must be denied even on port 53"
+        );
+    }
+
+    #[test]
     fn allowlist_resolves_hostnames() {
         let al = AllowList::from_hosts(&["localhost"]).unwrap();
         assert!(
@@ -2656,11 +2734,15 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_blocklist_allows_dns() {
+    fn network_policy_blocklist_denies_blocked_ip_on_port53() {
+        // A blocked IP must not be exempted just because the port is 53.
         let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
         let policy = NetworkPolicy::BlockList(bl);
         let addr: std::net::SocketAddr = "1.2.3.4:53".parse().unwrap();
-        assert!(policy.check(&addr).is_ok());
+        assert!(
+            policy.check(&addr).is_err(),
+            "blocked IP 1.2.3.4 must be denied even on port 53"
+        );
     }
 
     #[test]
