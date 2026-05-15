@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778825754746,
+  "lastUpdate": 1778827086926,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -561,6 +561,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 697,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 393,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2ad29b819efcc215d02d71f31f286442b85dfc18",
+          "message": "Merge pull request #35 from hyperlight-dev/fix/bugs\n\nfix: correct SO_TYPE for DGRAM sockets, stderr race, socket ID wrap",
+          "timestamp": "2026-05-14T23:28:40-07:00",
+          "tree_id": "eae7e2d65b960044e94b3854106038119a4297ae",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/2ad29b819efcc215d02d71f31f286442b85dfc18"
+        },
+        "date": 1778827084474,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 316,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 1015,
             "unit": "ms"
           },
           {
