@@ -365,6 +365,24 @@ fn dns_resolvers() -> &'static HashSet<IpAddr> {
 
 impl NetworkPolicy {
     fn check(&self, addr: &std::net::SocketAddr) -> Result<()> {
+        // Block link-local addresses (169.254.0.0/16, fe80::/10) for all
+        // policy variants.  In cloud environments the IPv4 link-local range
+        // hosts the instance metadata service (169.254.169.254) which hands
+        // out credentials without authentication.
+        let is_link_local = match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => {
+                let seg = v6.segments();
+                (seg[0] & 0xffc0) == 0xfe80
+            }
+        };
+        if is_link_local {
+            return Err(anyhow!(
+                "network policy denies connection to link-local address {}",
+                addr
+            ));
+        }
+
         match self {
             NetworkPolicy::AllowAll => Ok(()),
             NetworkPolicy::AllowList(al) => {
@@ -2722,6 +2740,37 @@ mod tests {
     fn blocklist_rejects_unresolvable_hostname() {
         let result = BlockList::from_hosts(&["this.host.definitely.does.not.exist.example"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn net_link_local_blocked() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        // AllowAll still blocks link-local
+        let policy = NetworkPolicy::AllowAll;
+        let meta = SocketAddr::new(Ipv4Addr::new(169, 254, 169, 254).into(), 80);
+        assert!(
+            policy.check(&meta).is_err(),
+            "AllowAll must block IPv4 link-local"
+        );
+
+        let link6 = SocketAddr::new(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into(), 80);
+        assert!(
+            policy.check(&link6).is_err(),
+            "AllowAll must block IPv6 link-local"
+        );
+
+        // BlockList (even empty) also blocks link-local
+        let bl = BlockList::from_hosts(&["192.0.2.1"]).unwrap();
+        let policy = NetworkPolicy::BlockList(bl);
+        assert!(
+            policy.check(&meta).is_err(),
+            "BlockList must block IPv4 link-local"
+        );
+        assert!(
+            policy.check(&link6).is_err(),
+            "BlockList must block IPv6 link-local"
+        );
     }
 
     #[test]
