@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778890610291,
+  "lastUpdate": 1778913073082,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -869,6 +869,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 814,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "86d26094187e2cc9513316f437a2df261ca58f47",
+          "message": "Merge pull request #56 from hyperlight-dev/fix/allowlist-dns-rotation",
+          "timestamp": "2026-05-15T23:22:23-07:00",
+          "tree_id": "dacef440fc4a77198718aead6a8b3bd6fa68cc3e",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/86d26094187e2cc9513316f437a2df261ca58f47"
+        },
+        "date": 1778913070592,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 245,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 725,
             "unit": "ms"
           },
           {
