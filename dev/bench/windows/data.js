@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778885615706,
+  "lastUpdate": 1778890610291,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -825,6 +825,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 829,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c6128d73968b188f4fd916624f1b962ce86e07ae",
+          "message": "Merge pull request #55 from hyperlight-dev/fix/socket-table-lifecycle\n\nfix: cap SocketTable size and clear on restore",
+          "timestamp": "2026-05-15T17:06:41-07:00",
+          "tree_id": "db46fcdd695f4d2a02e347ad05604c5e32bf042c",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/c6128d73968b188f4fd916624f1b962ce86e07ae"
+        },
+        "date": 1778890608196,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 235,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 814,
             "unit": "ms"
           },
           {
