@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778885402596,
+  "lastUpdate": 1778890418809,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -815,6 +815,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/a4831d753415543e53a56645fabd1bca652952fe"
         },
         "date": 1778885401708,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c6128d73968b188f4fd916624f1b962ce86e07ae",
+          "message": "Merge pull request #55 from hyperlight-dev/fix/socket-table-lifecycle\n\nfix: cap SocketTable size and clear on restore",
+          "timestamp": "2026-05-15T17:06:41-07:00",
+          "tree_id": "db46fcdd695f4d2a02e347ad05604c5e32bf042c",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/c6128d73968b188f4fd916624f1b962ce86e07ae"
+        },
+        "date": 1778890418152,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
