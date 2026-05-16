@@ -185,6 +185,7 @@ pub enum NetworkPolicy {
 pub struct AllowList {
     allowed_ips: HashSet<IpAddr>,
     hostnames: Vec<String>,
+    learned_ips: Arc<Mutex<HashSet<IpAddr>>>,
 }
 
 impl AllowList {
@@ -219,12 +220,18 @@ impl AllowList {
         Ok(Self {
             allowed_ips,
             hostnames,
+            learned_ips: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
     fn is_allowed(&self, ip: &IpAddr) -> bool {
         if self.allowed_ips.contains(ip) {
             return true;
+        }
+        if let Ok(learned) = self.learned_ips.lock() {
+            if learned.contains(ip) {
+                return true;
+            }
         }
         // Re-resolve hostnames to catch CDN/anycast IP rotation.
         use std::net::ToSocketAddrs;
@@ -238,6 +245,12 @@ impl AllowList {
             }
         }
         false
+    }
+
+    fn learn_ip(&self, ip: IpAddr) {
+        if let Ok(mut learned) = self.learned_ips.lock() {
+            learned.insert(ip);
+        }
     }
 }
 
@@ -1016,6 +1029,124 @@ fn sockaddr_to_json(addr: SocketAddr) -> serde_json::Value {
     })
 }
 
+/// Extract IPs from a DNS response for hostnames that match the allow list.
+/// Minimal parser — handles standard A (type 1) and AAAA (type 28) answers.
+fn learn_ips_from_dns_response(data: &[u8], al: &AllowList) {
+    if data.len() < 12 {
+        return;
+    }
+    let flags = u16::from_be_bytes([data[2], data[3]]);
+    let is_response = (flags & 0x8000) != 0;
+    if !is_response {
+        return;
+    }
+    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
+    if qdcount == 0 || ancount == 0 {
+        return;
+    }
+
+    // Parse question section to extract the queried name.
+    let mut pos = 12;
+    let qname = match dns_read_name(data, &mut pos) {
+        Some(n) => n,
+        None => return,
+    };
+    // Skip QTYPE (2) + QCLASS (2)
+    pos += 4;
+    if pos > data.len() {
+        return;
+    }
+
+    // Check if the queried name matches any allowed hostname.
+    let qname_lower = qname.to_lowercase();
+    let is_allowed_host = al.hostnames.iter().any(|h| h.to_lowercase() == qname_lower);
+    if !is_allowed_host {
+        return;
+    }
+
+    // Parse answer records and learn IPs.
+    for _ in 0..ancount {
+        // Skip name (may be a pointer)
+        if dns_read_name(data, &mut pos).is_none() {
+            return;
+        }
+        if pos + 10 > data.len() {
+            return;
+        }
+        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let rdlen = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > data.len() {
+            return;
+        }
+        match rtype {
+            1 if rdlen == 4 => {
+                let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                ));
+                al.learn_ip(ip);
+            }
+            28 if rdlen == 16 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&data[pos..pos + 16]);
+                al.learn_ip(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+            }
+            _ => {}
+        }
+        pos += rdlen;
+    }
+}
+
+/// Read a DNS name at `pos`, advancing pos past it. Returns the decoded name.
+fn dns_read_name(data: &[u8], pos: &mut usize) -> Option<String> {
+    let mut name = String::new();
+    let mut p = *pos;
+    let mut jumped = false;
+    let mut jump_save = 0;
+    loop {
+        if p >= data.len() {
+            return None;
+        }
+        let len = data[p] as usize;
+        if len == 0 {
+            p += 1;
+            break;
+        }
+        if (len & 0xC0) == 0xC0 {
+            // Pointer
+            if p + 1 >= data.len() {
+                return None;
+            }
+            let offset = ((len & 0x3F) << 8) | data[p + 1] as usize;
+            if !jumped {
+                jump_save = p + 2;
+                jumped = true;
+            }
+            p = offset;
+            continue;
+        }
+        p += 1;
+        if p + len > data.len() {
+            return None;
+        }
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(&String::from_utf8_lossy(&data[p..p + len]));
+        p += len;
+    }
+    if jumped {
+        *pos = jump_save;
+    } else {
+        *pos = p;
+    }
+    Some(name)
+}
+
 fn register_net_tools(
     tools: &mut ToolRegistry,
     policy: &NetworkPolicy,
@@ -1178,6 +1309,7 @@ fn register_net_tools(
 
     // net_recvfrom
     let t = table.clone();
+    let pol_recv = policy.clone();
     tools.register("net_recvfrom", move |args| {
         let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
         let len = args["len"].as_u64().unwrap_or(4096) as usize;
@@ -1192,6 +1324,18 @@ fn register_net_tools(
             sock.recv_from(buf_init)?
         };
         buf.truncate(n);
+
+        // Learn IPs from DNS responses so AllowList stays current with
+        // anycast/CDN rotation (guest may resolve via a different DNS
+        // server than the host, getting different IPs for the same name).
+        if let Some(pa) = peer.as_socket() {
+            if pa.port() == 53 {
+                if let NetworkPolicy::AllowList(al) = &*pol_recv {
+                    learn_ips_from_dns_response(&buf, al);
+                }
+            }
+        }
+
         let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
         let mut resp = json!({ "data": encoded, "len": n });
         if let Some(pa) = peer.as_socket() {
@@ -1405,10 +1549,24 @@ impl FsRouter {
             let target = fs.resolve(rel)?;
             let md =
                 std::fs::metadata(&target).map_err(|e| anyhow!("fs_stat {:?}: {}", path, e))?;
+            let mtime_ns = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let atime_ns = md
+                .accessed()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
             Ok(json!({
                 "size": md.len(),
                 "is_dir": md.is_dir(),
                 "is_file": md.is_file(),
+                "mtime_ns": mtime_ns,
+                "atime_ns": atime_ns,
             }))
         });
 
