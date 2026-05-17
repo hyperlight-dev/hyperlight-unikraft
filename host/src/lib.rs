@@ -948,8 +948,9 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
-enum HostSocket {
-    Socket(Socket, i32),
+struct HostSocket {
+    socket: Socket,
+    sock_type: i32,
 }
 
 const MAX_SOCKETS: usize = 1024;
@@ -989,15 +990,11 @@ impl SocketTable {
     }
 
     fn get_socket(&self, fd: u64) -> Result<&Socket> {
-        match self.get(fd)? {
-            HostSocket::Socket(s, _) => Ok(s),
-        }
+        Ok(&self.get(fd)?.socket)
     }
 
     fn get_sock_type(&self, fd: u64) -> Result<i32> {
-        match self.get(fd)? {
-            HostSocket::Socket(_, t) => Ok(*t),
-        }
+        Ok(self.get(fd)?.sock_type)
     }
 
     fn remove(&mut self, fd: u64) -> Result<()> {
@@ -1181,10 +1178,10 @@ fn register_net_tools(
             Some(Protocol::from(protocol))
         };
         let sock = Socket::new(domain, stype, proto)?;
-        let fd = t
-            .lock()
-            .unwrap()
-            .insert(HostSocket::Socket(sock, sock_type))?;
+        let fd = t.lock().unwrap().insert(HostSocket {
+            socket: sock,
+            sock_type,
+        })?;
         Ok(json!({ "fd": fd }))
     });
 
@@ -1242,10 +1239,10 @@ fn register_net_tools(
             (s, p, st)
         };
         let peer_addr: Option<SocketAddr> = peer.as_socket();
-        let new_fd = t
-            .lock()
-            .unwrap()
-            .insert(HostSocket::Socket(new_sock, parent_type))?;
+        let new_fd = t.lock().unwrap().insert(HostSocket {
+            socket: new_sock,
+            sock_type: parent_type,
+        })?;
         let mut resp = json!({ "fd": new_fd });
         if let Some(pa) = peer_addr {
             resp["addr"] = json!(pa.ip().to_string());
@@ -3015,10 +3012,14 @@ mod tests {
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
         let resp = tools.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
-        assert!(s.contains("\"fd\""), "net_socket should work: {s}");
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        let fd = v["result"]["fd"].as_u64().unwrap();
         // Try to bind — should fail because no listen_ports
-        let req = br#"{"name":"net_bind","args":{"fd":0,"addr":"127.0.0.1","port":8080}}"#;
-        let resp = tools.dispatch(req);
+        let req = format!(
+            r#"{{"name":"net_bind","args":{{"fd":{},"addr":"127.0.0.1","port":8080}}}}"#,
+            fd
+        );
+        let resp = tools.dispatch(req.as_bytes());
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.contains("\"error\""), "net_bind should be denied: {s}");
         assert!(s.contains("no --port"), "{s}");
@@ -3133,17 +3134,32 @@ mod tests {
         let mut table = SocketTable::new();
         for _ in 0..MAX_SOCKETS {
             let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-            table.insert(HostSocket::Socket(sock, 1)).unwrap();
+            table
+                .insert(HostSocket {
+                    socket: sock,
+                    sock_type: 1,
+                })
+                .unwrap();
         }
         let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-        assert!(table.insert(HostSocket::Socket(sock, 1)).is_err());
+        assert!(table
+            .insert(HostSocket {
+                socket: sock,
+                sock_type: 1
+            })
+            .is_err());
     }
 
     #[test]
     fn socket_table_clear() {
         let mut table = SocketTable::new();
         let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-        table.insert(HostSocket::Socket(sock, 1)).unwrap();
+        table
+            .insert(HostSocket {
+                socket: sock,
+                sock_type: 1,
+            })
+            .unwrap();
         assert_eq!(table.sockets.len(), 1);
         table.clear();
         assert_eq!(table.sockets.len(), 0);
