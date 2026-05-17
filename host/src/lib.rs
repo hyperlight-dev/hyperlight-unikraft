@@ -108,6 +108,9 @@ const MAX_DISPATCH_PAYLOAD: usize = 64 * 1024 * 1024;
 /// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
 const MAX_SLEEP_NS: u64 = 60_000_000_000;
 
+/// Default socket timeout for read/write/connect operations (30 s).
+const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A preopened host directory exposed to the guest.
 ///
 /// Semantics mirror Wasmtime's `preopened_dir`: `host_dir` is canonicalised
@@ -1211,6 +1214,8 @@ fn handle_net_socket(
         Some(Protocol::from(protocol))
     };
     let sock = Socket::new(domain, stype, proto)?;
+    sock.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+    sock.set_write_timeout(Some(SOCKET_TIMEOUT))?;
     let fd = table.lock().unwrap().insert(HostSocket {
         socket: sock,
         sock_type,
@@ -1229,9 +1234,11 @@ fn handle_net_connect(
     let addr = parse_sockaddr(args)?;
     policy.check(&addr)?;
     let sa: SockAddr = addr.into();
-    let tbl = table.lock().unwrap();
-    let sock = tbl.get_socket(fd)?;
-    sock.connect(&sa)?;
+    let sock = {
+        let tbl = table.lock().unwrap();
+        tbl.get_socket(fd)?.try_clone()?
+    };
+    sock.connect_timeout(&sa, SOCKET_TIMEOUT)?;
     Ok(json!({}))
 }
 
@@ -3434,5 +3441,28 @@ mod tests {
         // One more should NOT be added
         al.learn_ip(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1)));
         assert_eq!(al.learned_ips.lock().unwrap().len(), MAX_LEARNED_IPS);
+    }
+
+    #[test]
+    fn net_socket_has_default_timeout() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let table =
+            register_internal_tools(&mut tools, &exit_code, Some(&NetworkPolicy::AllowAll), None)
+                .expect("network tools should be registered");
+
+        let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(!s.contains("error"), "socket creation should succeed: {s}");
+
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        let fd = v["result"]["fd"].as_u64().unwrap();
+        assert!(fd > 0);
+
+        let tbl = table.lock().unwrap();
+        let sock = tbl.get_socket(fd).unwrap();
+        assert_eq!(sock.read_timeout().unwrap(), Some(SOCKET_TIMEOUT));
+        assert_eq!(sock.write_timeout().unwrap(), Some(SOCKET_TIMEOUT));
     }
 }
