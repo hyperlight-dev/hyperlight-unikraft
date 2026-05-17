@@ -46,7 +46,7 @@
 //! - [`Sandbox::save_snapshot`] writes the current snapshot to disk.
 //! - [`Sandbox::from_snapshot_file`] recreates a sandbox straight from
 //!   the file on disk, bypassing evolve entirely. This is how
-//!   `pyhl run` starts in ~200ms without re-doing `Py_Initialize`.
+//!   `pyhl run` starts in ~100ms without re-doing `Py_Initialize`.
 //!
 //! # Host filesystem
 //!
@@ -2213,63 +2213,8 @@ impl Sandbox {
 }
 
 // ---------------------------------------------------------------------------
-// Convenience: run_vm (single-shot execution)
+// Convenience: run_vm_capture_output (single-shot execution with output)
 // ---------------------------------------------------------------------------
-
-/// Run a Unikraft kernel to completion (single-shot). Thin shim over
-/// [`Sandbox::builder`] for callers that don't need the full fluent API.
-pub fn run_vm(
-    kernel_path: &Path,
-    initrd: Option<&[u8]>,
-    app_args: &[String],
-    config: VmConfig,
-) -> Result<()> {
-    let _ = Sandbox::evolve_inline(kernel_path, initrd, app_args, config, None, &[], None, None)?;
-    Ok(())
-}
-
-/// Run a Unikraft kernel with tool dispatch support.
-pub fn run_vm_with_tools(
-    kernel_path: &Path,
-    initrd: Option<&[u8]>,
-    app_args: &[String],
-    config: VmConfig,
-    tools: ToolRegistry,
-) -> Result<()> {
-    let _ = Sandbox::evolve_inline(
-        kernel_path,
-        initrd,
-        app_args,
-        config,
-        Some(tools),
-        &[],
-        None,
-        None,
-    )?;
-    Ok(())
-}
-
-/// Run a Unikraft kernel with preopened host directories exposed via
-/// `lib/hostfs`. Sandbox escape attempts are rejected host-side.
-pub fn run_vm_with_preopens(
-    kernel_path: &Path,
-    initrd: Option<&[u8]>,
-    app_args: &[String],
-    config: VmConfig,
-    preopens: &[Preopen],
-) -> Result<()> {
-    let _ = Sandbox::evolve_inline(
-        kernel_path,
-        initrd,
-        app_args,
-        config,
-        None,
-        preopens,
-        None,
-        None,
-    )?;
-    Ok(())
-}
 
 /// Output captured from a VM execution.
 pub struct VmOutput {

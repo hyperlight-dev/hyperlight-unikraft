@@ -135,11 +135,11 @@ pyhl run my_script.py
 pyhl run my_script.py --repeat 4      # 5 hermetic invocations
 ```
 
-Each `pyhl run` process pays a ~10s cold start (kernel boot + Py_Initialize
-+ preloaded imports) once, then every user invocation (including the
-first) runs hermetic at ~100ms — the driver snapshots the post-warmup
-state and restores between calls, so `__main__` globals and `sys.modules`
-don't leak between runs.
+Each `pyhl run` process pays a one-time warmup (~3 s for `Py_Initialize` +
+preloaded imports) on first call, then snapshots the post-warmup state.
+Every invocation thereafter (including subsequent calls in the same process
+and `--repeat` iterations) restores from the snapshot and runs hermetic
+at ~100 ms — `__main__` globals and `sys.modules` don't leak between runs.
 
 `pyhl setup` is idempotent — re-running reports the existing install and
 exits 0; pass `--force` to overwrite. Artifacts are found via
