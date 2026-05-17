@@ -19,9 +19,9 @@ ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/nodejs-kernel:latest"
 run:
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} -- /app/hello.js
 
-# Run 5 times via snapshot/restore
-run-5:
-    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 4 --memory {{memory}} -- /app/hello.js
+# Run 10 times via snapshot/restore
+run-10:
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 9 --memory {{memory}} -- /app/hello.js
 
 # Build rootfs via Docker (cross-platform)
 rootfs:

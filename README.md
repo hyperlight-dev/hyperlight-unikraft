@@ -90,7 +90,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo install just
 
 # 2. kraft-hyperlight (builds Unikraft kernels)
-git clone --branch hyperlight-platform https://github.com/danbugs/kraftkit.git
+git clone --branch plat-hyperlight https://github.com/unikraft/kraftkit/
 cd kraftkit && go build -o kraft-hyperlight ./cmd/kraft
 sudo mv kraft-hyperlight /usr/local/bin/ && cd ..
 

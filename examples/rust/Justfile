@@ -1,7 +1,7 @@
 # rust on Hyperlight
 #
 # just run      - Run once
-# just run-5    - Run 5x (snapshot/restore)
+# just run-10   - Run 10x (snapshot/restore)
 # just rootfs   - Build rootfs via Docker (cross-platform)
 # just build    - Build/pull kernel
 # just clean    - Remove build artifacts
@@ -19,9 +19,9 @@ ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/rust-kernel:latest"
 run:
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}}
 
-# Run 5 times via snapshot/restore
-run-5:
-    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 4 --memory {{memory}}
+# Run 10 times via snapshot/restore
+run-10:
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 9 --memory {{memory}}
 
 # Build rootfs via Docker (cross-platform)
 rootfs:

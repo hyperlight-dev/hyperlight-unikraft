@@ -41,14 +41,14 @@ run:
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} --mount {{mount_dir}} -- /hostfs_demo.py
 
 [unix]
-run-5:
+run-10:
     mkdir -p {{mount_dir}}
-    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 4 --memory {{memory}} --mount {{mount_dir}} -- /hostfs_demo.py
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 9 --memory {{memory}} --mount {{mount_dir}} -- /hostfs_demo.py
 
 [windows]
-run-5:
+run-10:
     New-Item -ItemType Directory -Force -Path {{mount_dir}} | Out-Null
-    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 4 --memory {{memory}} --mount {{mount_dir}} -- /hostfs_demo.py
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 9 --memory {{memory}} --mount {{mount_dir}} -- /hostfs_demo.py
 
 rootfs:
     docker build --platform linux/amd64 --target cpio -t {{image}}-cpio .
