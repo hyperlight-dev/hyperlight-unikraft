@@ -234,17 +234,12 @@ static void py_run_user_code(const uint8_t *fc, size_t fc_len)
 
 static void py_initialize_once(void)
 {
+	Py_UTF8Mode = 1;
 	Py_Initialize();
 
-	/* sys.argv so scripts that look at it don't crash. Also force
-	 * stdout/stderr to UTF-8 — the guest has no locale configured,
-	 * so Python defaults to ASCII and any non-ASCII char (em-dash,
-	 * smart quotes, …) in a script's print() raises UnicodeEncodeError. */
 	PyRun_SimpleString(
 		"import sys\n"
-		"sys.argv = ['hl_pydriver']\n"
-		"sys.stdout.reconfigure(encoding='utf-8')\n"
-		"sys.stderr.reconfigure(encoding='utf-8')\n");
+		"sys.argv = ['hl_pydriver']\n");
 
 	/* Pre-import the python-agent stack so every subsequent call
 	 * through the v2 callback sees a warm sys.modules and pays only
