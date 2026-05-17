@@ -1157,312 +1157,427 @@ fn dns_read_name(data: &[u8], pos: &mut usize) -> Option<String> {
     Some(name)
 }
 
+// ---------------------------------------------------------------------------
+// Named handler functions for each net_* tool.
+// ---------------------------------------------------------------------------
+
+fn handle_net_socket(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let family = args["family"].as_i64().unwrap_or(2) as i32; // AF_INET=2
+    let sock_type = args["type"].as_i64().unwrap_or(1) as i32; // SOCK_STREAM=1
+    let protocol = args["protocol"].as_i64().unwrap_or(0) as i32;
+
+    let domain = match family {
+        2 => Domain::IPV4,
+        10 => Domain::IPV6,
+        _ => return Err(anyhow!("InvalidInput: unsupported family {}", family)),
+    };
+    let stype = match sock_type {
+        1 => Type::STREAM,
+        2 => Type::DGRAM,
+        _ => return Err(anyhow!("InvalidInput: unsupported type {}", sock_type)),
+    };
+    let proto = if protocol == 0 {
+        None
+    } else {
+        Some(Protocol::from(protocol))
+    };
+    let sock = Socket::new(domain, stype, proto)?;
+    let fd = table.lock().unwrap().insert(HostSocket {
+        socket: sock,
+        sock_type,
+    })?;
+    Ok(json!({ "fd": fd }))
+}
+
+fn handle_net_connect(
+    table: &Mutex<SocketTable>,
+    policy: &NetworkPolicy,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let addr = parse_sockaddr(args)?;
+    policy.check(&addr)?;
+    let sa: SockAddr = addr.into();
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    sock.connect(&sa)?;
+    Ok(json!({}))
+}
+
+fn handle_net_bind(
+    table: &Mutex<SocketTable>,
+    listen_ports: Option<&ListenPorts>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let addr = parse_sockaddr(args)?;
+    match listen_ports {
+        Some(ports) => ports.check(addr.port())?,
+        None => return Err(anyhow!("Permission denied: no --port specified for bind")),
+    }
+    let sa: SockAddr = addr.into();
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    sock.bind(&sa)?;
+    Ok(json!({}))
+}
+
+fn handle_net_listen(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let backlog = args["backlog"].as_i64().unwrap_or(128) as i32;
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    sock.listen(backlog)?;
+    Ok(json!({}))
+}
+
+fn handle_net_accept(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let (new_sock, peer, parent_type) = {
+        let tbl = table.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        let (s, p) = sock.accept()?;
+        let st = tbl.get_sock_type(fd)?;
+        (s, p, st)
+    };
+    let peer_addr: Option<SocketAddr> = peer.as_socket();
+    let new_fd = table.lock().unwrap().insert(HostSocket {
+        socket: new_sock,
+        sock_type: parent_type,
+    })?;
+    let mut resp = json!({ "fd": new_fd });
+    if let Some(pa) = peer_addr {
+        resp["addr"] = json!(pa.ip().to_string());
+        resp["port"] = json!(pa.port());
+    }
+    Ok(resp)
+}
+
+fn handle_net_send(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use base64::Engine;
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let data_b64 = args["data"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing 'data'"))?;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(data_b64)
+        .map_err(|e| anyhow!("base64 decode: {}", e))?;
+    if data.len() > MAX_NET_SEND {
+        return Err(anyhow!(
+            "net_send: payload too large ({} bytes, max {})",
+            data.len(),
+            MAX_NET_SEND
+        ));
+    }
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    let sent = sock.send(&data)?;
+    Ok(json!({ "sent": sent }))
+}
+
+fn handle_net_sendto(
+    table: &Mutex<SocketTable>,
+    policy: &NetworkPolicy,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use base64::Engine;
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let data_b64 = args["data"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing 'data'"))?;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(data_b64)
+        .map_err(|e| anyhow!("base64 decode: {}", e))?;
+    if data.len() > MAX_NET_SEND {
+        return Err(anyhow!(
+            "net_sendto: payload too large ({} bytes, max {})",
+            data.len(),
+            MAX_NET_SEND
+        ));
+    }
+    let addr = parse_sockaddr(args)?;
+    policy.check(&addr)?;
+    let sa: SockAddr = addr.into();
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    let sent = sock.send_to(&data, &sa)?;
+    Ok(json!({ "sent": sent }))
+}
+
+fn handle_net_recv(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use base64::Engine;
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let len = args["len"].as_u64().unwrap_or(4096) as usize;
+    let mut buf = vec![std::mem::MaybeUninit::uninit(); len.min(65536)];
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    let n = sock.recv(&mut buf)?;
+    let data: Vec<u8> = buf[..n]
+        .iter()
+        .map(|b| unsafe { b.assume_init() })
+        .collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+    Ok(json!({ "data": encoded, "len": n }))
+}
+
+fn handle_net_recvfrom(
+    table: &Mutex<SocketTable>,
+    policy: &NetworkPolicy,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use base64::Engine;
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let len = args["len"].as_u64().unwrap_or(4096) as usize;
+    let mut buf = vec![0u8; len.min(65536)];
+
+    let buf_init =
+        unsafe { &mut *(buf.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) };
+
+    let (n, peer) = {
+        let tbl = table.lock().unwrap();
+        let sock = tbl.get_socket(fd)?;
+        sock.recv_from(buf_init)?
+    };
+    buf.truncate(n);
+
+    // Learn IPs from DNS responses so AllowList stays current with
+    // anycast/CDN rotation (guest may resolve via a different DNS
+    // server than the host, getting different IPs for the same name).
+    if let Some(pa) = peer.as_socket() {
+        if pa.port() == 53 {
+            if let NetworkPolicy::AllowList(al) = policy {
+                learn_ips_from_dns_response(&buf, al);
+            }
+        }
+    }
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+    let mut resp = json!({ "data": encoded, "len": n });
+    if let Some(pa) = peer.as_socket() {
+        resp["addr"] = json!(pa.ip().to_string());
+        resp["port"] = json!(pa.port());
+    }
+    Ok(resp)
+}
+
+fn handle_net_close(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    table.lock().unwrap().remove(fd)?;
+    Ok(json!({}))
+}
+
+fn handle_net_shutdown(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let how = args["how"].as_i64().unwrap_or(2) as i32;
+    let shutdown = match how {
+        0 => std::net::Shutdown::Read,
+        1 => std::net::Shutdown::Write,
+        _ => std::net::Shutdown::Both,
+    };
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    sock.shutdown(shutdown)?;
+    Ok(json!({}))
+}
+
+fn handle_net_setsockopt(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let level = args["level"].as_i64().unwrap_or(0) as i32;
+    let optname = args["optname"].as_i64().unwrap_or(0) as i32;
+    let value = args["value"].as_i64().unwrap_or(0) as i32;
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    match (level, optname) {
+        // SOL_SOCKET(1), SO_REUSEADDR(2)
+        (1, 2) => sock.set_reuse_address(value != 0)?,
+        // SOL_SOCKET(1), SO_KEEPALIVE(9)
+        (1, 9) => sock.set_keepalive(value != 0)?,
+        // IPPROTO_TCP(6), TCP_NODELAY(1)
+        (6, 1) => sock.set_nodelay(value != 0)?,
+        // Silently accepted — the dispatch round-trip makes
+        // guest-side timeouts and error-reporting opts
+        // counterproductive; the guest's own retry logic suffices.
+        _ => {}
+    }
+    Ok(json!({}))
+}
+
+fn handle_net_getsockopt(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let level = args["level"].as_i64().unwrap_or(0) as i32;
+    let optname = args["optname"].as_i64().unwrap_or(0) as i32;
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    let val: i32 = match (level, optname) {
+        // SOL_SOCKET(1), SO_TYPE(3)
+        (1, 3) => tbl.get_sock_type(fd)?,
+        // SOL_SOCKET(1), SO_REUSEADDR(2)
+        (1, 2) => sock.reuse_address()? as i32,
+        // IPPROTO_TCP(6), TCP_NODELAY(1)
+        (6, 1) => sock.nodelay()? as i32,
+        _ => 0,
+    };
+    Ok(json!({ "value": val }))
+}
+
+fn handle_net_getpeername(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    let peer = sock.peer_addr()?;
+    if let Some(addr) = peer.as_socket() {
+        Ok(sockaddr_to_json(addr))
+    } else {
+        Ok(json!({ "addr": "0.0.0.0", "port": 0 }))
+    }
+}
+
+fn handle_net_getsockname(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
+    let local = sock.local_addr()?;
+    if let Some(addr) = local.as_socket() {
+        Ok(sockaddr_to_json(addr))
+    } else {
+        Ok(json!({ "addr": "0.0.0.0", "port": 0 }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 fn register_net_tools(
     tools: &mut ToolRegistry,
     policy: &NetworkPolicy,
     listen_ports: Option<&ListenPorts>,
 ) -> Arc<Mutex<SocketTable>> {
-    use base64::Engine;
-    use serde_json::json;
-
     let table = Arc::new(Mutex::new(SocketTable::new()));
     let policy = Arc::new(policy.clone());
 
-    // net_socket
     let t = table.clone();
-    tools.register("net_socket", move |args| {
-        let family = args["family"].as_i64().unwrap_or(2) as i32; // AF_INET=2
-        let sock_type = args["type"].as_i64().unwrap_or(1) as i32; // SOCK_STREAM=1
-        let protocol = args["protocol"].as_i64().unwrap_or(0) as i32;
+    tools.register("net_socket", move |args| handle_net_socket(&t, &args));
 
-        let domain = match family {
-            2 => Domain::IPV4,
-            10 => Domain::IPV6,
-            _ => return Err(anyhow!("InvalidInput: unsupported family {}", family)),
-        };
-        let stype = match sock_type {
-            1 => Type::STREAM,
-            2 => Type::DGRAM,
-            _ => return Err(anyhow!("InvalidInput: unsupported type {}", sock_type)),
-        };
-        let proto = if protocol == 0 {
-            None
-        } else {
-            Some(Protocol::from(protocol))
-        };
-        let sock = Socket::new(domain, stype, proto)?;
-        let fd = t.lock().unwrap().insert(HostSocket {
-            socket: sock,
-            sock_type,
-        })?;
-        Ok(json!({ "fd": fd }))
-    });
-
-    // net_connect
     let t = table.clone();
     let pol = policy.clone();
     tools.register("net_connect", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let addr = parse_sockaddr(&args)?;
-        pol.check(&addr)?;
-        let sa: SockAddr = addr.into();
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        sock.connect(&sa)?;
-        Ok(json!({}))
+        handle_net_connect(&t, &pol, &args)
     });
 
-    // net_bind — gated by listen-port allowlist
     let t = table.clone();
     let lp = listen_ports.cloned().map(Arc::new);
     tools.register("net_bind", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let addr = parse_sockaddr(&args)?;
-        match lp.as_ref() {
-            Some(ports) => ports.check(addr.port())?,
-            None => return Err(anyhow!("Permission denied: no --port specified for bind")),
-        }
-        let sa: SockAddr = addr.into();
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        sock.bind(&sa)?;
-        Ok(json!({}))
+        handle_net_bind(&t, lp.as_deref(), &args)
     });
 
-    // net_listen
     let t = table.clone();
-    tools.register("net_listen", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let backlog = args["backlog"].as_i64().unwrap_or(128) as i32;
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        sock.listen(backlog)?;
-        Ok(json!({}))
-    });
+    tools.register("net_listen", move |args| handle_net_listen(&t, &args));
 
-    // net_accept
     let t = table.clone();
-    tools.register("net_accept", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let (new_sock, peer, parent_type) = {
-            let tbl = t.lock().unwrap();
-            let sock = tbl.get_socket(fd)?;
-            let (s, p) = sock.accept()?;
-            let st = tbl.get_sock_type(fd)?;
-            (s, p, st)
-        };
-        let peer_addr: Option<SocketAddr> = peer.as_socket();
-        let new_fd = t.lock().unwrap().insert(HostSocket {
-            socket: new_sock,
-            sock_type: parent_type,
-        })?;
-        let mut resp = json!({ "fd": new_fd });
-        if let Some(pa) = peer_addr {
-            resp["addr"] = json!(pa.ip().to_string());
-            resp["port"] = json!(pa.port());
-        }
-        Ok(resp)
-    });
+    tools.register("net_accept", move |args| handle_net_accept(&t, &args));
 
-    // net_send
     let t = table.clone();
-    tools.register("net_send", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let data_b64 = args["data"]
-            .as_str()
-            .ok_or_else(|| anyhow!("missing 'data'"))?;
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(data_b64)
-            .map_err(|e| anyhow!("base64 decode: {}", e))?;
-        if data.len() > MAX_NET_SEND {
-            return Err(anyhow!(
-                "net_send: payload too large ({} bytes, max {})",
-                data.len(),
-                MAX_NET_SEND
-            ));
-        }
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        let sent = sock.send(&data)?;
-        Ok(json!({ "sent": sent }))
-    });
+    tools.register("net_send", move |args| handle_net_send(&t, &args));
 
-    // net_sendto
     let t = table.clone();
     let pol = policy.clone();
-    tools.register("net_sendto", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let data_b64 = args["data"]
-            .as_str()
-            .ok_or_else(|| anyhow!("missing 'data'"))?;
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(data_b64)
-            .map_err(|e| anyhow!("base64 decode: {}", e))?;
-        if data.len() > MAX_NET_SEND {
-            return Err(anyhow!(
-                "net_sendto: payload too large ({} bytes, max {})",
-                data.len(),
-                MAX_NET_SEND
-            ));
-        }
-        let addr = parse_sockaddr(&args)?;
-        pol.check(&addr)?;
-        let sa: SockAddr = addr.into();
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        let sent = sock.send_to(&data, &sa)?;
-        Ok(json!({ "sent": sent }))
-    });
+    tools.register("net_sendto", move |args| handle_net_sendto(&t, &pol, &args));
 
-    // net_recv (alias for net_recvfrom with no addr returned for stream)
     let t = table.clone();
-    tools.register("net_recv", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let len = args["len"].as_u64().unwrap_or(4096) as usize;
-        let mut buf = vec![std::mem::MaybeUninit::uninit(); len.min(65536)];
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        let n = sock.recv(&mut buf)?;
-        let data: Vec<u8> = buf[..n]
-            .iter()
-            .map(|b| unsafe { b.assume_init() })
-            .collect();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
-        Ok(json!({ "data": encoded, "len": n }))
-    });
+    tools.register("net_recv", move |args| handle_net_recv(&t, &args));
 
-    // net_recvfrom
     let t = table.clone();
-    let pol_recv = policy.clone();
+    let pol = policy.clone();
     tools.register("net_recvfrom", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let len = args["len"].as_u64().unwrap_or(4096) as usize;
-        let mut buf = vec![0u8; len.min(65536)];
-
-        let buf_init =
-            unsafe { &mut *(buf.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) };
-
-        let (n, peer) = {
-            let tbl = t.lock().unwrap();
-            let sock = tbl.get_socket(fd)?;
-            sock.recv_from(buf_init)?
-        };
-        buf.truncate(n);
-
-        // Learn IPs from DNS responses so AllowList stays current with
-        // anycast/CDN rotation (guest may resolve via a different DNS
-        // server than the host, getting different IPs for the same name).
-        if let Some(pa) = peer.as_socket() {
-            if pa.port() == 53 {
-                if let NetworkPolicy::AllowList(al) = &*pol_recv {
-                    learn_ips_from_dns_response(&buf, al);
-                }
-            }
-        }
-
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
-        let mut resp = json!({ "data": encoded, "len": n });
-        if let Some(pa) = peer.as_socket() {
-            resp["addr"] = json!(pa.ip().to_string());
-            resp["port"] = json!(pa.port());
-        }
-        Ok(resp)
+        handle_net_recvfrom(&t, &pol, &args)
     });
 
-    // net_close
     let t = table.clone();
-    tools.register("net_close", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        t.lock().unwrap().remove(fd)?;
-        Ok(json!({}))
-    });
+    tools.register("net_close", move |args| handle_net_close(&t, &args));
 
-    // net_shutdown
     let t = table.clone();
-    tools.register("net_shutdown", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let how = args["how"].as_i64().unwrap_or(2) as i32;
-        let shutdown = match how {
-            0 => std::net::Shutdown::Read,
-            1 => std::net::Shutdown::Write,
-            _ => std::net::Shutdown::Both,
-        };
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        sock.shutdown(shutdown)?;
-        Ok(json!({}))
-    });
+    tools.register("net_shutdown", move |args| handle_net_shutdown(&t, &args));
 
-    // net_setsockopt
     let t = table.clone();
     tools.register("net_setsockopt", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let level = args["level"].as_i64().unwrap_or(0) as i32;
-        let optname = args["optname"].as_i64().unwrap_or(0) as i32;
-        let value = args["value"].as_i64().unwrap_or(0) as i32;
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        match (level, optname) {
-            // SOL_SOCKET(1), SO_REUSEADDR(2)
-            (1, 2) => sock.set_reuse_address(value != 0)?,
-            // SOL_SOCKET(1), SO_KEEPALIVE(9)
-            (1, 9) => sock.set_keepalive(value != 0)?,
-            // IPPROTO_TCP(6), TCP_NODELAY(1)
-            (6, 1) => sock.set_nodelay(value != 0)?,
-            // Silently accepted — the dispatch round-trip makes
-            // guest-side timeouts and error-reporting opts
-            // counterproductive; the guest's own retry logic suffices.
-            _ => {}
-        }
-        Ok(json!({}))
+        handle_net_setsockopt(&t, &args)
     });
 
-    // net_getsockopt
     let t = table.clone();
     tools.register("net_getsockopt", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let level = args["level"].as_i64().unwrap_or(0) as i32;
-        let optname = args["optname"].as_i64().unwrap_or(0) as i32;
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        let val: i32 = match (level, optname) {
-            // SOL_SOCKET(1), SO_TYPE(3)
-            (1, 3) => tbl.get_sock_type(fd)?,
-            // SOL_SOCKET(1), SO_REUSEADDR(2)
-            (1, 2) => sock.reuse_address()? as i32,
-            // IPPROTO_TCP(6), TCP_NODELAY(1)
-            (6, 1) => sock.nodelay()? as i32,
-            _ => 0,
-        };
-        Ok(json!({ "value": val }))
+        handle_net_getsockopt(&t, &args)
     });
 
-    // net_getpeername
     let t = table.clone();
     tools.register("net_getpeername", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        let peer = sock.peer_addr()?;
-        if let Some(addr) = peer.as_socket() {
-            Ok(sockaddr_to_json(addr))
-        } else {
-            Ok(json!({ "addr": "0.0.0.0", "port": 0 }))
-        }
+        handle_net_getpeername(&t, &args)
     });
 
-    // net_getsockname
     let t = table.clone();
     tools.register("net_getsockname", move |args| {
-        let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-        let tbl = t.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        let local = sock.local_addr()?;
-        if let Some(addr) = local.as_socket() {
-            Ok(sockaddr_to_json(addr))
-        } else {
-            Ok(json!({ "addr": "0.0.0.0", "port": 0 }))
-        }
+        handle_net_getsockname(&t, &args)
     });
 
     table
