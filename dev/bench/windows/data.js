@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779006853437,
+  "lastUpdate": 1779009104688,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1089,6 +1089,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 966,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d42ff50f05cf196509c6829fbbc42fee087195df",
+          "message": "Merge pull request #69 from hyperlight-dev/fix/windows-connect-timeout\n\nfix: avoid try_clone in net_connect to fix Windows DNS resolution",
+          "timestamp": "2026-05-17T02:02:43-07:00",
+          "tree_id": "2324382896523918db3d99644b5395d79543a4df",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/d42ff50f05cf196509c6829fbbc42fee087195df"
+        },
+        "date": 1779009101581,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 179,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 533,
             "unit": "ms"
           },
           {
