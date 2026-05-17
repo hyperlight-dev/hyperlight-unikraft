@@ -96,6 +96,15 @@ const MAX_FS_READ: u64 = 16 * 1024 * 1024;
 /// Cap for `net_send`/`net_sendto` decoded payload (1 MiB).
 const MAX_NET_SEND: usize = 1024 * 1024;
 
+/// Cap for `fs_write`/`fs_write_bytes` payload to prevent guest-triggered OOM (16 MiB).
+const MAX_FS_WRITE: usize = 16 * 1024 * 1024;
+
+/// Cap for `fs_truncate` length to prevent disk exhaustion (1 GiB).
+const MAX_TRUNCATE_LEN: u64 = 1024 * 1024 * 1024;
+
+/// Cap for incoming dispatch payload size (64 MiB).
+const MAX_DISPATCH_PAYLOAD: usize = 64 * 1024 * 1024;
+
 /// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
 const MAX_SLEEP_NS: u64 = 60_000_000_000;
 
@@ -674,6 +683,12 @@ impl ToolRegistry {
     /// payload and result to stderr — useful when diagnosing
     /// guest/host protocol mismatches.
     pub fn dispatch(&self, payload: &[u8]) -> Vec<u8> {
+        if payload.len() > MAX_DISPATCH_PAYLOAD {
+            return serde_json::to_vec(&serde_json::json!({
+                "error": format!("payload too large: {} bytes (max {})", payload.len(), MAX_DISPATCH_PAYLOAD)
+            }))
+            .unwrap_or_default();
+        }
         let debug = std::env::var("HL_DISPATCH_DEBUG")
             .ok()
             .map(|v| v == "1")
@@ -1122,6 +1137,7 @@ fn dns_read_name(data: &[u8], pos: &mut usize) -> Option<String> {
     let mut p = *pos;
     let mut jumped = false;
     let mut jump_save = 0;
+    let mut hops = 0u8;
     loop {
         if p >= data.len() {
             return None;
@@ -1132,8 +1148,11 @@ fn dns_read_name(data: &[u8], pos: &mut usize) -> Option<String> {
             break;
         }
         if (len & 0xC0) == 0xC0 {
-            // Pointer
             if p + 1 >= data.len() {
+                return None;
+            }
+            hops += 1;
+            if hops > 128 {
                 return None;
             }
             let offset = ((len & 0x3F) << 8) | data[p + 1] as usize;
@@ -1658,6 +1677,13 @@ impl FsRouter {
             let text = args["text"]
                 .as_str()
                 .ok_or_else(|| anyhow!("fs_write: missing 'text'"))?;
+            if text.len() > MAX_FS_WRITE {
+                return Err(anyhow!(
+                    "fs_write: payload too large ({} bytes, max {})",
+                    text.len(),
+                    MAX_FS_WRITE
+                ));
+            }
             let append = args["append"].as_bool().unwrap_or(false);
             let (fs, rel) = r.route(path)?;
             let target = fs.resolve(rel)?;
@@ -1764,9 +1790,22 @@ impl FsRouter {
             let data_b64 = args["data"]
                 .as_str()
                 .ok_or_else(|| anyhow!("fs_write_bytes: missing 'data'"))?;
+            if data_b64.len() > MAX_FS_WRITE * 4 / 3 + 4 {
+                return Err(anyhow!(
+                    "fs_write_bytes: payload too large (max {} decoded bytes)",
+                    MAX_FS_WRITE
+                ));
+            }
             let data = base64::engine::general_purpose::STANDARD
                 .decode(data_b64)
                 .map_err(|e| anyhow!("fs_write_bytes: bad base64: {}", e))?;
+            if data.len() > MAX_FS_WRITE {
+                return Err(anyhow!(
+                    "fs_write_bytes: decoded payload too large ({} bytes, max {})",
+                    data.len(),
+                    MAX_FS_WRITE
+                ));
+            }
             let offset = args["offset"].as_u64();
             let append = args["append"].as_bool().unwrap_or(false);
             let (fs, rel) = r.route(path)?;
@@ -1797,6 +1836,13 @@ impl FsRouter {
             let length = args["length"]
                 .as_u64()
                 .ok_or_else(|| anyhow!("fs_truncate: missing 'length'"))?;
+            if length > MAX_TRUNCATE_LEN {
+                return Err(anyhow!(
+                    "fs_truncate: length too large ({} bytes, max {})",
+                    length,
+                    MAX_TRUNCATE_LEN
+                ));
+            }
             let (fs, rel) = r.route(path)?;
             let target = fs.resolve(rel)?;
             let f = std::fs::OpenOptions::new()
