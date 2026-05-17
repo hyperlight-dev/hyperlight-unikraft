@@ -108,6 +108,9 @@ const MAX_DISPATCH_PAYLOAD: usize = 64 * 1024 * 1024;
 /// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
 const MAX_SLEEP_NS: u64 = 60_000_000_000;
 
+/// Cap for `fs_list` directory entries to prevent host OOM on huge directories.
+const MAX_DIR_ENTRIES: usize = 100_000;
+
 /// Default socket timeout for read/write/connect operations (30 s).
 const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1290,6 +1293,8 @@ fn handle_net_accept(
         let st = tbl.get_sock_type(fd)?;
         (s, p, st)
     };
+    new_sock.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+    new_sock.set_write_timeout(Some(SOCKET_TIMEOUT))?;
     let peer_addr: Option<SocketAddr> = peer.as_socket();
     let new_fd = table.lock().unwrap().insert(HostSocket {
         socket: new_sock,
@@ -1716,6 +1721,13 @@ impl FsRouter {
             for entry in
                 std::fs::read_dir(&target).map_err(|e| anyhow!("fs_list {:?}: {}", path, e))?
             {
+                if entries.len() >= MAX_DIR_ENTRIES {
+                    return Err(anyhow!(
+                        "fs_list {:?}: too many entries (max {})",
+                        path,
+                        MAX_DIR_ENTRIES
+                    ));
+                }
                 let entry = entry?;
                 let ft = entry.file_type()?;
                 entries.push(json!({
@@ -1814,6 +1826,13 @@ impl FsRouter {
                 ));
             }
             let offset = args["offset"].as_u64();
+            if let Some(off) = offset {
+                if off > MAX_TRUNCATE_LEN {
+                    return Err(anyhow!(
+                        "fs_write_bytes: offset too large ({off}, max {MAX_TRUNCATE_LEN})"
+                    ));
+                }
+            }
             let append = args["append"].as_bool().unwrap_or(false);
             let (fs, rel) = r.route(path)?;
             let target = fs.resolve(rel)?;
@@ -1885,6 +1904,9 @@ impl FsRouter {
                 .ok_or_else(|| anyhow!("fs_unlink: missing 'path'"))?;
             let (fs, rel) = r.route(path)?;
             let target = fs.resolve(rel)?;
+            if target == *fs.root() {
+                return Err(anyhow!("fs_unlink: cannot remove mount root"));
+            }
             let md =
                 std::fs::metadata(&target).map_err(|e| anyhow!("fs_unlink {:?}: {}", path, e))?;
             if md.is_dir() {
@@ -3464,5 +3486,16 @@ mod tests {
         let sock = tbl.get_socket(fd).unwrap();
         assert_eq!(sock.read_timeout().unwrap(), Some(SOCKET_TIMEOUT));
         assert_eq!(sock.write_timeout().unwrap(), Some(SOCKET_TIMEOUT));
+    }
+
+    #[test]
+    fn dns_read_name_rejects_circular_pointer() {
+        // Two compression pointers pointing at each other: offset 0 → 2, offset 2 → 0
+        let data = [0xC0, 0x02, 0xC0, 0x00];
+        let mut pos = 0usize;
+        assert!(
+            dns_read_name(&data, &mut pos).is_none(),
+            "circular DNS compression pointers should be rejected"
+        );
     }
 }
