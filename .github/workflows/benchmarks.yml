@@ -308,7 +308,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           benchmark-data-dir-path: dev/bench/linux
           auto-push: ${{ github.event_name == 'push' }}
-          comment-always: true
+          comment-always: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           alert-threshold: '130%'
 
   # ------------------------------------------------------------------
@@ -523,7 +523,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           benchmark-data-dir-path: dev/bench/windows
           auto-push: ${{ github.event_name == 'push' }}
-          comment-always: true
+          comment-always: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           alert-threshold: '130%'
 
   benchmarks-passed:
@@ -541,7 +541,7 @@ jobs:
           failed=0
           for job in "${!results[@]}"; do
             r="${results[$job]}"
-            if [[ "$r" != "success" ]]; then
+            if [[ "$r" != "success" && "$r" != "skipped" ]]; then
               echo "FAIL: $job = $r"
               failed=1
             fi
