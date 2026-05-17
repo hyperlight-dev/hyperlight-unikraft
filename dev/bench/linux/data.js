@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779001907858,
+  "lastUpdate": 1779004930383,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1089,6 +1089,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4c053f6d2dca26454f7cc6789a159b86c3cead1e",
+          "message": "Merge pull request #65 from hyperlight-dev/fix/socket-timeouts\n\nfix: set default 30s timeout on guest-created sockets",
+          "timestamp": "2026-05-17T00:55:18-07:00",
+          "tree_id": "949cd59bd2ea09ecaac4dbdadb083ad45b2eba83",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/4c053f6d2dca26454f7cc6789a159b86c3cead1e"
+        },
+        "date": 1779004929392,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 90,
             "unit": "ms"
           },
           {
