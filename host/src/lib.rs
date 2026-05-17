@@ -252,7 +252,9 @@ impl AllowList {
 
     fn learn_ip(&self, ip: IpAddr) {
         if let Ok(mut learned) = self.learned_ips.lock() {
-            learned.insert(ip);
+            if learned.len() < MAX_LEARNED_IPS {
+                learned.insert(ip);
+            }
         }
     }
 }
@@ -965,6 +967,9 @@ struct HostSocket {
     socket: Socket,
     sock_type: i32,
 }
+
+/// Maximum number of IPs learned from DNS responses for AllowList policy.
+const MAX_LEARNED_IPS: usize = 256;
 
 const MAX_SOCKETS: usize = 1024;
 
@@ -3368,5 +3373,20 @@ mod tests {
             resp.contains("too large"),
             "expected 'too large' error for net_sendto, got: {resp}"
         );
+    }
+
+    #[test]
+    fn allowlist_learned_ips_capped() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let al = AllowList::from_hosts(&["192.0.2.1"]).unwrap();
+        // Fill up to the cap
+        for i in 0..MAX_LEARNED_IPS {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8));
+            al.learn_ip(ip);
+        }
+        assert_eq!(al.learned_ips.lock().unwrap().len(), MAX_LEARNED_IPS);
+        // One more should NOT be added
+        al.learn_ip(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1)));
+        assert_eq!(al.learned_ips.lock().unwrap().len(), MAX_LEARNED_IPS);
     }
 }
