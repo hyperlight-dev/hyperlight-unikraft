@@ -46,7 +46,7 @@
 //! - [`Sandbox::save_snapshot`] writes the current snapshot to disk.
 //! - [`Sandbox::from_snapshot_file`] recreates a sandbox straight from
 //!   the file on disk, bypassing evolve entirely. This is how
-//!   `pyhl run` starts in ~200ms without re-doing `Py_Initialize`.
+//!   `pyhl run` starts in ~100ms without re-doing `Py_Initialize`.
 //!
 //! # Host filesystem
 //!
@@ -92,6 +92,9 @@ const RESERVED_GUEST_MOUNTPOINTS: &[&str] = &["/", "/bin", "/dev", "/proc", "/sy
 
 /// Cap for `fs_read_bytes` allocation to prevent guest-controlled OOM (16 MiB).
 const MAX_FS_READ: u64 = 16 * 1024 * 1024;
+
+/// Cap for `net_send`/`net_sendto` decoded payload (1 MiB).
+const MAX_NET_SEND: usize = 1024 * 1024;
 
 /// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
 const MAX_SLEEP_NS: u64 = 60_000_000_000;
@@ -1261,6 +1264,13 @@ fn register_net_tools(
         let data = base64::engine::general_purpose::STANDARD
             .decode(data_b64)
             .map_err(|e| anyhow!("base64 decode: {}", e))?;
+        if data.len() > MAX_NET_SEND {
+            return Err(anyhow!(
+                "net_send: payload too large ({} bytes, max {})",
+                data.len(),
+                MAX_NET_SEND
+            ));
+        }
         let tbl = t.lock().unwrap();
         let sock = tbl.get_socket(fd)?;
         let sent = sock.send(&data)?;
@@ -1278,6 +1288,13 @@ fn register_net_tools(
         let data = base64::engine::general_purpose::STANDARD
             .decode(data_b64)
             .map_err(|e| anyhow!("base64 decode: {}", e))?;
+        if data.len() > MAX_NET_SEND {
+            return Err(anyhow!(
+                "net_sendto: payload too large ({} bytes, max {})",
+                data.len(),
+                MAX_NET_SEND
+            ));
+        }
         let addr = parse_sockaddr(&args)?;
         pol.check(&addr)?;
         let sa: SockAddr = addr.into();
@@ -1487,6 +1504,17 @@ impl FsRouter {
                 .ok_or_else(|| anyhow!("fs_read: missing 'path'"))?;
             let (fs, rel) = r.route(path)?;
             let target = fs.resolve(rel)?;
+            let size = std::fs::metadata(&target)
+                .map_err(|e| anyhow!("fs_read {:?}: {}", path, e))?
+                .len();
+            if size > MAX_FS_READ {
+                return Err(anyhow!(
+                    "fs_read {:?}: file too large ({} bytes, max {})",
+                    path,
+                    size,
+                    MAX_FS_READ
+                ));
+            }
             let text = std::fs::read_to_string(&target)
                 .map_err(|e| anyhow!("fs_read {:?}: {}", path, e))?;
             Ok(json!({ "text": text }))
@@ -2210,63 +2238,8 @@ impl Sandbox {
 }
 
 // ---------------------------------------------------------------------------
-// Convenience: run_vm (single-shot execution)
+// Convenience: run_vm_capture_output (single-shot execution with output)
 // ---------------------------------------------------------------------------
-
-/// Run a Unikraft kernel to completion (single-shot). Thin shim over
-/// [`Sandbox::builder`] for callers that don't need the full fluent API.
-pub fn run_vm(
-    kernel_path: &Path,
-    initrd: Option<&[u8]>,
-    app_args: &[String],
-    config: VmConfig,
-) -> Result<()> {
-    let _ = Sandbox::evolve_inline(kernel_path, initrd, app_args, config, None, &[], None, None)?;
-    Ok(())
-}
-
-/// Run a Unikraft kernel with tool dispatch support.
-pub fn run_vm_with_tools(
-    kernel_path: &Path,
-    initrd: Option<&[u8]>,
-    app_args: &[String],
-    config: VmConfig,
-    tools: ToolRegistry,
-) -> Result<()> {
-    let _ = Sandbox::evolve_inline(
-        kernel_path,
-        initrd,
-        app_args,
-        config,
-        Some(tools),
-        &[],
-        None,
-        None,
-    )?;
-    Ok(())
-}
-
-/// Run a Unikraft kernel with preopened host directories exposed via
-/// `lib/hostfs`. Sandbox escape attempts are rejected host-side.
-pub fn run_vm_with_preopens(
-    kernel_path: &Path,
-    initrd: Option<&[u8]>,
-    app_args: &[String],
-    config: VmConfig,
-    preopens: &[Preopen],
-) -> Result<()> {
-    let _ = Sandbox::evolve_inline(
-        kernel_path,
-        initrd,
-        app_args,
-        config,
-        None,
-        preopens,
-        None,
-        None,
-    )?;
-    Ok(())
-}
 
 /// Output captured from a VM execution.
 pub struct VmOutput {
@@ -3164,5 +3137,81 @@ mod tests {
         table.clear();
         assert_eq!(table.sockets.len(), 0);
         assert_eq!(table.next_id, 1);
+    }
+
+    #[test]
+    fn test_fs_read_size_cap() {
+        use std::io::Write;
+
+        let root = tmpdir("fs_read_cap");
+        // Create a file that exceeds MAX_FS_READ (16 MiB) using a sparse file
+        let big_path = root.join("big.txt");
+        let f = std::fs::File::create(&big_path).unwrap();
+        f.set_len(MAX_FS_READ + 1).unwrap();
+        drop(f);
+
+        // Also create a small file to verify normal reads work
+        let small_path = root.join("small.txt");
+        let mut sf = std::fs::File::create(&small_path).unwrap();
+        sf.write_all(b"hello").unwrap();
+        drop(sf);
+
+        let preopens = vec![Preopen::new(&root, "/host").unwrap()];
+        let mut reg = ToolRegistry::new();
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
+
+        // Small file should succeed
+        let req = br#"{"name":"fs_read","args":{"path":"/host/small.txt"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(!s.contains("\"error\""), "small read should succeed: {s}");
+
+        // Large file should fail with "too large"
+        let req = br#"{"name":"fs_read","args":{"path":"/host/big.txt"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(
+            s.contains("too large"),
+            "expected 'too large' error, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_net_send_size_cap() {
+        use base64::Engine;
+
+        let mut reg = ToolRegistry::new();
+        let policy = NetworkPolicy::AllowAll;
+        register_net_tools(&mut reg, &policy, None);
+
+        // Create a socket
+        let req = br#"{"name":"net_socket","args":{"family":2,"type":2}}"#;
+        let resp = std::str::from_utf8(&reg.dispatch(req)).unwrap().to_string();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let fd = v["result"]["fd"].as_u64().unwrap();
+
+        // Create payload larger than MAX_NET_SEND (1 MiB)
+        let big_payload = vec![0u8; MAX_NET_SEND + 1];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&big_payload);
+        let req = format!(r#"{{"name":"net_send","args":{{"fd":{fd},"data":"{b64}"}}}}"#);
+        let resp = std::str::from_utf8(&reg.dispatch(req.as_bytes()))
+            .unwrap()
+            .to_string();
+        assert!(
+            resp.contains("too large"),
+            "expected 'too large' error for net_send, got: {resp}"
+        );
+
+        // Also test net_sendto
+        let req = format!(
+            r#"{{"name":"net_sendto","args":{{"fd":{fd},"data":"{b64}","addr":"127.0.0.1","port":9999}}}}"#
+        );
+        let resp = std::str::from_utf8(&reg.dispatch(req.as_bytes()))
+            .unwrap()
+            .to_string();
+        assert!(
+            resp.contains("too large"),
+            "expected 'too large' error for net_sendto, got: {resp}"
+        );
     }
 }
