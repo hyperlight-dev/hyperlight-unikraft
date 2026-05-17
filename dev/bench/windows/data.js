@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779009104688,
+  "lastUpdate": 1779040795993,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1133,6 +1133,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 533,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "2674b966449348264d92987e36018920c1b8cc00",
+          "message": "fix: skip benchmark PR comments on fork PRs\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-17T17:48:44Z",
+          "tree_id": "ae65b6f188355db38f69253db6b31a0b6bec2fb8",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/2674b966449348264d92987e36018920c1b8cc00"
+        },
+        "date": 1779040792992,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 298,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 953,
             "unit": "ms"
           },
           {
