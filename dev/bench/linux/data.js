@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778912878969,
+  "lastUpdate": 1778998365549,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -913,6 +913,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c9d37ee780d638d657db7f21e5e00e5087f7ee53",
+          "message": "fix: add size caps to fs_read and net_send/net_sendto (#60)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-16T23:06:40-07:00",
+          "tree_id": "deb3373b36fa49f01b6a718d1855fbfe9f172b07",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/c9d37ee780d638d657db7f21e5e00e5087f7ee53"
+        },
+        "date": 1778998364670,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 80,
             "unit": "ms"
           },
           {
