@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779005182298,
+  "lastUpdate": 1779006853437,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1045,6 +1045,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 557,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "52a28ce99fe572d533bc0eec17cf5c3bc6561fb8",
+          "message": "Merge pull request #68 from hyperlight-dev/fix/re-audit-round2\n\nfix: harden fs and net handlers",
+          "timestamp": "2026-05-17T01:25:19-07:00",
+          "tree_id": "6d65261ee141640429781408309e95590a240e0f",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/52a28ce99fe572d533bc0eec17cf5c3bc6561fb8"
+        },
+        "date": 1779006847774,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 301,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 966,
             "unit": "ms"
           },
           {
