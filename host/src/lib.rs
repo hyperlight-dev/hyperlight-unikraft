@@ -3223,7 +3223,7 @@ mod tests {
     #[test]
     fn allowlist_learned_ips_capped() {
         use std::net::{IpAddr, Ipv4Addr};
-        let al = AllowList::from_hosts(&["example.com"]).unwrap();
+        let al = AllowList::from_hosts(&["192.0.2.1"]).unwrap();
         // Fill up to the cap
         for i in 0..MAX_LEARNED_IPS {
             let ip = IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8));
