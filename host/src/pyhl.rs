@@ -48,20 +48,28 @@ use std::time::Instant;
 
 use crate::{Preopen, Sandbox};
 
-/// Default Hyperlight's surrogate-process pool to 1 on Windows.
+/// Set `HYPERLIGHT_INITIAL_SURROGATES=1` if unset (Windows only).
 ///
-/// The surrogate-process manager pre-spawns `HYPERLIGHT_INITIAL_SURROGATES`
-/// Windows processes (default 512) the first time any sandbox is created.
-/// At ~7 ms per `CreateProcessA` that is ~3.5 s of latency that library
-/// callers would pay on the very first sandbox. Pinning the default to 1
-/// drops that to ~7 ms. Callers (or the embedding binary) can still
-/// override by setting the env var before calling into `pyhl`.
+/// On Windows, Hyperlight pre-spawns surrogate processes (one per
+/// potential sandbox). The default count is 512, each costing ~7 ms
+/// of `CreateProcessA` latency. For pyhl's single-sandbox usage,
+/// pinning to 1 avoids ~3.5 s of wasted startup.
+///
+/// # Safety
+///
+/// Must be called from the main thread before spawning any additional
+/// threads or creating any `Sandbox`. Violating this is undefined
+/// behavior due to `std::env::set_var` not being thread-safe.
 pub fn default_surrogate_count() {
-    if std::env::var_os("HYPERLIGHT_INITIAL_SURROGATES").is_none() {
-        // Safety: must be called before any sandbox is created and
-        // before additional threads are spawned.
-        unsafe {
-            std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", "1");
+    #[cfg(target_os = "windows")]
+    {
+        if std::env::var_os("HYPERLIGHT_INITIAL_SURROGATES").is_none() {
+            // SAFETY: Called from main thread before any sandbox or
+            // thread pool is created. The binary entry points (cmd_run,
+            // cmd_setup) call this first.
+            unsafe {
+                std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", "1");
+            }
         }
     }
 }
