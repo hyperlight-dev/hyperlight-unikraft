@@ -399,6 +399,16 @@ impl NetworkPolicy {
             ));
         }
 
+        // Block loopback addresses (127.0.0.0/8, ::1) for all policy
+        // variants. Host-local services typically trust loopback traffic
+        // and perform no authentication.
+        if addr.ip().is_loopback() {
+            return Err(anyhow!(
+                "network policy denies connection to loopback address {}",
+                addr
+            ));
+        }
+
         match self {
             NetworkPolicy::AllowAll => Ok(()),
             NetworkPolicy::AllowList(al) => {
@@ -2919,6 +2929,36 @@ mod tests {
         assert!(
             policy.check(&link6).is_err(),
             "BlockList must block IPv6 link-local"
+        );
+    }
+
+    #[test]
+    fn net_loopback_blocked() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        let policy = NetworkPolicy::AllowAll;
+        let lo4 = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 80);
+        assert!(
+            policy.check(&lo4).is_err(),
+            "AllowAll must block IPv4 loopback"
+        );
+
+        let lo6 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 80);
+        assert!(
+            policy.check(&lo6).is_err(),
+            "AllowAll must block IPv6 loopback"
+        );
+
+        // BlockList should also block loopback
+        let bl = BlockList::from_hosts(&["192.0.2.1"]).unwrap();
+        let policy = NetworkPolicy::BlockList(bl);
+        assert!(
+            policy.check(&lo4).is_err(),
+            "BlockList must block IPv4 loopback"
+        );
+        assert!(
+            policy.check(&lo6).is_err(),
+            "BlockList must block IPv6 loopback"
         );
     }
 
