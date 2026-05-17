@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778913073082,
+  "lastUpdate": 1778999069379,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -913,6 +913,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 725,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2c927888a41354f80f2e580823b8036680bdb72e",
+          "message": "test: add pyhl::Runtime integration tests (#61)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-16T23:14:46-07:00",
+          "tree_id": "b713640a723a0f5cca85000081c5ceae8e2235d9",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/2c927888a41354f80f2e580823b8036680bdb72e"
+        },
+        "date": 1778999067036,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 187,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 545,
             "unit": "ms"
           },
           {
