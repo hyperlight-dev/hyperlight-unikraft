@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778999069379,
+  "lastUpdate": 1779002130660,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -957,6 +957,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 545,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "519857083445dff88302538b813d440804f713b9",
+          "message": "fix: cap AllowList learned_ips at 256 entries (#63)\n\n* fix: cap AllowList learned_ips at 256 entries\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: use IP literal in learned_ips cap test to avoid DNS dependency\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-17T00:03:42-07:00",
+          "tree_id": "e2a3889cd1f3235d9c0bee47f3790e1d720cd87b",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/519857083445dff88302538b813d440804f713b9"
+        },
+        "date": 1779002125959,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 191,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 540,
             "unit": "ms"
           },
           {
