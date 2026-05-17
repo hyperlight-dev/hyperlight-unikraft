@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779001284784,
+  "lastUpdate": 1779001907858,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1035,6 +1035,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/b69cdbf3f1f97e5fc0af9cc48248478422406ef8"
         },
         "date": 1779001284424,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "519857083445dff88302538b813d440804f713b9",
+          "message": "fix: cap AllowList learned_ips at 256 entries (#63)\n\n* fix: cap AllowList learned_ips at 256 entries\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: use IP literal in learned_ips cap test to avoid DNS dependency\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-17T00:03:42-07:00",
+          "tree_id": "e2a3889cd1f3235d9c0bee47f3790e1d720cd87b",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/519857083445dff88302538b813d440804f713b9"
+        },
+        "date": 1779001906941,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
