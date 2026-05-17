@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778998847311,
+  "lastUpdate": 1779001284784,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -991,6 +991,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/2c927888a41354f80f2e580823b8036680bdb72e"
         },
         "date": 1778998846461,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b69cdbf3f1f97e5fc0af9cc48248478422406ef8",
+          "message": "refactor: extract net tool handlers into named functions (#64)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-16T23:54:42-07:00",
+          "tree_id": "a6ceace4a182701ac8832f753e8601f7566c2c72",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/b69cdbf3f1f97e5fc0af9cc48248478422406ef8"
+        },
+        "date": 1779001284424,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
