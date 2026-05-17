@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779040795993,
+  "lastUpdate": 1779058640052,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1177,6 +1177,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 953,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ca05c5af35f1728bbce94e17677a18200b7247a6",
+          "message": "chore: bump version to 0.5.0 (#72)\n\n* chore: bump version to 0.5.0\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* chore: update Cargo.lock for 0.5.0\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-17T15:48:31-07:00",
+          "tree_id": "1cf723827283b54db03f5eb48a8ba61ac922ee92",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/ca05c5af35f1728bbce94e17677a18200b7247a6"
+        },
+        "date": 1779058636958,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 266,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 817,
             "unit": "ms"
           },
           {
