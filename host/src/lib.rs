@@ -1237,10 +1237,8 @@ fn handle_net_connect(
     let addr = parse_sockaddr(args)?;
     policy.check(&addr)?;
     let sa: SockAddr = addr.into();
-    let sock = {
-        let tbl = table.lock().unwrap();
-        tbl.get_socket(fd)?.try_clone()?
-    };
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?;
     sock.connect_timeout(&sa, SOCKET_TIMEOUT)?;
     Ok(json!({}))
 }
