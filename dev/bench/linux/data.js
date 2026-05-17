@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779040586850,
+  "lastUpdate": 1779058448209,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1255,6 +1255,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/2674b966449348264d92987e36018920c1b8cc00"
         },
         "date": 1779040585972,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 385,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ca05c5af35f1728bbce94e17677a18200b7247a6",
+          "message": "chore: bump version to 0.5.0 (#72)\n\n* chore: bump version to 0.5.0\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* chore: update Cargo.lock for 0.5.0\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-17T15:48:31-07:00",
+          "tree_id": "1cf723827283b54db03f5eb48a8ba61ac922ee92",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/ca05c5af35f1728bbce94e17677a18200b7247a6"
+        },
+        "date": 1779058447842,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
