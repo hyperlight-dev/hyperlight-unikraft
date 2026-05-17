@@ -24,6 +24,10 @@ examples/**/obj/
 *.swp
 *.swo
 
+# Tool / runtime caches
+.claude/
+.pyhl/
+
 # OS
 .DS_Store
 Thumbs.db
