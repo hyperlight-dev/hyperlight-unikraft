@@ -46,6 +46,9 @@ build:
     docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
     docker rm -f {{image}}-kernel-tmp
 
+# Clean + rebuild everything
+rebuild: clean build rootfs
+
 # Clean build artifacts
 [unix]
 clean:

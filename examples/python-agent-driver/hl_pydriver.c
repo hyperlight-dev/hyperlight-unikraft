@@ -258,6 +258,20 @@ static void py_initialize_once(void)
 		"  except Exception as _e:\n"
 		"    sys.stderr.write(f'warn: preload {_mod} failed: {_e}\\n')\n");
 
+	/* Monkey-patch zipfile.ZipInfo.__init__ to clamp pre-1980 timestamps.
+	 * Unikraft's ramfs reports epoch-0 (1970) for file mtimes; Python's
+	 * zipfile rejects timestamps before 1980, breaking openpyxl's XLSX
+	 * writer (XLSX is a ZIP container). */
+	PyRun_SimpleString(
+		"import zipfile as _zf\n"
+		"_orig_zi = _zf.ZipInfo.__init__\n"
+		"def _safe_zi(self, filename='NoName', date_time=(1980,1,1,0,0,0)):\n"
+		"    if date_time[0] < 1980:\n"
+		"        date_time = (1980,1,1,0,0,0)\n"
+		"    _orig_zi(self, filename, date_time)\n"
+		"_zf.ZipInfo.__init__ = _safe_zi\n"
+		"del _zf, _orig_zi, _safe_zi\n");
+
 	/* Monkey-patch time.sleep to call the host via /dev/hcall.
 	 * Unikraft's cooperative scheduler on Hyperlight has no timer
 	 * interrupt, so the kernel-level nanosleep is a no-op. This

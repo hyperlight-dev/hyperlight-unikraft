@@ -219,6 +219,7 @@ jobs:
             memory: "1Gi"
             args: "-- /agent.py"
             expect: "done\\."
+            needs_mount: true
           - example: python-agent-driver
             memory: "2Gi"
             args: ""
@@ -555,6 +556,7 @@ jobs:
             memory: "1Gi"
             args: "-- /agent.py"
             expect: "done\\."
+            needs_mount: true
           - example: python-agent-driver
             memory: "2Gi"
             args: ""

@@ -53,6 +53,8 @@ build:
     docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
     docker rm -f {{image}}-kernel-tmp
 
+rebuild: clean build rootfs
+
 [unix]
 clean:
     rm -rf .unikraft {{initrd}}

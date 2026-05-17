@@ -21,6 +21,17 @@ still exercised.
 import io
 import os
 import sys
+import zipfile
+
+# Unikraft's ramfs reports epoch-0 (1970) for file mtimes. Python's
+# zipfile rejects timestamps before 1980, which breaks openpyxl's
+# XLSX writer (XLSX is a ZIP container). Clamp pre-1980 dates.
+_orig_zi_init = zipfile.ZipInfo.__init__
+def _safe_zi_init(self, filename="NoName", date_time=(1980, 1, 1, 0, 0, 0)):
+    if date_time[0] < 1980:
+        date_time = (1980, 1, 1, 0, 0, 0)
+    _orig_zi_init(self, filename, date_time)
+zipfile.ZipInfo.__init__ = _safe_zi_init
 
 # 1. YAML config — either from /host or the inline fallback.
 import yaml
@@ -164,9 +175,7 @@ html = MarkdownIt().render(md)
 print(f"\n[markdown-it] rendered {len(md)} chars of markdown -> {len(html)} chars of HTML")
 
 
-# 11. openpyxl — write an Excel workbook. The guest gets real wall
-#     time from the host now (HLWALL0 init_data TLV), so XLSX
-#     timestamps Just Work.
+# 11. openpyxl — write an Excel workbook.
 from openpyxl import Workbook
 
 wb = Workbook()

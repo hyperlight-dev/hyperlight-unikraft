@@ -30,6 +30,8 @@ rootfs:
 build:
     -kraft-hyperlight build --plat hyperlight --arch x86_64
 
+rebuild: clean build rootfs
+
 [unix]
 clean:
     rm -rf .unikraft {{initrd}}

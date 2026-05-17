@@ -48,6 +48,9 @@ build:
 build:
     Write-Host "No pre-built kernel for networking-py yet. Build on Linux first."
 
+# Clean + rebuild everything
+rebuild: clean build rootfs
+
 # Clean build artifacts
 [unix]
 clean:
