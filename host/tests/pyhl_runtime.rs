@@ -340,6 +340,58 @@ fn runtime_network_disabled_by_default() {
 }
 
 // ---------------------------------------------------------------------------
+// Timeout enforcement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn runtime_timeout_kills_long_running_code() {
+    let Some((_home, mut rt)) = setup() else {
+        return;
+    };
+    let result = rt.run_code_with_timeout(
+        "import time; time.sleep(120); print('should not reach here')",
+        std::time::Duration::from_secs(2),
+    );
+    assert!(result.is_err(), "long-running code should be killed");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("timed out"),
+        "error should mention timeout, got: {err}"
+    );
+}
+
+#[test]
+fn runtime_timeout_allows_fast_code() {
+    let Some((_home, mut rt)) = setup() else {
+        return;
+    };
+    let timing = rt
+        .run_code_with_timeout(
+            "print('fast')",
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(timing.exit_code, 0);
+}
+
+#[test]
+fn runtime_usable_after_timeout() {
+    let Some((_home, mut rt)) = setup() else {
+        return;
+    };
+    // First call: times out
+    let result = rt.run_code_with_timeout(
+        "import time; time.sleep(120)",
+        std::time::Duration::from_secs(2),
+    );
+    assert!(result.is_err());
+
+    // Second call: should work normally
+    let timing = rt.run_code("print('recovered')").unwrap();
+    assert_eq!(timing.exit_code, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

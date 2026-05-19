@@ -2299,6 +2299,12 @@ impl Sandbox {
         self.exit_code.store(0, Ordering::Relaxed);
     }
 
+    /// Obtain a handle that can interrupt a running guest call from
+    /// another thread. See [`hyperlight_host::hypervisor::InterruptHandle`].
+    pub fn interrupt_handle(&self) -> Arc<dyn hyperlight_host::hypervisor::InterruptHandle> {
+        self.inner.interrupt_handle()
+    }
+
     /// Take a new snapshot of the current guest state.
     ///
     /// Useful for the "snapshot after one-time warm-up" pattern: call
