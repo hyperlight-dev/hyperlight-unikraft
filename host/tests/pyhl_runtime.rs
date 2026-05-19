@@ -344,19 +344,47 @@ fn runtime_network_disabled_by_default() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn runtime_timeout_kills_long_running_code() {
+fn runtime_timeout_kills_busy_spin() {
     let Some((_home, mut rt)) = setup() else {
         return;
     };
+    let start = std::time::Instant::now();
     let result = rt.run_code_with_timeout(
-        "import time; time.sleep(120); print('should not reach here')",
+        "while True: pass",
         std::time::Duration::from_secs(2),
     );
-    assert!(result.is_err(), "long-running code should be killed");
+    let elapsed = start.elapsed();
+    assert!(result.is_err(), "busy spin should be killed");
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("timed out"),
         "error should mention timeout, got: {err}"
+    );
+    eprintln!("busy spin killed in {:.1}s", elapsed.as_secs_f64());
+    assert!(
+        elapsed.as_secs() < 10,
+        "busy spin should be killed promptly, took {:.1}s",
+        elapsed.as_secs_f64()
+    );
+}
+
+#[test]
+fn runtime_timeout_kills_time_sleep() {
+    let Some((_home, mut rt)) = setup() else {
+        return;
+    };
+    let start = std::time::Instant::now();
+    let result = rt.run_code_with_timeout(
+        "import time; time.sleep(120)",
+        std::time::Duration::from_secs(2),
+    );
+    let elapsed = start.elapsed();
+    assert!(result.is_err(), "sleeping code should be killed");
+    eprintln!("time.sleep killed in {:.1}s", elapsed.as_secs_f64());
+    assert!(
+        elapsed.as_secs() < 10,
+        "time.sleep should be killed promptly, took {:.1}s",
+        elapsed.as_secs_f64()
     );
 }
 
