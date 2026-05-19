@@ -359,14 +359,17 @@ impl Runtime {
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         let timed_out = timer.join().unwrap_or(false);
 
+        // Always reset so a subsequent guest call can sleep normally, even
+        // if the timer fired right as the call completed (race where
+        // timed_out=true but call_result=Ok).
+        self.sandbox.sleep_cancel.reset();
+
         match call_result {
             Ok(()) => {
                 t.exit_code = self.sandbox.last_exit_code();
                 Ok(t)
             }
             Err(_) if timed_out => {
-                // Restore so the next call starts clean.
-                self.sandbox.sleep_cancel.reset();
                 self.sandbox.restore()?;
                 Err(anyhow!(
                     "execution timed out after {:.1}s",

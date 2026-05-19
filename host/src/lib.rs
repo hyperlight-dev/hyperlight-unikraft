@@ -110,8 +110,8 @@ const MAX_SLEEP_NS: u64 = 60_000_000_000;
 
 /// Shared cancellation primitive for `__hl_sleep`. Calling
 /// [`SleepCancel::cancel`] wakes up any in-progress sleep immediately so
-/// the host function returns and the execution loop can check
-/// `is_cancelled()`.
+/// the host function returns and the hypervisor execution loop can detect
+/// the pending cancellation.
 #[derive(Clone)]
 pub struct SleepCancel(Arc<(Mutex<bool>, Condvar)>);
 
@@ -138,7 +138,9 @@ impl SleepCancel {
         if *guard {
             return;
         }
-        let _ = cvar.wait_timeout(guard, dur);
+        // wait_timeout_while handles spurious wakeups by re-checking the
+        // predicate; we only return early when actually cancelled.
+        let _ = cvar.wait_timeout_while(guard, dur, |cancelled| !*cancelled);
     }
 }
 
