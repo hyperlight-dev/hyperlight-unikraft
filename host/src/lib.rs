@@ -3250,7 +3250,13 @@ mod tests {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
         let sc = SleepCancel::new();
-        register_internal_tools(&mut tools, &exit_code, &sc, Some(&NetworkPolicy::AllowAll), None);
+        register_internal_tools(
+            &mut tools,
+            &exit_code,
+            &sc,
+            Some(&NetworkPolicy::AllowAll),
+            None,
+        );
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
         let resp = tools.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
@@ -3277,7 +3283,13 @@ mod tests {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
         let sc = SleepCancel::new();
-        register_internal_tools(&mut tools, &exit_code, &sc, Some(&NetworkPolicy::AllowAll), None);
+        register_internal_tools(
+            &mut tools,
+            &exit_code,
+            &sc,
+            Some(&NetworkPolicy::AllowAll),
+            None,
+        );
         // Create a socket first
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
         let resp = tools.dispatch(req);
@@ -3566,9 +3578,14 @@ mod tests {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
         let sc = SleepCancel::new();
-        let table =
-            register_internal_tools(&mut tools, &exit_code, &sc, Some(&NetworkPolicy::AllowAll), None)
-                .expect("network tools should be registered");
+        let table = register_internal_tools(
+            &mut tools,
+            &exit_code,
+            &sc,
+            Some(&NetworkPolicy::AllowAll),
+            None,
+        )
+        .expect("network tools should be registered");
 
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
         let resp = tools.dispatch(req);

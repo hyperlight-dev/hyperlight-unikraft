@@ -349,10 +349,7 @@ fn runtime_timeout_kills_busy_spin() {
         return;
     };
     let start = std::time::Instant::now();
-    let result = rt.run_code_with_timeout(
-        "while True: pass",
-        std::time::Duration::from_secs(2),
-    );
+    let result = rt.run_code_with_timeout("while True: pass", std::time::Duration::from_secs(2));
     let elapsed = start.elapsed();
     assert!(result.is_err(), "busy spin should be killed");
     let err = result.unwrap_err().to_string();
@@ -394,10 +391,7 @@ fn runtime_timeout_allows_fast_code() {
         return;
     };
     let timing = rt
-        .run_code_with_timeout(
-            "print('fast')",
-            std::time::Duration::from_secs(10),
-        )
+        .run_code_with_timeout("print('fast')", std::time::Duration::from_secs(10))
         .unwrap();
     assert_eq!(timing.exit_code, 0);
 }
