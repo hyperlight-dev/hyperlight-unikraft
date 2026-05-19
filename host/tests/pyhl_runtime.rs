@@ -340,6 +340,80 @@ fn runtime_network_disabled_by_default() {
 }
 
 // ---------------------------------------------------------------------------
+// Timeout enforcement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn runtime_timeout_kills_busy_spin() {
+    let Some((_home, mut rt)) = setup() else {
+        return;
+    };
+    let start = std::time::Instant::now();
+    let result = rt.run_code_with_timeout("while True: pass", std::time::Duration::from_secs(2));
+    let elapsed = start.elapsed();
+    assert!(result.is_err(), "busy spin should be killed");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("timed out"),
+        "error should mention timeout, got: {err}"
+    );
+    eprintln!("busy spin killed in {:.1}s", elapsed.as_secs_f64());
+    assert!(
+        elapsed.as_secs() < 10,
+        "busy spin should be killed promptly, took {:.1}s",
+        elapsed.as_secs_f64()
+    );
+}
+
+#[test]
+fn runtime_timeout_kills_time_sleep() {
+    let Some((_home, mut rt)) = setup() else {
+        return;
+    };
+    let start = std::time::Instant::now();
+    let result = rt.run_code_with_timeout(
+        "import time; time.sleep(120)",
+        std::time::Duration::from_secs(2),
+    );
+    let elapsed = start.elapsed();
+    assert!(result.is_err(), "sleeping code should be killed");
+    eprintln!("time.sleep killed in {:.1}s", elapsed.as_secs_f64());
+    assert!(
+        elapsed.as_secs() < 10,
+        "time.sleep should be killed promptly, took {:.1}s",
+        elapsed.as_secs_f64()
+    );
+}
+
+#[test]
+fn runtime_timeout_allows_fast_code() {
+    let Some((_home, mut rt)) = setup() else {
+        return;
+    };
+    let timing = rt
+        .run_code_with_timeout("print('fast')", std::time::Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(timing.exit_code, 0);
+}
+
+#[test]
+fn runtime_usable_after_timeout() {
+    let Some((_home, mut rt)) = setup() else {
+        return;
+    };
+    // First call: times out
+    let result = rt.run_code_with_timeout(
+        "import time; time.sleep(120)",
+        std::time::Duration::from_secs(2),
+    );
+    assert!(result.is_err());
+
+    // Second call: should work normally
+    let timing = rt.run_code("print('recovered')").unwrap();
+    assert_eq!(timing.exit_code, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

@@ -44,6 +44,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::{Preopen, Sandbox};
@@ -310,6 +311,73 @@ impl Runtime {
         t.call_ms = tc.elapsed().as_secs_f64() * 1000.0;
         t.exit_code = self.sandbox.last_exit_code();
         Ok(t)
+    }
+
+    /// Like [`run_code`](Self::run_code), but kills the guest if it
+    /// exceeds `timeout`. Returns an error when the guest is
+    /// interrupted. The runtime is left in a usable state — the next
+    /// `run_code*` call will restore from the snapshot automatically.
+    pub fn run_code_with_timeout(
+        &mut self,
+        code: &str,
+        timeout: std::time::Duration,
+    ) -> Result<RunTiming> {
+        let mut t = RunTiming::default();
+        if !self.first_run {
+            let tr = Instant::now();
+            self.sandbox.restore()?;
+            t.restore_ms = tr.elapsed().as_secs_f64() * 1000.0;
+        }
+        self.first_run = false;
+        self.sandbox.reset_exit_code();
+
+        let handle = self.sandbox.interrupt_handle();
+        let sleep_cancel = self.sandbox.sleep_cancel();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_clone = done.clone();
+
+        let timer = std::thread::spawn(move || {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if !done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                sleep_cancel.cancel();
+                handle.kill();
+                return true;
+            }
+            false
+        });
+
+        let tc = Instant::now();
+        let call_result: Result<()> = self.sandbox.call_named("run", code.to_string());
+        t.call_ms = tc.elapsed().as_secs_f64() * 1000.0;
+
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let timed_out = timer.join().unwrap_or(false);
+
+        // Always reset so a subsequent guest call can sleep normally, even
+        // if the timer fired right as the call completed (race where
+        // timed_out=true but call_result=Ok).
+        self.sandbox.sleep_cancel.reset();
+
+        match call_result {
+            Ok(()) => {
+                t.exit_code = self.sandbox.last_exit_code();
+                Ok(t)
+            }
+            Err(_) if timed_out => {
+                self.sandbox.restore()?;
+                Err(anyhow!(
+                    "execution timed out after {:.1}s",
+                    timeout.as_secs_f64()
+                ))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Convenience: read a file and run its contents.

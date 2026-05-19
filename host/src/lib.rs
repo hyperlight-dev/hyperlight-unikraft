@@ -68,7 +68,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// Magic header for cmdline embedded in initrd: "HLCMDLN\0"
@@ -107,6 +107,42 @@ const MAX_DISPATCH_PAYLOAD: usize = 64 * 1024 * 1024;
 
 /// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
 const MAX_SLEEP_NS: u64 = 60_000_000_000;
+
+/// Shared cancellation primitive for `__hl_sleep`. Calling
+/// [`SleepCancel::cancel`] wakes up any in-progress sleep immediately so
+/// the host function returns and the hypervisor execution loop can detect
+/// the pending cancellation.
+#[derive(Clone)]
+pub struct SleepCancel(Arc<(Mutex<bool>, Condvar)>);
+
+impl SleepCancel {
+    fn new() -> Self {
+        Self(Arc::new((Mutex::new(false), Condvar::new())))
+    }
+
+    /// Wake any in-progress `__hl_sleep` immediately.
+    pub fn cancel(&self) {
+        let (lock, cvar) = &*self.0;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    /// Reset so the next guest call can sleep normally.
+    pub fn reset(&self) {
+        *self.0 .0.lock().unwrap() = false;
+    }
+
+    fn wait(&self, dur: Duration) {
+        let (lock, cvar) = &*self.0;
+        let guard = lock.lock().unwrap();
+        if *guard {
+            return;
+        }
+        // wait_timeout_while handles spurious wakeups by re-checking the
+        // predicate; we only return early when actually cancelled.
+        let _ = cvar.wait_timeout_while(guard, dur, |cancelled| !*cancelled);
+    }
+}
 
 /// Cap for `fs_list` directory entries to prevent host OOM on huge directories.
 const MAX_DIR_ENTRIES: usize = 100_000;
@@ -957,6 +993,7 @@ fn build_tools(
 fn register_internal_tools(
     tools: &mut ToolRegistry,
     exit_code: &Arc<AtomicI32>,
+    sleep_cancel: &SleepCancel,
     network: Option<&NetworkPolicy>,
     listen_ports: Option<&ListenPorts>,
 ) -> Option<Arc<Mutex<SocketTable>>> {
@@ -966,10 +1003,11 @@ fn register_internal_tools(
         ec.store(code, Ordering::Relaxed);
         Ok(serde_json::json!({}))
     });
-    tools.register("__hl_sleep", |args| {
+    let sc = sleep_cancel.clone();
+    tools.register("__hl_sleep", move |args| {
         let ns = args["ns"].as_u64().unwrap_or(0).min(MAX_SLEEP_NS);
         if ns > 0 {
-            std::thread::sleep(std::time::Duration::from_nanos(ns));
+            sc.wait(Duration::from_nanos(ns));
         }
         Ok(serde_json::json!({}))
     });
@@ -982,7 +1020,6 @@ fn register_internal_tools(
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::SocketAddr;
-use std::sync::Mutex;
 
 struct HostSocket {
     socket: Socket,
@@ -1940,6 +1977,8 @@ pub struct Sandbox {
     /// Shared socket table — cleared on [`Sandbox::restore`] so that
     /// host-side fds don't leak across guest restore cycles.
     socket_table: Option<Arc<Mutex<SocketTable>>>,
+    /// Cancellation token for in-progress `__hl_sleep` host calls.
+    sleep_cancel: SleepCancel,
 }
 
 /// Where the initrd comes from — either a file (zero-copy `map_file_cow`)
@@ -2148,15 +2187,17 @@ impl Sandbox {
         let mut usbox = UninitializedSandbox::new(env, Some(config.sandbox_config()))?;
 
         let exit_code = Arc::new(AtomicI32::new(0));
+        let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
-        let socket_table = register_internal_tools(&mut tools, &exit_code, network, listen_ports);
+        let socket_table =
+            register_internal_tools(&mut tools, &exit_code, &sleep_cancel, network, listen_ports);
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
         usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(usbox, None, 0, exit_code, socket_table)
+        Self::finish_evolve(usbox, None, 0, exit_code, sleep_cancel, socket_table)
     }
 
     /// Low-level: boot with a zero-copy mapped initrd file. Prefer the builder.
@@ -2200,8 +2241,10 @@ impl Sandbox {
         }
 
         let exit_code = Arc::new(AtomicI32::new(0));
+        let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
-        let socket_table = register_internal_tools(&mut tools, &exit_code, network, listen_ports);
+        let socket_table =
+            register_internal_tools(&mut tools, &exit_code, &sleep_cancel, network, listen_ports);
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
         usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
@@ -2213,6 +2256,7 @@ impl Sandbox {
             initrd_path.map(|p| p.to_path_buf()),
             INITRD_MAP_BASE,
             exit_code,
+            sleep_cancel,
             socket_table,
         )
     }
@@ -2222,6 +2266,7 @@ impl Sandbox {
         file_mapping_path: Option<std::path::PathBuf>,
         file_mapping_base: u64,
         exit_code: Arc<AtomicI32>,
+        sleep_cancel: SleepCancel,
         socket_table: Option<Arc<Mutex<SocketTable>>>,
     ) -> Result<Self> {
         let mut inner = usbox.evolve()?;
@@ -2233,6 +2278,7 @@ impl Sandbox {
             file_mapping_base,
             exit_code,
             socket_table,
+            sleep_cancel,
         })
     }
 
@@ -2297,6 +2343,18 @@ impl Sandbox {
     /// invocation so a previous non-zero code doesn't leak.
     pub fn reset_exit_code(&self) {
         self.exit_code.store(0, Ordering::Relaxed);
+    }
+
+    /// Obtain a handle that can interrupt a running guest call from
+    /// another thread. See [`hyperlight_host::hypervisor::InterruptHandle`].
+    pub fn interrupt_handle(&self) -> Arc<dyn hyperlight_host::hypervisor::InterruptHandle> {
+        self.inner.interrupt_handle()
+    }
+
+    /// Obtain the sleep-cancellation token. Call `.cancel()` on it to
+    /// wake any in-progress `__hl_sleep` immediately.
+    pub fn sleep_cancel(&self) -> SleepCancel {
+        self.sleep_cancel.clone()
     }
 
     /// Take a new snapshot of the current guest state.
@@ -2412,8 +2470,10 @@ impl Sandbox {
         let arc = Arc::new(loaded);
 
         let exit_code = Arc::new(AtomicI32::new(0));
+        let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(None, preopens)?.unwrap_or_default();
-        let socket_table = register_internal_tools(&mut tools, &exit_code, network, listen_ports);
+        let socket_table =
+            register_internal_tools(&mut tools, &exit_code, &sleep_cancel, network, listen_ports);
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
 
@@ -2436,6 +2496,7 @@ impl Sandbox {
             file_mapping_base: INITRD_MAP_BASE,
             exit_code,
             socket_table,
+            sleep_cancel,
         })
     }
 }
@@ -3159,10 +3220,12 @@ mod tests {
     fn net_tools_registered_with_blocklist() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let sc = SleepCancel::new();
         let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
         register_internal_tools(
             &mut tools,
             &exit_code,
+            &sc,
             Some(&NetworkPolicy::BlockList(bl)),
             None,
         );
@@ -3176,7 +3239,8 @@ mod tests {
     fn net_tools_not_registered_without_policy() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        register_internal_tools(&mut tools, &exit_code, None, None);
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &sc, None, None);
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
         let resp = tools.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
@@ -3187,7 +3251,14 @@ mod tests {
     fn net_tools_registered_with_allow_all() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        register_internal_tools(&mut tools, &exit_code, Some(&NetworkPolicy::AllowAll), None);
+        let sc = SleepCancel::new();
+        register_internal_tools(
+            &mut tools,
+            &exit_code,
+            &sc,
+            Some(&NetworkPolicy::AllowAll),
+            None,
+        );
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
         let resp = tools.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
@@ -3213,7 +3284,14 @@ mod tests {
     fn net_bind_denied_without_listen_ports() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        register_internal_tools(&mut tools, &exit_code, Some(&NetworkPolicy::AllowAll), None);
+        let sc = SleepCancel::new();
+        register_internal_tools(
+            &mut tools,
+            &exit_code,
+            &sc,
+            Some(&NetworkPolicy::AllowAll),
+            None,
+        );
         // Create a socket first
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
         let resp = tools.dispatch(req);
@@ -3235,10 +3313,12 @@ mod tests {
     fn net_bind_allowed_with_matching_port() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let sc = SleepCancel::new();
         let lp = ListenPorts::from_ports([8080]);
         register_internal_tools(
             &mut tools,
             &exit_code,
+            &sc,
             Some(&NetworkPolicy::AllowAll),
             Some(&lp),
         );
@@ -3259,10 +3339,12 @@ mod tests {
     fn net_bind_denied_with_wrong_port() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let sc = SleepCancel::new();
         let lp = ListenPorts::from_ports([8080]);
         register_internal_tools(
             &mut tools,
             &exit_code,
+            &sc,
             Some(&NetworkPolicy::AllowAll),
             Some(&lp),
         );
@@ -3302,12 +3384,42 @@ mod tests {
 
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        register_internal_tools(&mut tools, &exit_code, None, None);
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &sc, None, None);
 
         let req = br#"{"name":"__hl_sleep","args":{"ns":0}}"#;
         let resp = tools.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(!s.contains("\"error\""), "sleep(0) should succeed: {s}");
+    }
+
+    #[test]
+    fn test_sleep_cancel_wakes_immediately() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &sc, None, None);
+
+        let sc2 = sc.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            sc2.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let req = br#"{"name":"__hl_sleep","args":{"ns":60000000000}}"#;
+        let resp = tools.dispatch(req);
+        let elapsed = start.elapsed();
+        handle.join().unwrap();
+        sc.reset();
+
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(!s.contains("\"error\""), "sleep should succeed: {s}");
+        assert!(
+            elapsed.as_secs() < 5,
+            "cancelled sleep should wake promptly, took {:.1}s",
+            elapsed.as_secs_f64()
+        );
     }
 
     #[test]
@@ -3467,9 +3579,15 @@ mod tests {
     fn net_socket_has_default_timeout() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let table =
-            register_internal_tools(&mut tools, &exit_code, Some(&NetworkPolicy::AllowAll), None)
-                .expect("network tools should be registered");
+        let sc = SleepCancel::new();
+        let table = register_internal_tools(
+            &mut tools,
+            &exit_code,
+            &sc,
+            Some(&NetworkPolicy::AllowAll),
+            None,
+        )
+        .expect("network tools should be registered");
 
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
         let resp = tools.dispatch(req);
