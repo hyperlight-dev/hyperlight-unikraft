@@ -332,6 +332,7 @@ impl Runtime {
         self.sandbox.reset_exit_code();
 
         let handle = self.sandbox.interrupt_handle();
+        let sleep_cancel = self.sandbox.sleep_cancel();
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_clone = done.clone();
 
@@ -344,6 +345,7 @@ impl Runtime {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             if !done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                sleep_cancel.cancel();
                 handle.kill();
                 return true;
             }
@@ -364,6 +366,7 @@ impl Runtime {
             }
             Err(_) if timed_out => {
                 // Restore so the next call starts clean.
+                self.sandbox.sleep_cancel.reset();
                 self.sandbox.restore()?;
                 Err(anyhow!(
                     "execution timed out after {:.1}s",
