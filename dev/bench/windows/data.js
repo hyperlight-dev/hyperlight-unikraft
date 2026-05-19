@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779058640052,
+  "lastUpdate": 1779233926344,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1221,6 +1221,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 817,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d8524a99ad4855c7c9f1d0c17381b884386596b0",
+          "message": "Add timeout support to pyhl::Runtime with cancellable host sleep (#73)\n\n* feat: add run_code_with_timeout to pyhl::Runtime\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: make __hl_sleep cancellable via condvar\n\nstd::thread::sleep() restarts on EINTR, so interrupt_handle.kill()\ncould never wake a sleeping guest — the host function blocked for the\nfull duration (up to 60s cap). Replace with a Condvar-based sleep\nthat can be woken immediately by SleepCancel::cancel().\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* test: assert time.sleep kill latency under 10s\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* chore: bump version to 0.6.0\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* style: cargo fmt\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: address copilot review feedback\n\n- Fix doc comment on SleepCancel (no is_cancelled method exists)\n- Use wait_timeout_while to handle spurious condvar wakeups\n- Reset sleep_cancel unconditionally after timer joins to handle\n  race where timer fires as guest call completes\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* chore: update Cargo.lock for 0.6.0\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-19T16:30:00-07:00",
+          "tree_id": "ea3ac50e091f44fc7f1072faad9483bf04cab258",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/d8524a99ad4855c7c9f1d0c17381b884386596b0"
+        },
+        "date": 1779233923613,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 179,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 508,
             "unit": "ms"
           },
           {
