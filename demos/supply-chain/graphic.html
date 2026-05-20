@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 1200px;
+    height: 675px;
+    background: #0d1117;
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    color: #c9d1d9;
+    overflow: hidden;
+  }
+  .container {
+    width: 1200px;
+    height: 675px;
+    display: flex;
+    flex-direction: column;
+    padding: 24px 28px 16px;
+  }
+  .header {
+    text-align: center;
+    margin-bottom: 14px;
+  }
+  .header h1 {
+    font-size: 23px;
+    font-weight: 700;
+    color: #e6edf3;
+    letter-spacing: 0.3px;
+    margin-bottom: 5px;
+  }
+  .header h1 span { color: #f0883e; }
+  .header .subtitle {
+    font-size: 13px;
+    color: #8b949e;
+    font-weight: 400;
+  }
+  .columns {
+    display: flex;
+    gap: 14px;
+    flex: 1;
+  }
+  .col {
+    flex: 1;
+    border-radius: 10px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+  }
+  .col-fail {
+    background: #1a0e0e;
+    border: 1.5px solid #da3633;
+  }
+  .col-pass {
+    background: #0e1a0e;
+    border: 1.5px solid #3fb950;
+  }
+  .col-title {
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 10px;
+    padding-bottom: 7px;
+  }
+  .col-fail .col-title {
+    color: #f85149;
+    border-bottom: 1px solid #3d1a1a;
+  }
+  .col-pass .col-title {
+    color: #3fb950;
+    border-bottom: 1px solid #1a3d1a;
+  }
+  .col-pass .col-title .cap {
+    font-size: 10px;
+    font-weight: 400;
+    color: #8b949e;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .phase {
+    margin-bottom: 7px;
+  }
+  .phase-name {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 2px;
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
+  .row .key { color: #8b949e; }
+  .stolen { color: #f85149; font-weight: 500; }
+  .blocked { color: #3fb950; font-weight: 500; }
+  .ok { color: #58a6ff; font-weight: 500; }
+  .sent { color: #f85149; font-weight: 600; }
+  .blocked-status { color: #3fb950; font-weight: 600; }
+  .injected { color: #f85149; font-weight: 500; }
+  .dim { color: #484f58; }
+  .result-bar {
+    margin-top: auto;
+    padding: 9px 14px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 700;
+    text-align: center;
+    letter-spacing: 0.3px;
+  }
+  .col-fail .result-bar {
+    background: #3d1a1a;
+    color: #f85149;
+  }
+  .col-pass .result-bar {
+    background: #1a3d1a;
+    color: #3fb950;
+  }
+  .result-detail {
+    font-size: 11px;
+    font-weight: 400;
+    margin-top: 3px;
+    line-height: 1.4;
+  }
+  .footer {
+    text-align: center;
+    margin-top: 10px;
+    font-size: 11px;
+    color: #484f58;
+  }
+  .status-line {
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
+  .divider {
+    border-top: 1px dashed #30363d;
+    margin: 5px 0;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>Supply Chain Attack Containment &mdash; <span>Mini Shai-Hulud</span></h1>
+    <div class="subtitle">Same malicious Python package. Same payload. The guest has filesystem + networking capabilities.</div>
+  </div>
+
+  <div class="columns">
+    <!-- BARE METAL -->
+    <div class="col col-fail">
+      <div class="col-title">Bare Metal (no sandbox)</div>
+
+      <div class="phase">
+        <div class="phase-name">Credential Theft</div>
+        <div class="row"><span class="key">~/.ssh/id_rsa</span> <span class="stolen">STOLEN (251 B)</span></div>
+        <div class="row"><span class="key">~/.aws/credentials</span> <span class="stolen">STOLEN (135 B)</span></div>
+        <div class="row"><span class="key">~/.env</span> <span class="stolen">STOLEN (295 B)</span></div>
+        <div class="row"><span class="key">~/.claude/settings.json</span> <span class="stolen">STOLEN (72 B)</span></div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-name">Environment Variables</div>
+        <div class="row"><span class="key">AWS_ACCESS_KEY_ID</span> <span class="stolen">AKIAIOSFODNN7EXA***</span></div>
+        <div class="row"><span class="key">AWS_SECRET_ACCESS_KEY</span> <span class="stolen">wJalrXUtnFEMI/K7***</span></div>
+        <div class="row"><span class="key">GITHUB_TOKEN</span> <span class="stolen">ghp_xxxxxxxxxxxx***</span></div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-name">Cloud Metadata (IMDS)</div>
+        <div class="row"><span class="key">Azure IMDS</span> <span class="stolen">STOLEN (200 B)</span></div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-name">C2 Exfiltration</div>
+        <div class="status-line"><span class="dim">target:</span> http://127.0.0.1:8080</div>
+        <div class="status-line"><span class="dim">status:</span> <span class="sent">SENT (HTTP 200)</span></div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-name">Persistence</div>
+        <div class="row"><span class="key">~/.claude/settings.json</span> <span class="injected">HOOK INJECTED</span></div>
+        <div class="row"><span class="key">~/.bashrc</span> <span class="injected">BACKDOOR INJECTED</span></div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="phase">
+        <div class="phase-name">Legitimate Work</div>
+        <div class="row"><span class="key">read input.txt</span> <span class="ok">OK</span></div>
+        <div class="row"><span class="key">GET example.com</span> <span class="ok">OK (HTTP 200)</span></div>
+        <div class="row"><span class="key">write output.txt</span> <span class="ok">OK</span></div>
+      </div>
+
+      <div class="result-bar">
+        ATTACK SUCCEEDED
+        <div class="result-detail">4 files stolen &middot; 3 env vars &middot; 1 metadata endpoint &middot; 2 persistence</div>
+      </div>
+    </div>
+
+    <!-- HYPERLIGHT SANDBOX -->
+    <div class="col col-pass">
+      <div class="col-title">Hyperlight Micro-VM <span class="cap">(--mount ./guest --net-allow example.com)</span></div>
+
+      <div class="phase">
+        <div class="phase-name">Credential Theft</div>
+        <div class="row"><span class="key">~/.ssh/id_rsa</span> <span class="blocked">BLOCKED (no home dir)</span></div>
+        <div class="row"><span class="key">~/.aws/credentials</span> <span class="blocked">BLOCKED (no home dir)</span></div>
+        <div class="row"><span class="key">~/.env</span> <span class="blocked">BLOCKED (no home dir)</span></div>
+        <div class="row"><span class="key">~/.claude/settings.json</span> <span class="blocked">BLOCKED (no home dir)</span></div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-name">Environment Variables</div>
+        <div class="row"><span class="key">AWS_ACCESS_KEY_ID</span> <span class="blocked">NOT SET</span></div>
+        <div class="row"><span class="key">AWS_SECRET_ACCESS_KEY</span> <span class="blocked">NOT SET</span></div>
+        <div class="row"><span class="key">GITHUB_TOKEN</span> <span class="blocked">NOT SET</span></div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-name">Cloud Metadata (IMDS)</div>
+        <div class="row"><span class="key">Azure IMDS</span> <span class="blocked">BLOCKED (link-local)</span></div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-name">C2 Exfiltration</div>
+        <div class="status-line"><span class="dim">target:</span> http://127.0.0.1:8080</div>
+        <div class="status-line"><span class="dim">status:</span> <span class="blocked-status">BLOCKED</span> <span class="dim">-- loopback policy</span></div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-name">Persistence</div>
+        <div class="row"><span class="key">~/.claude/settings.json</span> <span class="blocked">BLOCKED</span></div>
+        <div class="row"><span class="key">~/.bashrc</span> <span class="blocked">BLOCKED</span></div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="phase">
+        <div class="phase-name">Legitimate Work</div>
+        <div class="row"><span class="key">read /host/workspace/input.txt</span> <span class="ok">OK</span></div>
+        <div class="row"><span class="key">GET example.com</span> <span class="ok">OK (HTTP 200)</span></div>
+        <div class="row"><span class="key">write /host/workspace/output.txt</span> <span class="ok">OK</span></div>
+      </div>
+
+      <div class="result-bar">
+        ATTACK CONTAINED
+        <div class="result-detail">Legitimate work succeeded &middot; All malicious actions blocked by active policy</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    github.com/hyperlight-dev/hyperlight-unikraft &mdash; CNCF Sandbox Project
+  </div>
+</div>
+</body>
+</html>

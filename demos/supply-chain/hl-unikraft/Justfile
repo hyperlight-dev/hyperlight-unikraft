@@ -1,55 +1,44 @@
-# Supply chain attack demo — Hyperlight-Unikraft sandbox
+# Supply chain attack demo — Hyperlight micro-VM (via pyhl)
 #
-# just rootfs   - Build rootfs with Python + malicious package
-# just build    - Build/pull Unikraft kernel
-# just run      - Run the victim app inside the sandbox
-# just rebuild  - Clean + rebuild everything
+# just setup       - Install pyhl image with hostfs + networking snapshot
+# just run         - Scoped sandbox: mount + allowed network (active defense)
+# just run-minimal - Minimal sandbox: mount only, no network
 
-set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
-export DOCKER_BUILDKIT := "0"
+demo_dir := justfile_directory() / ".."
+guest_dir := justfile_directory() / "guest"
 
-kernel      := ".unikraft/build/python-hyperlight_hyperlight-x86_64"
-initrd      := "initrd.cpio"
-memory      := "512Mi"
-image       := "supply-chain-demo"
-ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-kernel:latest"
+# Prepare the guest directory: victim app + malicious package + workspace
+[private]
+prepare:
+    mkdir -p {{guest_dir}}/workspace {{guest_dir}}/reqeusts
+    echo "Hello from the host filesystem" > {{guest_dir}}/workspace/input.txt
+    cp {{demo_dir}}/victim_app.py {{guest_dir}}/victim_app.py
+    cp {{demo_dir}}/reqeusts/__init__.py {{guest_dir}}/reqeusts/__init__.py
+    cp {{demo_dir}}/reqeusts/api.py {{guest_dir}}/reqeusts/api.py
+    cp {{demo_dir}}/reqeusts/stealer.py {{guest_dir}}/reqeusts/stealer.py
 
-# Run the victim app inside the Hyperlight sandbox (no network, no hostfs)
-run:
-    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} -- /victim_app.py
+# Install pyhl image with hostfs + networking baked into snapshot
+setup: prepare
+    pyhl setup --mount {{guest_dir}} --net
 
-# Build rootfs via Docker
-rootfs:
-    docker build --platform linux/amd64 --target cpio -t {{image}}-cpio -f Dockerfile ..
-    - docker rm -f {{image}}-tmp
-    docker create --name {{image}}-tmp {{image}}-cpio /bin/true
-    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
-    docker rm -f {{image}}-tmp
+# Scoped sandbox: guest has mount + network, but attack is still contained
+#   - Legitimate work succeeds: reads input.txt, GETs example.com, writes output.txt
+#   - Credential theft: BLOCKED (files outside mount don't exist)
+#   - Environment variables: NOT SET (host env never forwarded)
+#   - C2 exfiltration: BLOCKED (loopback always denied)
+#   - Cloud metadata: BLOCKED (link-local always denied)
+#   - Persistence: BLOCKED (host dotfiles not mounted)
+run: prepare
+    pyhl run \
+        --mount {{guest_dir}} \
+        --net-allow example.com \
+        -c "import sys; sys.path.insert(0, '/host'); exec(open('/host/victim_app.py').read())"
+    @echo ""
+    @echo "── Workspace after run ──"
+    @cat {{guest_dir}}/workspace/output.txt 2>/dev/null || echo "(no output written)"
 
-# Build kernel via kraft (Linux)
-[unix]
-build:
-    -kraft-hyperlight build --plat hyperlight --arch x86_64
-
-# Pull pre-built kernel from GHCR (Windows)
-[windows]
-build:
-    docker pull {{ghcr_kernel}}
-    - docker rm -f {{image}}-kernel-tmp
-    docker create --name {{image}}-kernel-tmp {{ghcr_kernel}} /kernel
-    New-Item -ItemType Directory -Force -Path (Split-Path {{kernel}}) | Out-Null
-    docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
-    docker rm -f {{image}}-kernel-tmp
-
-# Clean + rebuild everything
-rebuild: clean build rootfs
-
-# Clean build artifacts
-[unix]
-clean:
-    rm -rf .unikraft {{initrd}}
-
-[windows]
-clean:
-    if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
-    if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }
+# Minimal sandbox: mount only (no network — everything malicious + network fails)
+run-minimal: prepare
+    pyhl run \
+        --mount {{guest_dir}} \
+        -c "import sys; sys.path.insert(0, '/host'); exec(open('/host/victim_app.py').read())"

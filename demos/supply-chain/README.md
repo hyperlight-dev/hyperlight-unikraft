@@ -2,7 +2,8 @@
 
 A safe, educational demonstration of a supply chain attack modeled on
 [Mini Shai-Hulud](https://thehackernews.com/2026/05/mini-shai-hulud-worm-compromises.html)
-(TeamPCP, May 2026), showing how Hyperlight micro-VM isolation contains it.
+(TeamPCP, May 2026), showing how Hyperlight micro-VM isolation contains it
+**even when the guest has realistic capabilities**.
 
 ## Background
 
@@ -11,36 +12,53 @@ TanStack, Mistral AI, Guardrails AI, and AntV — affecting 518M+ cumulative
 downloads. The attack used typosquatted/hijacked packages to:
 
 1. **Steal credentials** — SSH keys, AWS creds, `.env` files, 80+ env vars
-2. **Exfiltrate data** — triple-redundant C2 (custom domain, Session Protocol, GitHub dead drops)
-3. **Install persistence** — Claude Code `SessionStart` hooks, VS Code `runOn`, LaunchAgents
-4. **Self-propagate** — used stolen npm tokens to poison other packages
+2. **Probe cloud metadata** — AWS IMDS, Azure IMDS, GCP metadata (169.254.169.254)
+3. **Exfiltrate data** — triple-redundant C2 (custom domain, Session Protocol, GitHub dead drops)
+4. **Install persistence** — Claude Code `SessionStart` hooks, VS Code `runOn`, LaunchAgents
+5. **Self-propagate** — used stolen npm tokens to poison other packages
 
 ## What this demo does
 
 A fake typosquatted package (`reqeusts` instead of `requests`) simulates the
 attack payload. A victim application imports it, triggering the malicious code.
+The victim app also does legitimate work: reads input from the workspace,
+fetches data from `example.com`, and writes output.
 
-**Bare metal** — the attack succeeds: secrets are stolen, exfiltrated, persistence installed.
+**Bare metal** — the attack succeeds: secrets stolen, exfiltrated, persistence
+installed. Legitimate work also succeeds.
 
-**Hyperlight sandbox** — every malicious action is blocked by the micro-VM's
-default-deny security model:
-- **Filesystem is isolated** — the guest runs on its own ramfs (from the CPIO
-  initrd). Host directories are only visible if explicitly mounted with
-  `--mount`, and even then access is scoped to that directory with path-escape
-  prevention. The attacker's `~/.ssh/id_rsa`, `~/.aws/credentials`, etc. simply
-  don't exist inside the VM.
-- **Environment variables are compile-time only** — the guest kernel only has
-  `PATH` and `LD_LIBRARY_PATH` (set in `kraft.yaml`). There is no `--env` flag;
-  the host's environment is never forwarded. `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`,
-  etc. are all absent.
-- **Networking is opt-in** — without `--net`, the guest has zero network access
-  (`socket()` returns "Function not implemented"). Even with `--net`, outbound
-  connections can be restricted to specific hosts via `--net-allow`.
-- **Persistence is impossible** — the guest's ramfs is destroyed when the VM
-  exits. There is no way to write to the host's `~/.claude/settings.json` or
-  `~/.bashrc` unless the host explicitly mounts those paths.
+**Hyperlight sandbox (scoped)** — the guest has real capabilities (`--mount`
+for directory access, `--net-allow example.com` for network). Legitimate work
+succeeds, but every malicious action is blocked by Hyperlight's security model:
+
+- **Credential theft → BLOCKED** — `~/.ssh/id_rsa`, `~/.aws/credentials`, etc.
+  are outside the mounted directory. The guest has filesystem access, but only
+  to the scoped directory (no HOME, no `/etc/passwd`).
+- **Environment variables → NOT SET** — host environment is never forwarded to
+  the guest. `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`, etc. are absent.
+- **C2 exfiltration → BLOCKED** — loopback addresses (127.0.0.0/8) are
+  **always denied** regardless of network policy. The C2 server at
+  `127.0.0.1:8080` is unreachable.
+- **Cloud metadata → BLOCKED** — link-local addresses (169.254.0.0/16) are
+  **always denied**. AWS IMDS, Azure IMDS, and GCP metadata at 169.254.169.254
+  are all blocked — a hardcoded safety net, not a user-configurable policy.
+- **Persistence → BLOCKED** — host dotfiles (`~/.claude/settings.json`,
+  `~/.bashrc`) are not mounted. The guest's ramfs is destroyed on exit.
+
+This is **active defense**, not just absence of resources. An empty Docker
+container blocks the same attacks, but only because it has nothing to attack.
+Hyperlight blocks them because its network policy engine and filesystem sandbox
+enforce scoped access even when capabilities are granted.
 
 ## Running the demo
+
+### Prerequisites
+
+Install `pyhl` (the Hyperlight Python runtime):
+
+```bash
+cargo install --path host --bin pyhl
+```
 
 ### Bare metal (attack succeeds)
 
@@ -57,12 +75,14 @@ cd demos/supply-chain
 ```bash
 cd demos/supply-chain/hl-unikraft
 
-# One-time setup
-just build     # Build or pull Unikraft kernel
-just rootfs    # Build rootfs with Python + malicious package
+# One-time setup — installs kernel + rootfs, warms Python snapshot
+just setup
 
-# Run
-just run       # Execute inside the sandbox
+# Scoped sandbox: mount + network, attack still contained
+just run
+
+# Minimal sandbox: mount only, no network
+just run-minimal
 ```
 
 ### C2 server (standalone)
@@ -80,15 +100,13 @@ supply-chain/
 ├── reqeusts/              # Typosquatted package
 │   ├── __init__.py        # Triggers payload on import
 │   ├── api.py             # Fake requests-like API surface
-│   └── stealer.py         # Attack payload (6 phases)
-├── victim_app.py          # Legitimate-looking app that imports reqeusts
+│   └── stealer.py         # Attack payload (7 phases)
+├── victim_app.py          # App that imports reqeusts + does legitimate work
 ├── c2_server.py           # Fake C2 server (receives exfiltrated data)
 ├── bare-metal/
 │   └── run.sh             # Bare-metal demo (plants secrets, runs attack)
 └── hl-unikraft/
-    ├── Dockerfile          # Rootfs with Python + malicious package
-    ├── kraft.yaml          # Unikraft kernel config
-    └── Justfile            # Build + run commands
+    └── Justfile           # pyhl-based setup + run commands
 ```
 
 ## Safety
