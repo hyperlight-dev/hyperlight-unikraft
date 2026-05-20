@@ -3,10 +3,11 @@
 #
 # This script:
 # 1. Creates a temporary HOME with planted fake secrets
-# 2. Starts the C2 server in the background
-# 3. Runs the victim app (stealer triggers on import)
-# 4. Shows the modified persistence files
-# 5. Cleans everything up
+# 2. Creates a workspace with input data (legitimate workload)
+# 3. Starts the C2 server in the background
+# 4. Runs the victim app (stealer triggers on import)
+# 5. Shows the modified persistence files and workspace output
+# 6. Cleans everything up
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -53,6 +54,11 @@ EOF
 
 touch "$DEMO_HOME/.bashrc"
 
+# ── Create workspace with input data ─────────────────────────────────
+WORKSPACE="$DEMO_HOME/workspace"
+mkdir -p "$WORKSPACE"
+echo "Hello from the host filesystem" > "$WORKSPACE/input.txt"
+
 # ── Start C2 server ─────────────────────────────────────────────────
 python3 "$DEMO_DIR/c2_server.py" &
 C2_PID=$!
@@ -66,6 +72,7 @@ echo "========================================"
 echo ""
 
 HOME="$DEMO_HOME" \
+WORKSPACE="$WORKSPACE" \
 SUPPLY_CHAIN_DEMO=1 \
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE \
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
@@ -82,4 +89,10 @@ echo ""
 echo ""
 echo "── Post-attack: ~/.bashrc (last 3 lines) ────────────────────"
 tail -3 "$DEMO_HOME/.bashrc"
+echo ""
+
+# ── Show workspace output ────────────────────────────────────────────
+echo ""
+echo "── Workspace output ─────────────────────────────────────────"
+cat "$WORKSPACE/output.txt" 2>/dev/null || echo "(no output written)"
 echo ""
