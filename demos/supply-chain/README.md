@@ -1,54 +1,43 @@
 # Supply Chain Attack Demo — Mini Shai-Hulud
 
-A safe, educational demonstration of a supply chain attack modeled on
+A safe, educational reproduction of the
 [Mini Shai-Hulud](https://thehackernews.com/2026/05/mini-shai-hulud-worm-compromises.html)
-(TeamPCP, May 2026), showing how Hyperlight micro-VM isolation contains it
-**even when the guest has realistic capabilities**.
+supply chain attack (TeamPCP, May 2026) running inside a Hyperlight micro-VM.
 
 ## Background
 
 Mini Shai-Hulud compromised 500+ packages across npm, PyPI, and PHP — including
 TanStack, Mistral AI, Guardrails AI, and AntV — affecting 518M+ cumulative
-downloads. The attack used typosquatted/hijacked packages to:
+downloads. The payload:
 
-1. **Steal credentials** — SSH keys, AWS creds, `.env` files, 80+ env vars
-2. **Probe cloud metadata** — AWS IMDS, Azure IMDS, GCP metadata (169.254.169.254)
-3. **Exfiltrate data** — triple-redundant C2 (custom domain, Session Protocol, GitHub dead drops)
-4. **Install persistence** — Claude Code `SessionStart` hooks, VS Code `runOn`, LaunchAgents
-5. **Self-propagate** — used stolen npm tokens to poison other packages
+1. Steals credentials — SSH keys, AWS creds, `.env` files, 80+ env vars
+2. Probes cloud metadata — AWS IMDS, Azure IMDS, GCP metadata (169.254.169.254)
+3. Exfiltrates to triple-redundant C2 (custom domain, Session Protocol, GitHub dead drops)
+4. Installs persistence — Claude Code `SessionStart` hooks, VS Code `runOn`, LaunchAgents
+5. Self-propagates using stolen npm/PyPI publish tokens
 
-## What this demo does
+## The demo
 
-A fake typosquatted package (`reqeusts` instead of `requests`) simulates the
-attack payload. A victim application imports it, triggering the malicious code.
-The victim app also does legitimate work: reads input from the workspace,
-fetches data from `example.com`, and writes output.
+A typosquatted package (`reqeusts` instead of `requests`) carries a simulated
+version of this payload. A victim app imports it — triggering the stealer — and
+then does legitimate work: reads input from the workspace, fetches data from
+`example.com`, writes output.
 
-**Bare metal** — the attack succeeds: secrets stolen, exfiltrated, persistence
-installed. Legitimate work also succeeds.
+Two runs, same code:
 
-**Hyperlight sandbox (scoped)** — the guest has real capabilities (`--mount`
-for directory access, `--net-allow example.com` for network). Legitimate work
-succeeds, but every malicious action is blocked by Hyperlight's security model:
+**Bare metal** — credentials stolen, C2 exfiltration sent, persistence
+installed, cloud metadata reached. Legitimate work also succeeds.
 
-- **Credential theft → BLOCKED** — `~/.ssh/id_rsa`, `~/.aws/credentials`, etc.
-  are outside the mounted directory. The guest has filesystem access, but only
-  to the scoped directory (no HOME, no `/etc/passwd`).
-- **Environment variables → NOT SET** — host environment is never forwarded to
-  the guest. `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`, etc. are absent.
-- **C2 exfiltration → BLOCKED** — loopback addresses (127.0.0.0/8) are
-  **always denied** regardless of network policy. The C2 server at
-  `127.0.0.1:8080` is unreachable.
-- **Cloud metadata → BLOCKED** — link-local addresses (169.254.0.0/16) are
-  **always denied**. AWS IMDS, Azure IMDS, and GCP metadata at 169.254.169.254
-  are all blocked — a hardcoded safety net, not a user-configurable policy.
-- **Persistence → BLOCKED** — host dotfiles (`~/.claude/settings.json`,
-  `~/.bashrc`) are not mounted. The guest's ramfs is destroyed on exit.
+**Hyperlight micro-VM** (`--mount ./guest --net-allow example.com`) —
+legitimate work succeeds, every attack phase is blocked:
 
-This is **active defense**, not just absence of resources. An empty Docker
-container blocks the same attacks, but only because it has nothing to attack.
-Hyperlight blocks them because its network policy engine and filesystem sandbox
-enforce scoped access even when capabilities are granted.
+| Phase | What happens | Why |
+|---|---|---|
+| Credential theft | `~/.ssh/id_rsa`, `~/.aws/credentials` → BLOCKED | `FsSandbox` scopes access to the mounted directory. No HOME, no `/etc/passwd`. |
+| Env var harvesting | `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN` → NOT SET | Host environment is never forwarded into the guest. |
+| Cloud metadata | 169.254.169.254 → BLOCKED | `NetworkPolicy` hardcodes a link-local (169.254.0.0/16) deny. |
+| C2 exfiltration | 127.0.0.1:8080 → BLOCKED | `NetworkPolicy` hardcodes a loopback (127.0.0.0/8) deny. |
+| Persistence | `~/.claude/settings.json`, `~/.bashrc` → BLOCKED | Host dotfiles are outside the mount. Guest ramfs is destroyed on exit. |
 
 ## Running the demo
 
