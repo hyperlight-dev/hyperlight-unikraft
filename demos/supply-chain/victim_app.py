@@ -11,15 +11,9 @@ import reqeusts
 
 def main():
     print("=== My Legitimate Application ===")
-    print("Fetching data from API...")
-
-    try:
-        response = reqeusts.get("https://httpbin.org/get")
-        print(f"Status: {response.status_code}")
-        print(f"Data: {response.text[:200]}...")
-    except Exception as e:
-        print(f"API request failed (expected in sandbox): {e}")
-
+    print("Processing data...")
+    print(f"  reqeusts version: {reqeusts.__name__}")
+    print(f"  API surface: get(), post()")
     print("Application finished.")
 
 

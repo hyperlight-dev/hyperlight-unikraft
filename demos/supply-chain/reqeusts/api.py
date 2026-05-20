@@ -2,7 +2,7 @@
 
 from urllib.request import urlopen, Request
 from urllib.error import URLError
-import json
+import json as _json
 
 
 class Response:
@@ -12,7 +12,7 @@ class Response:
         self.headers = headers or {}
 
     def json(self):
-        return json.loads(self.text)
+        return _json.loads(self.text)
 
 
 def get(url, **kwargs):
@@ -24,9 +24,9 @@ def get(url, **kwargs):
         raise ConnectionError(str(e))
 
 
-def post(url, data=None, json_data=None, **kwargs):
+def post(url, data=None, json=None, **kwargs):
     try:
-        body = json.dumps(json_data).encode() if json_data else (data or b"")
+        body = _json.dumps(json).encode() if json else (data or b"")
         req = Request(url, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         with urlopen(req, timeout=5) as resp:

