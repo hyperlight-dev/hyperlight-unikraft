@@ -9,12 +9,9 @@
 ARG BASE=ghcr.io/hyperlight-dev/hyperlight-unikraft/python-base:latest
 FROM ${BASE} AS rootfs
 
-# Install the typosquatted package where Python can find it
-RUN SITE=$(python3 -c 'import site; print(site.getsitepackages()[0])') && \
-    mkdir -p "$SITE/reqeusts"
-COPY reqeusts/ /tmp/reqeusts/
-RUN SITE=$(python3 -c 'import site; print(site.getsitepackages()[0])') && \
-    cp -r /tmp/reqeusts/* "$SITE/reqeusts/" && rm -rf /tmp/reqeusts
+# Install the typosquatted package into site-packages.
+# The base image is a shell-less rootfs so RUN is not available; COPY only.
+COPY reqeusts/ /usr/local/lib/python3.12/site-packages/reqeusts/
 
 # Install the victim application
 COPY victim_app.py /victim_app.py
