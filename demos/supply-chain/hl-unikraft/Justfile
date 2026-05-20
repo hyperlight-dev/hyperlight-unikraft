@@ -1,0 +1,55 @@
+# Supply chain attack demo — Hyperlight-Unikraft sandbox
+#
+# just rootfs   - Build rootfs with Python + malicious package
+# just build    - Build/pull Unikraft kernel
+# just run      - Run the victim app inside the sandbox
+# just rebuild  - Clean + rebuild everything
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+export DOCKER_BUILDKIT := "0"
+
+kernel      := ".unikraft/build/python-hyperlight_hyperlight-x86_64"
+initrd      := "initrd.cpio"
+memory      := "512Mi"
+image       := "supply-chain-demo"
+ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-kernel:latest"
+
+# Run the victim app inside the Hyperlight sandbox (no network, no hostfs)
+run:
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} -- /victim_app.py
+
+# Build rootfs via Docker
+rootfs:
+    docker build --platform linux/amd64 --target cpio -t {{image}}-cpio -f Dockerfile ..
+    - docker rm -f {{image}}-tmp
+    docker create --name {{image}}-tmp {{image}}-cpio /bin/true
+    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
+    docker rm -f {{image}}-tmp
+
+# Build kernel via kraft (Linux)
+[unix]
+build:
+    -kraft-hyperlight build --plat hyperlight --arch x86_64
+
+# Pull pre-built kernel from GHCR (Windows)
+[windows]
+build:
+    docker pull {{ghcr_kernel}}
+    - docker rm -f {{image}}-kernel-tmp
+    docker create --name {{image}}-kernel-tmp {{ghcr_kernel}} /kernel
+    New-Item -ItemType Directory -Force -Path (Split-Path {{kernel}}) | Out-Null
+    docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
+    docker rm -f {{image}}-kernel-tmp
+
+# Clean + rebuild everything
+rebuild: clean build rootfs
+
+# Clean build artifacts
+[unix]
+clean:
+    rm -rf .unikraft {{initrd}}
+
+[windows]
+clean:
+    if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
+    if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }
