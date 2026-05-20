@@ -204,7 +204,7 @@
 
     <!-- HYPERLIGHT SANDBOX -->
     <div class="col col-pass">
-      <div class="col-title">Hyperlight Micro-VM <span class="cap">(--mount ./workspace --net-allow example.com)</span></div>
+      <div class="col-title">Hyperlight Micro-VM <span class="cap">(--mount ./guest --net-allow example.com)</span></div>
 
       <div class="phase">
         <div class="phase-name">Credential Theft</div>
@@ -242,9 +242,9 @@
 
       <div class="phase">
         <div class="phase-name">Legitimate Work</div>
-        <div class="row"><span class="key">read /host/input.txt</span> <span class="ok">OK</span></div>
+        <div class="row"><span class="key">read /host/workspace/input.txt</span> <span class="ok">OK</span></div>
         <div class="row"><span class="key">GET example.com</span> <span class="ok">OK (HTTP 200)</span></div>
-        <div class="row"><span class="key">write /host/output.txt</span> <span class="ok">OK</span></div>
+        <div class="row"><span class="key">write /host/workspace/output.txt</span> <span class="ok">OK</span></div>
       </div>
 
       <div class="result-bar">

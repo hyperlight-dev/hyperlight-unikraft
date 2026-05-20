@@ -2,7 +2,7 @@
 """
 A simple application that fetches data from an API.
 
-The developer installed `reqeusts` instead of `requests` --- a common
+The developer installed `reqeusts` instead of `requests` -- a common
 typosquatting vector. The malicious payload runs silently on import.
 """
 

@@ -28,13 +28,12 @@ fetches data from `example.com`, and writes output.
 installed. Legitimate work also succeeds.
 
 **Hyperlight sandbox (scoped)** — the guest has real capabilities (`--mount`
-for workspace access, `--net-allow example.com` for network). Legitimate work
-succeeds, but every malicious action is blocked by active policy enforcement:
+for directory access, `--net-allow example.com` for network). Legitimate work
+succeeds, but every malicious action is blocked by Hyperlight's security model:
 
 - **Credential theft → BLOCKED** — `~/.ssh/id_rsa`, `~/.aws/credentials`, etc.
-  are outside the mounted workspace. The guest has filesystem access, but only
-  to the scoped directory. `expanduser()` itself fails (no HOME, no
-  `/etc/passwd`).
+  are outside the mounted directory. The guest has filesystem access, but only
+  to the scoped directory (no HOME, no `/etc/passwd`).
 - **Environment variables → NOT SET** — host environment is never forwarded to
   the guest. `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`, etc. are absent.
 - **C2 exfiltration → BLOCKED** — loopback addresses (127.0.0.0/8) are
@@ -58,7 +57,7 @@ enforce scoped access even when capabilities are granted.
 Install `pyhl` (the Hyperlight Python runtime):
 
 ```bash
-cargo install --path tools/pyhl
+cargo install --path host --bin pyhl
 ```
 
 ### Bare metal (attack succeeds)
@@ -82,7 +81,7 @@ just setup
 # Scoped sandbox: mount + network, attack still contained
 just run
 
-# Minimal sandbox: no mount, no network (total isolation)
+# Minimal sandbox: mount only, no network
 just run-minimal
 ```
 
