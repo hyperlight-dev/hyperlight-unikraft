@@ -11,7 +11,7 @@ export DOCKER_BUILDKIT := "0"
 
 kernel      := ".unikraft/build/python-tools-hyperlight_hyperlight-x86_64"
 initrd      := "initrd.cpio"
-memory      := "96Mi"
+memory      := "512Mi"
 image       := "python-tools-hyperlight"
 ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-tools-kernel:latest"
 
