@@ -11,7 +11,7 @@ export DOCKER_BUILDKIT := "0"
 
 kernel      := ".unikraft/build/helloworld-hyperlight_hyperlight-x86_64"
 initrd      := "hello-initrd.cpio"
-memory      := "4Mi"
+memory      := "2Mi"
 image       := "helloworld-c-hyperlight"
 ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/helloworld-c-kernel:latest"
 

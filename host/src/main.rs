@@ -27,8 +27,8 @@ struct Args {
     #[arg(long)]
     initrd: Option<PathBuf>,
 
-    /// Memory allocation (e.g., 64Mi, 256Mi, 1Gi)
-    #[arg(long, short = 'm', default_value = "64Mi")]
+    /// Memory allocation (e.g., 32Mi, 256Mi, 1Gi)
+    #[arg(long, short = 'm', default_value = "32Mi")]
     memory: String,
 
     /// Stack size (e.g., 8Mi)

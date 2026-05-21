@@ -11,7 +11,7 @@ export DOCKER_BUILDKIT := "0"
 
 kernel      := ".unikraft/build/networking-py-hyperlight_hyperlight-x86_64"
 initrd      := "initrd.cpio"
-memory      := "512Mi"
+memory      := "32Mi"
 image       := "networking-py-hyperlight"
 
 # Run HTTP GET test (raw sockets)

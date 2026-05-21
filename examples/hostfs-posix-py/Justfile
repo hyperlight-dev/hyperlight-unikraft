@@ -8,7 +8,7 @@ export DOCKER_BUILDKIT := "0"
 
 kernel      := ".unikraft/build/hostfs-posix-py-hyperlight_hyperlight-x86_64"
 initrd      := "hostfs-posix-py-initrd.cpio"
-memory      := "96Mi"
+memory      := "512Mi"
 image       := "hostfs-posix-py-hyperlight"
 ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/hostfs-posix-py-kernel:latest"
 mount_dir   := "./work"

@@ -153,6 +153,9 @@ jobs:
   # Full matrix — every example actually runs and its expected output is
   # greped from the guest console. This is the real regression gate;
   # build-example above only catches link-time errors.
+  #
+  # Memory values are read from each example's Justfile at runtime
+  # (the `memory` variable), so the matrix only carries args/expect.
   runtime-test:
     runs-on: ubuntu-latest
     needs: build-example
@@ -165,76 +168,59 @@ jobs:
       matrix:
         include:
           - example: helloworld-c
-            memory: "4Mi"
             args: ""
             expect: "Hello from C on Hyperlight"
           - example: rust
-            memory: "16Mi"
             args: ""
             expect: "Hello from Rust on Hyperlight"
           - example: go
-            memory: "96Mi"
             args: ""
             expect: "Hello from Go on Hyperlight"
           - example: shell
-            memory: "16Mi"
             args: "-- /demo.sh"
             expect: "Hello from Shell on Hyperlight"
           - example: python
-            memory: "512Mi"
             args: "-- /hello.py"
             expect: "Hello from Python on Hyperlight"
           - example: python-tools
-            memory: "1Gi"
             args: "--enable-tools -- /test_tools.py"
             expect: "Tool returned"
           - example: nodejs
-            memory: "512Mi"
             args: "-- /app/hello.js"
             expect: "Hello from Node.js on Hyperlight"
           - example: dotnet
-            memory: "512Mi"
             args: ""
             expect: "Hello, World! From .NET on Hyperlight"
           - example: dotnet-nativeaot
-            memory: "512Mi"
             args: ""
             expect: "Hello, World! From .NET NativeAOT on Hyperlight"
           - example: hostfs-posix-c
-            memory: "16Mi"
             args: ""
             expect: "done\\."
             needs_mount: true
           - example: hostfs-posix-py
-            memory: "512Mi"
             args: "-- /hostfs_demo.py"
             expect: "done\\."
             needs_mount: true
           - example: multifn-c
-            memory: "4Mi"
             args: ""
             expect: "RUN: world"
             driver: multifn-test
           - example: python-agent
-            memory: "1Gi"
             args: "-- /agent.py"
             expect: "done\\."
             needs_mount: true
           - example: python-agent-driver
-            memory: "2Gi"
             args: ""
             expect: "hello from driver"
             driver: pydriver-run
           - example: powershell
-            memory: "1Gi"
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
           - example: networking-py
-            memory: "512Mi"
             args: "--net -- /urllib_get.py"
             expect: "SUCCESS: urllib GET worked!"
           - example: networking-py
-            memory: "512Mi"
             args: "--port 8080 -- /echo_server_test.py"
             expect: "SUCCESS: bind\\+listen on port 8080 allowed"
     steps:
@@ -340,6 +326,11 @@ jobs:
             ls -la .unikraft/build/ *.cpio 2>&1 | head -40 || true
             exit 1
           fi
+          # Read memory from the example's Justfile (single source of truth).
+          memory=$(grep '^memory' Justfile | sed 's/memory.*:= *"//' | sed 's/".*//')
+          if [ -z "$memory" ]; then
+            echo "::notice::No memory variable in Justfile, using binary default"
+          fi
           expect='${{ matrix.expect }}'
           mount_args=""
           if [ "${{ matrix.needs_mount }}" = "true" ]; then
@@ -355,7 +346,11 @@ jobs:
               cmd=(timeout 120 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/pydriver-run "$kernel" "$cpio" /tmp/tiny.py)
               ;;
             *)
-              cmd=(timeout 120 hyperlight-unikraft -q -m "${{ matrix.memory }}" "$kernel" --initrd "$cpio" $mount_args ${{ matrix.args }})
+              mem_args=""
+              if [ -n "$memory" ]; then
+                mem_args="-m $memory"
+              fi
+              cmd=(timeout 120 hyperlight-unikraft -q $mem_args "$kernel" --initrd "$cpio" $mount_args ${{ matrix.args }})
               ;;
           esac
           set +e
@@ -490,6 +485,8 @@ jobs:
   # The only difference is we can't build the images on Windows (no
   # kraft-hyperlight + no Linux docker), so we download them from the
   # package-images-for-windows job.
+  #
+  # Memory values are read from each example's Justfile at runtime.
   runtime-test-windows:
     runs-on: windows-latest
     needs: package-images-for-windows
@@ -502,76 +499,59 @@ jobs:
       matrix:
         include:
           - example: helloworld-c
-            memory: "4Mi"
             args: ""
             expect: "Hello from C on Hyperlight"
           - example: rust
-            memory: "16Mi"
             args: ""
             expect: "Hello from Rust on Hyperlight"
           - example: go
-            memory: "96Mi"
             args: ""
             expect: "Hello from Go on Hyperlight"
           - example: shell
-            memory: "16Mi"
             args: "-- /demo.sh"
             expect: "Hello from Shell on Hyperlight"
           - example: python
-            memory: "512Mi"
             args: "-- /hello.py"
             expect: "Hello from Python on Hyperlight"
           - example: python-tools
-            memory: "1Gi"
             args: "--enable-tools -- /test_tools.py"
             expect: "Tool returned"
           - example: nodejs
-            memory: "512Mi"
             args: "-- /app/hello.js"
             expect: "Hello from Node.js on Hyperlight"
           - example: dotnet
-            memory: "512Mi"
             args: ""
             expect: "Hello, World! From .NET on Hyperlight"
           - example: dotnet-nativeaot
-            memory: "512Mi"
             args: ""
             expect: "Hello, World! From .NET NativeAOT on Hyperlight"
           - example: hostfs-posix-c
-            memory: "16Mi"
             args: ""
             expect: "done\\."
             needs_mount: true
           - example: hostfs-posix-py
-            memory: "512Mi"
             args: "-- /hostfs_demo.py"
             expect: "done\\."
             needs_mount: true
           - example: multifn-c
-            memory: "4Mi"
             args: ""
             expect: "RUN: world"
             driver: multifn-test
           - example: python-agent
-            memory: "1Gi"
             args: "-- /agent.py"
             expect: "done\\."
             needs_mount: true
           - example: python-agent-driver
-            memory: "2Gi"
             args: ""
             expect: "hello from driver"
             driver: pydriver-run
           - example: powershell
-            memory: "1Gi"
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
           - example: networking-py
-            memory: "512Mi"
             args: "--net -- /urllib_get.py"
             expect: "SUCCESS: urllib GET worked!"
           - example: networking-py
-            memory: "512Mi"
             args: "--port 8080 -- /echo_server_test.py"
             expect: "SUCCESS: bind\\+listen on port 8080 allowed"
     steps:
@@ -614,9 +594,18 @@ jobs:
           $cpio   = (Resolve-Path "image/initrd.cpio").Path
           $expect = '${{ matrix.expect }}'
           $driver = '${{ matrix.driver }}'
-          $memory = '${{ matrix.memory }}'
           $runArgs = '${{ matrix.args }}'
           $needsMount = '${{ matrix.needs_mount }}'
+
+          # Read memory from the example's Justfile (single source of truth).
+          $memory = ''
+          $justfile = "examples/${{ matrix.example }}/Justfile"
+          if (Test-Path $justfile) {
+            $memLine = Get-Content $justfile | Where-Object { $_ -match '^\s*memory\s*:=' }
+            if ($memLine -match '"([^"]+)"') {
+              $memory = $Matches[1]
+            }
+          }
 
           $mountArgs = @()
           if ($needsMount -eq 'true') {
@@ -649,7 +638,11 @@ jobs:
               if ($runArgs -ne '') {
                 $argList = $runArgs.Split(' ') | Where-Object { $_ -ne '' }
               }
-              $out = & hyperlight-unikraft -q -m $memory `
+              $memArgs = @()
+              if ($memory -ne '') {
+                $memArgs = @('-m', $memory)
+              }
+              $out = & hyperlight-unikraft -q @memArgs `
                 $kernel --initrd $cpio @mountArgs @argList 2>&1
               $rc = $LASTEXITCODE
             }
