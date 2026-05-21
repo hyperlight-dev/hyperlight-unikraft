@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779233926344,
+  "lastUpdate": 1779404232328,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1265,6 +1265,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 508,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "20ccc2ddb01632a1f82cabb5bcfcf139e157f29b",
+          "message": "Reduce default --memory to 32Mi, set examples to measured minimums (#77)\n\n* reduce default memory from 512Mi to 64Mi\n\nevery example already specifies its own --memory value in its Justfile,\nso nothing depends on the CLI default. 64Mi comfortably covers the\nlightweight examples (helloworld-c needs 4Mi, rust/go/dotnet/shell need\n16Mi) while heavier workloads (python 512Mi, powershell 1Gi) continue\nto set their own.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* set example memory to measured minimums, derive CI values from Justfiles\n\nbinary-searched the minimum --memory each example needs to produce its\nexpected output:\n\n  helloworld-c: 2Mi    rust: 16Mi         go: 16Mi\n  shell: 16Mi          dotnet: 16Mi       dotnet-nativeaot: 8Mi\n  hostfs-posix-c: 2Mi  hostfs-posix-py: 512Mi  python: 512Mi\n  python-tools: 512Mi  nodejs: 512Mi      powershell: 1Gi\n  networking-py: 32Mi  python-agent: 1Gi\n\nupdate each example's Justfile to use its measured minimum, and have CI\nread the memory value from the Justfile instead of hardcoding it in the\nworkflow matrix. this makes the Justfile the single source of truth.\n\nalso fixes two under-provisioned examples that were silently relying on\nheadroom: hostfs-posix-py (was 96Mi, needs 512Mi) and python-tools\n(was 96Mi, needs 512Mi).\n\nlower the CLI default from 512Mi to 32Mi — covers every lightweight\nexample with headroom while giving an honest signal that heavy runtimes\n(python, nodejs, powershell) need explicit --memory.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-21T15:48:22-07:00",
+          "tree_id": "b3f99c7c208534756b62db667264eab2f699ae1a",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/20ccc2ddb01632a1f82cabb5bcfcf139e157f29b"
+        },
+        "date": 1779404228491,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 261,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 800,
             "unit": "ms"
           },
           {
