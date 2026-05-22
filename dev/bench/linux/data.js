@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779492049915,
+  "lastUpdate": 1779493103382,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1529,6 +1529,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 100,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 11,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 656,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "05c4d642b445c17a4cb3f72559b15523ae5ed499",
+          "message": "chore: bump version to 0.7.0 (#83)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-22T16:29:06-07:00",
+          "tree_id": "f7807b4d25e1a23e197f6bf8eed55d5d5ee3b894",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/05c4d642b445c17a4cb3f72559b15523ae5ed499"
+        },
+        "date": 1779493102829,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
             "unit": "ms"
           },
           {
