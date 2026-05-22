@@ -118,6 +118,21 @@ fn runtime_pandas_import() {
 }
 
 // ---------------------------------------------------------------------------
+// zipfile.ZipInfo monkey-patch (pre-1980 date clamping)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn runtime_zipinfo_patch_survives_cleanup() {
+    let Some((_home, mut rt)) = setup() else {
+        return;
+    };
+    let timing = rt
+        .run_code("from docx import Document\ndoc = Document()\nprint('ok')")
+        .unwrap();
+    assert_eq!(timing.exit_code, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Exit code propagation
 // ---------------------------------------------------------------------------
 
