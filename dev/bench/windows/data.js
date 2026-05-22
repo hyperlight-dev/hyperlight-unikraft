@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779478452177,
+  "lastUpdate": 1779490998265,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1363,6 +1363,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot (disk)",
             "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "581b8d82ba327f62b01cc883abf199dd1f8ed1ce",
+          "message": "feat: expand python-agent-driver to 102 pip packages (#80)\n\n* feat: expand python-agent-driver to 102 pip packages\n\n- Add 88 new pip packages to Dockerfile (removed edgartools due to\n  pyarrow pulling in concurrent.futures.thread which crashes Unikraft)\n- Bump heap to 2.5 GiB across all entry points to accommodate the\n  larger rootfs\n- Pre-import docx and pptx during warmup for zero-cost access\n- Add pydoc stub for pyarrow compatibility\n- Update --help to list all shipped packages\n- Add docs/python-packages.md reference\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* ci: add smoke test and improve pandas benchmark\n\n- Add smoke test step before benchmarks to catch pyhl run failures early\n- Add explicit pandas smoke check before timing loop\n- Redirect stdout to /dev/null in timing runs to isolate timing output\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-22T15:48:56-07:00",
+          "tree_id": "10bc14d4646ab2b0a872e4fcbdaf2a8b5459162a",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/581b8d82ba327f62b01cc883abf199dd1f8ed1ce"
+        },
+        "date": 1779490995852,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 332,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 1014,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 10,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 663,
             "unit": "MiB"
           }
         ]
