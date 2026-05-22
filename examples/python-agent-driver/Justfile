@@ -14,7 +14,7 @@ export DOCKER_BUILDKIT := "0"
 
 kernel   := ".unikraft/build/python-agent-driver-hyperlight_hyperlight-x86_64"
 initrd   := "python-agent-driver-initrd.cpio"
-memory   := "1Gi"
+memory   := "2560Mi"
 image    := "python-agent-driver-hyperlight"
 script   := "../python-agent/agent.py"
 

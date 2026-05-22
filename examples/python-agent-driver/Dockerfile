@@ -10,10 +10,38 @@ ARG BASE=ghcr.io/hyperlight-dev/hyperlight-unikraft/python-base:latest
 
 # Stage 1: Python deps (same as python-agent).
 FROM python:3.12-slim AS deps
-RUN pip install --target=/deps --no-cache-dir \
+RUN pip install --target=/deps --no-cache-dir --prefer-binary \
     tqdm pyyaml jinja2 beautifulsoup4 tabulate click tenacity \
     python-dotenv pypdf openpyxl markdown-it-py pydantic pillow \
-    lxml cryptography python-dateutil numpy pandas
+    lxml cryptography python-dateutil numpy pandas \
+    python-docx python-pptx \
+    chardet charset-normalizer \
+    requests httpx aiohttp \
+    feedparser markdown markdownify \
+    Faker pycountry \
+    loguru schedule send2trash \
+    duckdb polars \
+    xlrd xlsxwriter pyxlsb odfpy \
+    pdfplumber pdfrw PyPDF2 \
+    qrcode svgwrite \
+    rapidfuzz \
+    networkx sympy \
+    pydub srt mutagen \
+    plotly altair bokeh \
+    statsmodels scikit-learn scipy \
+    wordcloud \
+    nltk textblob gensim \
+    fastapi uvicorn hypercorn \
+    typer pygments platformdirs distro \
+    pytest pytest-cov pytest-asyncio coverage hypothesis \
+    ruff pylint pyflakes bandit vulture radon rope \
+    websockets \
+    fpdf2 reportlab \
+    APScheduler celery \
+    numpy-financial docx2txt pipdeptree watchdog rarfile \
+    boto3 google-api-python-client slack-sdk praw tweepy \
+    scrapy trafilatura builtwith exchange-calendars \
+    paramiko fabric pexpect gitpython
 RUN set -eux; \
     find /deps -maxdepth 1 -type d -name '*.dist-info' -exec rm -rf {} + 2>/dev/null || true; \
     find /deps \( -type d -name tests -o -type d -name test \) -exec rm -rf {} + 2>/dev/null || true; \
@@ -41,6 +69,7 @@ RUN PY_INC=$(python3.12 -c 'import sysconfig; print(sysconfig.get_path("include"
 FROM ${BASE} AS rootfs
 COPY --from=deps         /deps            /usr/local/lib/python3.12/site-packages
 COPY --from=driver-build /src/hl_pydriver /bin/hl_pydriver
+COPY pydoc_stub.py /usr/local/lib/python3.12/pydoc.py
 
 # Stage 4: pack CPIO.
 FROM alpine:3.20 AS cpio

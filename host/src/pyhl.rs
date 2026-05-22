@@ -197,7 +197,7 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
     {
         let mut builder = Sandbox::builder(&dst_kernel)
             .initrd_file(&dst_initrd)
-            .heap_size(3 * 512 * 1024 * 1024);
+            .heap_size(5 * 512 * 1024 * 1024);
         for p in opts.mounts {
             builder = builder.preopen(p.clone());
         }
@@ -275,15 +275,10 @@ impl Runtime {
             );
         }
         let initrd = home.join(INITRD_FILE);
-        let initrd_ref = if initrd.is_file() {
-            Some(initrd.as_path())
-        } else {
-            None
-        };
         let sandbox = Sandbox::from_snapshot_file_configured(
             &snap,
             mounts,
-            initrd_ref,
+            Some(initrd.as_path()),
             network,
             listen_ports,
         )?;
