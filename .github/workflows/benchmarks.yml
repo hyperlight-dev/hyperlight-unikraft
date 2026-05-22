@@ -170,6 +170,15 @@ jobs:
         if: steps.kvm_check.outputs.available == 'true'
         run: pyhl setup --from src-dir --force
 
+      - name: "Smoke: verify pyhl run works"
+        if: steps.kvm_check.outputs.available == 'true'
+        run: |
+          echo "--- snapshot and system info ---"
+          ls -lh .pyhl/
+          free -h
+          echo "--- smoke test ---"
+          pyhl run -c "print('smoke ok')" || { echo "FAIL: pyhl run exited $?"; exit 1; }
+
       - name: "Perf: hello world (15 runs)"
         if: steps.kvm_check.outputs.available == 'true'
         run: |
@@ -210,9 +219,10 @@ jobs:
           df = pd.DataFrame(np.random.randn(1000, 4), columns=list('ABCD'))
           print(df.describe())
           PYEOF
+          pyhl run /tmp/pandas_bench.py > /dev/null || { echo "FAIL: pandas smoke check failed"; exit 1; }
           times=()
           for i in $(seq 1 10); do
-            ms=$( { /usr/bin/time -f "%e" pyhl run /tmp/pandas_bench.py; } 2>&1 | tail -1 )
+            ms=$( { /usr/bin/time -f "%e" pyhl run /tmp/pandas_bench.py > /dev/null; } 2>&1 )
             ms_int=$(echo "$ms * 1000" | bc | cut -d. -f1)
             times+=($ms_int)
             echo "  run $i: ${ms_int}ms"
