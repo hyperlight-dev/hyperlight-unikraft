@@ -89,6 +89,8 @@ const PREIMPORTED_MODULES: &[&str] = &[
     "cryptography",
     "dateutil",
     "dotenv",
+    "docx",
+    "pptx",
 ];
 
 /// Build the long-about blurb shown by `pyhl --help`. Lists the
@@ -114,9 +116,23 @@ fn long_about() -> String {
     }
     s.push_str(
         "\n\n\
-         Other third-party packages shipped in the rootfs still work — \
-         they just pay the usual import cost on first access. Packages \
-         not in the rootfs will raise ModuleNotFoundError.",
+         Additional packages shipped in the rootfs (pay import cost on \
+         first use): aiohttp, altair, APScheduler, bandit, bokeh, \
+         boto3, builtwith, celery, chardet, charset-normalizer, \
+         coverage, distro, docx2txt, duckdb, \
+         exchange-calendars, fabric, Faker, fastapi, feedparser, \
+         fpdf2, gensim, gitpython, google-api-python-client, \
+         hypercorn, httpx, hypothesis, loguru, markdown, markdownify, \
+         mutagen, networkx, nltk, numpy-financial, odfpy, paramiko, \
+         pdfplumber, pdfrw, pexpect, pipdeptree, platformdirs, plotly, \
+         polars, praw, pycountry, pydub, pyflakes, pygments, pylint, \
+         PyPDF2, pytest, pytest-asyncio, pytest-cov, pyxlsb, qrcode, \
+         radon, rapidfuzz, rarfile, reportlab, requests, rope, ruff, \
+         schedule, scikit-learn, scipy, scrapy, send2trash, slack-sdk, \
+         srt, statsmodels, svgwrite, sympy, textblob, trafilatura, \
+         tweepy, typer, uvicorn, vulture, watchdog, websockets, \
+         wordcloud, xlrd, xlsxwriter.\n\n\
+         Packages not in the rootfs will raise ModuleNotFoundError.",
     );
     s
 }
@@ -435,7 +451,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
     {
         let mut builder = Sandbox::builder(&dst_kernel)
             .initrd_file(&dst_initrd)
-            .heap_size(3 * 512 * 1024 * 1024);
+            .heap_size(5 * 512 * 1024 * 1024);
         for p in &setup_preopens {
             builder = builder.preopen(p.clone());
         }
@@ -577,18 +593,12 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         listen_ports.is_some(),
     )?;
 
-    let initrd = home.join(INITRD_FILE);
-
     let t_load = Instant::now();
-    let initrd_ref = if initrd.is_file() {
-        Some(initrd.as_path())
-    } else {
-        None
-    };
+    let initrd = home.join(INITRD_FILE);
     let mut sandbox = Sandbox::from_snapshot_file_configured(
         &snapshot,
         &run_preopens,
-        initrd_ref,
+        Some(initrd.as_path()),
         network.as_ref(),
         listen_ports.as_ref(),
     )?;
