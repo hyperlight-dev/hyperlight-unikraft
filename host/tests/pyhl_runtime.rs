@@ -302,7 +302,10 @@ fn runtime_filesystem_large_binary_write() {
 
     let size = 40 * 1024;
     let timing = rt
-        .run_code(&format!("with open('/host/big.bin', 'wb') as f: f.write(b'x' * {})", size))
+        .run_code(&format!(
+            "with open('/host/big.bin', 'wb') as f: f.write(b'x' * {})",
+            size
+        ))
         .unwrap();
     assert_eq!(timing.exit_code, 0);
 
