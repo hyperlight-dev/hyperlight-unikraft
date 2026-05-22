@@ -265,13 +265,15 @@ static void py_initialize_once(void)
 	 * writer (XLSX is a ZIP container). */
 	PyRun_SimpleString(
 		"import zipfile as _zf\n"
-		"_orig_zi = _zf.ZipInfo.__init__\n"
-		"def _safe_zi(self, filename='NoName', date_time=(1980,1,1,0,0,0)):\n"
-		"    if date_time[0] < 1980:\n"
-		"        date_time = (1980,1,1,0,0,0)\n"
-		"    _orig_zi(self, filename, date_time)\n"
-		"_zf.ZipInfo.__init__ = _safe_zi\n"
-		"del _zf, _orig_zi, _safe_zi\n");
+		"def _patch_zipinfo():\n"
+		"    _orig = _zf.ZipInfo.__init__\n"
+		"    def _safe(self, filename='NoName', date_time=(1980,1,1,0,0,0)):\n"
+		"        if date_time[0] < 1980:\n"
+		"            date_time = (1980,1,1,0,0,0)\n"
+		"        _orig(self, filename, date_time)\n"
+		"    _zf.ZipInfo.__init__ = _safe\n"
+		"_patch_zipinfo()\n"
+		"del _patch_zipinfo, _zf\n");
 
 	/* Monkey-patch time.sleep to call the host via /dev/hcall.
 	 * Unikraft's cooperative scheduler on Hyperlight has no timer
