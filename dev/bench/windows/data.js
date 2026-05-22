@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779404232328,
+  "lastUpdate": 1779478452177,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1309,6 +1309,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 800,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 392,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "71621726942a1954a43d95b5a74b8c9585890ef1",
+          "message": "fix: increase Hyperlight I/O buffer for large hostfs writes (#81)\n\n* fix: increase Hyperlight I/O buffer size for large hostfs writes\n\nThe Hyperlight SDK defaults input/output shared-memory stacks to 16 KiB\neach. The hostfs VFS layer chunks writes at 32 KiB, but after base64\nencoding + JSON envelope + FlatBuffer framing, a single chunk occupies\n~44 KiB — overflowing the 16 KiB output stack and causing hcall_push\nto fail with EIO on writes exceeding ~12 KiB.\n\nSet the I/O buffer size to 128 KiB (sufficient for any single-chunk RPC\nwith headroom) and expose it as a configurable field on VmConfig and\nSandboxBuilder so embedders can tune it for their workload.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: address Copilot review feedback\n\n- Mark VmConfig as #[non_exhaustive] to prevent semver breakage when\n  new fields are added\n- Use explicit 40 KiB (40 * 1024) in the large binary write test to\n  match the PR description and make the boundary condition clearer\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* style: fix cargo fmt\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-22T12:24:45-07:00",
+          "tree_id": "6a6865a9eb1647cb6bbfefd155f48c260ae20f10",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/71621726942a1954a43d95b5a74b8c9585890ef1"
+        },
+        "date": 1779478450116,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 234,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 699,
             "unit": "ms"
           },
           {
