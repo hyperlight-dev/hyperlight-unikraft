@@ -281,6 +281,42 @@ fn runtime_filesystem_mkdir_and_stat() {
 }
 
 // ---------------------------------------------------------------------------
+// Large binary write
+// ---------------------------------------------------------------------------
+
+#[test]
+fn runtime_filesystem_large_binary_write() {
+    let tmp = tempdir("hl-rt-bigwrite");
+    let preopen = match Preopen::new(&tmp, "/host") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("SKIP: cannot create preopen: {e}");
+            cleanup(&tmp);
+            return;
+        }
+    };
+    let Some(mut rt) = setup_with_mount(preopen) else {
+        cleanup(&tmp);
+        return;
+    };
+
+    let size = 40 * 1024;
+    let timing = rt
+        .run_code(&format!(
+            "with open('/host/big.bin', 'wb') as f: f.write(b'x' * {})",
+            size
+        ))
+        .unwrap();
+    assert_eq!(timing.exit_code, 0);
+
+    let data = std::fs::read(tmp.join("big.bin")).unwrap();
+    assert_eq!(data.len(), size);
+    assert!(data.iter().all(|&b| b == b'x'));
+
+    cleanup(&tmp);
+}
+
+// ---------------------------------------------------------------------------
 // Network policy enforcement
 // ---------------------------------------------------------------------------
 

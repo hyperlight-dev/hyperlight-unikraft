@@ -525,16 +525,27 @@ impl ListenPorts {
 // ---------------------------------------------------------------------------
 
 /// Configuration for a Unikraft VM.
+#[non_exhaustive]
 pub struct VmConfig {
     pub heap_size: u64,
     pub stack_size: u64,
+    pub io_buffer_size: usize,
 }
+
+/// Hyperlight I/O buffer size (128 KiB). Each host function call is serialized
+/// into a FlatBuffer and pushed onto a shared-memory stack whose capacity is
+/// `io_buffer_size`. The hostfs VFS layer chunks writes at 32 KiB, but after
+/// base64 encoding + JSON envelope + FlatBuffer framing a single chunk
+/// occupies ~44 KiB. The Hyperlight SDK default (16 KiB) is too small; 128 KiB
+/// accommodates any single-chunk RPC with comfortable headroom.
+const DEFAULT_IO_BUFFER_SIZE: usize = 128 * 1024;
 
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
             heap_size: 512 * 1024 * 1024,
             stack_size: 8 * 1024 * 1024,
+            io_buffer_size: DEFAULT_IO_BUFFER_SIZE,
         }
     }
 }
@@ -553,9 +564,17 @@ impl VmConfig {
         self
     }
 
+    /// Set the I/O buffer size for host function calls (default 128 KiB).
+    pub fn with_io_buffer_size(mut self, size: usize) -> Self {
+        self.io_buffer_size = size;
+        self
+    }
+
     fn sandbox_config(&self) -> SandboxConfiguration {
         let mut cfg = SandboxConfiguration::default();
         cfg.set_heap_size(self.heap_size);
+        cfg.set_input_data_size(self.io_buffer_size);
+        cfg.set_output_data_size(self.io_buffer_size);
 
         // Scratch holds page tables + CoW copies of writable pages touched at
         // runtime.  pt_estimate covers page tables; the base covers kernel
@@ -2008,6 +2027,7 @@ pub struct SandboxBuilder {
     args: Vec<String>,
     heap_size: Option<u64>,
     stack_size: Option<u64>,
+    io_buffer_size: Option<usize>,
     preopens: Vec<Preopen>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
@@ -2057,6 +2077,14 @@ impl SandboxBuilder {
         self
     }
 
+    /// Shared-memory I/O buffer size for host function calls (default 128 KiB).
+    /// Must be large enough to hold a single base64-encoded hostfs write chunk
+    /// plus JSON and FlatBuffer framing (~44 KiB for the default 32 KiB chunk).
+    pub fn io_buffer_size(mut self, bytes: usize) -> Self {
+        self.io_buffer_size = Some(bytes);
+        self
+    }
+
     /// Expose a host directory to the guest. `lib/hostfs` mounts each
     /// `preopen.host_dir` at `preopen.guest_path`; FS tool handlers
     /// cover all of them and route by guest path prefix. Repeatable —
@@ -2101,6 +2129,7 @@ impl SandboxBuilder {
         let config = VmConfig {
             heap_size: self.heap_size.unwrap_or(512 * 1024 * 1024),
             stack_size: self.stack_size.unwrap_or(8 * 1024 * 1024),
+            io_buffer_size: self.io_buffer_size.unwrap_or(DEFAULT_IO_BUFFER_SIZE),
         };
         let tools = if self.has_tools {
             Some(self.tools)
@@ -2154,6 +2183,7 @@ impl Sandbox {
             args: Vec::new(),
             heap_size: None,
             stack_size: None,
+            io_buffer_size: None,
             preopens: Vec::new(),
             network: None,
             listen_ports: None,
