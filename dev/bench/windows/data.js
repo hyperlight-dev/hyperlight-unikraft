@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779490998265,
+  "lastUpdate": 1779492293568,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1397,6 +1397,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 1014,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 10,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 663,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d89c576c017ed0f27bbe2d8ffeb2bffc9cd534fb",
+          "message": "fix: zipfile.ZipInfo monkey-patch NameError after init cleanup (#79)\n\nThe _safe_zi wrapper referenced _orig_zi as a module-level global, but\n`del _orig_zi` at the end of the init block destroyed it before any\ncall to ZipInfo() could use it. This broke all libraries that use\nzip-based formats (python-docx, openpyxl, etc.) with:\n\n    NameError: name '_orig_zi' is not defined\n\nWrap the patch in a function so _orig becomes a proper closure cell\nthat survives the namespace cleanup.\n\nAdds a regression test using python-docx's Document() constructor.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-05-22T16:11:27-07:00",
+          "tree_id": "1a57e9206084d5472e870e054c5bfee2295da2cd",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/d89c576c017ed0f27bbe2d8ffeb2bffc9cd534fb"
+        },
+        "date": 1779492291312,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 344,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 971,
             "unit": "ms"
           },
           {
