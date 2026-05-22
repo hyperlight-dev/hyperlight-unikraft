@@ -300,13 +300,14 @@ fn runtime_filesystem_large_binary_write() {
         return;
     };
 
+    let size = 40 * 1024;
     let timing = rt
-        .run_code("with open('/host/big.bin', 'wb') as f: f.write(b'x' * 40000)")
+        .run_code(&format!("with open('/host/big.bin', 'wb') as f: f.write(b'x' * {})", size))
         .unwrap();
     assert_eq!(timing.exit_code, 0);
 
     let data = std::fs::read(tmp.join("big.bin")).unwrap();
-    assert_eq!(data.len(), 40000);
+    assert_eq!(data.len(), size);
     assert!(data.iter().all(|&b| b == b'x'));
 
     cleanup(&tmp);

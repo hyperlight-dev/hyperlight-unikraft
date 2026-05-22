@@ -525,6 +525,7 @@ impl ListenPorts {
 // ---------------------------------------------------------------------------
 
 /// Configuration for a Unikraft VM.
+#[non_exhaustive]
 pub struct VmConfig {
     pub heap_size: u64,
     pub stack_size: u64,
