@@ -2,9 +2,7 @@
 
 This document describes how the **hyperlight-unikraft** host exposes capabilities to a Unikraft guest on the Hyperlight platform, what is enabled by default, and what security boundaries apply.
 
-Implementation lives in [`host/src/lib.rs`](host/src/lib.rs). Guest-side callers include [`unikraft/lib/hostfs`](unikraft/lib/hostfs) (filesystem) and the Hyperlight platform’s `hyperlight_hcall()` path (dispatch).
-
-Closes [hyperlight-dev/hyperlight-unikraft#42](https://github.com/hyperlight-dev/hyperlight-unikraft/issues/42).
+Implementation lives in [`host/src/lib.rs`](../host/src/lib.rs). Guest-side callers include [`lib/hostfs`](https://github.com/unikraft/unikraft/tree/plat-hyperlight/lib/hostfs) (filesystem) and [`lib/hostsock`](https://github.com/unikraft/unikraft/tree/plat-hyperlight/lib/hostsock) (networking), both on the Unikraft `plat-hyperlight` branch.
 
 ---
 
@@ -27,16 +25,24 @@ With **no flags**, the guest cannot reach the host filesystem or network through
 
 ```
 Guest (Unikraft)
-  ├─ lib/hostfs  ──► hyperlight_hcall() ──► __dispatch ──► fs_* handlers ──► FsSandbox ──► host files
-  ├─ lib/hostsock (when enabled) ─────────► __dispatch ──► net_* handlers ──► host sockets
-  └─ /dev/hcall or direct hcall ──────────► __dispatch ──► named tool in ToolRegistry
+  ├─ lib/hostfs  (when --mount) ──► hyperlight_hcall() ──► __dispatch ──► fs_* handlers ──► FsSandbox ──► host files
+  ├─ lib/hostsock (when --net)  ──► hyperlight_hcall() ──► __dispatch ──► net_* handlers ──► host sockets
+  └─ /dev/hcall or direct hcall ──► hyperlight_hcall() ──► __dispatch ──► named tool in ToolRegistry
         │
         ▼
 Hyperlight host (hyperlight-unikraft)
   ToolRegistry::dispatch(payload)  →  JSON in / JSON out
 ```
 
-There is **one** guest→host RPC channel for tools: the Hyperlight host function **`__dispatch`**, registered when the sandbox is created. All tool names are looked up in a host-side `ToolRegistry`.
+There is **one** guest-to-host RPC channel for tools: the Hyperlight host function **`__dispatch`**, registered when the sandbox is created. All tool names are looked up in a host-side `ToolRegistry`.
+
+### End-to-end example: `time.sleep(2)` in a Python guest
+
+1. The Python app calls `time.sleep(2)`.
+2. The Hyperlight Python driver patches the call to open `/dev/hcall` and write JSON: `{"name": "__hl_sleep", "args": {"ns": 2000000000}}`.
+3. Unikraft's Hyperlight platform routes writes to `/dev/hcall` to execute the `__dispatch` host function call.
+4. The host parses the call to `__dispatch`, looks up `__hl_sleep` in the `ToolRegistry`, and calls the handler.
+5. `__hl_sleep` executes, and the response flows back via the normal hyperlight-core host function mechanism (writing the response into shared memory via the input shared buffer).
 
 ---
 
@@ -79,7 +85,7 @@ hyperlight-unikraft KERNEL [--initrd CPIO] [options] [-- APP_ARGS...]
 | `--net-allow HOST_OR_IP` | Allow-list outbound destinations (implies `--net`). Repeatable. |
 | `--net-block HOST_OR_IP` | Block-list; all other destinations allowed (implies `--net`). Mutually exclusive with `--net-allow`. |
 | `--port PORT` | Allow `net_bind` / listen on `PORT` (implies `--net`). Without `--port`, outbound-only: bind is rejected. |
-| `--enable-tools` | Registers the demo `echo` tool (returns args unchanged). Library users can add more via `SandboxBuilder::tool()`. |
+| `--enable-tools` | Enables custom tool registration. Registers a built-in `echo` tool (used by the `python-tools` example). Library users add their own tools via `SandboxBuilder::tool()`. |
 
 **Mount rules (host-enforced before boot):**
 
@@ -87,7 +93,7 @@ hyperlight-unikraft KERNEL [--initrd CPIO] [options] [-- APP_ARGS...]
 - Cannot use reserved guest paths: `/`, `/bin`, `/dev`, `/proc`, `/sys`, `/usr`.
 - Duplicate `GUEST` paths are rejected.
 
-**Initrd metadata** (not dispatch, but host→guest config): cmdline (`HLCMDLN`), mount table (`HLHSMNT`), optional wall-clock seed (`HLWALL0`). See `prepend_cmdline_to_initrd()` in `host/src/lib.rs`.
+**Initrd metadata** (not dispatch, but host-to-guest config): cmdline (`HLCMDLN`), mount table (`HLHSMNT`), optional wall-clock seed (`HLWALL0`). See `prepend_cmdline_to_initrd()` in `host/src/lib.rs`.
 
 ---
 
@@ -121,7 +127,7 @@ Can be cancelled via `SleepCancel` when tearing down the sandbox.
 
 ## Filesystem tools (`fs_*`)
 
-Registered when at least one `--mount` / `Preopen` is configured. Paths in `args.path` are **guest paths** (e.g. `/host/project/file.txt`). The host routes to the longest matching preopen prefix, then resolves under that host directory via [`FsSandbox`](host/src/lib.rs).
+Registered when at least one `--mount` / `Preopen` is configured. Paths in `args.path` are **guest paths** (e.g. `/host/project/file.txt`). The host routes to the longest matching preopen prefix, then resolves under that host directory via [`FsSandbox`](../host/src/lib.rs).
 
 **Sandbox guarantees:**
 
@@ -135,7 +141,7 @@ Registered when at least one `--mount` / `Preopen` is configured. Paths in `args
 | `fs_write` | `path`, `text`, `append?` | `{"bytes_written": N}` — max **16 MiB** text |
 | `fs_read_bytes` | `path`, `offset?`, `len?` | `{"data": "<base64>", "eof": bool, "bytes_read": N}` — default `len` 65536, max **16 MiB** |
 | `fs_write_bytes` | `path`, `data` (base64), `offset?`, `append?` | `{"bytes_written": N}` — max **16 MiB** decoded |
-| `fs_list` | `path` (optional, default `""`) | `{"entries": [{"name", "is_dir", "is_file", "is_symlink"}, ...]}` — max **100 000** entries |
+| `fs_list` | `path` (required; must match a preopen prefix, e.g. `/host`) | `{"entries": [{"name", "is_dir", "is_file", "is_symlink"}, ...]}` — max **100 000** entries |
 | `fs_stat` | `path` | `{"size", "is_dir", "is_file", "mtime_ns", "atime_ns"}` |
 | `fs_truncate` | `path`, `length` | `{}` — max length **1 GiB** |
 | `fs_mkdir` | `path`, `parents?` | `{}` |
@@ -143,13 +149,13 @@ Registered when at least one `--mount` / `Preopen` is configured. Paths in `args
 
 Errors are normalized to Linux-style `std::io::Error` wording where possible so the guest `lib/hostfs` can map them to POSIX errno (see `normalize_fs_error()`).
 
-**Guest integration:** With `CONFIG_LIBHOSTFS`, unmodified POSIX under the mount point uses these same tools via `hostfs_rpc_*` → `hyperlight_hcall()`. See [`unikraft/lib/hostfs/README.md`](unikraft/lib/hostfs/README.md).
+**Guest integration:** With `CONFIG_LIBHOSTFS`, unmodified POSIX under the mount point uses these same tools via `hostfs_rpc_*` → `hyperlight_hcall()`. See [`lib/hostfs`](https://github.com/unikraft/unikraft/tree/plat-hyperlight/lib/hostfs).
 
 ---
 
 ## Network tools (`net_*`)
 
-Registered only when a [`NetworkPolicy`](host/src/lib.rs) is set (`--net`, `--net-allow`, or `--net-block`).
+Registered only when a [`NetworkPolicy`](../host/src/lib.rs) is set (`--net`, `--net-allow`, or `--net-block`).
 
 Sockets are host-side (`socket2`); the guest sees opaque numeric **`fd`** handles (per-sandbox table, max **1024** sockets, **30 s** read/write/connect timeout).
 
@@ -162,7 +168,7 @@ Sockets are host-side (`socket2`); the guest sees opaque numeric **`fd`** handle
 | `net_bind` | Bind; requires `--port` allowlist entry |
 | `net_listen` | Listen after bind |
 | `net_accept` | Accept; returns new `fd` + peer |
-| `net_send` / `net_recv` | Stream/datagram I/O — payload max **1 MiB** (base64 on wire where applicable) |
+| `net_send` / `net_recv` | Stream/datagram I/O — payload max **1 MiB decoded bytes** (base64-encoded on wire) |
 | `net_sendto` / `net_recvfrom` | Datagram with address (policy on destination) |
 | `net_close` | Close host socket |
 | `net_shutdown` | Shutdown (best-effort) |
@@ -177,17 +183,13 @@ Sockets are host-side (`socket2`); the guest sees opaque numeric **`fd`** handle
 | **AllowList** (`--net-allow`) | Only listed IPs/hostnames; hostnames re-resolved at check time; DNS to resolver IPs on port **53** allowed for listed resolvers + common public DNS. |
 | **BlockList** (`--net-block`) | Block listed targets; others allowed (same loopback/link-local deny for all policies). |
 
-**Inbound:** `--port` adds a listen-port allowlist. Without it, `net_bind` fails with “no --port specified” (outbound-only mode).
+**Inbound:** `--port` adds a listen-port allowlist. Without it, `net_bind` fails with "no --port specified" (outbound-only mode).
 
 ---
 
 ## Custom tools
 
-**CLI:** `--enable-tools` registers:
-
-| Tool | Behavior |
-|------|----------|
-| `echo` | Returns `args` unchanged (demo / test). |
+**CLI:** `--enable-tools` registers a built-in `echo` tool (returns `args` unchanged) used by the [`python-tools` example](../examples/python-tools). The primary purpose of `--enable-tools` is to demonstrate custom host function registration via the API.
 
 **Library:**
 
@@ -209,8 +211,8 @@ Custom handlers run with the same JSON request/response envelope as built-in too
 | `fs_read` / `fs_read_bytes` | 16 MiB per call |
 | `fs_write` / `fs_write_bytes` | 16 MiB per call |
 | `fs_truncate` length | 1 GiB |
-| `fs_list` entries | 100 000 |
-| `net_send` / `net_sendto` | 1 MiB |
+| `fs_list` entries | 100 000 |
+| `net_send` / `net_sendto` | 1 MiB decoded bytes |
 | `__hl_sleep` | 60 s |
 | Open host sockets | 1024 per sandbox |
 | AllowList learned DNS IPs | 256 |
@@ -219,7 +221,7 @@ Custom handlers run with the same JSON request/response envelope as built-in too
 
 ## Security and attack surface
 
-**Default posture:** The guest is a micro-VM with no host FS and no host network unless the operator opts in. That matches Hyperlight’s embed-in-application threat model: the host application chooses what to expose per sandbox.
+**Default posture:** The guest is a micro-VM with no host FS and no host network unless the operator opts in. That matches Hyperlight's embed-in-application threat model: the host application chooses what to expose per sandbox.
 
 **When `--mount` is used:**
 
@@ -248,7 +250,7 @@ Custom handlers run with the same JSON request/response envelope as built-in too
 
 ## Programmatic API
 
-Same behavior as the CLI via [`Sandbox`](host/src/lib.rs) / [`SandboxBuilder`](host/src/lib.rs):
+Same behavior as the CLI via [`Sandbox`](../host/src/lib.rs) / [`SandboxBuilder`](../host/src/lib.rs):
 
 ```rust
 use hyperlight_unikraft::{AllowList, NetworkPolicy, Preopen, Sandbox};
@@ -262,12 +264,3 @@ let mut sbox = Sandbox::builder("./kernel")
 ```
 
 See crate docs in `host/src/lib.rs` for snapshot/restore and `call_run()`.
-
----
-
-## Related work
-
-- Guest hostfs driver: `unikraft/lib/hostfs/` (on `plat-hyperlight`)
-- Issue [#42 — Document host functions and attack surface](https://github.com/hyperlight-dev/hyperlight-unikraft/issues/42)
-- Issue [#49 — Formalize host function implementations](https://github.com/hyperlight-dev/hyperlight-unikraft/issues/49)
-- Issue [#41 — CI tests for `--net-allow` / `--net-block`](https://github.com/hyperlight-dev/hyperlight-unikraft/issues/41)
