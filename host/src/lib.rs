@@ -160,6 +160,7 @@ const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub struct Preopen {
     pub host_dir: std::path::PathBuf,
     pub guest_path: String,
+    pub read_only: bool,
 }
 
 impl Preopen {
@@ -192,7 +193,14 @@ impl Preopen {
         Ok(Self {
             host_dir,
             guest_path,
+            read_only: false,
         })
+    }
+
+    /// Mark this preopen as read-only.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// Parse a `HOST[:GUEST]` CLI argument. When `GUEST` is omitted the
@@ -1677,14 +1685,18 @@ fn register_net_tools(
 /// matching the guest-supplied path against each preopen's guest path.
 #[derive(Clone)]
 struct FsRouter {
-    entries: Vec<(String, FsSandbox)>,
+    entries: Vec<(String, FsSandbox, bool)>,
 }
 
 impl FsRouter {
     fn new(preopens: &[Preopen]) -> Result<Self> {
         let mut entries = Vec::with_capacity(preopens.len());
         for p in preopens {
-            entries.push((p.guest_path.clone(), FsSandbox::new(&p.host_dir)?));
+            entries.push((
+                p.guest_path.clone(),
+                FsSandbox::new(&p.host_dir)?,
+                p.read_only,
+            ));
         }
         // Sort by descending prefix length so longer matches win (e.g.
         // /data/public should match before /data).
@@ -1692,21 +1704,29 @@ impl FsRouter {
         Ok(Self { entries })
     }
 
-    /// Pick the preopen matching `path` and return its sandbox plus
-    /// the path-relative-to-that-sandbox.
-    fn route<'a>(&'a self, path: &'a str) -> Result<(&'a FsSandbox, &'a str)> {
-        for (prefix, fs) in &self.entries {
+    /// Pick the preopen matching `path` and return its sandbox,
+    /// the path-relative-to-that-sandbox, and whether it is read-only.
+    fn route<'a>(&'a self, path: &'a str) -> Result<(&'a FsSandbox, &'a str, bool)> {
+        for (prefix, fs, ro) in &self.entries {
             if path == prefix {
-                return Ok((fs, ""));
+                return Ok((fs, "", *ro));
             }
             if let Some(tail) = path.strip_prefix(prefix).and_then(|t| t.strip_prefix('/')) {
-                return Ok((fs, tail));
+                return Ok((fs, tail, *ro));
             }
         }
         Err(anyhow!(
             "path {:?} does not match any preopened mount",
             path
         ))
+    }
+
+    fn require_writable<'a>(&'a self, path: &'a str) -> Result<(&'a FsSandbox, &'a str)> {
+        let (fs, rel, ro) = self.route(path)?;
+        if ro {
+            return Err(anyhow!("read-only mount: write to {} denied", path));
+        }
+        Ok((fs, rel))
     }
 
     fn register(self, registry: &mut ToolRegistry) {
@@ -1717,7 +1737,7 @@ impl FsRouter {
             let path = args["path"]
                 .as_str()
                 .ok_or_else(|| anyhow!("fs_read: missing 'path'"))?;
-            let (fs, rel) = r.route(path)?;
+            let (fs, rel, _ro) = r.route(path)?;
             let target = fs.resolve(rel)?;
             let size = std::fs::metadata(&target)
                 .map_err(|e| anyhow!("fs_read {:?}: {}", path, e))?
@@ -1751,7 +1771,7 @@ impl FsRouter {
                 ));
             }
             let append = args["append"].as_bool().unwrap_or(false);
-            let (fs, rel) = r.route(path)?;
+            let (fs, rel) = r.require_writable(path)?;
             let target = fs.resolve(rel)?;
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
@@ -1769,7 +1789,7 @@ impl FsRouter {
         let r = self.clone();
         registry.register("fs_list", move |args| {
             let path = args["path"].as_str().unwrap_or("");
-            let (fs, rel) = r.route(path)?;
+            let (fs, rel, _ro) = r.route(path)?;
             let target = fs.resolve(rel)?;
             let mut entries = Vec::new();
             for entry in
@@ -1799,7 +1819,7 @@ impl FsRouter {
             let path = args["path"]
                 .as_str()
                 .ok_or_else(|| anyhow!("fs_stat: missing 'path'"))?;
-            let (fs, rel) = r.route(path)?;
+            let (fs, rel, _ro) = r.route(path)?;
             let target = fs.resolve(rel)?;
             let md =
                 std::fs::metadata(&target).map_err(|e| anyhow!("fs_stat {:?}: {}", path, e))?;
@@ -1833,7 +1853,7 @@ impl FsRouter {
                 .ok_or_else(|| anyhow!("fs_read_bytes: missing 'path'"))?;
             let offset = args["offset"].as_u64().unwrap_or(0);
             let want = args["len"].as_u64().unwrap_or(65536).min(MAX_FS_READ);
-            let (fs, rel) = r.route(path)?;
+            let (fs, rel, _ro) = r.route(path)?;
             let target = fs.resolve(rel)?;
             let mut f = std::fs::File::open(&target)
                 .map_err(|e| anyhow!("fs_read_bytes {:?}: {}", path, e))?;
@@ -1888,7 +1908,7 @@ impl FsRouter {
                 }
             }
             let append = args["append"].as_bool().unwrap_or(false);
-            let (fs, rel) = r.route(path)?;
+            let (fs, rel) = r.require_writable(path)?;
             let target = fs.resolve(rel)?;
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
@@ -1923,7 +1943,7 @@ impl FsRouter {
                     MAX_TRUNCATE_LEN
                 ));
             }
-            let (fs, rel) = r.route(path)?;
+            let (fs, rel) = r.require_writable(path)?;
             let target = fs.resolve(rel)?;
             let f = std::fs::OpenOptions::new()
                 .write(true)
@@ -1940,7 +1960,7 @@ impl FsRouter {
                 .as_str()
                 .ok_or_else(|| anyhow!("fs_mkdir: missing 'path'"))?;
             let parents = args["parents"].as_bool().unwrap_or(false);
-            let (fs, rel) = r.route(path)?;
+            let (fs, rel) = r.require_writable(path)?;
             let target = fs.resolve(rel)?;
             if parents {
                 std::fs::create_dir_all(&target)
@@ -1956,7 +1976,7 @@ impl FsRouter {
             let path = args["path"]
                 .as_str()
                 .ok_or_else(|| anyhow!("fs_unlink: missing 'path'"))?;
-            let (fs, rel) = r.route(path)?;
+            let (fs, rel) = r.require_writable(path)?;
             let target = fs.resolve(rel)?;
             if target == *fs.root() {
                 return Err(anyhow!("fs_unlink: cannot remove mount root"));
@@ -3036,6 +3056,130 @@ mod tests {
         let resp = reg.dispatch(r);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.contains("\"text\":\"hi\""), "{s}");
+    }
+
+    // -- Read-only mount tests ------------------------------------------------
+
+    #[test]
+    fn readonly_mount_allows_reads() {
+        let root = tmpdir("ro-read");
+        fs::write(root.join("file.txt"), b"hello").unwrap();
+        let preopens = vec![Preopen::new(&root, "/data").unwrap().read_only()];
+        let mut reg = ToolRegistry::new();
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
+
+        let req = br#"{"name":"fs_read","args":{"path":"/data/file.txt"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"text\":\"hello\""), "{s}");
+    }
+
+    #[test]
+    fn readonly_mount_blocks_fs_write() {
+        let root = tmpdir("ro-write");
+        let preopens = vec![Preopen::new(&root, "/data").unwrap().read_only()];
+        let mut reg = ToolRegistry::new();
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
+
+        let req = br#"{"name":"fs_write","args":{"path":"/data/new.txt","text":"nope"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"error\""), "{s}");
+        assert!(s.contains("read-only mount"), "{s}");
+    }
+
+    #[test]
+    fn readonly_mount_blocks_fs_mkdir() {
+        let root = tmpdir("ro-mkdir");
+        let preopens = vec![Preopen::new(&root, "/data").unwrap().read_only()];
+        let mut reg = ToolRegistry::new();
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
+
+        let req = br#"{"name":"fs_mkdir","args":{"path":"/data/subdir"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"error\""), "{s}");
+        assert!(s.contains("read-only mount"), "{s}");
+    }
+
+    #[test]
+    fn readonly_mount_blocks_fs_unlink() {
+        let root = tmpdir("ro-unlink");
+        fs::write(root.join("victim.txt"), b"data").unwrap();
+        let preopens = vec![Preopen::new(&root, "/data").unwrap().read_only()];
+        let mut reg = ToolRegistry::new();
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
+
+        let req = br#"{"name":"fs_unlink","args":{"path":"/data/victim.txt"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"error\""), "{s}");
+        assert!(s.contains("read-only mount"), "{s}");
+        assert!(
+            root.join("victim.txt").exists(),
+            "file should not be deleted"
+        );
+    }
+
+    #[test]
+    fn readonly_mount_blocks_fs_truncate() {
+        let root = tmpdir("ro-trunc");
+        fs::write(root.join("file.txt"), b"hello world").unwrap();
+        let preopens = vec![Preopen::new(&root, "/data").unwrap().read_only()];
+        let mut reg = ToolRegistry::new();
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
+
+        let req = br#"{"name":"fs_truncate","args":{"path":"/data/file.txt","length":0}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"error\""), "{s}");
+        assert!(s.contains("read-only mount"), "{s}");
+    }
+
+    #[test]
+    fn readonly_mount_blocks_fs_write_bytes() {
+        let root = tmpdir("ro-wbytes");
+        let preopens = vec![Preopen::new(&root, "/data").unwrap().read_only()];
+        let mut reg = ToolRegistry::new();
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
+
+        let req = br#"{"name":"fs_write_bytes","args":{"path":"/data/bin.dat","data":"AAAA"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"error\""), "{s}");
+        assert!(s.contains("read-only mount"), "{s}");
+    }
+
+    #[test]
+    fn mixed_rw_and_ro_mounts() {
+        let rw_root = tmpdir("mixed-rw");
+        let ro_root = tmpdir("mixed-ro");
+        fs::write(ro_root.join("existing.txt"), b"read me").unwrap();
+        let preopens = vec![
+            Preopen::new(&rw_root, "/rw").unwrap(),
+            Preopen::new(&ro_root, "/ro").unwrap().read_only(),
+        ];
+        let mut reg = ToolRegistry::new();
+        FsRouter::new(&preopens).unwrap().register(&mut reg);
+
+        // Write to rw mount succeeds
+        let req = br#"{"name":"fs_write","args":{"path":"/rw/ok.txt","text":"yes"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"bytes_written\""), "{s}");
+
+        // Read from ro mount succeeds
+        let req = br#"{"name":"fs_read","args":{"path":"/ro/existing.txt"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"text\":\"read me\""), "{s}");
+
+        // Write to ro mount fails
+        let req = br#"{"name":"fs_write","args":{"path":"/ro/nope.txt","text":"no"}}"#;
+        let resp = reg.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("\"error\""), "{s}");
+        assert!(s.contains("read-only mount"), "{s}");
     }
 
     // -- NetworkPolicy tests --------------------------------------------------
