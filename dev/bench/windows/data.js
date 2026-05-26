@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779493378060,
+  "lastUpdate": 1779824199213,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1490,6 +1490,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "density (per VM)",
             "value": 11,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 663,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "19a25757addc4f446c7f1783a1183e0c78cad094",
+          "message": "Merge pull request #85 from hyperlight-dev/feat/readonly-mounts\n\nfeat: support read-only filesystem mounts",
+          "timestamp": "2026-05-26T12:20:49-07:00",
+          "tree_id": "1919e2dfd90735caaaab9dba72989c4e6cae58e6",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/19a25757addc4f446c7f1783a1183e0c78cad094"
+        },
+        "date": 1779824196242,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 367,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 1063,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 10,
             "unit": "MB"
           },
           {
