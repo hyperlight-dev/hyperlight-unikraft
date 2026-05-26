@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779824199213,
+  "lastUpdate": 1779825881847,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1529,6 +1529,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 1063,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 10,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 663,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b15806cc03140b139bac9375cf88739d5937151f",
+          "message": "Merge pull request #86 from hyperlight-dev/bump/v0.8.0\n\nchore: bump version to 0.8.0",
+          "timestamp": "2026-05-26T12:51:33-07:00",
+          "tree_id": "bedaf8c23d7753667f061162d5d6562aa3cecf81",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/b15806cc03140b139bac9375cf88739d5937151f"
+        },
+        "date": 1779825879253,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 347,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 1044,
             "unit": "ms"
           },
           {
