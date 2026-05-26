@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779493103382,
+  "lastUpdate": 1779823948745,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1563,6 +1563,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/05c4d642b445c17a4cb3f72559b15523ae5ed499"
         },
         "date": 1779493102829,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 11,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 656,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "19a25757addc4f446c7f1783a1183e0c78cad094",
+          "message": "Merge pull request #85 from hyperlight-dev/feat/readonly-mounts\n\nfeat: support read-only filesystem mounts",
+          "timestamp": "2026-05-26T12:20:49-07:00",
+          "tree_id": "1919e2dfd90735caaaab9dba72989c4e6cae58e6",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/19a25757addc4f446c7f1783a1183e0c78cad094"
+        },
+        "date": 1779823947566,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
