@@ -582,7 +582,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hyperlight-common"
 version = "0.15.0"
-source = "git+https://github.com/hyperlight-dev/hyperlight?branch=disk_snapshot_copy#621cc03beadae3d9158e72d07d3d156abf2b21fd"
+source = "git+https://github.com/danbugs/hyperlight?rev=5cf37d92#5cf37d92262c918e7d633577a6cf946fb1f069bd"
 dependencies = [
  "anyhow",
  "flatbuffers",
@@ -596,7 +596,7 @@ dependencies = [
 [[package]]
 name = "hyperlight-host"
 version = "0.15.0"
-source = "git+https://github.com/hyperlight-dev/hyperlight?branch=disk_snapshot_copy#621cc03beadae3d9158e72d07d3d156abf2b21fd"
+source = "git+https://github.com/danbugs/hyperlight?rev=5cf37d92#5cf37d92262c918e7d633577a6cf946fb1f069bd"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",

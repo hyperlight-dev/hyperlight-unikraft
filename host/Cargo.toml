@@ -27,9 +27,8 @@ name = "pyhl"
 path = "src/bin/pyhl.rs"
 
 [dependencies]
-# hyperlight-dev/hyperlight#1373 — Ludvig's Snapshot::to_file/from_file
-# Uses PAGE_READONLY mapping (no host commit charge per VM).
-hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", branch = "disk_snapshot_copy", features = ["executable_heap", "hw-interrupts"] }
+# danbugs/hyperlight perf/whp-warm-start — snapshot file support + WHP warm-start optimizations.
+hyperlight-host = { git = "https://github.com/danbugs/hyperlight", rev = "5cf37d92", features = ["executable_heap", "hw-interrupts", "whp-no-surrogate"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 memmap2 = "0.9"

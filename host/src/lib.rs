@@ -2008,10 +2008,9 @@ pub struct Sandbox {
     inner: MultiUseSandbox,
     /// Post-init snapshot for fast restore between calls.
     snapshot: Option<Arc<Snapshot>>,
-    /// File mapping to re-register after snapshot restore.
-    /// Snapshot restore unmaps all non-snapshot regions.
+    /// When set, restore uses the preserving variant to keep the
+    /// read-only file mapping alive across restores.
     file_mapping_path: Option<std::path::PathBuf>,
-    file_mapping_base: u64,
     exit_code: Arc<AtomicI32>,
     /// Shared socket table — cleared on [`Sandbox::restore`] so that
     /// host-side fds don't leak across guest restore cycles.
@@ -2247,7 +2246,7 @@ impl Sandbox {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(usbox, None, 0, exit_code, sleep_cancel, socket_table)
+        Self::finish_evolve(usbox, None, exit_code, sleep_cancel, socket_table)
     }
 
     /// Low-level: boot with a zero-copy mapped initrd file. Prefer the builder.
@@ -2304,7 +2303,6 @@ impl Sandbox {
         Self::finish_evolve(
             usbox,
             initrd_path.map(|p| p.to_path_buf()),
-            INITRD_MAP_BASE,
             exit_code,
             sleep_cancel,
             socket_table,
@@ -2314,7 +2312,6 @@ impl Sandbox {
     fn finish_evolve(
         usbox: UninitializedSandbox,
         file_mapping_path: Option<std::path::PathBuf>,
-        file_mapping_base: u64,
         exit_code: Arc<AtomicI32>,
         sleep_cancel: SleepCancel,
         socket_table: Option<Arc<Mutex<SocketTable>>>,
@@ -2325,7 +2322,6 @@ impl Sandbox {
             inner,
             snapshot,
             file_mapping_path,
-            file_mapping_base,
             exit_code,
             socket_table,
             sleep_cancel,
@@ -2338,15 +2334,12 @@ impl Sandbox {
     /// guest memory to the state captured after init.
     pub fn restore(&mut self) -> Result<()> {
         if let Some(ref snap) = self.snapshot {
-            self.inner.restore(snap.clone())?;
+            if self.file_mapping_path.is_some() {
+                self.inner.restore_preserving_file_mappings(snap.clone())?;
+            } else {
+                self.inner.restore(snap.clone())?;
+            }
         }
-        // Re-register file mapping after restore (snapshot restore
-        // unmaps all non-snapshot regions including file mappings)
-        if let Some(ref path) = self.file_mapping_path {
-            self.inner
-                .map_file_cow(path, self.file_mapping_base, Some("initrd"))?;
-        }
-        // Close leaked host-side sockets the guest "forgot" about.
         if let Some(ref table) = self.socket_table {
             table.lock().unwrap().clear();
         }
@@ -2543,7 +2536,6 @@ impl Sandbox {
             inner,
             snapshot: Some(arc),
             file_mapping_path: initrd,
-            file_mapping_base: INITRD_MAP_BASE,
             exit_code,
             socket_table,
             sleep_cancel,
