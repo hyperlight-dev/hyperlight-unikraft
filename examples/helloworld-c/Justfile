@@ -46,6 +46,10 @@ build:
     docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
     docker rm -f {{image}}-kernel-tmp
 
+# Build urunc-compatible OCI image (requires kernel to be built first)
+urunc-image: build
+    docker build --platform linux/amd64 -f urunc.Dockerfile -t hello-hyperlight-unikraft:latest .
+
 # Clean + rebuild everything
 rebuild: clean build rootfs
 
