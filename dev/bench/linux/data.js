@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779902708261,
+  "lastUpdate": 1780448904957,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1695,6 +1695,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/05c79a72845d88f1b9e5ae4b47e62991235716d4"
         },
         "date": 1779902707384,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 11,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 656,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f51e9da55253ac2fd8fd4b38f143519e101c9a08",
+          "message": "feat: add urunc-ready OCI image for helloworld-c (#89)\n\n* chore: sync Cargo.lock with 0.9.0 version bump\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* feat: add urunc-ready OCI image for helloworld-c\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* feat: add urunc-image recipe to helloworld-c Justfile\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* ci: publish hello-hyperlight-unikraft urunc image to GHCR\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* docs: add urunc usage guide for helloworld-c\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-06-02T17:59:24-07:00",
+          "tree_id": "9de1b230e086e70da61fa75cea7144d345baf0e3",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/f51e9da55253ac2fd8fd4b38f143519e101c9a08"
+        },
+        "date": 1780448903956,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
