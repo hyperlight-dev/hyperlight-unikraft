@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779903072822,
+  "lastUpdate": 1780449145256,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1617,6 +1617,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 832,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 656,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 664,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f51e9da55253ac2fd8fd4b38f143519e101c9a08",
+          "message": "feat: add urunc-ready OCI image for helloworld-c (#89)\n\n* chore: sync Cargo.lock with 0.9.0 version bump\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* feat: add urunc-ready OCI image for helloworld-c\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* feat: add urunc-image recipe to helloworld-c Justfile\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* ci: publish hello-hyperlight-unikraft urunc image to GHCR\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* docs: add urunc usage guide for helloworld-c\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-06-02T17:59:24-07:00",
+          "tree_id": "9de1b230e086e70da61fa75cea7144d345baf0e3",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/f51e9da55253ac2fd8fd4b38f143519e101c9a08"
+        },
+        "date": 1780449142518,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 294,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 749,
             "unit": "ms"
           },
           {
