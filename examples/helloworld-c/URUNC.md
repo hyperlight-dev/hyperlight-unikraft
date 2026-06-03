@@ -39,7 +39,7 @@ The OCI image contains just three files:
 - `/unikernel/initrd.cpio` — CPIO archive containing `/bin/hello` (static-PIE C binary)
 - `/urunc.json` — urunc annotations identifying this as a `hyperlight` + `unikraft` workload
 
-When urunc runs the image, it finds `hyperlight-unikraft` on the host, bind-mounts it along with `/dev/kvm` into an isolated rootfs, and exec's:
+When urunc runs the image, it finds `hyperlight-unikraft` on the host, bind-mounts it along with `/dev/kvm` into an isolated rootfs, and execs:
 
 ```
 hyperlight-unikraft /unikernel/kernel --initrd /unikernel/initrd.cpio --memory <bytes>
