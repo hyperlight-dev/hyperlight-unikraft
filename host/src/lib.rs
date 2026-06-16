@@ -2469,7 +2469,7 @@ impl Sandbox {
     }
 
     /// Load a snapshot with an initrd file re-mapped at the standard
-    /// guest VA (0xC000_0000). Required when the snapshot was taken
+    /// guest VA (0xFEF0_0000). Required when the snapshot was taken
     /// from a cpiovfs-backed guest whose VFS nodes point into the
     /// initrd region.
     pub fn from_snapshot_file_with_initrd<P: AsRef<Path>, I: AsRef<Path>>(
