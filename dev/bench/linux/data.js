@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781701421133,
+  "lastUpdate": 1781702718174,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1783,6 +1783,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/96021d926690dc850ce0c2c012b8c9e1711f5ab3"
         },
         "date": 1781701420679,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 11,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 656,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c2092b3a060658575402a1bfc2febffcf27ef462",
+          "message": "chore: bump version to 0.10.0 (#95)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-06-17T06:14:57-07:00",
+          "tree_id": "8e34f58736827c717da737cf216ab20c17dfe25f",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/c2092b3a060658575402a1bfc2febffcf27ef462"
+        },
+        "date": 1781702716929,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
