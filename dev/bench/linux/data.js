@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780448904957,
+  "lastUpdate": 1781701421133,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1739,6 +1739,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/f51e9da55253ac2fd8fd4b38f143519e101c9a08"
         },
         "date": 1780448903956,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 11,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 656,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "96021d926690dc850ce0c2c012b8c9e1711f5ab3",
+          "message": "fix: move INITRD_MAP_BASE past LAPIC MMIO region (#94)\n\n* fix: move INITRD_MAP_BASE past LAPIC MMIO region\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: update doc comment to reflect new INITRD_MAP_BASE address\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: bump ILCompiler to 9.0.17 to match SDK 9.0-alpine\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-06-17T05:53:20-07:00",
+          "tree_id": "5a628709541ea4231487204d66b253ea8fc70cf0",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/96021d926690dc850ce0c2c012b8c9e1711f5ab3"
+        },
+        "date": 1781701420679,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
