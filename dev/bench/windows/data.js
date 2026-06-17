@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780449145256,
+  "lastUpdate": 1781701782966,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1661,6 +1661,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 749,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 656,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 664,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "96021d926690dc850ce0c2c012b8c9e1711f5ab3",
+          "message": "fix: move INITRD_MAP_BASE past LAPIC MMIO region (#94)\n\n* fix: move INITRD_MAP_BASE past LAPIC MMIO region\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: update doc comment to reflect new INITRD_MAP_BASE address\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: bump ILCompiler to 9.0.17 to match SDK 9.0-alpine\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-06-17T05:53:20-07:00",
+          "tree_id": "5a628709541ea4231487204d66b253ea8fc70cf0",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/96021d926690dc850ce0c2c012b8c9e1711f5ab3"
+        },
+        "date": 1781701779636,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 340,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 948,
             "unit": "ms"
           },
           {
