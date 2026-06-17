@@ -7,6 +7,6 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="runtime.linux-musl-x64.Microsoft.DotNet.ILCompiler" Version="9.0.16" />
+    <PackageReference Include="runtime.linux-musl-x64.Microsoft.DotNet.ILCompiler" Version="9.0.17" />
   </ItemGroup>
 </Project>

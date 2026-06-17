@@ -2282,9 +2282,11 @@ impl Sandbox {
         let mut usbox = UninitializedSandbox::new(env, Some(config.sandbox_config()))?;
 
         // Map the initrd file (zero-copy via mmap)
-        // Place at 3 GiB — high enough to not overlap any reasonable
-        // primary shared memory region, within the 4 GiB identity map.
-        const INITRD_MAP_BASE: u64 = 0xC000_0000; // 3 GiB
+        // Place past the x86 LAPIC MMIO page (0xFEE0_0000) so that
+        // large initrds (>1 GiB) don't overlap it and trigger EEXIST
+        // from KVM_SET_USER_MEMORY_REGION on kernels where in-kernel
+        // IRQCHIP reserves that range.
+        const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
         if let Some(path) = initrd_path {
             usbox.map_file_cow(path, INITRD_MAP_BASE, Some("initrd"))?;
         }
@@ -2467,7 +2469,7 @@ impl Sandbox {
     }
 
     /// Load a snapshot with an initrd file re-mapped at the standard
-    /// guest VA (0xC000_0000). Required when the snapshot was taken
+    /// guest VA (0xFEF0_0000). Required when the snapshot was taken
     /// from a cpiovfs-backed guest whose VFS nodes point into the
     /// initrd region.
     pub fn from_snapshot_file_with_initrd<P: AsRef<Path>, I: AsRef<Path>>(
@@ -2527,7 +2529,7 @@ impl Sandbox {
 
         let mut inner = MultiUseSandbox::from_snapshot(arc.clone(), host_funcs, None)?;
 
-        const INITRD_MAP_BASE: u64 = 0xC000_0000;
+        const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
         if let Some(ref initrd_path) = initrd {
             inner.map_file_cow(initrd_path, INITRD_MAP_BASE, Some("initrd"))?;
         }
