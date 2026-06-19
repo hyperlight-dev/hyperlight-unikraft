@@ -61,6 +61,8 @@ jobs:
           - python-agent-driver
           - powershell
           - networking-py
+          - go-http
+          - dotnet-http
     steps:
       - uses: actions/checkout@v4
 
@@ -223,6 +225,14 @@ jobs:
           - example: networking-py
             args: "--port 8080 -- /echo_server_test.py"
             expect: "SUCCESS: bind\\+listen on port 8080 allowed"
+          - example: go-http
+            args: "--port 8080 -- /bin/server"
+            expect: "Hello from Hyperlight-Unikraft!"
+            http_port: "8080"
+          - example: dotnet-http
+            args: "--port 8080 -- /app/KestrelHyperlight"
+            expect: "Hello from Kestrel on Hyperlight!"
+            http_port: "8080"
     steps:
       - uses: actions/checkout@v4
 
@@ -338,6 +348,42 @@ jobs:
             mkdir -p "$mount_dir"
             mount_args="--mount $mount_dir:/host"
           fi
+          # HTTP server examples: start in background, poll, curl, kill.
+          http_port="${{ matrix.http_port }}"
+          if [ -n "$http_port" ]; then
+            mem_args=""
+            if [ -n "$memory" ]; then
+              mem_args="-m $memory"
+            fi
+            hyperlight-unikraft -q $mem_args "$kernel" --initrd "$cpio" ${{ matrix.args }} &
+            server_pid=$!
+            sleep 3
+            ready=0
+            for i in $(seq 1 30); do
+              if curl -s --max-time 10 "http://127.0.0.1:${http_port}" >/dev/null 2>&1; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "FAIL: server did not become ready within timeout"
+              kill "$server_pid" 2>/dev/null || true
+              exit 1
+            fi
+            response=$(curl -s --max-time 10 "http://127.0.0.1:${http_port}")
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+            echo "=== HTTP response ==="
+            echo "$response"
+            if echo "$response" | grep -qF "$expect"; then
+              echo "PASS: matched /$expect/"
+            else
+              echo "FAIL: did not match /$expect/"
+              exit 1
+            fi
+            exit 0
+          fi
           case "${{ matrix.driver }}" in
             multifn-test)
               cmd=(timeout 60 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/multifn-test "$kernel" "$cpio")
@@ -403,6 +449,8 @@ jobs:
           - python-agent-driver
           - powershell
           - networking-py
+          - go-http
+          - dotnet-http
     steps:
       - uses: actions/checkout@v4
 
@@ -554,6 +602,14 @@ jobs:
           - example: networking-py
             args: "--port 8080 -- /echo_server_test.py"
             expect: "SUCCESS: bind\\+listen on port 8080 allowed"
+          - example: go-http
+            args: "--port 8080 -- /bin/server"
+            expect: "Hello from Hyperlight-Unikraft!"
+            http_port: "8080"
+          - example: dotnet-http
+            args: "--port 8080 -- /app/KestrelHyperlight"
+            expect: "Hello from Kestrel on Hyperlight!"
+            http_port: "8080"
     steps:
       - uses: actions/checkout@v4
 
@@ -621,6 +677,54 @@ jobs:
           # must exit 0. Matches Linux semantics.
           $PSNativeCommandUseErrorActionPreference = $false
           $ErrorActionPreference = 'Continue'
+
+          # HTTP server examples: start in background, poll, curl, kill.
+          $httpPort = '${{ matrix.http_port }}'
+          if ($httpPort -ne '') {
+            $argList = @()
+            if ($runArgs -ne '') {
+              $argList = $runArgs.Split(' ') | Where-Object { $_ -ne '' }
+            }
+            $memArgs = @()
+            if ($memory -ne '') {
+              $memArgs = @('-m', $memory)
+            }
+            $stderrLog = Join-Path $env:RUNNER_TEMP 'hl-stderr.log'
+            $proc = Start-Process -FilePath 'hyperlight-unikraft' `
+              -ArgumentList (@('-q') + $memArgs + @($kernel, '--initrd', $cpio) + $argList) `
+              -PassThru -NoNewWindow -RedirectStandardError $stderrLog
+            # Give the server time to boot the unikernel and start listening
+            Start-Sleep -Seconds 5
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              try {
+                $null = Invoke-WebRequest -Uri "http://127.0.0.1:${httpPort}" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                $ready = $true
+                break
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if (-not $ready) {
+              Write-Host "FAIL: server did not become ready within timeout"
+              Write-Host "=== stderr (last 200 lines) ==="
+              Get-Content $stderrLog -Tail 200 -ErrorAction SilentlyContinue
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              exit 1
+            }
+            $raw = (Invoke-WebRequest -Uri "http://127.0.0.1:${httpPort}" -UseBasicParsing -TimeoutSec 10).Content
+            if ($raw -is [byte[]]) { $resp = [System.Text.Encoding]::UTF8.GetString($raw) } else { $resp = $raw }
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "=== HTTP response ==="
+            Write-Host $resp
+            if ($resp -match [regex]::Escape($expect)) {
+              Write-Host "PASS: matched /$expect/"
+              exit 0
+            } else {
+              Write-Host "FAIL: did not match /$expect/"
+              exit 1
+            }
+          }
 
           switch ($driver) {
             'multifn-test' {

@@ -1030,15 +1030,26 @@ fn register_internal_tools(
         ec.store(code, Ordering::Relaxed);
         Ok(serde_json::json!({}))
     });
+    // Create socket table early so __hl_sleep can poll sockets while sleeping.
+    let socket_table = network.map(|_| Arc::new(Mutex::new(SocketTable::new())));
+
     let sc = sleep_cancel.clone();
+    let st_for_sleep = socket_table.clone();
     tools.register("__hl_sleep", move |args| {
         let ns = args["ns"].as_u64().unwrap_or(0).min(MAX_SLEEP_NS);
         if ns > 0 {
+            if let Some(ref table) = st_for_sleep {
+                return hl_sleep_poll_sockets(&sc, table, ns);
+            }
             sc.wait(Duration::from_nanos(ns));
         }
         Ok(serde_json::json!({}))
     });
-    network.map(|policy| register_net_tools(tools, policy, listen_ports))
+
+    if let (Some(policy), Some(ref table)) = (network, &socket_table) {
+        register_net_tools(tools, policy, listen_ports, table.clone());
+    }
+    socket_table
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,14 +1616,291 @@ fn handle_net_getsockname(
     }
 }
 
+/// Poll host sockets for readiness using the real OS `poll()` syscall.
+///
+/// Input:  `{"fds": [{"fd": N, "events": N}, ...], "timeout_ms": N}`
+/// Output: `{"ready": [{"fd": N, "revents": N}, ...]}`
+///
+/// `events`/`revents` use standard POSIX poll flags (POLLIN=1, POLLOUT=4).
+#[cfg(unix)]
+fn handle_net_poll(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    use std::os::unix::io::AsRawFd;
+
+    let fds_val = args
+        .get("fds")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("net_poll: missing 'fds' array"))?;
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, libc::c_int::MAX as i64) as libc::c_int;
+
+    let tbl = table.lock().unwrap();
+    let mut pollfds: Vec<libc::pollfd> = Vec::new();
+    let mut guest_fds: Vec<u64> = Vec::new();
+    let mut ready = Vec::new();
+
+    for entry in fds_val {
+        let fd = entry
+            .get("fd")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("net_poll: entry missing 'fd'"))?;
+        let raw_events = entry.get("events").and_then(|v| v.as_i64()).unwrap_or(0);
+        if !(0..=i16::MAX as i64).contains(&raw_events) {
+            return Err(anyhow!("net_poll: events {raw_events} out of i16 range"));
+        }
+        let events = raw_events as i16;
+        if let Ok(sock) = tbl.get_socket(fd) {
+            pollfds.push(libc::pollfd {
+                fd: sock.as_raw_fd(),
+                events,
+                revents: 0,
+            });
+            guest_fds.push(fd);
+        } else {
+            ready.push(json!({ "fd": fd, "revents": libc::POLLNVAL as i64 }));
+        }
+    }
+    drop(tbl);
+
+    if pollfds.is_empty() {
+        return Ok(json!({"ready": ready}));
+    }
+
+    let ret = unsafe {
+        libc::poll(
+            pollfds.as_mut_ptr(),
+            pollfds.len() as libc::nfds_t,
+            timeout_ms,
+        )
+    };
+
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(anyhow!("net_poll: poll() failed: {err}"));
+        }
+    }
+
+    for (i, pfd) in pollfds.iter().enumerate() {
+        if pfd.revents != 0 {
+            ready.push(json!({
+                "fd": guest_fds[i],
+                "revents": pfd.revents as i64,
+            }));
+        }
+    }
+    Ok(json!({"ready": ready}))
+}
+
+#[cfg(windows)]
+fn handle_net_poll(
+    table: &Mutex<SocketTable>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAPoll, POLLERR as W_POLLERR, POLLHUP as W_POLLHUP, POLLNVAL as W_POLLNVAL, POLLRDNORM,
+        POLLWRNORM, WSAPOLLFD,
+    };
+
+    const POSIX_POLLIN: i16 = 0x0001;
+    const POSIX_POLLOUT: i16 = 0x0004;
+    const POSIX_POLLERR: i16 = 0x0008;
+    const POSIX_POLLHUP: i16 = 0x0010;
+    const POSIX_POLLNVAL: i16 = 0x0020;
+
+    fn posix_to_win(posix: i16) -> i16 {
+        let mut win: i16 = 0;
+        if posix & POSIX_POLLIN != 0 {
+            win |= POLLRDNORM;
+        }
+        if posix & POSIX_POLLOUT != 0 {
+            win |= POLLWRNORM;
+        }
+        win
+    }
+
+    fn win_to_posix(win: i16) -> i16 {
+        let mut posix: i16 = 0;
+        if win & POLLRDNORM != 0 {
+            posix |= POSIX_POLLIN;
+        }
+        if win & POLLWRNORM != 0 {
+            posix |= POSIX_POLLOUT;
+        }
+        if win & W_POLLERR != 0 {
+            posix |= POSIX_POLLERR;
+        }
+        if win & W_POLLHUP != 0 {
+            posix |= POSIX_POLLHUP;
+        }
+        if win & W_POLLNVAL != 0 {
+            posix |= POSIX_POLLNVAL;
+        }
+        posix
+    }
+
+    let fds_val = args
+        .get("fds")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("net_poll: missing 'fds' array"))?;
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, i32::MAX as i64) as i32;
+
+    let tbl = table.lock().unwrap();
+    let mut pollfds: Vec<WSAPOLLFD> = Vec::new();
+    let mut guest_fds: Vec<u64> = Vec::new();
+    let mut ready = Vec::new();
+
+    for entry in fds_val {
+        let fd = entry
+            .get("fd")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("net_poll: entry missing 'fd'"))?;
+        let raw_events = entry.get("events").and_then(|v| v.as_i64()).unwrap_or(0);
+        if !(0..=i16::MAX as i64).contains(&raw_events) {
+            return Err(anyhow!("net_poll: events {raw_events} out of i16 range"));
+        }
+        let events = posix_to_win(raw_events as i16);
+        if let Ok(sock) = tbl.get_socket(fd) {
+            pollfds.push(WSAPOLLFD {
+                fd: sock.as_raw_socket() as usize,
+                events,
+                revents: 0,
+            });
+            guest_fds.push(fd);
+        } else {
+            ready.push(json!({ "fd": fd, "revents": POSIX_POLLNVAL as i64 }));
+        }
+    }
+    drop(tbl);
+
+    if pollfds.is_empty() {
+        return Ok(json!({"ready": ready}));
+    }
+
+    let ret = unsafe { WSAPoll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout_ms) };
+
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow!("net_poll: WSAPoll() failed: {err}"));
+    }
+
+    for (i, pfd) in pollfds.iter().enumerate() {
+        if pfd.revents != 0 {
+            ready.push(json!({
+                "fd": guest_fds[i],
+                "revents": win_to_posix(pfd.revents) as i64,
+            }));
+        }
+    }
+    Ok(json!({"ready": ready}))
+}
+
+/// `__hl_sleep` variant: poll all sockets in the table while sleeping.
+/// Returns early if any socket becomes ready.
+#[cfg(unix)]
+fn hl_sleep_poll_sockets(
+    _sc: &SleepCancel,
+    table: &Mutex<SocketTable>,
+    ns: u64,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    use std::os::unix::io::AsRawFd;
+
+    let tbl = table.lock().unwrap();
+    let mut pollfds: Vec<libc::pollfd> = tbl
+        .sockets
+        .values()
+        .map(|hs| libc::pollfd {
+            fd: hs.socket.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLOUT | libc::POLLERR,
+            revents: 0,
+        })
+        .collect();
+    drop(tbl);
+
+    if pollfds.is_empty() {
+        _sc.wait(Duration::from_nanos(ns));
+        return Ok(json!({}));
+    }
+
+    let timeout_ms = ((ns / 1_000_000) as libc::c_int).clamp(1, 30_000);
+    let ret = unsafe {
+        libc::poll(
+            pollfds.as_mut_ptr(),
+            pollfds.len() as libc::nfds_t,
+            timeout_ms,
+        )
+    };
+
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(anyhow!("hl_sleep poll failed: {err}"));
+        }
+    }
+
+    Ok(json!({"socket_ready": ret > 0}))
+}
+
+#[cfg(windows)]
+fn hl_sleep_poll_sockets(
+    _sc: &SleepCancel,
+    table: &Mutex<SocketTable>,
+    ns: u64,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, POLLWRNORM, WSAPOLLFD};
+
+    let tbl = table.lock().unwrap();
+    let mut pollfds: Vec<WSAPOLLFD> = tbl
+        .sockets
+        .values()
+        .map(|hs| WSAPOLLFD {
+            fd: hs.socket.as_raw_socket() as usize,
+            // POLLERR is output-only on Windows; setting it in events causes WSAEINVAL
+            events: (POLLRDNORM | POLLWRNORM) as i16,
+            revents: 0,
+        })
+        .collect();
+    drop(tbl);
+
+    if pollfds.is_empty() {
+        _sc.wait(Duration::from_nanos(ns));
+        return Ok(json!({}));
+    }
+
+    let timeout_ms = ((ns / 1_000_000) as i32).clamp(1, 30_000);
+    let ret = unsafe { WSAPoll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout_ms) };
+
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow!("hl_sleep WSAPoll failed: {err}"));
+    }
+
+    Ok(json!({"socket_ready": ret > 0}))
+}
+
 // ---------------------------------------------------------------------------
 
 fn register_net_tools(
     tools: &mut ToolRegistry,
     policy: &NetworkPolicy,
     listen_ports: Option<&ListenPorts>,
-) -> Arc<Mutex<SocketTable>> {
-    let table = Arc::new(Mutex::new(SocketTable::new()));
+    table: Arc<Mutex<SocketTable>>,
+) {
     let policy = Arc::new(policy.clone());
 
     let t = table.clone();
@@ -1678,7 +1966,10 @@ fn register_net_tools(
         handle_net_getsockname(&t, &args)
     });
 
-    table
+    {
+        let t = table.clone();
+        tools.register("net_poll", move |args| handle_net_poll(&t, &args));
+    }
 }
 
 /// Routes incoming fs_* tool calls to the matching `FsSandbox` by
@@ -3594,7 +3885,8 @@ mod tests {
     fn net_getsockopt_returns_correct_type_for_dgram() {
         let mut reg = ToolRegistry::new();
         let policy = NetworkPolicy::AllowAll;
-        register_net_tools(&mut reg, &policy, None);
+        let table = Arc::new(Mutex::new(SocketTable::new()));
+        register_net_tools(&mut reg, &policy, None, table);
 
         let req = br#"{"name":"net_socket","args":{"family":2,"type":2}}"#;
         let resp = std::str::from_utf8(&reg.dispatch(req)).unwrap().to_string();
@@ -3695,7 +3987,8 @@ mod tests {
 
         let mut reg = ToolRegistry::new();
         let policy = NetworkPolicy::AllowAll;
-        register_net_tools(&mut reg, &policy, None);
+        let table = Arc::new(Mutex::new(SocketTable::new()));
+        register_net_tools(&mut reg, &policy, None, table);
 
         // Create a socket
         let req = br#"{"name":"net_socket","args":{"family":2,"type":2}}"#;
