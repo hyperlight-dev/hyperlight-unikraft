@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781703058994,
+  "lastUpdate": 1781828170364,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1749,6 +1749,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 887,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 656,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 664,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4460ae2c37fa4db29331db11eb56efcf1004b66d",
+          "message": "Merge pull request #97 from hyperlight-dev/feat/networking-examples\n\nfeat: add Go and .NET Kestrel HTTP server examples",
+          "timestamp": "2026-06-18T17:03:38-07:00",
+          "tree_id": "b191c69a2c060b511b9f05cbb3cb5834c50bcb3f",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/4460ae2c37fa4db29331db11eb56efcf1004b66d"
+        },
+        "date": 1781828168388,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 301,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 768,
             "unit": "ms"
           },
           {
