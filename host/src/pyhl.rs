@@ -4,7 +4,7 @@
 //! Two pieces:
 //!
 //! - [`install`] — one-time: take a source image (or a GHCR pull) and
-//!   materialize `kernel`, `initrd.cpio`, and a warmed-up `snapshot.hls`
+//!   materialize `kernel`, `initrd.cpio`, and a warmed-up `snapshot/`
 //!   in the image home.
 //!
 //! - [`Runtime`] — the steady-state object: holds an open
@@ -80,14 +80,14 @@ pub const KERNEL_FILE: &str = "kernel";
 /// Standard file names inside an image home.
 pub const INITRD_FILE: &str = "initrd.cpio";
 /// Standard file names inside an image home.
-pub const SNAPSHOT_FILE: &str = "snapshot.hls";
+pub const SNAPSHOT_DIR: &str = "snapshot";
 /// Standard file names inside an image home.
 pub const VERSION_FILE: &str = "VERSION";
 
 /// Configuration for [`install`].
 pub struct InstallOptions<'a> {
     /// Target directory. Files are written at
-    /// `{home}/{kernel,initrd.cpio,snapshot.hls,VERSION}`.
+    /// `{home}/{kernel,initrd.cpio,snapshot/,VERSION}`.
     pub home: &'a Path,
 
     /// Where to get the image from.
@@ -146,10 +146,10 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
     let home = opts.home.to_path_buf();
     let dst_kernel = home.join(KERNEL_FILE);
     let dst_initrd = home.join(INITRD_FILE);
-    let dst_snapshot = home.join(SNAPSHOT_FILE);
+    let dst_snapshot = home.join(SNAPSHOT_DIR);
     let dst_version = home.join(VERSION_FILE);
 
-    let already = dst_kernel.is_file() && dst_initrd.is_file() && dst_snapshot.is_file();
+    let already = dst_kernel.is_file() && dst_initrd.is_file() && dst_snapshot.is_dir();
     if already && !opts.force {
         return Ok(InstallReport {
             home,
@@ -197,7 +197,7 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
     {
         let mut builder = Sandbox::builder(&dst_kernel)
             .initrd_file(&dst_initrd)
-            .heap_size(5 * 512 * 1024 * 1024);
+            .heap_size(1280 * 1024 * 1024);
         for p in opts.mounts {
             builder = builder.preopen(p.clone());
         }
@@ -255,7 +255,7 @@ pub struct Runtime {
 
 impl Runtime {
     /// Open a runtime against an existing install. Looks for
-    /// `{home}/snapshot.hls` and mmap-loads it. `mounts` specify host
+    /// `{home}/snapshot/` and mmap-loads it. `mounts` specify host
     /// directories to expose under the guest paths that were baked in
     /// at `install` time. `network` enables guest networking with the
     /// given policy (`None` = disabled). `listen_ports` controls which
@@ -267,8 +267,8 @@ impl Runtime {
         listen_ports: Option<&crate::ListenPorts>,
     ) -> Result<Self> {
         default_surrogate_count();
-        let snap = home.join(SNAPSHOT_FILE);
-        if !snap.is_file() {
+        let snap = home.join(SNAPSHOT_DIR);
+        if !snap.is_dir() {
             bail!(
                 "no snapshot at {} — run pyhl::install first",
                 snap.display()

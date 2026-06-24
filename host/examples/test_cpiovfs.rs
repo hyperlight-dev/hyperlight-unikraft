@@ -21,14 +21,9 @@ fn main() -> anyhow::Result<()> {
         sbox.snapshot_now()?;
         eprintln!("  snapshot OK");
 
-        let snap_path = "/tmp/cpiovfs_snapshot.hls";
+        let snap_path = "/tmp/cpiovfs_snapshot";
         sbox.save_snapshot(snap_path)?;
-        let snap_size = std::fs::metadata(snap_path)?.len();
-        eprintln!(
-            "  snapshot size: {} MiB ({} bytes)",
-            snap_size / 1024 / 1024,
-            snap_size
-        );
+        eprintln!("  snapshot saved to {snap_path}");
 
         sbox.restore()?;
         eprintln!("  restore OK");

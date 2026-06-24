@@ -3,7 +3,7 @@
 //!
 //! Usage: `cargo run --release --example pyhl_as_library -- <code>`
 //!
-//! Assumes `pyhl setup` has already run and `.pyhl/snapshot.hls` exists
+//! Assumes `pyhl setup` has already run and `.pyhl/snapshot/` exists
 //! in the current directory (or override with `PYHL_HOME`).
 
 use hyperlight_unikraft::{pyhl, Preopen};

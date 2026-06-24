@@ -302,7 +302,7 @@ struct RunArgs {
 const CWD_HOME: &str = ".pyhl";
 const KERNEL_FILE: &str = "kernel";
 const INITRD_FILE: &str = "initrd.cpio";
-const SNAPSHOT_FILE: &str = "snapshot.hls";
+const SNAPSHOT_DIR: &str = "snapshot";
 const VERSION_FILE: &str = "VERSION";
 
 /// Resolve the image home to use. Tries (in order): explicit, PYHL_HOME,
@@ -368,10 +368,10 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
 
     let dst_kernel = home.join(KERNEL_FILE);
     let dst_initrd = home.join(INITRD_FILE);
-    let dst_snapshot = home.join(SNAPSHOT_FILE);
+    let dst_snapshot = home.join(SNAPSHOT_DIR);
     let dst_version = home.join(VERSION_FILE);
 
-    if image_installed(&home) && dst_snapshot.is_file() && !args.force {
+    if image_installed(&home) && dst_snapshot.is_dir() && !args.force {
         eprintln!(
             "pyhl: image already installed at {} (use --force to overwrite)",
             home.display()
@@ -451,7 +451,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
     {
         let mut builder = Sandbox::builder(&dst_kernel)
             .initrd_file(&dst_initrd)
-            .heap_size(5 * 512 * 1024 * 1024);
+            .heap_size(1280 * 1024 * 1024);
         for p in &setup_preopens {
             builder = builder.preopen(p.clone());
         }
@@ -494,49 +494,12 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         dst_initrd.display(),
         mib(&dst_initrd)
     );
-    eprintln!(
-        "  snapshot: {} ({} MiB on disk, {} MiB apparent)",
-        dst_snapshot.display(),
-        disk_mib(&dst_snapshot),
-        mib(&dst_snapshot)
-    );
+    eprintln!("  snapshot: {}", dst_snapshot.display());
     Ok(())
 }
 
 fn mib(p: &Path) -> u64 {
     fs::metadata(p).map(|m| m.len() / 1024 / 1024).unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn disk_mib(p: &Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    fs::metadata(p)
-        .map(|m| m.blocks() * 512 / 1024 / 1024)
-        .unwrap_or_else(|_| mib(p))
-}
-
-#[cfg(windows)]
-fn disk_mib(p: &Path) -> u64 {
-    use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = p
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut high: u32 = 0;
-    let low = unsafe {
-        windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW(wide.as_ptr(), &mut high)
-    };
-    if low == u32::MAX {
-        return mib(p);
-    }
-    let bytes = ((high as u64) << 32) | (low as u64);
-    bytes / 1024 / 1024
-}
-
-#[cfg(not(any(unix, windows)))]
-fn disk_mib(p: &Path) -> u64 {
-    mib(p)
 }
 
 /// Lightweight timestamp (seconds since epoch in ISO-8601-ish) so we don't
@@ -563,17 +526,13 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     };
 
     let home = resolve_home(args.dest.as_deref(), ResolveMode::ForRun)?;
-    let snapshot = home.join(SNAPSHOT_FILE);
+    let snapshot = home.join(SNAPSHOT_DIR);
 
-    // Fast path: `pyhl setup` already warmed up a sandbox, ran
-    // Py_Initialize + preloaded modules, captured the state, and
-    // persisted it to snapshot.hls. Here we mmap that file back and
-    // instantiate a sandbox directly — no kernel boot, no Python init.
-    if !snapshot.is_file() {
+    if !snapshot.is_dir() {
         return Err(anyhow!(
             "no warmed-up snapshot at {}.\n\
              run `pyhl setup` first (or `pyhl setup --force` if you have\n\
-             an older install without the snapshot file).",
+             an older install without the snapshot).",
             snapshot.display()
         ));
     }
