@@ -5,7 +5,7 @@
 //! (filesystem mounts, network policies, exit codes, hermetic rewinds).
 //!
 //! All tests self-skip if the pyhl image is not installed (no snapshot at
-//! `.pyhl/snapshot.hls`) or if no hypervisor is available. Run `pyhl setup`
+//! `.pyhl/snapshot/`) or if no hypervisor is available. Run `pyhl setup`
 //! to populate the image before running these tests.
 
 use hyperlight_unikraft::pyhl::Runtime;
@@ -37,12 +37,12 @@ fn pyhl_home() -> Option<PathBuf> {
         .parent()
         .unwrap()
         .join(".pyhl");
-    if workspace.join("snapshot.hls").is_file() {
+    if workspace.join("snapshot").is_dir() {
         return Some(workspace);
     }
     // Check user-level install
     if let Some(home) = dirs_or_default() {
-        if home.join("snapshot.hls").is_file() {
+        if home.join("snapshot").is_dir() {
             return Some(home);
         }
     }
