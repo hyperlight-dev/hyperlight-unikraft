@@ -2,8 +2,8 @@ specification: '0.6'
 name: dotnet-nativeaot-hyperlight
 
 unikraft:
-  source: https://github.com/unikraft/unikraft.git
-  version: plat-hyperlight
+  source: https://github.com/danbugs/unikraft.git
+  version: perf/demand-page-heap
   kconfig:
     CONFIG_PLAT_HYPERLIGHT: 'y'
     CONFIG_PAGING: 'n'
