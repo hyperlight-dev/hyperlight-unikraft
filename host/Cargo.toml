@@ -28,7 +28,7 @@ path = "src/bin/pyhl.rs"
 
 [dependencies]
 # danbugs/hyperlight feat/whp-no-surrogate — testing runtime no-surrogate mode.
-hyperlight-host = { git = "https://github.com/danbugs/hyperlight", rev = "4a0c1cdc", features = ["executable_heap", "hw-interrupts"] }
+hyperlight-host = { git = "https://github.com/danbugs/hyperlight", rev = "91fcb14c", features = ["executable_heap", "hw-interrupts"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 serde_json = "1"
