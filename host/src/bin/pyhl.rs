@@ -228,6 +228,13 @@ struct SetupArgs {
     /// entirely, using VirtualAlloc + WHvMapGpaRange (single-VM-per-process).
     #[arg(long, value_name = "N")]
     max_surrogates: Option<u32>,
+
+    /// Enable the host-pip overlay: creates a `packages/` directory in the
+    /// image home and mounts it into the guest at `/host/packages`. This
+    /// allows `pyhl run --pip <pkg>` to install packages on the host and
+    /// make them available inside the guest.
+    #[arg(long)]
+    host_pip: bool,
 }
 
 #[derive(Args)]
@@ -305,7 +312,20 @@ struct RunArgs {
     /// entirely, using VirtualAlloc + WHvMapGpaRange (single-VM-per-process).
     #[arg(long, value_name = "N")]
     max_surrogates: Option<u32>,
+
+    /// Install pip packages on the host and make them available inside the
+    /// guest. Runs `pip install --target <home>/packages/ <PKG>` on the
+    /// host, then mounts that directory at `/host/packages` and prepends
+    /// `sys.path.insert(0, '/host/packages')` to the user code.
+    ///
+    /// Requires `pyhl setup --host-pip` to have been run first (bakes the
+    /// `/host/packages` mount point into the snapshot).
+    #[arg(long = "pip", value_name = "PKG")]
+    pip: Vec<String>,
 }
+
+const PACKAGES_DIR: &str = "packages";
+const PACKAGES_GUEST_PATH: &str = "/host/packages";
 
 // -- image-home resolution ----------------------------------------------------
 
@@ -445,11 +465,20 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
     // given guest path(s) during boot. The guest-side mount point is
     // baked into the snapshot's memory image; at `pyhl run --mount` the
     // host_dir side is remappable but the guest path is fixed.
-    let setup_preopens: Vec<Preopen> = args
+    let mut setup_preopens: Vec<Preopen> = args
         .mounts
         .iter()
         .map(|m| parse_mount(m))
         .collect::<Result<_>>()?;
+
+    if args.host_pip {
+        let pkg_dir = home.join(PACKAGES_DIR);
+        fs::create_dir_all(&pkg_dir)
+            .with_context(|| format!("create packages dir {}", pkg_dir.display()))?;
+        setup_preopens.push(Preopen::new(&pkg_dir, PACKAGES_GUEST_PATH)?);
+        eprintln!("pyhl: host-pip overlay enabled ({})", pkg_dir.display());
+    }
+
     let listen_ports = build_listen_ports(&args.port);
     let network = build_network_policy(
         args.net,
@@ -551,13 +580,43 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         ));
     }
 
+    // If --pip was passed, install the packages on the host first.
+    let has_pip = !args.pip.is_empty();
+    if has_pip {
+        let pkg_dir = home.join(PACKAGES_DIR);
+        if !pkg_dir.is_dir() {
+            bail!(
+                "packages directory {} does not exist.\n\
+                 run `pyhl setup --host-pip --force` first to enable the host-pip overlay.",
+                pkg_dir.display()
+            );
+        }
+        eprintln!("pyhl: installing {} on host…", args.pip.join(", "));
+        let status = std::process::Command::new("pip")
+            .args(["install", "--target"])
+            .arg(&pkg_dir)
+            .args(&args.pip)
+            .args(["--no-cache-dir", "--quiet"])
+            .status()
+            .context("spawn pip — is pip installed on this host?")?;
+        if !status.success() {
+            bail!("pip install failed (exit {})", status.code().unwrap_or(-1));
+        }
+    }
+
     // If --mount was passed, parse the specs and register fs_* host
     // handlers on the loaded sandbox so guest file I/O routes back here.
-    let run_preopens: Vec<Preopen> = args
+    let mut run_preopens: Vec<Preopen> = args
         .mounts
         .iter()
         .map(|m| parse_mount(m))
         .collect::<Result<_>>()?;
+
+    if has_pip {
+        let pkg_dir = home.join(PACKAGES_DIR);
+        run_preopens.push(Preopen::new(&pkg_dir, PACKAGES_GUEST_PATH)?);
+    }
+
     let listen_ports = build_listen_ports(&args.port);
     let network = build_network_policy(
         args.net,
@@ -600,11 +659,17 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         // asked for bit-for-bit reproducibility across calls. Every run
         // picks up a new seed so np.random.randint / random.random
         // match python3's "different result every invocation" behavior.
-        let payload = if args.deterministic {
-            code.clone()
-        } else {
-            let mut full = String::with_capacity(code.len() + 256);
-            full.push_str(&reseed_prelude());
+        let payload = {
+            let mut full = String::with_capacity(code.len() + 512);
+            if has_pip {
+                full.push_str(&format!(
+                    "import sys\nif '{}' not in sys.path:\n    sys.path.insert(0, '{}')\n",
+                    PACKAGES_GUEST_PATH, PACKAGES_GUEST_PATH
+                ));
+            }
+            if !args.deterministic {
+                full.push_str(&reseed_prelude());
+            }
             full.push_str(&code);
             full
         };
