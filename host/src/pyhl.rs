@@ -404,6 +404,38 @@ impl Runtime {
         }
     }
 
+    /// Execute a string of Python code **without** restoring the
+    /// snapshot first. Python state (globals, imports, variables)
+    /// persists across consecutive `run_code_stateful` calls on the
+    /// same `Runtime` instance.
+    ///
+    /// The very first call on a freshly-constructed `Runtime` still
+    /// performs the initial restore (the sandbox is in the raw
+    /// snapshot-loaded state and needs one restore to become runnable).
+    /// All subsequent calls skip the restore entirely.
+    ///
+    /// This is the building block for stateful / REPL-like sessions
+    /// where a sequence of exec calls should share a single Python
+    /// interpreter lifetime.
+    pub fn run_code_stateful(&mut self, code: &str) -> Result<RunTiming> {
+        let mut t = RunTiming::default();
+        // The very first call after construction needs the initial
+        // restore to transition from "snapshot loaded" to "runnable".
+        if self.first_run {
+            let tr = Instant::now();
+            self.sandbox.restore()?;
+            t.restore_ms = tr.elapsed().as_secs_f64() * 1000.0;
+            self.first_run = false;
+        }
+        self.sandbox.reset_exit_code();
+
+        let tc = Instant::now();
+        let _: () = self.sandbox.call_named("run", code.to_string())?;
+        t.call_ms = tc.elapsed().as_secs_f64() * 1000.0;
+        t.exit_code = self.sandbox.last_exit_code();
+        Ok(t)
+    }
+
     /// Convenience: read a file and run its contents.
     pub fn run_script(&mut self, path: &Path) -> Result<RunTiming> {
         let code =
