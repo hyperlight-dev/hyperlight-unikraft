@@ -43,6 +43,11 @@ struct Args {
     #[arg(long)]
     enable_tools: bool,
 
+    /// Maximum surrogate processes (Windows only). 0 disables surrogates
+    /// entirely, using VirtualAlloc + WHvMapGpaRange (single-VM-per-process).
+    #[arg(long, value_name = "N")]
+    max_surrogates: Option<u32>,
+
     /// Preopen a host directory for the guest's sandboxed filesystem.
     ///
     /// Syntax: `HOST_DIR[:GUEST_PATH]`. When `GUEST_PATH` is omitted the
@@ -136,6 +141,8 @@ fn argparse_escape(code: &str) -> String {
 fn main() -> Result<()> {
     let t0 = std::time::Instant::now();
     let args = Args::parse();
+
+    hyperlight_unikraft::pyhl::configure_surrogates(args.max_surrogates);
 
     let heap_size = parse_memory(&args.memory)?;
     let stack_size = parse_memory(&args.stack)?;

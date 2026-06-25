@@ -223,6 +223,11 @@ struct SetupArgs {
     /// Repeatable: `--port 8080 --port 3000`.
     #[arg(long, value_name = "PORT")]
     port: Vec<u16>,
+
+    /// Maximum surrogate processes (Windows only). 0 disables surrogates
+    /// entirely, using VirtualAlloc + WHvMapGpaRange (single-VM-per-process).
+    #[arg(long, value_name = "N")]
+    max_surrogates: Option<u32>,
 }
 
 #[derive(Args)]
@@ -295,6 +300,11 @@ struct RunArgs {
     /// you want bit-for-bit reproducibility across calls).
     #[arg(long = "deterministic")]
     deterministic: bool,
+
+    /// Maximum surrogate processes (Windows only). 0 disables surrogates
+    /// entirely, using VirtualAlloc + WHvMapGpaRange (single-VM-per-process).
+    #[arg(long, value_name = "N")]
+    max_surrogates: Option<u32>,
 }
 
 // -- image-home resolution ----------------------------------------------------
@@ -364,6 +374,8 @@ fn image_installed(home: &Path) -> bool {
 // -- `setup` ------------------------------------------------------------------
 
 fn cmd_setup(args: SetupArgs) -> Result<()> {
+    hyperlight_unikraft::pyhl::configure_surrogates(args.max_surrogates);
+
     let home = resolve_home(args.dest.as_deref(), ResolveMode::ForSetup)?;
 
     let dst_kernel = home.join(KERNEL_FILE);
@@ -516,6 +528,8 @@ fn now_iso8601() -> String {
 // -- `run` --------------------------------------------------------------------
 
 fn cmd_run(args: RunArgs) -> Result<()> {
+    hyperlight_unikraft::pyhl::configure_surrogates(args.max_surrogates);
+
     let code = match (args.script.as_deref(), args.code.as_deref()) {
         (Some(_), Some(_)) => bail!("pass either <SCRIPT> or -c <CODE>, not both"),
         (Some(p), None) => {
@@ -668,7 +682,6 @@ fn fresh_seed() -> u128 {
 // -- main ---------------------------------------------------------------------
 
 fn main() -> Result<()> {
-    hyperlight_unikraft::pyhl::default_surrogate_count();
     let cli = Cli::parse();
     match cli.cmd {
         Command::Setup(args) => cmd_setup(args),

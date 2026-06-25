@@ -49,30 +49,51 @@ use std::time::Instant;
 
 use crate::{Preopen, Sandbox};
 
-/// Set `HYPERLIGHT_INITIAL_SURROGATES=1` if unset (Windows only).
+/// Configure surrogate process count (Windows only).
 ///
 /// On Windows, Hyperlight pre-spawns surrogate processes (one per
 /// potential sandbox). The default count is 512, each costing ~7 ms
-/// of `CreateProcessA` latency. For pyhl's single-sandbox usage,
-/// pinning to 1 avoids ~3.5 s of wasted startup.
+/// of `CreateProcessA` latency.
+///
+/// When `max_surrogates` is `Some(0)`, surrogates are fully disabled:
+/// the host uses `VirtualAlloc` + `WHvMapGpaRange` directly
+/// (single-VM-per-process mode).
+///
+/// When `max_surrogates` is `None`, defaults to 1 (suitable for
+/// pyhl's single-sandbox usage, avoids ~3.5 s of wasted startup).
 ///
 /// # Safety
 ///
 /// Must be called from the main thread before spawning any additional
 /// threads or creating any `Sandbox`. Violating this is undefined
 /// behavior due to `std::env::set_var` not being thread-safe.
-pub fn default_surrogate_count() {
+pub fn configure_surrogates(max_surrogates: Option<u32>) {
     #[cfg(target_os = "windows")]
     {
-        if std::env::var_os("HYPERLIGHT_INITIAL_SURROGATES").is_none() {
-            // SAFETY: Called from main thread before any sandbox or
-            // thread pool is created. The binary entry points (cmd_run,
-            // cmd_setup) call this first.
-            unsafe {
-                std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", "1");
+        // SAFETY: Called from main thread before any sandbox or
+        // thread pool is created. The binary entry points (cmd_run,
+        // cmd_setup) call this first.
+        unsafe {
+            match max_surrogates {
+                Some(n) => {
+                    std::env::set_var("HYPERLIGHT_MAX_SURROGATES", n.to_string());
+                    std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", n.to_string());
+                }
+                None => {
+                    if std::env::var_os("HYPERLIGHT_INITIAL_SURROGATES").is_none() {
+                        std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", "1");
+                    }
+                }
             }
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = max_surrogates;
+}
+
+/// Deprecated: use [`configure_surrogates`] instead.
+pub fn default_surrogate_count() {
+    configure_surrogates(None);
 }
 
 /// Standard file names inside an image home.
@@ -105,6 +126,11 @@ pub struct InstallOptions<'a> {
     /// Ports the guest may bind to for inbound connections.
     /// `None` means outbound-only (when networking is enabled).
     pub listen_ports: Option<&'a crate::ListenPorts>,
+
+    /// Maximum surrogate processes on Windows. `Some(0)` disables
+    /// surrogates entirely (single-VM-per-process). `None` uses the
+    /// default (1 for pyhl).
+    pub max_surrogates: Option<u32>,
 
     /// Overwrite an existing install.
     pub force: bool,
@@ -142,7 +168,7 @@ pub struct InstallReport {
 /// are local file copies. See [`InstallSource`] for each variant's
 /// semantics.
 pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
-    default_surrogate_count();
+    configure_surrogates(opts.max_surrogates);
     let home = opts.home.to_path_buf();
     let dst_kernel = home.join(KERNEL_FILE);
     let dst_initrd = home.join(INITRD_FILE);
@@ -260,13 +286,16 @@ impl Runtime {
     /// at `install` time. `network` enables guest networking with the
     /// given policy (`None` = disabled). `listen_ports` controls which
     /// ports the guest may bind to (`None` = outbound-only).
+    /// `max_surrogates` controls surrogate process count on Windows
+    /// (`Some(0)` disables them entirely, `None` defaults to 1).
     pub fn new(
         home: &Path,
         mounts: &[Preopen],
         network: Option<&crate::NetworkPolicy>,
         listen_ports: Option<&crate::ListenPorts>,
+        max_surrogates: Option<u32>,
     ) -> Result<Self> {
-        default_surrogate_count();
+        configure_surrogates(max_surrogates);
         let snap = home.join(SNAPSHOT_DIR);
         if !snap.is_dir() {
             bail!(

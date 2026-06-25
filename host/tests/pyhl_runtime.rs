@@ -71,7 +71,7 @@ fn setup() -> Option<(PathBuf, Runtime)> {
         return None;
     }
     let home = pyhl_home()?;
-    let rt = Runtime::new(&home, &[], None, None).ok()?;
+    let rt = Runtime::new(&home, &[], None, None, None).ok()?;
     Some((home, rt))
 }
 
@@ -81,7 +81,7 @@ fn setup_with_net(policy: NetworkPolicy) -> Option<Runtime> {
         return None;
     }
     let home = pyhl_home()?;
-    Runtime::new(&home, &[], Some(&policy), None).ok()
+    Runtime::new(&home, &[], Some(&policy), None, None).ok()
 }
 
 fn setup_with_mount(preopen: Preopen) -> Option<Runtime> {
@@ -90,7 +90,7 @@ fn setup_with_mount(preopen: Preopen) -> Option<Runtime> {
         return None;
     }
     let home = pyhl_home()?;
-    Runtime::new(&home, &[preopen], None, None).ok()
+    Runtime::new(&home, &[preopen], None, None, None).ok()
 }
 
 // ---------------------------------------------------------------------------
