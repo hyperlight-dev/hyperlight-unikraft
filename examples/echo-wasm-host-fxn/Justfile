@@ -1,0 +1,19 @@
+# echo-wasm-host-fxn
+#
+# Builds a tiny WASIp1 command module that can be registered with:
+#   --tool echo=target/wasm32-wasip1/release/echo-wasm-host-fxn.wasm
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+
+target := "wasm32-wasip1"
+wasm := "target/wasm32-wasip1/release/echo-wasm-host-fxn.wasm"
+
+build:
+    rustup target add {{target}}
+    cargo build --release --target {{target}}
+
+path:
+    @echo {{wasm}}
+
+clean:
+    cargo clean

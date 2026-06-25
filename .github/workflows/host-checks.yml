@@ -60,6 +60,9 @@ jobs:
       - name: Cargo clippy (warnings are errors)
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: Cargo clippy with Wasm host tools
+        run: cargo clippy --bin hyperlight-unikraft --tests --locked --features wasm-host-fns -- -D warnings
+
       - name: Enable KVM permissions
         working-directory: .
         run: |
@@ -74,6 +77,11 @@ jobs:
           # skip themselves if /dev/kvm isn't available.
           RUST_BACKTRACE: '1'
         run: cargo test --all-targets --locked
+
+      - name: Cargo test with Wasm host tools
+        env:
+          RUST_BACKTRACE: '1'
+        run: cargo test --bin hyperlight-unikraft --locked --features wasm-host-fns wasm_host_fns::tests
 
   host-checks-passed:
     if: always()

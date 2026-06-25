@@ -49,7 +49,7 @@ This project enables running Linux applications (Python, Node.js, Go, Rust, C/C+
 
 ### Key Features
 
-- **Thin, opt-in host surface** — by default, the guest has no access to the host filesystem, network, or any host functions. When you enable features like `--mount`, `--net`, or `--enable-tools`, a single `__dispatch` JSON-RPC bridge is registered as the only guest→host channel. See [HOST_FUNCTIONS.md](HOST_FUNCTIONS.md) for the full list of dispatchable operations
+- **Thin, opt-in host surface** — by default, the guest has no access to the host filesystem, network, or custom host tools. When you enable capabilities like `--mount`, `--net`, or `--tool`, a single `__dispatch` JSON-RPC bridge is registered as the only guest→host channel. See [host_functions.md](docs/host_functions.md) for the full list of dispatchable operations
 - **Identity-mapped memory** - Simplified memory layout (vaddr == paddr)
 - **Generic cmdline mechanism** - Pass arguments to any application via `-- arg1 arg2 ...`
 - **Fast cold start** - Hyperlight's lightweight design enables millisecond startup times
@@ -182,6 +182,7 @@ just run
 | `helloworld-c` | Static PIE C binary | Compiled with `musl-gcc` |
 | `rust` | Static PIE Rust binary | Compiled with `rustc --target x86_64-unknown-linux-musl` |
 | `python` | CPython 3.12 | Rootfs from Docker, script passed via cmdline |
+| `python-tools` | CPython 3.12 + host function call | Calls an echo Wasm host function registered with `--tool echo=...` |
 | `go` | Static PIE Go binary | Compiled with musl via Docker for CGO support |
 | `nodejs` | Node.js 21 | Rootfs from Alpine, script passed via cmdline |
 | `hostfs-posix-c` | C + unmodified POSIX | `open`/`read`/`write`/`mkdir` against `/host`, forwarded by `lib/hostfs` |
@@ -281,7 +282,18 @@ Options:
   -m, --memory <MEMORY>        Memory allocation (e.g., 256Mi, 512Mi, 1Gi) [default: 512Mi]
       --stack <STACK>          Stack size (e.g., 8Mi) [default: 8Mi]
   -q, --quiet                  Quiet mode — suppress host-side status messages
-      --enable-tools           Enable tool dispatch via __dispatch host function
+      --tool <NAME=WASM>        Register a WASIp1 module as a host tool (requires wasm-host-fns)
+      --tool-wasi-dir <HOST[:GUEST]>
+                               Preopen a read-write host directory for Wasm tools
+      --tool-wasi-dir-ro <HOST[:GUEST]>
+                               Preopen a read-only host directory for Wasm tools
+      --tool-wasi-env <KEY=VALUE>
+                               Set an environment variable for Wasm tools
+      --tool-wasi-env-inherit <KEY>
+                               Inherit one host environment variable into Wasm tools
+      --tool-wasi-fuel <FUEL>  Fuel units available to each Wasm tool call [default: 100000000]
+      --tool-wasi-output-limit <SIZE>
+                               Maximum stdout or stderr captured from one Wasm tool call [default: 1Mi]
       --mount <HOST[:GUEST]>   Preopen a host directory for the guest's sandboxed filesystem
                                (repeatable; default guest path: /host)
       --net                    Enable guest networking (off by default)
@@ -296,6 +308,20 @@ Options:
   -h, --help                   Print help
   -V, --version                Print version
 ```
+
+### Wasm host tools
+
+Build the CLI with the optional `wasm-host-fns` feature to register host-side custom tools from WASIp1 modules:
+
+```bash
+cargo build --manifest-path host/Cargo.toml --release --features wasm-host-fns --bin hyperlight-unikraft
+rustup target add wasm32-wasip1
+cargo build --manifest-path examples/echo-wasm-host-fxn/Cargo.toml --release --target wasm32-wasip1
+hyperlight-unikraft kernel --initrd app.cpio \
+    --tool echo=examples/echo-wasm-host-fxn/target/wasm32-wasip1/release/echo-wasm-host-fxn.wasm
+```
+
+The guest still calls the existing `__dispatch` envelope, for example `{"name":"echo","args":{"message":"hello"}}`. The Wasm handler runs on the host in Wasmtime, receives that request JSON on stdin, and writes either a raw JSON result or `{"result": ...}` / `{"error": "..."}` to stdout. WASI filesystem and environment access are off unless granted with `--tool-wasi-dir`, `--tool-wasi-dir-ro`, `--tool-wasi-env`, or `--tool-wasi-env-inherit`.
 
 ## Project Structure
 

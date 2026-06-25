@@ -15,13 +15,19 @@ memory      := "512Mi"
 image       := "python-tools-hyperlight"
 ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-tools-kernel:latest"
 
+echo_tool := "../echo-wasm-host-fxn/target/wasm32-wasip1/release/echo-wasm-host-fxn.wasm"
+
+# Build the Wasm host function used by --tool echo=...
+echo-tool:
+    just -d ../echo-wasm-host-fxn build
+
 # Run the example
-run:
-    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} --enable-tools -- /test_tools.py
+run: echo-tool
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} --tool echo={{echo_tool}} -- /test_tools.py
 
 # Run 10 times via snapshot/restore
-run-10:
-    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 9 --memory {{memory}} --enable-tools -- /test_tools.py
+run-10: echo-tool
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 9 --memory {{memory}} --tool echo={{echo_tool}} -- /test_tools.py
 
 # Build rootfs via Docker (cross-platform)
 rootfs:

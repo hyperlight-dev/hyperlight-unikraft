@@ -13,6 +13,9 @@ use hyperlight_unikraft::{
 };
 use std::path::PathBuf;
 
+#[cfg(feature = "wasm-host-fns")]
+mod wasm_host_fns;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "hyperlight-unikraft",
@@ -39,9 +42,63 @@ struct Args {
     #[arg(long, short = 'q')]
     quiet: bool,
 
-    /// Enable tool dispatch via __dispatch host function
-    #[arg(long)]
-    enable_tools: bool,
+    #[cfg(feature = "wasm-host-fns")]
+    #[arg(
+        long = "tool",
+        value_name = "NAME=WASM",
+        help = "Register a WASIp1 module as a host tool"
+    )]
+    tool: Vec<String>,
+
+    #[cfg(feature = "wasm-host-fns")]
+    #[arg(
+        long = "tool-wasi-dir",
+        value_name = "HOST[:GUEST]",
+        help = "Preopen a read-write host directory for Wasm tools"
+    )]
+    tool_wasi_dir: Vec<String>,
+
+    #[cfg(feature = "wasm-host-fns")]
+    #[arg(
+        long = "tool-wasi-dir-ro",
+        value_name = "HOST[:GUEST]",
+        help = "Preopen a read-only host directory for Wasm tools"
+    )]
+    tool_wasi_dir_ro: Vec<String>,
+
+    #[cfg(feature = "wasm-host-fns")]
+    #[arg(
+        long = "tool-wasi-env",
+        value_name = "KEY=VALUE",
+        help = "Set an environment variable for Wasm tools"
+    )]
+    tool_wasi_env: Vec<String>,
+
+    #[cfg(feature = "wasm-host-fns")]
+    #[arg(
+        long = "tool-wasi-env-inherit",
+        value_name = "KEY",
+        help = "Inherit one host environment variable into Wasm tools"
+    )]
+    tool_wasi_env_inherit: Vec<String>,
+
+    #[cfg(feature = "wasm-host-fns")]
+    #[arg(
+        long = "tool-wasi-fuel",
+        default_value_t = 100_000_000,
+        value_name = "FUEL",
+        help = "Fuel units available to each Wasm tool call"
+    )]
+    tool_wasi_fuel: u64,
+
+    #[cfg(feature = "wasm-host-fns")]
+    #[arg(
+        long = "tool-wasi-output-limit",
+        default_value = "1Mi",
+        value_name = "SIZE",
+        help = "Maximum stdout or stderr captured from one Wasm tool call"
+    )]
+    tool_wasi_output_limit: String,
 
     /// Preopen a host directory for the guest's sandboxed filesystem.
     ///
@@ -206,6 +263,48 @@ fn main() -> Result<()> {
         None
     };
 
+    #[cfg(feature = "wasm-host-fns")]
+    let wasm_tools = {
+        if args.tool.is_empty()
+            && wasm_host_fns::WasmToolOptions::has_capabilities(
+                &args.tool_wasi_dir,
+                &args.tool_wasi_dir_ro,
+                &args.tool_wasi_env,
+                &args.tool_wasi_env_inherit,
+            )
+        {
+            return Err(anyhow::anyhow!(
+                "--tool-wasi-* flags require at least one --tool"
+            ));
+        }
+        if args.tool.is_empty() {
+            Vec::new()
+        } else {
+            let output_limit = parse_memory(&args.tool_wasi_output_limit)?;
+            let output_limit = usize::try_from(output_limit).map_err(|_| {
+                anyhow::anyhow!(
+                    "--tool-wasi-output-limit too large: {}",
+                    args.tool_wasi_output_limit
+                )
+            })?;
+            let options = wasm_host_fns::WasmToolOptions::from_cli(
+                &args.tool_wasi_dir,
+                &args.tool_wasi_dir_ro,
+                &args.tool_wasi_env,
+                &args.tool_wasi_env_inherit,
+                args.tool_wasi_fuel,
+                output_limit,
+            )?;
+            let tools = wasm_host_fns::WasmTool::load_all(&args.tool, &options)?;
+            if !args.quiet {
+                for tool in &tools {
+                    eprintln!("Tool: {} -> {}", tool.name(), tool.path().display());
+                }
+            }
+            tools
+        }
+    };
+
     let mut builder = Sandbox::builder(&args.kernel)
         .args(app_args)
         .heap_size(heap_size)
@@ -222,8 +321,11 @@ fn main() -> Result<()> {
     if let Some(ports) = listen_ports {
         builder = builder.listen_ports(ports);
     }
-    if args.enable_tools {
-        builder = builder.tool("echo", Ok);
+    #[cfg(feature = "wasm-host-fns")]
+    for tool in wasm_tools {
+        let name = tool.name().to_string();
+        let tool = std::sync::Arc::new(tool);
+        builder = builder.tool(&name, move |args| tool.invoke(args));
     }
     let mut sandbox = builder.build()?;
     let evolve_time = t0.elapsed();
