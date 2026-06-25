@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781828170364,
+  "lastUpdate": 1782405384023,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1793,6 +1793,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 768,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 656,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 664,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "897275c22827f060144815fbebac6cc706ad240a",
+          "message": "Merge pull request #91 from cachebag/main\n\nFeature-gated Wasm host tools for the CLI",
+          "timestamp": "2026-06-25T09:18:15-07:00",
+          "tree_id": "41c3b625d508055f1dac1f29a98905e573a4903b",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/897275c22827f060144815fbebac6cc706ad240a"
+        },
+        "date": 1782405381059,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 373,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 1092,
             "unit": "ms"
           },
           {
