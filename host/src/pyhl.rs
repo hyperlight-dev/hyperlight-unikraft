@@ -134,6 +134,12 @@ pub struct InstallOptions<'a> {
 
     /// Overwrite an existing install.
     pub force: bool,
+
+    /// Extra Python snippets to run after warmup but before snapshot.
+    /// Each string is passed as a separate `call_named("run", …)`.
+    /// Use this to inject `sys.path` entries and pre-import packages
+    /// so they're baked into the snapshot.
+    pub warmup_code: &'a [String],
 }
 
 /// Where `install` pulls its kernel and CPIO from.
@@ -236,6 +242,9 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
         let mut sbox = builder.build()?;
         sbox.restore()?;
         let _: () = sbox.call_named("run", "pass".to_string())?;
+        for snippet in opts.warmup_code {
+            let _: () = sbox.call_named("run", snippet.clone())?;
+        }
         sbox.snapshot_now()?;
         sbox.save_snapshot(&dst_snapshot)?;
     }

@@ -228,7 +228,19 @@ struct SetupArgs {
     /// entirely, using VirtualAlloc + WHvMapGpaRange (single-VM-per-process).
     #[arg(long, value_name = "N")]
     max_surrogates: Option<u32>,
+
+    /// Install a pip package on the host and bake it into the snapshot
+    /// so it's instantly importable at runtime with zero import cost.
+    ///
+    /// Runs `pip install --target <home>/packages/ <PKG>`, mounts that
+    /// dir into the guest, then runs `import <PKG>` between warmup and
+    /// snapshot so the module is already in `sys.modules`.
+    #[arg(long = "warmup-pip", value_name = "PKG")]
+    warmup_pip: Vec<String>,
 }
+
+const PACKAGES_DIR: &str = "packages";
+const PACKAGES_GUEST_PATH: &str = "/packages";
 
 #[derive(Args)]
 struct RunArgs {
@@ -445,11 +457,35 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
     // given guest path(s) during boot. The guest-side mount point is
     // baked into the snapshot's memory image; at `pyhl run --mount` the
     // host_dir side is remappable but the guest path is fixed.
-    let setup_preopens: Vec<Preopen> = args
+    let mut setup_preopens: Vec<Preopen> = args
         .mounts
         .iter()
         .map(|m| parse_mount(m))
         .collect::<Result<_>>()?;
+
+    if !args.warmup_pip.is_empty() {
+        let pkg_dir = home.join(PACKAGES_DIR);
+        fs::create_dir_all(&pkg_dir)
+            .with_context(|| format!("create packages dir {}", pkg_dir.display()))?;
+
+        eprintln!(
+            "pyhl: installing {} on host…",
+            args.warmup_pip.join(", ")
+        );
+        let status = std::process::Command::new("pip")
+            .args(["install", "--target"])
+            .arg(&pkg_dir)
+            .args(&args.warmup_pip)
+            .args(["--no-cache-dir", "--quiet"])
+            .status()
+            .context("spawn pip — is pip installed on this host?")?;
+        if !status.success() {
+            bail!("pip install failed (exit {})", status.code().unwrap_or(-1));
+        }
+
+        setup_preopens.push(Preopen::new(&pkg_dir, PACKAGES_GUEST_PATH)?);
+    }
+
     let listen_ports = build_listen_ports(&args.port);
     let network = build_network_policy(
         args.net,
@@ -476,6 +512,24 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         let mut sbox = builder.build()?;
         sbox.restore()?;
         let _: () = sbox.call_named("run", "pass".to_string())?;
+
+        if !args.warmup_pip.is_empty() {
+            let _: () = sbox.call_named(
+                "run",
+                format!(
+                    "import sys; sys.path.insert(0, '{}')",
+                    PACKAGES_GUEST_PATH
+                ),
+            )?;
+            for pkg in &args.warmup_pip {
+                eprintln!("pyhl:   warmup-importing {pkg}…");
+                let _: () = sbox.call_named(
+                    "run",
+                    format!("import {pkg}; print('warmup: {pkg} imported')"),
+                )?;
+            }
+        }
+
         sbox.snapshot_now()?;
         sbox.save_snapshot(&dst_snapshot)?;
     }
