@@ -26,6 +26,10 @@ path = "src/bin/pydriver_run.rs"
 name = "pyhl"
 path = "src/bin/pyhl.rs"
 
+[[bin]]
+name = "shared-vm-demo"
+path = "src/bin/shared_vm_demo.rs"
+
 [dependencies]
 # danbugs/hyperlight feat/whp-no-surrogate — testing runtime no-surrogate mode.
 hyperlight-host = { git = "https://github.com/danbugs/hyperlight", rev = "820c9536", features = ["executable_heap", "hw-interrupts"] }
