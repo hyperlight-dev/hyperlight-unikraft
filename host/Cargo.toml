@@ -27,8 +27,8 @@ name = "pyhl"
 path = "src/bin/pyhl.rs"
 
 [dependencies]
-# hyperlight-dev/hyperlight main — no custom branch, upstream only.
-hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "69c362b6", features = ["executable_heap", "hw-interrupts"] }
+# danbugs/hyperlight feat/whp-no-surrogate — testing runtime no-surrogate mode.
+hyperlight-host = { git = "https://github.com/danbugs/hyperlight", rev = "820c9536", features = ["executable_heap", "hw-interrupts"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 serde_json = "1"
