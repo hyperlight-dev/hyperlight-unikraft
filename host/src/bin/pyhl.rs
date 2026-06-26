@@ -514,7 +514,6 @@ fn mib(p: &Path) -> u64 {
     fs::metadata(p).map(|m| m.len() / 1024 / 1024).unwrap_or(0)
 }
 
-
 /// Lightweight timestamp (seconds since epoch in ISO-8601-ish) so we don't
 /// need to pull chrono just for the VERSION stamp.
 fn now_iso8601() -> String {
