@@ -1,6 +1,6 @@
-# Run one example per language to verify the build+run pipeline.
-# Languages: C, Rust, Go, .NET, PowerShell, Shell, Python
-#
+# Run representative finite examples to verify the build+run pipeline.
+# Covers C, Rust, Go, .NET, PowerShell, Shell, Python, Node.js, hostfs, and Wasm host tools.
+
 # Usage: .\scripts\test-examples.ps1
 
 $ErrorActionPreference = "Continue"
@@ -72,9 +72,15 @@ Run-Example "helloworld-c"
 Run-Example "rust"
 Run-Example "go"
 Run-Example "dotnet"
+Run-Example "dotnet-nativeaot"
 Run-Example "powershell"
 Run-Example "shell"
 Run-Example "python"
+Run-Example "python-tools"
+Run-Example "nodejs"
+Run-Example "hostfs-posix-c"
+Run-Example "hostfs-posix-py"
+Run-Example "python-agent"
 
 Write-Host ""
 if ($Failures -gt 0) {

@@ -1,7 +1,7 @@
 #!/bin/bash
-# Run one example per language to verify the build+run pipeline.
-# Languages: C, Rust, Go, .NET, PowerShell, Shell, Python
-#
+# Run representative finite examples to verify the build+run pipeline.
+# Covers C, Rust, Go, .NET, PowerShell, Shell, Python, Node.js, hostfs, and Wasm host tools.
+
 # Usage: ./scripts/test-examples.sh
 
 set -uo pipefail
@@ -89,9 +89,15 @@ run_example "helloworld-c"
 run_example "rust"
 run_example "go"
 run_example "dotnet"
+run_example "dotnet-nativeaot"
 run_example "powershell"
 run_example "shell"
 run_example "python"
+run_example "python-tools"
+run_example "nodejs"
+run_example "hostfs-posix-c"
+run_example "hostfs-posix-py"
+run_example "python-agent"
 
 echo ""
 if [ "$FAILURES" -gt 0 ]; then
