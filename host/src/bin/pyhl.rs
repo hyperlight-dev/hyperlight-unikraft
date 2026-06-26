@@ -223,6 +223,11 @@ struct SetupArgs {
     /// Repeatable: `--port 8080 --port 3000`.
     #[arg(long, value_name = "PORT")]
     port: Vec<u16>,
+
+    /// Maximum surrogate processes (Windows only). 0 disables surrogates
+    /// entirely, using VirtualAlloc + WHvMapGpaRange (single-VM-per-process).
+    #[arg(long, value_name = "N")]
+    max_surrogates: Option<u32>,
 }
 
 #[derive(Args)]
@@ -295,6 +300,11 @@ struct RunArgs {
     /// you want bit-for-bit reproducibility across calls).
     #[arg(long = "deterministic")]
     deterministic: bool,
+
+    /// Maximum surrogate processes (Windows only). 0 disables surrogates
+    /// entirely, using VirtualAlloc + WHvMapGpaRange (single-VM-per-process).
+    #[arg(long, value_name = "N")]
+    max_surrogates: Option<u32>,
 }
 
 // -- image-home resolution ----------------------------------------------------
@@ -302,7 +312,7 @@ struct RunArgs {
 const CWD_HOME: &str = ".pyhl";
 const KERNEL_FILE: &str = "kernel";
 const INITRD_FILE: &str = "initrd.cpio";
-const SNAPSHOT_FILE: &str = "snapshot.hls";
+const SNAPSHOT_DIR: &str = "snapshot";
 const VERSION_FILE: &str = "VERSION";
 
 /// Resolve the image home to use. Tries (in order): explicit, PYHL_HOME,
@@ -364,14 +374,16 @@ fn image_installed(home: &Path) -> bool {
 // -- `setup` ------------------------------------------------------------------
 
 fn cmd_setup(args: SetupArgs) -> Result<()> {
+    hyperlight_unikraft::pyhl::configure_surrogates(args.max_surrogates);
+
     let home = resolve_home(args.dest.as_deref(), ResolveMode::ForSetup)?;
 
     let dst_kernel = home.join(KERNEL_FILE);
     let dst_initrd = home.join(INITRD_FILE);
-    let dst_snapshot = home.join(SNAPSHOT_FILE);
+    let dst_snapshot = home.join(SNAPSHOT_DIR);
     let dst_version = home.join(VERSION_FILE);
 
-    if image_installed(&home) && dst_snapshot.is_file() && !args.force {
+    if image_installed(&home) && dst_snapshot.is_dir() && !args.force {
         eprintln!(
             "pyhl: image already installed at {} (use --force to overwrite)",
             home.display()
@@ -451,7 +463,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
     {
         let mut builder = Sandbox::builder(&dst_kernel)
             .initrd_file(&dst_initrd)
-            .heap_size(5 * 512 * 1024 * 1024);
+            .heap_size(1280 * 1024 * 1024);
         for p in &setup_preopens {
             builder = builder.preopen(p.clone());
         }
@@ -494,12 +506,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         dst_initrd.display(),
         mib(&dst_initrd)
     );
-    eprintln!(
-        "  snapshot: {} ({} MiB on disk, {} MiB apparent)",
-        dst_snapshot.display(),
-        disk_mib(&dst_snapshot),
-        mib(&dst_snapshot)
-    );
+    eprintln!("  snapshot: {}", dst_snapshot.display());
     Ok(())
 }
 
@@ -507,37 +514,6 @@ fn mib(p: &Path) -> u64 {
     fs::metadata(p).map(|m| m.len() / 1024 / 1024).unwrap_or(0)
 }
 
-#[cfg(unix)]
-fn disk_mib(p: &Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    fs::metadata(p)
-        .map(|m| m.blocks() * 512 / 1024 / 1024)
-        .unwrap_or_else(|_| mib(p))
-}
-
-#[cfg(windows)]
-fn disk_mib(p: &Path) -> u64 {
-    use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = p
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut high: u32 = 0;
-    let low = unsafe {
-        windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW(wide.as_ptr(), &mut high)
-    };
-    if low == u32::MAX {
-        return mib(p);
-    }
-    let bytes = ((high as u64) << 32) | (low as u64);
-    bytes / 1024 / 1024
-}
-
-#[cfg(not(any(unix, windows)))]
-fn disk_mib(p: &Path) -> u64 {
-    mib(p)
-}
 
 /// Lightweight timestamp (seconds since epoch in ISO-8601-ish) so we don't
 /// need to pull chrono just for the VERSION stamp.
@@ -553,6 +529,8 @@ fn now_iso8601() -> String {
 // -- `run` --------------------------------------------------------------------
 
 fn cmd_run(args: RunArgs) -> Result<()> {
+    hyperlight_unikraft::pyhl::configure_surrogates(args.max_surrogates);
+
     let code = match (args.script.as_deref(), args.code.as_deref()) {
         (Some(_), Some(_)) => bail!("pass either <SCRIPT> or -c <CODE>, not both"),
         (Some(p), None) => {
@@ -563,13 +541,13 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     };
 
     let home = resolve_home(args.dest.as_deref(), ResolveMode::ForRun)?;
-    let snapshot = home.join(SNAPSHOT_FILE);
+    let snapshot = home.join(SNAPSHOT_DIR);
 
     // Fast path: `pyhl setup` already warmed up a sandbox, ran
     // Py_Initialize + preloaded modules, captured the state, and
-    // persisted it to snapshot.hls. Here we mmap that file back and
+    // persisted it to snapshot/. Here we load that OCI layout back and
     // instantiate a sandbox directly — no kernel boot, no Python init.
-    if !snapshot.is_file() {
+    if !snapshot.is_dir() {
         return Err(anyhow!(
             "no warmed-up snapshot at {}.\n\
              run `pyhl setup` first (or `pyhl setup --force` if you have\n\
@@ -709,7 +687,6 @@ fn fresh_seed() -> u128 {
 // -- main ---------------------------------------------------------------------
 
 fn main() -> Result<()> {
-    hyperlight_unikraft::pyhl::default_surrogate_count();
     let cli = Cli::parse();
     match cli.cmd {
         Command::Setup(args) => cmd_setup(args),
