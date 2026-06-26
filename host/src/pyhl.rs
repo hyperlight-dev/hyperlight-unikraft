@@ -175,7 +175,8 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
     let dst_snapshot = home.join(SNAPSHOT_DIR);
     let dst_version = home.join(VERSION_FILE);
 
-    let already = dst_kernel.is_file() && dst_initrd.is_file() && dst_snapshot.is_dir();
+    let already =
+        dst_kernel.is_file() && dst_initrd.is_file() && dst_snapshot.join("index.json").is_file();
     if already && !opts.force {
         return Ok(InstallReport {
             home,
@@ -297,7 +298,7 @@ impl Runtime {
     ) -> Result<Self> {
         configure_surrogates(max_surrogates);
         let snap = home.join(SNAPSHOT_DIR);
-        if !snap.is_dir() {
+        if !snap.join("index.json").is_file() {
             bail!(
                 "no snapshot at {} — run pyhl::install first",
                 snap.display()

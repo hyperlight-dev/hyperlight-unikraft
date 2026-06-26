@@ -546,7 +546,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     // Py_Initialize + preloaded modules, captured the state, and
     // persisted it to snapshot/. Here we load that OCI layout back and
     // instantiate a sandbox directly — no kernel boot, no Python init.
-    if !snapshot.is_dir() {
+    if !snapshot.join("index.json").is_file() {
         return Err(anyhow!(
             "no warmed-up snapshot at {}.\n\
              run `pyhl setup` first (or `pyhl setup --force` if you have\n\
