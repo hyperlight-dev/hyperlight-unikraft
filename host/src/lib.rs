@@ -2717,6 +2717,7 @@ impl Sandbox {
             .ok_or_else(|| anyhow!("no snapshot present; build() or snapshot_now() first"))?;
         let tag = OciTag::new("latest").map_err(|e| anyhow!("{e}"))?;
         snap.save(path.as_ref(), &tag).map_err(|e| anyhow!("{e}"))?;
+        sparsify_oci_blobs(path.as_ref())?;
         Ok(())
     }
 
@@ -2905,6 +2906,162 @@ pub fn run_vm_capture_output(
 // absolute paths passed in an RPC arg, and symlinks inside the mount
 // that point outside it.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// OCI blob sparsification
+// ---------------------------------------------------------------------------
+
+fn sparsify_oci_blobs(oci_dir: &Path) -> Result<()> {
+    let blobs_dir = oci_dir.join("blobs").join("sha256");
+    if !blobs_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&blobs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && entry.metadata()?.len() > 1024 * 1024 {
+            sparsify_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sparsify_file(path: &Path) -> Result<()> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+
+    const PAGE: usize = 4096;
+    let zero_page = [0u8; PAGE];
+    let mut buf = [0u8; PAGE];
+    let mut reader = std::io::BufReader::with_capacity(PAGE, &file);
+
+    let mut punched = 0u64;
+    let mut offset: u64 = 0;
+    while offset + PAGE as u64 <= len {
+        reader.read_exact(&mut buf)?;
+        if buf == zero_page {
+            let ret = unsafe {
+                libc::fallocate(
+                    file.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset as i64,
+                    PAGE as i64,
+                )
+            };
+            if ret == 0 {
+                punched += 1;
+            }
+        }
+        offset += PAGE as u64;
+    }
+
+    if punched > 0 {
+        let disk_mib = (len - punched * PAGE as u64) / 1024 / 1024;
+        eprintln!("  sparsified: {disk_mib} MiB on disk (punched {punched} zero pages)");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn sparsify_file(path: &Path) -> Result<()> {
+    use std::io::Read;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::{FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    let handle = file.as_raw_handle();
+
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Ok(());
+    }
+
+    const PAGE: usize = 4096;
+    let zero_page = [0u8; PAGE];
+    let mut buf = [0u8; PAGE];
+    let mut reader = std::io::BufReader::with_capacity(PAGE, &file);
+
+    let mut punched = 0u64;
+    let mut offset: u64 = 0;
+    while offset + PAGE as u64 <= len {
+        reader.read_exact(&mut buf)?;
+        if buf != zero_page {
+            offset += PAGE as u64;
+            continue;
+        }
+        let range_start = offset;
+        offset += PAGE as u64;
+        let mut range_end = offset;
+        while offset + PAGE as u64 <= len {
+            reader.read_exact(&mut buf)?;
+            offset += PAGE as u64;
+            if buf != zero_page {
+                break;
+            }
+            range_end = offset;
+        }
+
+        #[repr(C)]
+        struct FileZeroDataInformation {
+            file_offset: i64,
+            beyond_final_zero: i64,
+        }
+
+        let info = FileZeroDataInformation {
+            file_offset: range_start as i64,
+            beyond_final_zero: range_end as i64,
+        };
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_ZERO_DATA,
+                &info as *const _ as *const _,
+                std::mem::size_of::<FileZeroDataInformation>() as u32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            punched += (range_end - range_start) / PAGE as u64;
+        }
+    }
+
+    if punched > 0 {
+        let disk_mib = (len - punched * PAGE as u64) / 1024 / 1024;
+        eprintln!("  sparsified: {disk_mib} MiB on disk (punched {punched} zero pages)");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn sparsify_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
