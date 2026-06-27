@@ -6,7 +6,7 @@ description = "PowerPoint generator using Hyperlight-Unikraft sandboxed Python e
 
 [dependencies]
 # Hyperlight-Unikraft library
-hyperlight-unikraft = { path = "../../host", package = "hyperlight-unikraft-host" }
+hyperlight-unikraft = { path = "../../host" }
 
 # OpenAI API client
 async-openai = "0.25"
