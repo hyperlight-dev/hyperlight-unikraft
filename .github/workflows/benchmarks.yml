@@ -483,10 +483,29 @@ jobs:
       - name: "Snapshot size"
         shell: pwsh
         run: |
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class SparseFileHelper {
+              [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+              public static extern uint GetCompressedFileSizeW(string lpFileName, out uint lpFileSizeHigh);
+          }
+          "@
+          function Get-CompressedSize($path) {
+              $high = [uint32]0
+              $low = [SparseFileHelper]::GetCompressedFileSizeW($path, [ref]$high)
+              if ($low -eq 0xFFFFFFFF) {
+                  $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                  if ($err -ne 0) { return (Get-Item $path).Length }
+              }
+              return ([uint64]$high -shl 32) -bor [uint64]$low
+          }
           $snap = ".pyhl\snapshot"
           $files = Get-ChildItem -Path $snap -Recurse -File
           $apparentMiB = [math]::Round(($files | Measure-Object -Property Length -Sum).Sum / 1MB)
-          $diskMiB = $apparentMiB
+          $diskBytes = [uint64]0
+          foreach ($f in $files) { $diskBytes += Get-CompressedSize $f.FullName }
+          $diskMiB = [math]::Round($diskBytes / 1MB)
           Write-Host "| Metric | Value |"
           Write-Host "|--------|-------|"
           Write-Host "| Apparent size | ${apparentMiB} MiB |"
