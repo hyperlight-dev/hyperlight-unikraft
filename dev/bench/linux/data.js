@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782537458741,
+  "lastUpdate": 1782549749350,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1959,6 +1959,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/1caba5cdbb4c3c843fb27f649e0a4d04e299c486"
         },
         "date": 1782537458362,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 120,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 8,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 653,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "682ad20cfa00f1b46251f04b202afb3b28230db8",
+          "message": "release: v0.11.0 — first crates.io publish (#102)\n\n* chore: bump version to 0.11.0 and add crates.io metadata\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* docs: update pyhl install instructions for crates.io\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* ci: add cargo publish workflow for crates.io releases\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* ci: trigger publish on release, skip auth for dry runs\n\n- Trigger on release published event (creating a release in GitHub UI)\n- Keep workflow_dispatch for manual dry runs\n- Only authenticate with crates.io when actually publishing\n- Dry runs use cargo publish --dry-run without minting a token\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: rename crate to hyperlight-unikraft (matches crates.io reservation)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: remove stale package rename in pptx-gen demo\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-06-27T01:34:02-07:00",
+          "tree_id": "fa6a90ee352cf0520e7660449ae9ed94be224320",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/682ad20cfa00f1b46251f04b202afb3b28230db8"
+        },
+        "date": 1782549748980,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
