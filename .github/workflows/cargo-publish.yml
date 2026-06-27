@@ -1,6 +1,8 @@
 name: Publish to crates.io
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -16,8 +18,6 @@ jobs:
   publish:
     runs-on: ubuntu-latest
 
-    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.dry_run }}
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,8 +25,17 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Determine if dry run
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Verify version matches tag
-        if: ${{ !inputs.dry_run }}
+        if: ${{ steps.mode.outputs.dry_run == 'false' }}
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
           CARGO_VER=$(grep '^version' host/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
@@ -38,18 +47,22 @@ jobs:
       - name: Check crate not already published
         run: |
           CARGO_VER=$(grep '^version' host/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          if curl -sf "https://crates.io/api/v1/crates/hyperlight-unikraft-host/$CARGO_VER" | jq -e .version > /dev/null 2>&1; then
+          if curl -sf "https://crates.io/api/v1/crates/hyperlight-unikraft-host/$CARGO_VER" -H "User-Agent: hyperlight-unikraft" | jq -e .version > /dev/null 2>&1; then
             echo "::warning::hyperlight-unikraft-host@$CARGO_VER already published"
             echo "ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
           fi
 
+      - name: Dry run (no auth needed)
+        if: ${{ steps.mode.outputs.dry_run == 'true' && env.ALREADY_PUBLISHED != 'true' }}
+        run: cargo publish --manifest-path host/Cargo.toml --dry-run
+
       - name: Authenticate with crates.io
-        if: ${{ env.ALREADY_PUBLISHED != 'true' }}
+        if: ${{ steps.mode.outputs.dry_run == 'false' && env.ALREADY_PUBLISHED != 'true' }}
         uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
 
       - name: Publish hyperlight-unikraft-host
-        if: ${{ env.ALREADY_PUBLISHED != 'true' }}
-        run: cargo publish --manifest-path host/Cargo.toml ${{ inputs.dry_run && '--dry-run' || '' }}
+        if: ${{ steps.mode.outputs.dry_run == 'false' && env.ALREADY_PUBLISHED != 'true' }}
+        run: cargo publish --manifest-path host/Cargo.toml
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
