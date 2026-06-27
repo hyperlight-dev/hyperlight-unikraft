@@ -47,8 +47,8 @@ jobs:
       - name: Check crate not already published
         run: |
           CARGO_VER=$(grep '^version' host/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          if curl -sf "https://crates.io/api/v1/crates/hyperlight-unikraft-host/$CARGO_VER" -H "User-Agent: hyperlight-unikraft" | jq -e .version > /dev/null 2>&1; then
-            echo "::warning::hyperlight-unikraft-host@$CARGO_VER already published"
+          if curl -sf "https://crates.io/api/v1/crates/hyperlight-unikraft/$CARGO_VER" -H "User-Agent: hyperlight-unikraft" | jq -e .version > /dev/null 2>&1; then
+            echo "::warning::hyperlight-unikraft@$CARGO_VER already published"
             echo "ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
           fi
 
@@ -61,7 +61,7 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
 
-      - name: Publish hyperlight-unikraft-host
+      - name: Publish hyperlight-unikraft
         if: ${{ steps.mode.outputs.dry_run == 'false' && env.ALREADY_PUBLISHED != 'true' }}
         run: cargo publish --manifest-path host/Cargo.toml
         env:
