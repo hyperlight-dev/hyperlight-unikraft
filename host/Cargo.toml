@@ -1,9 +1,14 @@
 [package]
 name = "hyperlight-unikraft-host"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 description = "Embedded Hyperlight host for running Unikraft unikernels"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/hyperlight-dev/hyperlight-unikraft"
+homepage = "https://github.com/hyperlight-dev/hyperlight-unikraft"
+keywords = ["hyperlight", "unikraft", "unikernel", "microvm", "sandbox"]
+categories = ["virtualization"]
+readme = "../README.md"
 
 [lib]
 name = "hyperlight_unikraft"
