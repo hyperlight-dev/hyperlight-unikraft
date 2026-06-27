@@ -1203,8 +1203,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyperlight-unikraft-host"
-version = "0.10.0"
+name = "hyperlight-unikraft"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "base64",

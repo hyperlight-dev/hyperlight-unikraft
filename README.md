@@ -117,14 +117,13 @@ pillow/lxml/cryptography/dateutil/dotenv preloaded) behind a simple
 `setup` / `run` workflow:
 
 ```bash
+# Install pyhl from crates.io
+cargo install hyperlight-unikraft --bin pyhl
+
 # One-time: build the driver image (kernel + CPIO)
 cd examples/python-agent-driver
 just rootfs && just build
 cd ../..
-
-# Install pyhl
-cargo install --git https://github.com/hyperlight-dev/hyperlight-unikraft \
-    hyperlight-unikraft-host --bin pyhl
 
 # Point pyhl at the image you just built — creates ./.pyhl/ in cwd
 pyhl setup --from examples/python-agent-driver
