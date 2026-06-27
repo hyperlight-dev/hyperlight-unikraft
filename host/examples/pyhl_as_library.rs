@@ -3,7 +3,7 @@
 //!
 //! Usage: `cargo run --release --example pyhl_as_library -- <code>`
 //!
-//! Assumes `pyhl setup` has already run and `.pyhl/snapshot.hls` exists
+//! Assumes `pyhl setup` has already run and `.pyhl/snapshot/` exists
 //! in the current directory (or override with `PYHL_HOME`).
 
 use hyperlight_unikraft::{pyhl, Preopen};
@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     // expose host directories via the guest's hostfs.
     let mounts: &[Preopen] = &[];
 
-    let mut rt = pyhl::Runtime::new(&home, mounts, None, None)?;
+    let mut rt = pyhl::Runtime::new(&home, mounts, None, None, None)?;
 
     eprintln!("-- first run (hermetic from loaded snapshot) --");
     let t1 = rt.run_code(&code)?;

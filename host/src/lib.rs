@@ -60,7 +60,7 @@ pub mod stderr_capture;
 
 use anyhow::{anyhow, Result};
 use hyperlight_host::func::Registerable;
-use hyperlight_host::sandbox::snapshot::Snapshot;
+use hyperlight_host::sandbox::snapshot::{OciTag, Snapshot};
 use hyperlight_host::sandbox::uninitialized::GuestEnvironment;
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::{GuestBinary, HostFunctions, MultiUseSandbox, UninitializedSandbox};
@@ -2299,9 +2299,9 @@ pub struct Sandbox {
     inner: MultiUseSandbox,
     /// Post-init snapshot for fast restore between calls.
     snapshot: Option<Arc<Snapshot>>,
-    /// When set, restore uses the preserving variant to keep the
-    /// read-only file mapping alive across restores.
-    file_mapping_path: Option<std::path::PathBuf>,
+    /// Initrd path — re-mapped after every restore() since restore
+    /// overwrites the region with the snapshot's original memory.
+    initrd_path: Option<std::path::PathBuf>,
     exit_code: Arc<AtomicI32>,
     /// Shared socket table — cleared on [`Sandbox::restore`] so that
     /// host-side fds don't leak across guest restore cycles.
@@ -2578,9 +2578,12 @@ impl Sandbox {
         // from KVM_SET_USER_MEMORY_REGION on kernels where in-kernel
         // IRQCHIP reserves that range.
         const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
-        if let Some(path) = initrd_path {
-            usbox.map_file_cow(path, INITRD_MAP_BASE, Some("initrd"))?;
-        }
+        let initrd_owned = if let Some(path) = initrd_path {
+            usbox.map_file_cow(path, INITRD_MAP_BASE)?;
+            Some(path.to_path_buf())
+        } else {
+            None
+        };
 
         let exit_code = Arc::new(AtomicI32::new(0));
         let sleep_cancel = SleepCancel::new();
@@ -2593,18 +2596,12 @@ impl Sandbox {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(
-            usbox,
-            initrd_path.map(|p| p.to_path_buf()),
-            exit_code,
-            sleep_cancel,
-            socket_table,
-        )
+        Self::finish_evolve(usbox, initrd_owned, exit_code, sleep_cancel, socket_table)
     }
 
     fn finish_evolve(
         usbox: UninitializedSandbox,
-        file_mapping_path: Option<std::path::PathBuf>,
+        initrd_path: Option<std::path::PathBuf>,
         exit_code: Arc<AtomicI32>,
         sleep_cancel: SleepCancel,
         socket_table: Option<Arc<Mutex<SocketTable>>>,
@@ -2614,7 +2611,7 @@ impl Sandbox {
         Ok(Self {
             inner,
             snapshot,
-            file_mapping_path,
+            initrd_path,
             exit_code,
             socket_table,
             sleep_cancel,
@@ -2627,11 +2624,11 @@ impl Sandbox {
     /// guest memory to the state captured after init.
     pub fn restore(&mut self) -> Result<()> {
         if let Some(ref snap) = self.snapshot {
-            if self.file_mapping_path.is_some() {
-                self.inner.restore_preserving_file_mappings(snap.clone())?;
-            } else {
-                self.inner.restore(snap.clone())?;
-            }
+            self.inner.restore(snap.clone())?;
+        }
+        const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
+        if let Some(ref path) = self.initrd_path {
+            self.inner.map_file_cow(path, INITRD_MAP_BASE)?;
         }
         if let Some(ref table) = self.socket_table {
             table.lock().unwrap().clear();
@@ -2709,19 +2706,18 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Persist the current snapshot to disk as a sparse file.
+    /// Persist the current snapshot to disk in OCI image-layout format.
     ///
-    /// After writing the raw HLS snapshot, zero-filled 4 KiB pages are
-    /// punched out with `fallocate(PUNCH_HOLE)` so they consume no disk
-    /// space. The file is still mmap-loadable — holes read back as
-    /// zeros with no decompression overhead.
+    /// `path` is the directory for the OCI layout (created if absent).
+    /// The snapshot is tagged `latest`.
     pub fn save_snapshot<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let snap = self
             .snapshot
             .as_ref()
             .ok_or_else(|| anyhow!("no snapshot present; build() or snapshot_now() first"))?;
-        snap.to_file(path.as_ref())?;
-        sparsify_snapshot(path.as_ref())?;
+        let tag = OciTag::new("latest").map_err(|e| anyhow!("{e}"))?;
+        snap.save(path.as_ref(), &tag).map_err(|e| anyhow!("{e}"))?;
+        sparsify_oci_blobs(path.as_ref())?;
         Ok(())
     }
 
@@ -2734,12 +2730,10 @@ impl Sandbox {
     /// warm-Python snapshot once, and every `pyhl run` instantiates
     /// straight from it — no kernel boot, no Py_Initialize.
     ///
-    /// Uses `Snapshot::from_file_unchecked`, which skips the SHA-256
-    /// verification over the file. We trust snapshots written by our
-    /// own `save_snapshot()` earlier in the same process family (the
-    /// pyhl install dir), and the hash verify alone costs ~500ms on
-    /// a 2.5 GB snapshot — enough to double the whole `pyhl run` wall
-    /// time on simple scripts.
+    /// Uses `Snapshot::load`, which skips SHA-256 digest verification.
+    /// We trust snapshots written by our own `save_snapshot()` in the
+    /// same install dir; checked_load costs ~500ms on a 2.5 GB
+    /// snapshot — enough to double the whole `pyhl run` wall time.
     pub fn from_snapshot_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::from_snapshot_file_full(path, &[], None, None, None)
     }
@@ -2802,7 +2796,8 @@ impl Sandbox {
         network: Option<&NetworkPolicy>,
         listen_ports: Option<&ListenPorts>,
     ) -> Result<Self> {
-        let loaded = Snapshot::from_file_unchecked(path.as_ref())?;
+        let tag = OciTag::new("latest").map_err(|e| anyhow!("{e}"))?;
+        let loaded = Snapshot::load(path.as_ref(), tag).map_err(|e| anyhow!("{e}"))?;
         let arc = Arc::new(loaded);
 
         let exit_code = Arc::new(AtomicI32::new(0));
@@ -2822,13 +2817,13 @@ impl Sandbox {
 
         const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
         if let Some(ref initrd_path) = initrd {
-            inner.map_file_cow(initrd_path, INITRD_MAP_BASE, Some("initrd"))?;
+            inner.map_file_cow(initrd_path, INITRD_MAP_BASE)?;
         }
 
         Ok(Self {
             inner,
             snapshot: Some(arc),
-            file_mapping_path: initrd,
+            initrd_path: initrd,
             exit_code,
             socket_table,
             sleep_cancel,
@@ -2905,17 +2900,35 @@ pub fn run_vm_capture_output(
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot sparsification
+// FsSandbox tests — prove that host-side path resolution rejects escapes.
+//
+// These cover both attack vectors the host can see: lexical ".." /
+// absolute paths passed in an RPC arg, and symlinks inside the mount
+// that point outside it.
 // ---------------------------------------------------------------------------
 
-/// Punch holes in zero-filled 4 KiB pages of a snapshot file.
-///
-/// The HLS snapshot format is a 4 KiB header followed by a dense memory
-/// blob where ~80 % of pages are all-zeros (unused heap). Punching them
-/// with `fallocate(PUNCH_HOLE)` turns the file sparse — the zeros still
-/// read back via mmap but consume no disk blocks.
+// ---------------------------------------------------------------------------
+// OCI blob sparsification
+// ---------------------------------------------------------------------------
+
+fn sparsify_oci_blobs(oci_dir: &Path) -> Result<()> {
+    let blobs_dir = oci_dir.join("blobs").join("sha256");
+    if !blobs_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&blobs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && entry.metadata()?.len() > 1024 * 1024 {
+            sparsify_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
-fn sparsify_snapshot(path: &Path) -> Result<()> {
+fn sparsify_file(path: &Path) -> Result<()> {
+    use std::io::Read;
     use std::os::unix::io::AsRawFd;
 
     let file = std::fs::OpenOptions::new()
@@ -2923,16 +2936,17 @@ fn sparsify_snapshot(path: &Path) -> Result<()> {
         .write(true)
         .open(path)?;
     let len = file.metadata()?.len();
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
     const PAGE: usize = 4096;
-    const HEADER: usize = PAGE;
     let zero_page = [0u8; PAGE];
+    let mut buf = [0u8; PAGE];
+    let mut reader = std::io::BufReader::with_capacity(PAGE, &file);
 
     let mut punched = 0u64;
-    let mut offset = HEADER;
-    while offset + PAGE <= len as usize {
-        if mmap[offset..offset + PAGE] == zero_page {
+    let mut offset: u64 = 0;
+    while offset + PAGE as u64 <= len {
+        reader.read_exact(&mut buf)?;
+        if buf == zero_page {
             let ret = unsafe {
                 libc::fallocate(
                     file.as_raw_fd(),
@@ -2945,22 +2959,19 @@ fn sparsify_snapshot(path: &Path) -> Result<()> {
                 punched += 1;
             }
         }
-        offset += PAGE;
+        offset += PAGE as u64;
     }
-    drop(mmap);
 
     if punched > 0 {
         let disk_mib = (len - punched * PAGE as u64) / 1024 / 1024;
-        eprintln!("  sparsified: {disk_mib} MiB on disk (punched {punched} zero pages)",);
+        eprintln!("  sparsified: {disk_mib} MiB on disk (punched {punched} zero pages)");
     }
-
     Ok(())
 }
 
-/// Windows equivalent: mark the file sparse with FSCTL_SET_SPARSE, then
-/// punch zero ranges with FSCTL_SET_ZERO_DATA.
 #[cfg(target_os = "windows")]
-fn sparsify_snapshot(path: &Path) -> Result<()> {
+fn sparsify_file(path: &Path) -> Result<()> {
+    use std::io::Read;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Ioctl::{FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA};
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -2972,7 +2983,6 @@ fn sparsify_snapshot(path: &Path) -> Result<()> {
     let len = file.metadata()?.len();
     let handle = file.as_raw_handle();
 
-    // Mark file as sparse.
     let ok = unsafe {
         DeviceIoControl(
             handle,
@@ -2989,25 +2999,30 @@ fn sparsify_snapshot(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
-
     const PAGE: usize = 4096;
-    const HEADER: usize = PAGE;
     let zero_page = [0u8; PAGE];
+    let mut buf = [0u8; PAGE];
+    let mut reader = std::io::BufReader::with_capacity(PAGE, &file);
 
-    // Coalesce contiguous zero pages into ranges for fewer syscalls.
     let mut punched = 0u64;
-    let mut offset = HEADER;
-    while offset + PAGE <= len as usize {
-        if mmap[offset..offset + PAGE] != zero_page {
-            offset += PAGE;
+    let mut offset: u64 = 0;
+    while offset + PAGE as u64 <= len {
+        reader.read_exact(&mut buf)?;
+        if buf != zero_page {
+            offset += PAGE as u64;
             continue;
         }
         let range_start = offset;
-        while offset + PAGE <= len as usize && mmap[offset..offset + PAGE] == zero_page {
-            offset += PAGE;
+        offset += PAGE as u64;
+        let mut range_end = offset;
+        while offset + PAGE as u64 <= len {
+            reader.read_exact(&mut buf)?;
+            offset += PAGE as u64;
+            if buf != zero_page {
+                break;
+            }
+            range_end = offset;
         }
-        let range_end = offset;
 
         #[repr(C)]
         struct FileZeroDataInformation {
@@ -3032,31 +3047,21 @@ fn sparsify_snapshot(path: &Path) -> Result<()> {
             )
         };
         if ok != 0 {
-            punched += (range_end - range_start) as u64 / PAGE as u64;
+            punched += (range_end - range_start) / PAGE as u64;
         }
     }
-    drop(mmap);
 
     if punched > 0 {
         let disk_mib = (len - punched * PAGE as u64) / 1024 / 1024;
-        eprintln!("  sparsified: {disk_mib} MiB on disk (punched {punched} zero pages)",);
+        eprintln!("  sparsified: {disk_mib} MiB on disk (punched {punched} zero pages)");
     }
-
     Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn sparsify_snapshot(_path: &Path) -> Result<()> {
+fn sparsify_file(_path: &Path) -> Result<()> {
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// FsSandbox tests — prove that host-side path resolution rejects escapes.
-//
-// These cover both attack vectors the host can see: lexical ".." /
-// absolute paths passed in an RPC arg, and symlinks inside the mount
-// that point outside it.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

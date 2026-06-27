@@ -5,7 +5,7 @@
 //! (filesystem mounts, network policies, exit codes, hermetic rewinds).
 //!
 //! All tests self-skip if the pyhl image is not installed (no snapshot at
-//! `.pyhl/snapshot.hls`) or if no hypervisor is available. Run `pyhl setup`
+//! `.pyhl/snapshot/`) or if no hypervisor is available. Run `pyhl setup`
 //! to populate the image before running these tests.
 
 use hyperlight_unikraft::pyhl::Runtime;
@@ -37,12 +37,12 @@ fn pyhl_home() -> Option<PathBuf> {
         .parent()
         .unwrap()
         .join(".pyhl");
-    if workspace.join("snapshot.hls").is_file() {
+    if workspace.join("snapshot").join("index.json").is_file() {
         return Some(workspace);
     }
     // Check user-level install
     if let Some(home) = dirs_or_default() {
-        if home.join("snapshot.hls").is_file() {
+        if home.join("snapshot").join("index.json").is_file() {
             return Some(home);
         }
     }
@@ -71,7 +71,7 @@ fn setup() -> Option<(PathBuf, Runtime)> {
         return None;
     }
     let home = pyhl_home()?;
-    let rt = Runtime::new(&home, &[], None, None).ok()?;
+    let rt = Runtime::new(&home, &[], None, None, None).ok()?;
     Some((home, rt))
 }
 
@@ -81,7 +81,7 @@ fn setup_with_net(policy: NetworkPolicy) -> Option<Runtime> {
         return None;
     }
     let home = pyhl_home()?;
-    Runtime::new(&home, &[], Some(&policy), None).ok()
+    Runtime::new(&home, &[], Some(&policy), None, None).ok()
 }
 
 fn setup_with_mount(preopen: Preopen) -> Option<Runtime> {
@@ -90,7 +90,7 @@ fn setup_with_mount(preopen: Preopen) -> Option<Runtime> {
         return None;
     }
     let home = pyhl_home()?;
-    Runtime::new(&home, &[preopen], None, None).ok()
+    Runtime::new(&home, &[preopen], None, None, None).ok()
 }
 
 // ---------------------------------------------------------------------------

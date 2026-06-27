@@ -4,7 +4,7 @@
 //! Two pieces:
 //!
 //! - [`install`] — one-time: take a source image (or a GHCR pull) and
-//!   materialize `kernel`, `initrd.cpio`, and a warmed-up `snapshot.hls`
+//!   materialize `kernel`, `initrd.cpio`, and a warmed-up `snapshot/`
 //!   in the image home.
 //!
 //! - [`Runtime`] — the steady-state object: holds an open
@@ -32,7 +32,7 @@
 //!     force: false,
 //! })?;
 //!
-//! let mut rt = pyhl::Runtime::new(home, &[Preopen::new("./share", "/host")?], None, None)?;
+//! let mut rt = pyhl::Runtime::new(home, &[Preopen::new("./share", "/host")?], None, None, None)?;
 //! rt.run_code("print('hello from rust')")?;
 //! rt.run_code("print('hermetic second call')")?;  // fresh __main__ each time
 //! # Ok(())
@@ -49,30 +49,51 @@ use std::time::Instant;
 
 use crate::{Preopen, Sandbox};
 
-/// Set `HYPERLIGHT_INITIAL_SURROGATES=1` if unset (Windows only).
+/// Configure surrogate process count (Windows only).
 ///
 /// On Windows, Hyperlight pre-spawns surrogate processes (one per
 /// potential sandbox). The default count is 512, each costing ~7 ms
-/// of `CreateProcessA` latency. For pyhl's single-sandbox usage,
-/// pinning to 1 avoids ~3.5 s of wasted startup.
+/// of `CreateProcessA` latency.
+///
+/// When `max_surrogates` is `Some(0)`, surrogates are fully disabled:
+/// the host uses `VirtualAlloc` + `WHvMapGpaRange` directly
+/// (single-VM-per-process mode).
+///
+/// When `max_surrogates` is `None`, defaults to 1 (suitable for
+/// pyhl's single-sandbox usage, avoids ~3.5 s of wasted startup).
 ///
 /// # Safety
 ///
 /// Must be called from the main thread before spawning any additional
 /// threads or creating any `Sandbox`. Violating this is undefined
 /// behavior due to `std::env::set_var` not being thread-safe.
-pub fn default_surrogate_count() {
+pub fn configure_surrogates(max_surrogates: Option<u32>) {
     #[cfg(target_os = "windows")]
     {
-        if std::env::var_os("HYPERLIGHT_INITIAL_SURROGATES").is_none() {
-            // SAFETY: Called from main thread before any sandbox or
-            // thread pool is created. The binary entry points (cmd_run,
-            // cmd_setup) call this first.
-            unsafe {
-                std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", "1");
+        // SAFETY: Called from main thread before any sandbox or
+        // thread pool is created. The binary entry points (cmd_run,
+        // cmd_setup) call this first.
+        unsafe {
+            match max_surrogates {
+                Some(n) => {
+                    std::env::set_var("HYPERLIGHT_MAX_SURROGATES", n.to_string());
+                    std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", n.to_string());
+                }
+                None => {
+                    if std::env::var_os("HYPERLIGHT_INITIAL_SURROGATES").is_none() {
+                        std::env::set_var("HYPERLIGHT_INITIAL_SURROGATES", "1");
+                    }
+                }
             }
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = max_surrogates;
+}
+
+/// Deprecated: use [`configure_surrogates`] instead.
+pub fn default_surrogate_count() {
+    configure_surrogates(None);
 }
 
 /// Standard file names inside an image home.
@@ -80,14 +101,14 @@ pub const KERNEL_FILE: &str = "kernel";
 /// Standard file names inside an image home.
 pub const INITRD_FILE: &str = "initrd.cpio";
 /// Standard file names inside an image home.
-pub const SNAPSHOT_FILE: &str = "snapshot.hls";
+pub const SNAPSHOT_DIR: &str = "snapshot";
 /// Standard file names inside an image home.
 pub const VERSION_FILE: &str = "VERSION";
 
 /// Configuration for [`install`].
 pub struct InstallOptions<'a> {
     /// Target directory. Files are written at
-    /// `{home}/{kernel,initrd.cpio,snapshot.hls,VERSION}`.
+    /// `{home}/{kernel,initrd.cpio,snapshot/,VERSION}`.
     pub home: &'a Path,
 
     /// Where to get the image from.
@@ -105,6 +126,11 @@ pub struct InstallOptions<'a> {
     /// Ports the guest may bind to for inbound connections.
     /// `None` means outbound-only (when networking is enabled).
     pub listen_ports: Option<&'a crate::ListenPorts>,
+
+    /// Maximum surrogate processes on Windows. `Some(0)` disables
+    /// surrogates entirely (single-VM-per-process). `None` uses the
+    /// default (1 for pyhl).
+    pub max_surrogates: Option<u32>,
 
     /// Overwrite an existing install.
     pub force: bool,
@@ -142,14 +168,15 @@ pub struct InstallReport {
 /// are local file copies. See [`InstallSource`] for each variant's
 /// semantics.
 pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
-    default_surrogate_count();
+    configure_surrogates(opts.max_surrogates);
     let home = opts.home.to_path_buf();
     let dst_kernel = home.join(KERNEL_FILE);
     let dst_initrd = home.join(INITRD_FILE);
-    let dst_snapshot = home.join(SNAPSHOT_FILE);
+    let dst_snapshot = home.join(SNAPSHOT_DIR);
     let dst_version = home.join(VERSION_FILE);
 
-    let already = dst_kernel.is_file() && dst_initrd.is_file() && dst_snapshot.is_file();
+    let already =
+        dst_kernel.is_file() && dst_initrd.is_file() && dst_snapshot.join("index.json").is_file();
     if already && !opts.force {
         return Ok(InstallReport {
             home,
@@ -197,7 +224,7 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
     {
         let mut builder = Sandbox::builder(&dst_kernel)
             .initrd_file(&dst_initrd)
-            .heap_size(5 * 512 * 1024 * 1024);
+            .heap_size(1280 * 1024 * 1024);
         for p in opts.mounts {
             builder = builder.preopen(p.clone());
         }
@@ -255,20 +282,23 @@ pub struct Runtime {
 
 impl Runtime {
     /// Open a runtime against an existing install. Looks for
-    /// `{home}/snapshot.hls` and mmap-loads it. `mounts` specify host
+    /// `{home}/snapshot/` and mmap-loads it. `mounts` specify host
     /// directories to expose under the guest paths that were baked in
     /// at `install` time. `network` enables guest networking with the
     /// given policy (`None` = disabled). `listen_ports` controls which
     /// ports the guest may bind to (`None` = outbound-only).
+    /// `max_surrogates` controls surrogate process count on Windows
+    /// (`Some(0)` disables them entirely, `None` defaults to 1).
     pub fn new(
         home: &Path,
         mounts: &[Preopen],
         network: Option<&crate::NetworkPolicy>,
         listen_ports: Option<&crate::ListenPorts>,
+        max_surrogates: Option<u32>,
     ) -> Result<Self> {
-        default_surrogate_count();
-        let snap = home.join(SNAPSHOT_FILE);
-        if !snap.is_file() {
+        configure_surrogates(max_surrogates);
+        let snap = home.join(SNAPSHOT_DIR);
+        if !snap.join("index.json").is_file() {
             bail!(
                 "no snapshot at {} — run pyhl::install first",
                 snap.display()

@@ -287,9 +287,9 @@ jobs:
       - name: "Snapshot size"
         if: steps.kvm_check.outputs.available == 'true'
         run: |
-          snap=".pyhl/snapshot.hls"
-          apparent=$(($(stat -c '%s' "$snap") / 1024 / 1024))
-          disk=$(($(stat -c '%b' "$snap") * 512 / 1024 / 1024))
+          snap=".pyhl/snapshot"
+          apparent=$(($(find "$snap" -type f -exec stat -c '%s' {} + | paste -sd+ | bc) / 1024 / 1024))
+          disk=$(($(find "$snap" -type f -exec stat -c '%b' {} + | paste -sd+ | bc) * 512 / 1024 / 1024))
           echo "| Metric | Value |"
           echo "|--------|-------|"
           echo "| Apparent size | ${apparent} MiB |"
@@ -483,27 +483,29 @@ jobs:
       - name: "Snapshot size"
         shell: pwsh
         run: |
-          $snap = ".pyhl\snapshot.hls"
-          $f = Get-Item $snap
-          $apparentMiB = [math]::Round($f.Length / 1MB)
-          # GetCompressedFileSize returns actual on-disk allocation for sparse files
-          $wide = $f.FullName
           Add-Type -TypeDefinition @"
           using System;
           using System.Runtime.InteropServices;
-          public class SparseHelper {
-            [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-            public static extern uint GetCompressedFileSizeW(string lpFileName, out uint lpFileSizeHigh);
+          public class SparseFileHelper {
+              [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+              public static extern uint GetCompressedFileSizeW(string lpFileName, out uint lpFileSizeHigh);
           }
-          "@ -ErrorAction SilentlyContinue
-          $high = [uint32]0
-          $low = [SparseHelper]::GetCompressedFileSizeW($wide, [ref]$high)
-          if ($low -ne [uint32]::MaxValue) {
-            $diskBytes = ([uint64]$high -shl 32) -bor [uint64]$low
-            $diskMiB = [math]::Round($diskBytes / 1MB)
-          } else {
-            $diskMiB = $apparentMiB
+          "@
+          function Get-CompressedSize($path) {
+              $high = [uint32]0
+              $low = [SparseFileHelper]::GetCompressedFileSizeW($path, [ref]$high)
+              if ($low -eq 0xFFFFFFFF) {
+                  $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                  if ($err -ne 0) { return (Get-Item $path).Length }
+              }
+              return ([uint64]$high -shl 32) -bor [uint64]$low
           }
+          $snap = ".pyhl\snapshot"
+          $files = Get-ChildItem -Path $snap -Recurse -File
+          $apparentMiB = [math]::Round(($files | Measure-Object -Property Length -Sum).Sum / 1MB)
+          $diskBytes = [uint64]0
+          foreach ($f in $files) { $diskBytes += Get-CompressedSize $f.FullName }
+          $diskMiB = [math]::Round($diskBytes / 1MB)
           Write-Host "| Metric | Value |"
           Write-Host "|--------|-------|"
           Write-Host "| Apparent size | ${apparentMiB} MiB |"
