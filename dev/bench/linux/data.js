@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782405002935,
+  "lastUpdate": 1782537458741,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -1935,6 +1935,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot (disk)",
             "value": 656,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1caba5cdbb4c3c843fb27f649e0a4d04e299c486",
+          "message": "feat: use hyperlight-host 0.16.0 from crates.io (#99)\n\n* feat: adapt to hyperlight-host 0.16.0 from crates.io\n\nSwitch from git dep (danbugs/hyperlight) to crates.io hyperlight-host\n0.16.0. Key API changes:\n\n- Snapshot format: to_file/from_file_unchecked -> OCI save/load\n- snapshot.hls (single file) -> snapshot/ (OCI dir)\n- map_file_cow: 3-arg -> 2-arg (label param removed)\n- restore_preserving_file_mappings removed; re-map initrd after restore\n- Remove sparsify_snapshot (OCI format handles storage)\n- Remove whp-no-surrogate feature (now runtime env var)\n- Add max_surrogates API to configure_surrogates/InstallOptions/Runtime\n- Reduce default heap from 2560 MiB to 1280 MiB\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: remove extra blank line (fmt)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: check index.json for OCI snapshot validity\n\nAddress Copilot review: check snapshot/index.json instead of just\ntesting snapshot/ directory existence. Catches interrupted installs\nand incomplete OCI layouts with an actionable error message.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: re-add OCI blob sparsification for snapshot disk usage\n\nThe OCI snapshot format writes guest memory as a dense raw blob.\nWith CONFIG_PAGING=n in our Unikraft build, the heap pages retain\ntheir boot-time PTEs so the snapshot captures the full 1280 MiB\nheap even if most pages are untouched. Post-save sparsification\npunches holes in zero-filled 4K regions, reducing disk usage from\n~1755 MiB back to ~656 MiB.\n\nLinux uses fallocate(PUNCH_HOLE), Windows uses FSCTL_SET_ZERO_DATA.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: report real disk usage for sparse snapshots on Windows\n\nUse GetCompressedFileSizeW to measure actual on-disk allocation\ninstead of apparent file size, so Windows benchmark reports match\nLinux (which already uses stat block count).\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-06-26T22:05:32-07:00",
+          "tree_id": "893b08f42a2d3dc6bdf7b0810390342a495e8174",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/1caba5cdbb4c3c843fb27f649e0a4d04e299c486"
+        },
+        "date": 1782537458362,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 120,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 8,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 653,
             "unit": "MiB"
           }
         ]
