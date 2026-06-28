@@ -21,9 +21,9 @@ use std::time::Instant;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let kernel = args
-        .next()
-        .ok_or_else(|| anyhow!("usage: pydriver-run <kernel> <initrd> <script> [--repeat N] [--net]"))?;
+    let kernel = args.next().ok_or_else(|| {
+        anyhow!("usage: pydriver-run <kernel> <initrd> <script> [--repeat N] [--net]")
+    })?;
     let initrd = args.next().ok_or_else(|| anyhow!("missing <initrd>"))?;
     let script_path = args.next().ok_or_else(|| anyhow!("missing <script>"))?;
     let mut repeat: u32 = 0;
