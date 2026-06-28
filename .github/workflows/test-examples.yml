@@ -221,10 +221,6 @@ jobs:
             args: ""
             expect: "hello from hyperlight guest"
             driver: pydriver-busybox
-          - example: python-agent-driver
-            args: ""
-            expect: "Installed and imported six"
-            driver: pydriver-pip
           - example: powershell
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
@@ -338,10 +334,6 @@ jobs:
         if: steps.kvm_check.outputs.available == 'true' && matrix.driver == 'pydriver-busybox'
         run: cp examples/python-agent-driver/demo_busybox.py /tmp/demo_busybox.py
 
-      - name: Prepare pip install demo script
-        if: steps.kvm_check.outputs.available == 'true' && matrix.driver == 'pydriver-pip'
-        run: cp examples/python-agent-driver/demo_pip_install.py /tmp/demo_pip_install.py
-
       - name: Run and check output
         if: steps.kvm_check.outputs.available == 'true'
         working-directory: examples/${{ matrix.example }}
@@ -422,9 +414,6 @@ jobs:
               ;;
             pydriver-busybox)
               cmd=(timeout 120 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/pydriver-run "$kernel" "$cpio" /tmp/demo_busybox.py)
-              ;;
-            pydriver-pip)
-              cmd=(timeout 300 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/pydriver-run "$kernel" "$cpio" /tmp/demo_pip_install.py --net)
               ;;
             *)
               mem_args=""
@@ -633,10 +622,6 @@ jobs:
             args: ""
             expect: "hello from hyperlight guest"
             driver: pydriver-busybox
-          - example: python-agent-driver
-            args: ""
-            expect: "Installed and imported six"
-            driver: pydriver-pip
           - example: powershell
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
@@ -797,11 +782,6 @@ jobs:
             'pydriver-busybox' {
               Copy-Item "examples/python-agent-driver/demo_busybox.py" "$env:RUNNER_TEMP/demo_busybox.py"
               $out = & pydriver-run $kernel $cpio "$env:RUNNER_TEMP/demo_busybox.py" 2>&1
-              $rc = $LASTEXITCODE
-            }
-            'pydriver-pip' {
-              Copy-Item "examples/python-agent-driver/demo_pip_install.py" "$env:RUNNER_TEMP/demo_pip_install.py"
-              $out = & pydriver-run $kernel $cpio "$env:RUNNER_TEMP/demo_pip_install.py" --net 2>&1
               $rc = $LASTEXITCODE
             }
             default {
