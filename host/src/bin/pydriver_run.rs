@@ -15,7 +15,7 @@
 //! *measure* the warm-path cost on runs 2..N.
 
 use anyhow::{anyhow, Result};
-use hyperlight_unikraft::Sandbox;
+use hyperlight_unikraft::{NetworkPolicy, Sandbox};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -23,18 +23,21 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let kernel = args
         .next()
-        .ok_or_else(|| anyhow!("usage: pydriver-run <kernel> <initrd> <script> [--repeat N]"))?;
+        .ok_or_else(|| anyhow!("usage: pydriver-run <kernel> <initrd> <script> [--repeat N] [--net]"))?;
     let initrd = args.next().ok_or_else(|| anyhow!("missing <initrd>"))?;
     let script_path = args.next().ok_or_else(|| anyhow!("missing <script>"))?;
     let mut repeat: u32 = 0;
+    let mut net = false;
     while let Some(a) = args.next() {
-        if a == "--repeat" {
-            repeat = args
-                .next()
-                .ok_or_else(|| anyhow!("--repeat requires a value"))?
-                .parse()?;
-        } else {
-            return Err(anyhow!("unexpected arg: {}", a));
+        match a.as_str() {
+            "--repeat" => {
+                repeat = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--repeat requires a value"))?
+                    .parse()?;
+            }
+            "--net" => net = true,
+            _ => return Err(anyhow!("unexpected arg: {}", a)),
         }
     }
     let kernel = PathBuf::from(kernel);
@@ -42,10 +45,13 @@ fn main() -> Result<()> {
     let script = std::fs::read_to_string(&script_path)?;
 
     let t_evolve = Instant::now();
-    let mut sandbox = Sandbox::builder(&kernel)
+    let mut builder = Sandbox::builder(&kernel)
         .initrd_file(&initrd)
-        .heap_size(1280 * 1024 * 1024)
-        .build()?;
+        .heap_size(1280 * 1024 * 1024);
+    if net {
+        builder = builder.network(NetworkPolicy::AllowAll);
+    }
+    let mut sandbox = builder.build()?;
     eprintln!(
         "[timing] evolve={:.1}ms",
         t_evolve.elapsed().as_secs_f64() * 1000.0

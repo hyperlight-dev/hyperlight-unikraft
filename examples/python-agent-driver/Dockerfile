@@ -70,11 +70,54 @@ FROM ${BASE} AS rootfs
 COPY --from=deps         /deps            /usr/local/lib/python3.12/site-packages
 COPY --from=driver-build /src/hl_pydriver /bin/hl_pydriver
 COPY pydoc_stub.py /usr/local/lib/python3.12/pydoc.py
+# pip for in-guest package installation (vfork+execve subprocess)
+COPY --from=deps /usr/local/lib/python3.12/site-packages/pip /usr/local/lib/python3.12/site-packages/pip
+COPY --from=deps /usr/local/lib/python3.12/ensurepip /usr/local/lib/python3.12/ensurepip
+# stdlib modules needed by pip but missing from python-base
+COPY --from=deps /usr/local/lib/python3.12/xmlrpc /usr/local/lib/python3.12/xmlrpc
+COPY --from=deps /usr/local/lib/python3.12/zipapp.py /usr/local/lib/python3.12/zipapp.py
+# DNS-over-TCP resolver and pip target path (vfork subprocess support)
+COPY rootfs/usr/local/lib/python3.12/sitecustomize.py /usr/local/lib/python3.12/sitecustomize.py
+COPY rootfs/etc/pip.conf /etc/pip.conf
+
+# Stage 3b: build static PIE utility binaries (elfloader only supports ET_DYN).
+FROM debian:bookworm-slim AS utils-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libc6-dev make wget bzip2 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+RUN printf '#include <unistd.h>\n#include <string.h>\nint main(int c,char**v){int i;for(i=1;i<c;i++){if(i>1)write(1," ",1);write(1,v[i],strlen(v[i]));}write(1,"\\n",1);return 0;}\n' > /echo.c && \
+    gcc -O2 -static-pie -o /echo /echo.c
+RUN printf 'int main(){return 0;}\n' > /true.c && \
+    gcc -O2 -static-pie -o /true /true.c
+# Build busybox as static-pie (elfloader requires ET_DYN, so plain -static won't work).
+RUN wget -q https://busybox.net/downloads/busybox-1.36.1.tar.bz2 && \
+    tar xf busybox-1.36.1.tar.bz2 && cd busybox-1.36.1 && \
+    make defconfig && \
+    sed -i 's/CONFIG_TC=y/# CONFIG_TC is not set/' .config && \
+    sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config && \
+    sed -i 's|CONFIG_EXTRA_CFLAGS=""|CONFIG_EXTRA_CFLAGS="-fPIE -fPIC"|' .config && \
+    make -j$(nproc) && \
+    gcc -fPIE -fPIC -static-pie -o /busybox \
+      -Wl,--sort-common -Wl,--sort-section -Wl,alignment \
+      -Wl,--start-group \
+      applets/built-in.o \
+      $(find . -name 'lib.a' -path './*/lib.a' | sort) \
+      -Wl,--end-group \
+      -lm -lresolv && \
+    strip /busybox
 
 # Stage 4: pack CPIO.
 FROM alpine:3.20 AS cpio
 RUN apk add --no-cache cpio findutils ca-certificates
 COPY --from=rootfs / /rootfs/
+COPY --from=utils-build /echo /rootfs/bin/echo
+COPY --from=utils-build /true /rootfs/bin/true
+COPY --from=utils-build /busybox /rootfs/bin/busybox
+RUN cd /rootfs && for cmd in sh cat ls cp mv rm mkdir rmdir ln head tail wc \
+        grep sed awk sort uniq tr cut tee xargs find test basename dirname \
+        env which id whoami uname hostname date sleep; do \
+        ln -sf busybox bin/$cmd; \
+    done
 
 # DNS configuration for glibc's getaddrinfo
 RUN mkdir -p /rootfs/etc && \
