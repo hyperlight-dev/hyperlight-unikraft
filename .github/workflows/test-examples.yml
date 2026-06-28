@@ -217,6 +217,11 @@ jobs:
             args: ""
             expect: "hello from driver"
             driver: pydriver-run
+          - example: python-agent-driver
+            args: ""
+            expect: "hello from hyperlight guest"
+            driver: pydriver-run
+            pydriver_script: demo_busybox.py
           - example: powershell
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
@@ -324,7 +329,13 @@ jobs:
 
       - name: Prepare pydriver-run script (python-agent-driver only)
         if: steps.kvm_check.outputs.available == 'true' && matrix.driver == 'pydriver-run'
-        run: echo 'print("hello from driver")' > /tmp/tiny.py
+        working-directory: examples/${{ matrix.example }}
+        run: |
+          if [ -n "${{ matrix.pydriver_script }}" ]; then
+            cp "${{ matrix.pydriver_script }}" /tmp/tiny.py
+          else
+            echo 'print("hello from driver")' > /tmp/tiny.py
+          fi
 
       - name: Run and check output
         if: steps.kvm_check.outputs.available == 'true'
@@ -607,6 +618,11 @@ jobs:
             args: ""
             expect: "hello from driver"
             driver: pydriver-run
+          - example: python-agent-driver
+            args: ""
+            expect: "hello from hyperlight guest"
+            driver: pydriver-run
+            pydriver_script: demo_busybox.py
           - example: powershell
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
@@ -759,7 +775,12 @@ jobs:
               $rc = $LASTEXITCODE
             }
             'pydriver-run' {
-              "print('hello from driver')" | Out-File -Encoding ascii tiny.py
+              $pydriverScript = "${{ matrix.pydriver_script }}"
+              if ($pydriverScript -ne '') {
+                Copy-Item $pydriverScript -Destination tiny.py
+              } else {
+                "print('hello from driver')" | Out-File -Encoding ascii tiny.py
+              }
               $tiny = (Resolve-Path "tiny.py").Path
               $out = & pydriver-run $kernel $cpio $tiny 2>&1
               $rc = $LASTEXITCODE
