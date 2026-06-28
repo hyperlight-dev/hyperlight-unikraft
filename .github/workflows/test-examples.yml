@@ -777,7 +777,7 @@ jobs:
             'pydriver-run' {
               $pydriverScript = "${{ matrix.pydriver_script }}"
               if ($pydriverScript -ne '') {
-                Copy-Item $pydriverScript -Destination tiny.py
+                Copy-Item "examples/${{ matrix.example }}/$pydriverScript" -Destination tiny.py
               } else {
                 "print('hello from driver')" | Out-File -Encoding ascii tiny.py
               }
