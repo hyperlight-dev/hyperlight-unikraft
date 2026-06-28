@@ -82,6 +82,7 @@ unikraft:
     CONFIG_LIBPOSIX_FDTAB_MULTITAB: 'n'
 
     CONFIG_STACK_SIZE_PAGE_ORDER: '10'
+    CONFIG_LIBUKDEBUG_ENABLE_ASSERT: 'n'
 
 libraries:
   app-elfloader:
