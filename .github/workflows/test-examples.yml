@@ -222,6 +222,11 @@ jobs:
             expect: "hello from hyperlight guest"
             driver: pydriver-run
             pydriver_script: demo_busybox.py
+          - example: python-agent-driver
+            args: "--net"
+            expect: "Imported six"
+            driver: pydriver-run
+            pydriver_script: demo_pip_install.py
           - example: powershell
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
@@ -413,7 +418,7 @@ jobs:
               cmd=(timeout 60 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/multifn-test "$kernel" "$cpio")
               ;;
             pydriver-run)
-              cmd=(timeout 120 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/pydriver-run "$kernel" "$cpio" /tmp/tiny.py)
+              cmd=(timeout 120 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/pydriver-run "$kernel" "$cpio" /tmp/tiny.py ${{ matrix.args }})
               ;;
             *)
               mem_args=""
@@ -623,6 +628,11 @@ jobs:
             expect: "hello from hyperlight guest"
             driver: pydriver-run
             pydriver_script: demo_busybox.py
+          - example: python-agent-driver
+            args: "--net"
+            expect: "Imported six"
+            driver: pydriver-run
+            pydriver_script: demo_pip_install.py
           - example: powershell
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
@@ -782,7 +792,11 @@ jobs:
                 "print('hello from driver')" | Out-File -Encoding ascii tiny.py
               }
               $tiny = (Resolve-Path "tiny.py").Path
-              $out = & pydriver-run $kernel $cpio $tiny 2>&1
+              $pydriverArgs = @($kernel, $cpio, $tiny)
+              if ($runArgs -ne '') {
+                $pydriverArgs += $runArgs.Split(' ') | Where-Object { $_ -ne '' }
+              }
+              $out = & pydriver-run @pydriverArgs 2>&1
               $rc = $LASTEXITCODE
             }
             default {
