@@ -48,6 +48,15 @@ RUN set -eux; \
     find /deps -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true; \
     find /deps -type f -name '*.pyc' -delete 2>/dev/null || true; \
     find /deps -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true
+# Patch pip's user_agent() — the original probes platform/distro/libc/ssl
+# which triggers buddy allocator corruption in unikraft's memory manager.
+RUN python3 -c "\
+import re, pathlib; \
+p = pathlib.Path('/usr/local/lib/python3.12/site-packages/pip/_internal/network/session.py'); \
+src = p.read_text(); \
+src = re.sub(r'(def user_agent\(\)[^:]*:).*?(\n(?:def |class ))', \
+    r'\1\n    return \"pip/hyperlight\"\n\n\2', src, count=1, flags=re.DOTALL); \
+p.write_text(src)"
 
 # Stage 2: build hl_pydriver against the SAME Python 3.12-from-source
 # that produces local-python-base, so the glibc/libpython3.12.so ABI
