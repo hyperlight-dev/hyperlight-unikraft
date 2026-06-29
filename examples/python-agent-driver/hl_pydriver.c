@@ -249,7 +249,10 @@ static void py_initialize_once(void)
 	PyRun_SimpleString(
 		"import sys, importlib\n"
 		"for _mod in ("
-		"    'numpy', 'pandas', 'pydantic', 'yaml', 'jinja2',"
+		"    'numpy', 'numpy.rec', 'numpy.char', 'numpy.ma',"
+		"    'numpy.fft', 'numpy.linalg', 'numpy.random',"
+		"    'numpy.polynomial', 'numpy.strings',"
+		"    'pandas', 'pydantic', 'yaml', 'jinja2',"
 		"    'bs4', 'tabulate', 'click', 'tenacity', 'tqdm',"
 		"    'openpyxl', 'pypdf', 'markdown_it', 'PIL', 'lxml',"
 		"    'cryptography', 'dateutil', 'dotenv',"
@@ -258,6 +261,20 @@ static void py_initialize_once(void)
 		"    importlib.import_module(_mod)\n"
 		"  except Exception as _e:\n"
 		"    sys.stderr.write(f'warn: preload {_mod} failed: {_e}\\n')\n");
+
+	/* Exercise pandas/numpy code paths that trigger lazy imports.
+	 * The vfork kernel's exit_group destroys CPIO VFS directory
+	 * caches, so after snapshot/restore only modules already in
+	 * sys.modules can be used. Running describe() + repr() here
+	 * ensures all transitive lazy imports are resolved. */
+	PyRun_SimpleString(
+		"import pandas as _pd, numpy as _np, io as _io\n"
+		"_df = _pd.DataFrame(_np.random.randn(4, 4),\n"
+		"                    columns=list('ABCD'))\n"
+		"_ = _df.describe()\n"
+		"_ = repr(_df)\n"
+		"_ = _df.to_csv()\n"
+		"del _df, _pd, _np, _io, _\n");
 
 	/* Monkey-patch zipfile.ZipInfo.__init__ to clamp pre-1980 timestamps.
 	 * Unikraft's ramfs reports epoch-0 (1970) for file mtimes; Python's
