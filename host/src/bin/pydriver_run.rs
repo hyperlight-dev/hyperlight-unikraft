@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     let t_evolve = Instant::now();
     let mut builder = Sandbox::builder(&kernel)
         .initrd_file(&initrd)
-        .heap_size(1280 * 1024 * 1024);
+        .heap_size(3072 * 1024 * 1024);
     if net {
         builder = builder.network(NetworkPolicy::AllowAll);
     }
