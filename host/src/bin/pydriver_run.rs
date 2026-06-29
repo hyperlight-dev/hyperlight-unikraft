@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     sandbox.restore()?;
     let restore0_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let t1 = Instant::now();
-    let _: () = sandbox.call_named("run", script.clone())?;
+    let call_result: Result<()> = sandbox.call_named("run", script.clone());
     let call0_ms = t1.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "[run 1/{}] restore={:.1}ms call={:.1}ms (includes Py_Initialize + warmup)",
@@ -69,6 +69,20 @@ fn main() -> Result<()> {
         restore0_ms,
         call0_ms,
     );
+
+    // The guest driver halts the CPU directly (cli;hlt) after reporting
+    // the exit code via __hl_exit — this avoids the kernel's exit_group
+    // path which can hang on child process cleanup.  Hyperlight may
+    // surface the raw HLT as an error; treat it as success when the
+    // guest reported exit code 0.
+    let guest_exit = sandbox.last_exit_code();
+    match call_result {
+        Ok(()) => {}
+        Err(e) if guest_exit == 0 => {
+            eprintln!("[pydriver-run] guest halted (exit code 0): {e}");
+        }
+        Err(e) => return Err(e),
+    }
 
     /* Stateful loop — no snapshot/restore between runs. Each call just
      * resumes from the previous call's halt, so Python state, stack,
@@ -81,5 +95,8 @@ fn main() -> Result<()> {
         eprintln!("[run {}/{}] call={:.1}ms (warm)", i, repeat + 1, call_ms,);
     }
 
+    if guest_exit != 0 {
+        std::process::exit(guest_exit);
+    }
     Ok(())
 }
