@@ -224,7 +224,7 @@ jobs:
             pydriver_script: demo_busybox.py
           - example: python-agent-driver
             args: "--net"
-            expect: "Imported six"
+            expect: "imported six"
             driver: pydriver-run
             pydriver_script: demo_pip_install.py
           - example: powershell
@@ -630,7 +630,7 @@ jobs:
             pydriver_script: demo_busybox.py
           - example: python-agent-driver
             args: "--net"
-            expect: "Imported six"
+            expect: "imported six"
             driver: pydriver-run
             pydriver_script: demo_pip_install.py
           - example: powershell
