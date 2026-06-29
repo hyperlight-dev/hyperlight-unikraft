@@ -1,18 +1,13 @@
-import subprocess, sys, importlib, os, signal
+import subprocess, sys
 
-proc = subprocess.Popen(
+result = subprocess.run(
     [sys.executable, "-m", "pip", "install", "six"],
+    capture_output=True, text=True,
 )
+print(result.stdout)
+if result.returncode != 0:
+    print(result.stderr)
+    sys.exit(result.returncode)
 
-for _ in range(50_000_000):
-    try:
-        importlib.invalidate_caches()
-        import six
-        print(f"Installed and imported six {six.__version__}")
-        try:
-            os.kill(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        break
-    except ImportError:
-        pass
+import six
+print(f"Installed and imported six {six.__version__}")

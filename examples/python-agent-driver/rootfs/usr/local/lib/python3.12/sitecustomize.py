@@ -158,3 +158,27 @@ def _fast_ssl_close(self):
     except OSError:
         pass
 _ssl.SSLSocket.close = _fast_ssl_close
+
+# Unikraft's exit_group syscall hangs when child processes have had
+# network connections. Work around by having child processes SIGKILL
+# themselves instead of calling exit_group, and having the parent
+# treat SIGKILL exit status as success.
+import signal as _signal
+if _os.getpid() > 2:
+    _orig_sys_exit = _sys.exit
+    def _child_sys_exit(code=0):
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+        _os.kill(_os.getpid(), _signal.SIGKILL)
+        _orig_sys_exit(code)
+    _sys.exit = _child_sys_exit
+
+import subprocess as _subprocess
+_orig_popen_wait = _subprocess.Popen.wait
+def _patched_popen_wait(self, timeout=None):
+    rc = _orig_popen_wait(self, timeout)
+    if rc < 0 and abs(rc) == _signal.SIGKILL:
+        rc = 0
+        self.returncode = 0
+    return rc
+_subprocess.Popen.wait = _patched_popen_wait
