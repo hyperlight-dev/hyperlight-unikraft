@@ -51,12 +51,14 @@ RUN set -eux; \
 # Patch pip's user_agent() — the original probes platform/distro/libc/ssl
 # which triggers buddy allocator corruption in unikraft's memory manager.
 RUN python3 -c "\
-import re, pathlib; \
+import re, pathlib, sys; \
 p = pathlib.Path('/usr/local/lib/python3.12/site-packages/pip/_internal/network/session.py'); \
 src = p.read_text(); \
-src = re.sub(r'(def user_agent\(\)[^:]*:).*?(\n(?:def |class ))', \
+patched = re.sub(r'(def user_agent\(\)[^:]*:).*?(\n(?:def |class ))', \
     r'\1\n    return \"pip/hyperlight\"\n\n\2', src, count=1, flags=re.DOTALL); \
-p.write_text(src)"
+assert patched != src, 'pip user_agent() regex did not match — pip version changed?'; \
+p.write_text(patched)" && \
+    python3 -c "from pip._internal.network.session import user_agent; assert user_agent() == 'pip/hyperlight'"
 
 # Stage 2: build hl_pydriver against the SAME Python 3.12-from-source
 # that produces local-python-base, so the glibc/libpython3.12.so ABI

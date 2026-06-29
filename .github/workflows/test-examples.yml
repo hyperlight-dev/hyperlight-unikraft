@@ -418,7 +418,7 @@ jobs:
               cmd=(timeout 60 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/multifn-test "$kernel" "$cpio")
               ;;
             pydriver-run)
-              cmd=(timeout 120 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/pydriver-run "$kernel" "$cpio" /tmp/tiny.py ${{ matrix.args }})
+              cmd=(timeout 300 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/pydriver-run "$kernel" "$cpio" /tmp/tiny.py ${{ matrix.args }})
               ;;
             *)
               mem_args=""

@@ -1,5 +1,6 @@
 import subprocess, sys
 
+print("Starting pip install...", flush=True)
 result = subprocess.run(
     [sys.executable, "-m", "pip", "install", "six"],
     capture_output=True, text=True,
