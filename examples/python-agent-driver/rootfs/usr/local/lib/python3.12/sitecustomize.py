@@ -149,3 +149,12 @@ _os.rmdir = _patched_rmdir
 
 if '/tmp/pip_packages' not in _sys.path:
     _sys.path.insert(0, '/tmp/pip_packages')
+
+import ssl as _ssl
+_orig_ssl_close = _ssl.SSLSocket.close
+def _fast_ssl_close(self):
+    try:
+        super(_ssl.SSLSocket, self).close()
+    except OSError:
+        pass
+_ssl.SSLSocket.close = _fast_ssl_close
