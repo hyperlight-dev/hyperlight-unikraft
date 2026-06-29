@@ -123,7 +123,6 @@ static hl_dispatch_fn_t *g_v2_callback_slot;
  * save/restore of segment state) leaves FS_BASE pointing elsewhere.
  */
 static uint64_t g_py_fsbase;
-static int g_last_exit_code;
 
 static inline uint64_t rdmsr_fsbase(void)
 {
@@ -224,10 +223,13 @@ static void py_run_user_code(const uint8_t *fc, size_t fc_len)
 		buf[code_len] = '\0';
 	}
 
-	g_last_exit_code = run_code_with_exceptions(buf);
+	int exit_code = run_code_with_exceptions(buf);
 
 	if (buf != stack_buf)
 		free(buf);
+
+	if (exit_code != 0)
+		report_exit_code(exit_code);
 }
 
 static void py_initialize_once(void)
@@ -341,15 +343,11 @@ int main(int argc, char **argv, char **envp)
 
 	fflush(stdout);
 	fflush(stderr);
-	report_exit_code(g_last_exit_code);
-	__asm__ volatile(
-		"movw $108, %%dx\n\t"
-		"xorl %%eax, %%eax\n\t"
-		"outl %%eax, %%dx\n\t"
-		"cli\n\t"
-		"hlt\n\t"
-		: : : "eax", "edx"
-	);
+
+	register long rax __asm__("rax") = 231; /* SYS_exit_group */
+	register long rdi __asm__("rdi") = 0;
+	__asm__ volatile("syscall" : : "r"(rax), "r"(rdi)
+			 : "rcx", "r11", "memory");
 	/* not reached */
 	return 0;
 }

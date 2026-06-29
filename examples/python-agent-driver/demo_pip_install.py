@@ -8,7 +8,7 @@ for _ in range(50_000_000):
     try:
         importlib.invalidate_caches()
         import six
-        print(f"Installed and imported six {six.__version__}", flush=True)
+        print(f"Installed and imported six {six.__version__}")
         try:
             os.kill(proc.pid, signal.SIGKILL)
         except OSError:
