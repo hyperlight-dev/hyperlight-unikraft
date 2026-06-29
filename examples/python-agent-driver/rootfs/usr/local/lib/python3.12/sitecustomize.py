@@ -13,6 +13,7 @@ def _tcp_dns_resolve(host, port):
     results = []
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     try:
+        s.settimeout(10)
         s.connect(("8.8.8.8", 53))
         s.send(_struct.pack('>H', len(query)) + query)
         resp = b''
@@ -74,6 +75,77 @@ def _patched_scandir(path='.'):
         path = '.'
     return _orig_scandir(path)
 _os.scandir = _patched_scandir
+
+def _copy_tree(src, dst):
+    if _os.path.isdir(src):
+        _os.makedirs(dst, exist_ok=True)
+        for item in _os.listdir(src):
+            _copy_tree(_os.path.join(src, item), _os.path.join(dst, item))
+    else:
+        with open(src, 'rb') as _sf:
+            with open(dst, 'wb') as _df:
+                while True:
+                    _chunk = _sf.read(65536)
+                    if not _chunk:
+                        break
+                    _df.write(_chunk)
+
+_orig_rename = _os.rename
+def _patched_rename(src, dst):
+    try:
+        return _orig_rename(src, dst)
+    except OSError as _e:
+        if _e.errno in (30, 38):
+            _copy_tree(src, dst)
+        else:
+            raise
+_os.rename = _patched_rename
+
+_orig_replace = _os.replace
+def _patched_replace(src, dst):
+    try:
+        return _orig_replace(src, dst)
+    except OSError as _e:
+        if _e.errno in (30, 38):
+            _copy_tree(src, dst)
+        else:
+            raise
+_os.replace = _patched_replace
+
+import shutil as _shutil
+_orig_copystat = _shutil.copystat
+def _patched_copystat(src, dst, **kwargs):
+    try:
+        return _orig_copystat(src, dst, **kwargs)
+    except OSError as _e:
+        if _e.errno in (30, 38):
+            pass
+        else:
+            raise
+_shutil.copystat = _patched_copystat
+
+_orig_unlink = _os.unlink
+def _patched_unlink(path):
+    try:
+        return _orig_unlink(path)
+    except OSError as _e:
+        if _e.errno in (30, 38):
+            pass
+        else:
+            raise
+_os.unlink = _patched_unlink
+_os.remove = _patched_unlink
+
+_orig_rmdir = _os.rmdir
+def _patched_rmdir(path):
+    try:
+        return _orig_rmdir(path)
+    except OSError as _e:
+        if _e.errno in (30, 38):
+            pass
+        else:
+            raise
+_os.rmdir = _patched_rmdir
 
 if '/tmp/pip_packages' not in _sys.path:
     _sys.path.insert(0, '/tmp/pip_packages')
