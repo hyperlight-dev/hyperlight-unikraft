@@ -216,7 +216,18 @@ jobs:
           - example: python-agent-driver
             args: ""
             expect: "hello from driver"
-            driver: pydriver-run
+            driver: pyhl
+            pyhl_code: "print('hello from driver')"
+          - example: python-agent-driver
+            args: ""
+            expect: "hello from hyperlight guest"
+            driver: pyhl
+            pyhl_script: demo_busybox.py
+          - example: python-agent-driver
+            args: "--net"
+            expect: "imported six"
+            driver: pyhl
+            pyhl_script: demo_pip_install.py
           - example: powershell
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
@@ -281,8 +292,9 @@ jobs:
         if: steps.kvm_check.outputs.available == 'true'
         run: |
           cd host
-          cargo build --release --features wasm-host-fns --bin hyperlight-unikraft --bin multifn-test --bin pydriver-run
+          cargo build --release --features wasm-host-fns --bin hyperlight-unikraft --bin multifn-test --bin pyhl
           sudo cp target/release/hyperlight-unikraft /usr/local/bin/
+          sudo cp target/release/pyhl /usr/local/bin/
 
       - name: Build echo Wasm host function
         if: steps.kvm_check.outputs.available == 'true' && matrix.needs_echo_tool == true
@@ -322,9 +334,10 @@ jobs:
             kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64
           fi
 
-      - name: Prepare pydriver-run script (python-agent-driver only)
-        if: steps.kvm_check.outputs.available == 'true' && matrix.driver == 'pydriver-run'
-        run: echo 'print("hello from driver")' > /tmp/tiny.py
+      - name: pyhl setup (python-agent-driver only)
+        if: steps.kvm_check.outputs.available == 'true' && matrix.driver == 'pyhl'
+        working-directory: examples/${{ matrix.example }}
+        run: pyhl setup --from . --force
 
       - name: Run and check output
         if: steps.kvm_check.outputs.available == 'true'
@@ -401,8 +414,17 @@ jobs:
             multifn-test)
               cmd=(timeout 60 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/multifn-test "$kernel" "$cpio")
               ;;
-            pydriver-run)
-              cmd=(timeout 120 /home/runner/work/hyperlight-unikraft/hyperlight-unikraft/host/target/release/pydriver-run "$kernel" "$cpio" /tmp/tiny.py)
+            pyhl)
+              pyhl_args=()
+              if [ -n "${{ matrix.pyhl_script }}" ]; then
+                pyhl_args+=(examples/${{ matrix.example }}/${{ matrix.pyhl_script }})
+              elif [ -n "${{ matrix.pyhl_code }}" ]; then
+                pyhl_args+=(-c "${{ matrix.pyhl_code }}")
+              fi
+              if echo "${{ matrix.args }}" | grep -q "\-\-net"; then
+                pyhl_args+=(--net)
+              fi
+              cmd=(timeout 300 pyhl run -v "${pyhl_args[@]}")
               ;;
             *)
               mem_args=""
@@ -606,7 +628,18 @@ jobs:
           - example: python-agent-driver
             args: ""
             expect: "hello from driver"
-            driver: pydriver-run
+            driver: pyhl
+            pyhl_code: "print('hello from driver')"
+          - example: python-agent-driver
+            args: ""
+            expect: "hello from hyperlight guest"
+            driver: pyhl
+            pyhl_script: demo_busybox.py
+          - example: python-agent-driver
+            args: "--net"
+            expect: "imported six"
+            driver: pyhl
+            pyhl_script: demo_pip_install.py
           - example: powershell
             args: "-- -NoProfile -File /scripts/hello.ps1"
             expect: "Hello, World! From PowerShell on Hyperlight"
@@ -645,10 +678,9 @@ jobs:
         shell: pwsh
         run: |
           cd host
-          cargo build --release --features wasm-host-fns --bin hyperlight-unikraft --bin multifn-test --bin pydriver-run --bin pyhl
+          cargo build --release --features wasm-host-fns --bin hyperlight-unikraft --bin multifn-test --bin pyhl
           Copy-Item target\release\hyperlight-unikraft.exe $env:USERPROFILE\.cargo\bin\ -Force
           Copy-Item target\release\multifn-test.exe $env:USERPROFILE\.cargo\bin\ -Force
-          Copy-Item target\release\pydriver-run.exe $env:USERPROFILE\.cargo\bin\ -Force
           Copy-Item target\release\pyhl.exe $env:USERPROFILE\.cargo\bin\ -Force
 
       - name: Build echo Wasm host function
@@ -663,6 +695,15 @@ jobs:
         with:
           name: windows-image-${{ matrix.example }}
           path: image
+
+      - name: pyhl setup (python-agent-driver only)
+        if: matrix.driver == 'pyhl'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src-dir/.unikraft/build | Out-Null
+          Copy-Item image/kernel src-dir/.unikraft/build/pyhl-kernel_hyperlight-x86_64
+          Copy-Item image/initrd.cpio src-dir/pyhl-initrd.cpio
+          pyhl setup --from src-dir --force
 
       - name: Run and check output
         shell: pwsh
@@ -758,10 +799,20 @@ jobs:
               $out = & multifn-test $kernel $cpio 2>&1
               $rc = $LASTEXITCODE
             }
-            'pydriver-run' {
-              "print('hello from driver')" | Out-File -Encoding ascii tiny.py
-              $tiny = (Resolve-Path "tiny.py").Path
-              $out = & pydriver-run $kernel $cpio $tiny 2>&1
+            'pyhl' {
+              $pyhlArgs = @('run', '-v')
+              $pyhlScript = "${{ matrix.pyhl_script }}"
+              $pyhlCode = "${{ matrix.pyhl_code }}"
+              if ($pyhlScript -ne '') {
+                Copy-Item "examples/${{ matrix.example }}/$pyhlScript" -Destination tiny.py
+                $pyhlArgs += (Resolve-Path "tiny.py").Path
+              } elseif ($pyhlCode -ne '') {
+                $pyhlArgs += @('-c', $pyhlCode)
+              }
+              if ($runArgs -match '--net') {
+                $pyhlArgs += '--net'
+              }
+              $out = & pyhl @pyhlArgs 2>&1
               $rc = $LASTEXITCODE
             }
             default {

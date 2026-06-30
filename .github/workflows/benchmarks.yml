@@ -186,7 +186,7 @@ jobs:
           times=()
           for i in $(seq 1 15); do
             ms=$( { /usr/bin/time -f "%e" pyhl run -c "print(42)" > /dev/null; } 2>&1 )
-            ms_int=$(echo "$ms * 1000" | bc | cut -d. -f1)
+            ms_int=$(echo "$ms * 1000" | tr -d '\r' | bc | cut -d. -f1)
             times+=($ms_int)
             echo "  run $i: ${ms_int}ms"
           done
@@ -223,7 +223,7 @@ jobs:
           times=()
           for i in $(seq 1 10); do
             ms=$( { /usr/bin/time -f "%e" pyhl run /tmp/pandas_bench.py > /dev/null; } 2>&1 )
-            ms_int=$(echo "$ms * 1000" | bc | cut -d. -f1)
+            ms_int=$(echo "$ms * 1000" | tr -d '\r' | bc | cut -d. -f1)
             times+=($ms_int)
             echo "  run $i: ${ms_int}ms"
           done
