@@ -2,8 +2,8 @@ specification: '0.6'
 name: multifn-c-hyperlight
 
 unikraft:
-  source: https://github.com/unikraft/unikraft.git
-  version: plat-hyperlight
+  source: https://github.com/danbugs/unikraft.git
+  version: proto/vfork
   kconfig:
     CONFIG_PLAT_HYPERLIGHT: 'y'
     CONFIG_PAGING: 'n'
@@ -49,8 +49,8 @@ unikraft:
 
 libraries:
   app-elfloader:
-    source: https://github.com/unikraft/app-elfloader.git
-    version: plat-hyperlight
+    source: https://github.com/danbugs/app-elfloader.git
+    version: proto/vfork
   libelf:
     source: https://github.com/unikraft/lib-libelf.git
     version: staging

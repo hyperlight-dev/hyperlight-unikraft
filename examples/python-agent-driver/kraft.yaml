@@ -2,14 +2,15 @@ specification: '0.6'
 name: python-agent-driver-hyperlight
 
 unikraft:
-  source: https://github.com/unikraft/unikraft.git
-  version: plat-hyperlight
+  source: https://github.com/danbugs/unikraft.git
+  version: proto/vfork
   kconfig:
     CONFIG_PLAT_HYPERLIGHT: 'y'
     CONFIG_PAGING: 'n'
     CONFIG_LIBUKVMEM: 'n'
     CONFIG_LIBUKINTCTLR_HYPERLIGHT: 'y'
     CONFIG_HYPERLIGHT_MAX_GUEST_LOG_LEVEL: 4
+    CONFIG_LIBSYSCALL_SHIM_STRACE: 'n'
 
     CONFIG_LIBUKPRINT_KLVL_CRIT: 'y'
     CONFIG_LIBUKPRINT_PRINT_TIME: 'n'
@@ -70,21 +71,25 @@ unikraft:
     CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL: 'y'
 
     CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS: 'y'
-    CONFIG_LIBPOSIX_PROCESS_EXECVE: 'y'
     CONFIG_LIBPOSIX_PROCESS_SIGNAL: 'y'
+    CONFIG_LIBPOSIX_PROCESS_EXECVE: 'y'
     CONFIG_LIBUKBINFMT: 'y'
-    CONFIG_APPELFLOADER_MULTIPROCESS: 'y'
     CONFIG_APPELFLOADER_ELF_BINFMT: 'y'
 
     CONFIG_LIBCONTEXT: 'y'
     CONFIG_LIBCONTEXT_CLEAR_TBSS: 'y'
 
+    CONFIG_APPELFLOADER_MULTIPROCESS: 'y'
+
     CONFIG_LIBPOSIX_FDTAB_MULTITAB: 'n'
+
+    CONFIG_STACK_SIZE_PAGE_ORDER: 10
+    CONFIG_LIBUKDEBUG_ENABLE_ASSERT: 'n'
 
 libraries:
   app-elfloader:
-    source: https://github.com/unikraft/app-elfloader.git
-    version: plat-hyperlight
+    source: https://github.com/danbugs/app-elfloader.git
+    version: proto/vfork
   libelf:
     source: https://github.com/unikraft/lib-libelf.git
     version: staging
