@@ -56,10 +56,3 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           gh workflow run publish-examples.yml --ref "v$VERSION"
-
-      - name: Trigger crates.io publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          gh workflow run cargo-publish.yml --ref "v$VERSION" -f dry_run=false
