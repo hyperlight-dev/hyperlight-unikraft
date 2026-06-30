@@ -1679,11 +1679,21 @@ fn handle_net_poll(
         return Ok(json!({"ready": ready}));
     }
 
+    // The Unikraft guest may busy-poll with timeout_ms=0 without
+    // yielding via __hl_sleep. Enforce a minimum so poll() has time
+    // to detect incoming data that arrives between poll cycles.
+    let has_pollin = pollfds.iter().any(|p| p.events & libc::POLLIN != 0);
+    let effective_ms = if has_pollin {
+        timeout_ms.max(50)
+    } else {
+        timeout_ms
+    };
+
     let ret = unsafe {
         libc::poll(
             pollfds.as_mut_ptr(),
             pollfds.len() as libc::nfds_t,
-            timeout_ms,
+            effective_ms,
         )
     };
 
