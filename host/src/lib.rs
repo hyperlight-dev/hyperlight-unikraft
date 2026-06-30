@@ -1315,6 +1315,13 @@ fn handle_net_connect(
     let tbl = table.lock().unwrap();
     let sock = tbl.get_socket(fd)?;
     sock.connect_timeout(&sa, SOCKET_TIMEOUT)?;
+    // connect_timeout() internally sets nonblocking(false); restore
+    // the read/write timeouts that it may have cleared.
+    #[cfg(windows)]
+    {
+        sock.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+        sock.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+    }
     Ok(json!({}))
 }
 
@@ -1706,46 +1713,13 @@ fn handle_net_poll(
     use serde_json::json;
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
-        WSAPoll, POLLERR as W_POLLERR, POLLHUP as W_POLLHUP, POLLNVAL as W_POLLNVAL, POLLRDNORM,
-        POLLWRNORM, WSAPOLLFD,
+        __WSAFDIsSet, select, FD_SET, FD_SETSIZE, SOCKET, SOCKET_ERROR, TIMEVAL,
     };
 
     const POSIX_POLLIN: i16 = 0x0001;
     const POSIX_POLLOUT: i16 = 0x0004;
     const POSIX_POLLERR: i16 = 0x0008;
-    const POSIX_POLLHUP: i16 = 0x0010;
     const POSIX_POLLNVAL: i16 = 0x0020;
-
-    fn posix_to_win(posix: i16) -> i16 {
-        let mut win: i16 = 0;
-        if posix & POSIX_POLLIN != 0 {
-            win |= POLLRDNORM;
-        }
-        if posix & POSIX_POLLOUT != 0 {
-            win |= POLLWRNORM;
-        }
-        win
-    }
-
-    fn win_to_posix(win: i16) -> i16 {
-        let mut posix: i16 = 0;
-        if win & POLLRDNORM != 0 {
-            posix |= POSIX_POLLIN;
-        }
-        if win & POLLWRNORM != 0 {
-            posix |= POSIX_POLLOUT;
-        }
-        if win & W_POLLERR != 0 {
-            posix |= POSIX_POLLERR;
-        }
-        if win & W_POLLHUP != 0 {
-            posix |= POSIX_POLLHUP;
-        }
-        if win & W_POLLNVAL != 0 {
-            posix |= POSIX_POLLNVAL;
-        }
-        posix
-    }
 
     let fds_val = args
         .get("fds")
@@ -1758,8 +1732,15 @@ fn handle_net_poll(
         .clamp(0, i32::MAX as i64) as i32;
 
     let tbl = table.lock().unwrap();
-    let mut pollfds: Vec<WSAPOLLFD> = Vec::new();
-    let mut guest_fds: Vec<u64> = Vec::new();
+
+    struct FdEntry {
+        raw: SOCKET,
+        guest_fd: u64,
+        want_read: bool,
+        want_write: bool,
+    }
+
+    let mut entries: Vec<FdEntry> = Vec::new();
     let mut ready = Vec::new();
 
     for entry in fds_val {
@@ -1771,36 +1752,98 @@ fn handle_net_poll(
         if !(0..=i16::MAX as i64).contains(&raw_events) {
             return Err(anyhow!("net_poll: events {raw_events} out of i16 range"));
         }
-        let events = posix_to_win(raw_events as i16);
+        let events = raw_events as i16;
         if let Ok(sock) = tbl.get_socket(fd) {
-            pollfds.push(WSAPOLLFD {
-                fd: sock.as_raw_socket() as usize,
-                events,
-                revents: 0,
+            entries.push(FdEntry {
+                raw: sock.as_raw_socket() as SOCKET,
+                guest_fd: fd,
+                want_read: events & POSIX_POLLIN != 0,
+                want_write: events & POSIX_POLLOUT != 0,
             });
-            guest_fds.push(fd);
         } else {
             ready.push(json!({ "fd": fd, "revents": POSIX_POLLNVAL as i64 }));
         }
     }
     drop(tbl);
 
-    if pollfds.is_empty() {
+    if entries.is_empty() {
         return Ok(json!({"ready": ready}));
     }
-
-    let ret = unsafe { WSAPoll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout_ms) };
-
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(anyhow!("net_poll: WSAPoll() failed: {err}"));
+    if entries.len() > FD_SETSIZE as usize {
+        return Err(anyhow!("net_poll: too many fds for select()"));
     }
 
-    for (i, pfd) in pollfds.iter().enumerate() {
-        if pfd.revents != 0 {
+    let mut readfds: FD_SET = unsafe { std::mem::zeroed() };
+    let mut writefds: FD_SET = unsafe { std::mem::zeroed() };
+    let mut exceptfds: FD_SET = unsafe { std::mem::zeroed() };
+
+    for e in &entries {
+        if e.want_read {
+            let c = readfds.fd_count as usize;
+            readfds.fd_array[c] = e.raw;
+            readfds.fd_count += 1;
+        }
+        if e.want_write {
+            let c = writefds.fd_count as usize;
+            writefds.fd_array[c] = e.raw;
+            writefds.fd_count += 1;
+        }
+        let c = exceptfds.fd_count as usize;
+        exceptfds.fd_array[c] = e.raw;
+        exceptfds.fd_count += 1;
+    }
+
+    // The Unikraft guest may busy-poll with timeout_ms=0 without
+    // yielding via __hl_sleep. Enforce a minimum so select() has time
+    // to detect incoming data that arrives between poll cycles.
+    let effective_ms = if readfds.fd_count > 0 {
+        timeout_ms.max(50)
+    } else {
+        timeout_ms
+    };
+    let tv = TIMEVAL {
+        tv_sec: effective_ms / 1000,
+        tv_usec: (effective_ms % 1000) * 1000,
+    };
+
+    let ret = unsafe {
+        select(
+            0,
+            if readfds.fd_count > 0 {
+                &mut readfds
+            } else {
+                std::ptr::null_mut()
+            },
+            if writefds.fd_count > 0 {
+                &mut writefds
+            } else {
+                std::ptr::null_mut()
+            },
+            &mut exceptfds,
+            &tv,
+        )
+    };
+
+    if ret == SOCKET_ERROR {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow!("net_poll: select() failed: {err}"));
+    }
+
+    for e in &entries {
+        let mut revents: i16 = 0;
+        if unsafe { __WSAFDIsSet(e.raw, &mut readfds) } != 0 {
+            revents |= POSIX_POLLIN;
+        }
+        if unsafe { __WSAFDIsSet(e.raw, &mut writefds) } != 0 {
+            revents |= POSIX_POLLOUT;
+        }
+        if unsafe { __WSAFDIsSet(e.raw, &mut exceptfds) } != 0 {
+            revents |= POSIX_POLLERR;
+        }
+        if revents != 0 {
             ready.push(json!({
-                "fd": guest_fds[i],
-                "revents": win_to_posix(pfd.revents) as i64,
+                "fd": e.guest_fd,
+                "revents": revents as i64,
             }));
         }
     }
@@ -1824,7 +1867,7 @@ fn hl_sleep_poll_sockets(
         .values()
         .map(|hs| libc::pollfd {
             fd: hs.socket.as_raw_fd(),
-            events: libc::POLLIN | libc::POLLOUT | libc::POLLERR,
+            events: libc::POLLIN | libc::POLLOUT,
             revents: 0,
         })
         .collect();
@@ -1851,7 +1894,8 @@ fn hl_sleep_poll_sockets(
         }
     }
 
-    Ok(json!({"socket_ready": ret > 0}))
+    let ready = pollfds.iter().any(|p| p.revents != 0);
+    Ok(json!({"socket_ready": ready}))
 }
 
 #[cfg(windows)]
@@ -1862,35 +1906,54 @@ fn hl_sleep_poll_sockets(
 ) -> Result<serde_json::Value> {
     use serde_json::json;
     use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, POLLWRNORM, WSAPOLLFD};
+    use windows_sys::Win32::Networking::WinSock::{
+        select, FD_SET, FD_SETSIZE, SOCKET, SOCKET_ERROR, TIMEVAL,
+    };
 
     let tbl = table.lock().unwrap();
-    let mut pollfds: Vec<WSAPOLLFD> = tbl
+    let raw_sockets: Vec<SOCKET> = tbl
         .sockets
         .values()
-        .map(|hs| WSAPOLLFD {
-            fd: hs.socket.as_raw_socket() as usize,
-            // POLLERR is output-only on Windows; setting it in events causes WSAEINVAL
-            events: (POLLRDNORM | POLLWRNORM) as i16,
-            revents: 0,
-        })
+        .take(FD_SETSIZE as usize)
+        .map(|hs| hs.socket.as_raw_socket() as SOCKET)
         .collect();
     drop(tbl);
 
-    if pollfds.is_empty() {
+    if raw_sockets.is_empty() {
         _sc.wait(Duration::from_nanos(ns));
         return Ok(json!({}));
     }
 
-    let timeout_ms = ((ns / 1_000_000) as i32).clamp(1, 30_000);
-    let ret = unsafe { WSAPoll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout_ms) };
-
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(anyhow!("hl_sleep WSAPoll failed: {err}"));
+    let mut readfds: FD_SET = unsafe { std::mem::zeroed() };
+    let mut writefds: FD_SET = unsafe { std::mem::zeroed() };
+    let mut exceptfds: FD_SET = unsafe { std::mem::zeroed() };
+    for &s in &raw_sockets {
+        let rc = readfds.fd_count as usize;
+        readfds.fd_array[rc] = s;
+        readfds.fd_count += 1;
+        let wc = writefds.fd_count as usize;
+        writefds.fd_array[wc] = s;
+        writefds.fd_count += 1;
+        let ec = exceptfds.fd_count as usize;
+        exceptfds.fd_array[ec] = s;
+        exceptfds.fd_count += 1;
     }
 
-    Ok(json!({"socket_ready": ret > 0}))
+    let timeout_ms = ((ns / 1_000_000) as i32).clamp(1, 30_000);
+    let tv = TIMEVAL {
+        tv_sec: timeout_ms / 1000,
+        tv_usec: (timeout_ms % 1000) * 1000,
+    };
+
+    let ret = unsafe { select(0, &mut readfds, &mut writefds, &mut exceptfds, &tv) };
+
+    if ret == SOCKET_ERROR {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow!("hl_sleep select() failed: {err}"));
+    }
+
+    let ready = ret > 0;
+    Ok(json!({"socket_ready": ready}))
 }
 
 // ---------------------------------------------------------------------------
