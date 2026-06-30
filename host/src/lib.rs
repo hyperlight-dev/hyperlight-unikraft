@@ -60,7 +60,8 @@ pub mod stderr_capture;
 
 use anyhow::{anyhow, Result};
 use hyperlight_host::func::Registerable;
-use hyperlight_host::sandbox::snapshot::{OciTag, Snapshot};
+pub use hyperlight_host::hypervisor::InterruptHandle;
+pub use hyperlight_host::sandbox::snapshot::{ArchiveFormat, OciTag, Snapshot};
 use hyperlight_host::sandbox::uninitialized::GuestEnvironment;
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::{GuestBinary, HostFunctions, MultiUseSandbox, UninitializedSandbox};
@@ -584,13 +585,21 @@ impl VmConfig {
         cfg.set_input_data_size(self.io_buffer_size);
         cfg.set_output_data_size(self.io_buffer_size);
 
-        // Scratch holds page tables + CoW copies of writable pages touched at
-        // runtime.  pt_estimate covers page tables; the base covers kernel
-        // boot, CPIO extraction, ELF loading, and language runtime startup.
-        // Use 25% of heap as base: large guests (e.g. Node.js) load 100+ MB
-        // ELF binaries whose PT_LOAD segments trigger per-page CoW copies.
+        // Scratch holds page tables plus copy-on-write copies of writable
+        // pages. When resuming a paused snapshot the host eagerly
+        // materialises EVERY writable (CoW) page into scratch (see
+        // `SandboxMemoryManager::materialize_cow_pages`), because a guest
+        // resumed mid-execution cannot service its own CoW page-faults on
+        // the early resume path. Scratch must therefore hold the whole
+        // writable footprint (which exceeds the heap, since it also covers
+        // kernel data, code copies and stacks) AND leave generous headroom
+        // for the pages the guest allocates while it runs after resuming
+        // (e.g. fresh goroutine stacks). Undersizing it starves the guest
+        // allocator and corrupts execution. pt_estimate covers the page
+        // tables; the base budgets 2x the heap plus a 256 MiB working
+        // margin.
         let pt_estimate = ((self.heap_size as usize / (2 * 1024 * 1024)) + 16) * PAGE_SIZE;
-        let base = std::cmp::max(self.heap_size as usize / 4, 64 * 1024 * 1024);
+        let base = self.heap_size as usize * 2 + 256 * 1024 * 1024;
         let scratch = (pt_estimate + base).next_multiple_of(PAGE_SIZE);
         cfg.set_scratch_size(scratch);
         cfg
@@ -1062,6 +1071,12 @@ use std::net::SocketAddr;
 struct HostSocket {
     socket: Socket,
     sock_type: i32,
+    /// Address this socket was bound to via `net_bind`, if any.
+    /// Recorded so a listening socket can be re-created on restore.
+    bound_addr: Option<SocketAddr>,
+    /// `listen()` backlog if this socket is a listener (set by
+    /// `net_listen`). `None` for non-listening sockets.
+    listen_backlog: Option<i32>,
 }
 
 /// Maximum number of IPs learned from DNS responses for AllowList policy.
@@ -1103,6 +1118,12 @@ impl SocketTable {
             .ok_or_else(|| anyhow!("bad_fd: {}", fd))
     }
 
+    fn get_mut(&mut self, fd: u64) -> Result<&mut HostSocket> {
+        self.sockets
+            .get_mut(&fd)
+            .ok_or_else(|| anyhow!("bad_fd: {}", fd))
+    }
+
     fn get_socket(&self, fd: u64) -> Result<&Socket> {
         Ok(&self.get(fd)?.socket)
     }
@@ -1116,6 +1137,103 @@ impl SocketTable {
             .remove(&fd)
             .map(|_| ())
             .ok_or_else(|| anyhow!("bad_fd: {}", fd))
+    }
+
+    /// Serialize the currently-listening sockets (and the id counter)
+    /// to JSON so they can be re-created on the host after a restore.
+    ///
+    /// Only listening sockets are exported: a checkpoint of an idle
+    /// server has just its listener(s) open, and established/accepted
+    /// connections cannot be revived across a restore anyway. The
+    /// guest keeps using the same fd (= table id) for its listener, so
+    /// we must re-create each listener under its original id.
+    fn export_listeners(&self) -> serde_json::Value {
+        use serde_json::json;
+        let listeners: Vec<serde_json::Value> = self
+            .sockets
+            .iter()
+            .filter_map(|(id, sock)| {
+                let backlog = sock.listen_backlog?;
+                let addr = sock.bound_addr?;
+                let family: i32 = match addr {
+                    SocketAddr::V4(_) => 2,
+                    SocketAddr::V6(_) => 10,
+                };
+                Some(json!({
+                    "id": id,
+                    "family": family,
+                    "sock_type": sock.sock_type,
+                    "addr": addr.ip().to_string(),
+                    "port": addr.port(),
+                    "backlog": backlog,
+                }))
+            })
+            .collect();
+        json!({ "next_id": self.next_id, "listeners": listeners })
+    }
+
+    /// Re-create listening sockets described by [`Self::export_listeners`]
+    /// and re-insert them under their original ids, restoring `next_id`.
+    /// Called on restore, before the guest resumes, so the resumed guest
+    /// finds its listener fds backed by real, bound, listening sockets.
+    fn restore_listeners(&mut self, data: &serde_json::Value) -> Result<()> {
+        let listeners = data["listeners"]
+            .as_array()
+            .ok_or_else(|| anyhow!("listener snapshot missing 'listeners' array"))?;
+        for entry in listeners {
+            let id = entry["id"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("listener entry missing 'id'"))?;
+            let family = entry["family"].as_i64().unwrap_or(2) as i32;
+            let sock_type = entry["sock_type"].as_i64().unwrap_or(1) as i32;
+            let backlog = entry["backlog"].as_i64().unwrap_or(128) as i32;
+            let addr = parse_sockaddr(entry)?;
+
+            let domain = match family {
+                2 => Domain::IPV4,
+                10 => Domain::IPV6,
+                _ => {
+                    return Err(anyhow!(
+                        "unsupported family {} in listener snapshot",
+                        family
+                    ))
+                }
+            };
+            let stype = match sock_type {
+                1 => Type::STREAM,
+                2 => Type::DGRAM,
+                _ => {
+                    return Err(anyhow!(
+                        "unsupported type {} in listener snapshot",
+                        sock_type
+                    ))
+                }
+            };
+            let sock = Socket::new(domain, stype, None)?;
+            // The original listener's host port may still be in TIME_WAIT
+            // from the torn-down VM; allow rebinding it immediately.
+            sock.set_reuse_address(true)?;
+            sock.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+            sock.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+            let sa: SockAddr = addr.into();
+            sock.bind(&sa)
+                .map_err(|e| anyhow!("re-binding restored listener to {addr}: {e}"))?;
+            sock.listen(backlog)
+                .map_err(|e| anyhow!("re-listening restored listener on {addr}: {e}"))?;
+            self.sockets.insert(
+                id,
+                HostSocket {
+                    socket: sock,
+                    sock_type,
+                    bound_addr: Some(addr),
+                    listen_backlog: Some(backlog),
+                },
+            );
+        }
+        if let Some(next_id) = data["next_id"].as_u64() {
+            self.next_id = self.next_id.max(next_id);
+        }
+        Ok(())
     }
 }
 
@@ -1297,6 +1415,8 @@ fn handle_net_socket(
     let fd = table.lock().unwrap().insert(HostSocket {
         socket: sock,
         sock_type,
+        bound_addr: None,
+        listen_backlog: None,
     })?;
     Ok(json!({ "fd": fd }))
 }
@@ -1332,9 +1452,12 @@ fn handle_net_bind(
         None => return Err(anyhow!("Permission denied: no --port specified for bind")),
     }
     let sa: SockAddr = addr.into();
-    let tbl = table.lock().unwrap();
-    let sock = tbl.get_socket(fd)?;
-    sock.bind(&sa)?;
+    let mut tbl = table.lock().unwrap();
+    let host_sock = tbl.get_mut(fd)?;
+    host_sock.socket.bind(&sa)?;
+    // Remember the bound address so a listener can be re-created on
+    // restore (the host socket table is not part of the snapshot).
+    host_sock.bound_addr = Some(addr);
     Ok(json!({}))
 }
 
@@ -1346,9 +1469,11 @@ fn handle_net_listen(
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
     let backlog = args["backlog"].as_i64().unwrap_or(128) as i32;
-    let tbl = table.lock().unwrap();
-    let sock = tbl.get_socket(fd)?;
-    sock.listen(backlog)?;
+    let mut tbl = table.lock().unwrap();
+    let host_sock = tbl.get_mut(fd)?;
+    host_sock.socket.listen(backlog)?;
+    // Mark this as a listener so it is re-created on restore.
+    host_sock.listen_backlog = Some(backlog);
     Ok(json!({}))
 }
 
@@ -1372,6 +1497,8 @@ fn handle_net_accept(
     let new_fd = table.lock().unwrap().insert(HostSocket {
         socket: new_sock,
         sock_type: parent_type,
+        bound_addr: None,
+        listen_backlog: None,
     })?;
     let mut resp = json!({ "fd": new_fd });
     if let Some(pa) = peer_addr {
@@ -2636,6 +2763,32 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Export the currently-listening host sockets so they can be
+    /// re-created after a restore. Returns `None` if networking is
+    /// disabled for this sandbox.
+    ///
+    /// The host socket table lives in host process memory and is *not*
+    /// part of the guest snapshot, so a restored guest would find its
+    /// listener fds dangling. Persist this value alongside the snapshot
+    /// and pass it back to [`Sandbox::restore_listeners`] before
+    /// resuming the guest.
+    pub fn export_listeners(&self) -> Option<serde_json::Value> {
+        self.socket_table
+            .as_ref()
+            .map(|t| t.lock().unwrap().export_listeners())
+    }
+
+    /// Re-create listening host sockets previously produced by
+    /// [`Sandbox::export_listeners`], re-inserting them under their
+    /// original fds. Call before the guest resumes so its listener fds
+    /// are backed by real, bound, listening sockets.
+    pub fn restore_listeners(&mut self, data: &serde_json::Value) -> Result<()> {
+        if let Some(ref table) = self.socket_table {
+            table.lock().unwrap().restore_listeners(data)?;
+        }
+        Ok(())
+    }
+
     /// Call the dispatch function to re-run the application.
     ///
     /// Requires a prior `restore()` to reset guest state.
@@ -2680,7 +2833,7 @@ impl Sandbox {
 
     /// Obtain a handle that can interrupt a running guest call from
     /// another thread. See [`hyperlight_host::hypervisor::InterruptHandle`].
-    pub fn interrupt_handle(&self) -> Arc<dyn hyperlight_host::hypervisor::InterruptHandle> {
+    pub fn interrupt_handle(&self) -> Arc<dyn InterruptHandle> {
         self.inner.interrupt_handle()
     }
 
@@ -2688,6 +2841,27 @@ impl Sandbox {
     /// wake any in-progress `__hl_sleep` immediately.
     pub fn sleep_cancel(&self) -> SleepCancel {
         self.sleep_cancel.clone()
+    }
+
+    /// Consume the sandbox and start `"run"` as a pausable async call.
+    ///
+    /// Returns a [`PendingRun`] handle that can be polled, paused (via
+    /// the interrupt handle), snapshotted mid-execution, and resumed.
+    ///
+    /// Use [`interrupt_handle().pause()`](InterruptHandle::pause)
+    /// from another thread to request a pause, then call [`PendingRun::poll()`]
+    /// to observe the pause.
+    ///
+    /// Requires a prior `restore()` to reset guest state.
+    pub fn call_run_async(self) -> PendingRun {
+        let inner_call = self.inner.call_async_owned::<()>("run", ());
+        PendingRun {
+            inner: inner_call,
+            initrd_path: self.initrd_path,
+            exit_code: self.exit_code,
+            socket_table: self.socket_table,
+            sleep_cancel: self.sleep_cancel,
+        }
     }
 
     /// Take a new snapshot of the current guest state.
@@ -2704,6 +2878,11 @@ impl Sandbox {
         let snap = self.inner.snapshot()?;
         self.snapshot = Some(snap);
         Ok(())
+    }
+
+    /// Get a clone of the in-memory snapshot Arc, if one exists.
+    pub fn snapshot_arc(&self) -> Option<Arc<Snapshot>> {
+        self.snapshot.clone()
     }
 
     /// Persist the current snapshot to disk in OCI image-layout format.
@@ -2789,6 +2968,35 @@ impl Sandbox {
         )
     }
 
+    /// Load a snapshot from a `.tar` / `.tar.gz` archive written by
+    /// [`Snapshot::save_archive`] and create a `Sandbox` from it, the
+    /// archive counterpart of [`Sandbox::from_snapshot_file_configured`].
+    ///
+    /// The archive format is inferred from the path extension (with a
+    /// gzip-magic fallback). The archive is extracted to a temporary
+    /// directory that lives for the lifetime of the loaded snapshot, so
+    /// restoring from an archive trades the directory loader's lazy,
+    /// file-backed mmap for an up-front extraction of the full memory
+    /// image. Uses `Snapshot::load_archive`, which skips SHA-256
+    /// verification (we trust archives we wrote ourselves).
+    pub fn from_snapshot_archive_configured<P: AsRef<Path>>(
+        path: P,
+        preopens: &[Preopen],
+        initrd: Option<&Path>,
+        network: Option<&NetworkPolicy>,
+        listen_ports: Option<&ListenPorts>,
+    ) -> Result<Self> {
+        let tag = OciTag::new("latest").map_err(|e| anyhow!("{e}"))?;
+        let loaded = Snapshot::load_archive(path.as_ref(), tag).map_err(|e| anyhow!("{e}"))?;
+        Self::from_loaded_snapshot(
+            loaded,
+            preopens,
+            initrd.map(|p| p.to_path_buf()),
+            network,
+            listen_ports,
+        )
+    }
+
     fn from_snapshot_file_full<P: AsRef<Path>>(
         path: P,
         preopens: &[Preopen],
@@ -2798,6 +3006,21 @@ impl Sandbox {
     ) -> Result<Self> {
         let tag = OciTag::new("latest").map_err(|e| anyhow!("{e}"))?;
         let loaded = Snapshot::load(path.as_ref(), tag).map_err(|e| anyhow!("{e}"))?;
+        Self::from_loaded_snapshot(loaded, preopens, initrd, network, listen_ports)
+    }
+
+    /// Build a `Sandbox` around an already-loaded [`Snapshot`], wiring
+    /// up the internal tools, `__dispatch` host function, and optional
+    /// initrd remap. Shared by the directory loader
+    /// ([`Sandbox::from_snapshot_file_full`]) and the archive loader
+    /// ([`Sandbox::from_snapshot_archive_configured`]).
+    fn from_loaded_snapshot(
+        loaded: Snapshot,
+        preopens: &[Preopen],
+        initrd: Option<std::path::PathBuf>,
+        network: Option<&NetworkPolicy>,
+        listen_ports: Option<&ListenPorts>,
+    ) -> Result<Self> {
         let arc = Arc::new(loaded);
 
         let exit_code = Arc::new(AtomicI32::new(0));
@@ -2827,6 +3050,145 @@ impl Sandbox {
             exit_code,
             socket_table,
             sleep_cancel,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PendingRun: pausable guest execution handle
+// ---------------------------------------------------------------------------
+
+/// A handle to an in-progress guest `"run"` invocation that can be
+/// paused, snapshotted, and resumed.
+///
+/// Created by [`Sandbox::call_run_async()`]. The sandbox is consumed
+/// into this handle and can be recovered via [`into_sandbox()`](Self::into_sandbox)
+/// after the call completes.
+///
+/// # Pause/resume flow
+///
+/// ```text
+///   sandbox.call_run_async()  →  PendingRun
+///        │
+///        ├─ interrupt_handle().pause()  (from another thread)
+///        │
+///        ▼
+///    pending.poll()  →  CallProgress::Paused
+///        │
+///        ├─ pending.snapshot()   → save mid-execution state
+///        │
+///        ▼
+///    pending.poll()  →  resumes; eventually CallProgress::Completed(())
+///        │
+///        ▼
+///    pending.into_sandbox()  →  Sandbox (usable again)
+/// ```
+pub struct PendingRun {
+    inner: hyperlight_host::sandbox::pending_call::PendingCallOwned<()>,
+    initrd_path: Option<std::path::PathBuf>,
+    exit_code: Arc<AtomicI32>,
+    socket_table: Option<Arc<Mutex<SocketTable>>>,
+    sleep_cancel: SleepCancel,
+}
+
+/// Re-export for callers.
+pub use hyperlight_host::sandbox::pending_call::CallProgress;
+
+impl PendingRun {
+    /// Drive execution until completion or pause.
+    ///
+    /// Returns [`CallProgress::Completed(())`] when the guest finishes,
+    /// or [`CallProgress::Paused`] if the VM was paused mid-execution.
+    /// Calling `poll()` again after `Paused` resumes execution.
+    pub fn poll(&mut self) -> Result<CallProgress<()>> {
+        Ok(self.inner.poll()?)
+    }
+
+    /// Returns `true` if the VM is currently paused mid-execution.
+    pub fn is_paused(&self) -> bool {
+        self.inner.is_paused()
+    }
+
+    /// Take a snapshot of the VM in its current state.
+    ///
+    /// If paused, this captures a mid-execution snapshot including full
+    /// register state — it can be saved to disk and later used with
+    /// [`PendingRun::from_paused_snapshot()`] to resume.
+    pub fn snapshot(&mut self) -> Result<Arc<Snapshot>> {
+        Ok(self.inner.snapshot()?)
+    }
+
+    /// Export the currently-listening host sockets (see
+    /// [`Sandbox::export_listeners`]). Call at checkpoint time, after
+    /// taking the snapshot, to persist listener state alongside it.
+    pub fn export_listeners(&self) -> Option<serde_json::Value> {
+        self.socket_table
+            .as_ref()
+            .map(|t| t.lock().unwrap().export_listeners())
+    }
+
+    /// Cancel the in-progress call and recover the (poisoned) sandbox.
+    ///
+    /// The returned sandbox must be restored from a snapshot before use.
+    pub fn kill(self) -> Sandbox {
+        let inner = self.inner.kill();
+        Sandbox {
+            inner,
+            snapshot: None,
+            initrd_path: self.initrd_path,
+            exit_code: self.exit_code,
+            socket_table: self.socket_table,
+            sleep_cancel: self.sleep_cancel,
+        }
+    }
+
+    /// Consume this handle and recover the underlying sandbox.
+    ///
+    /// - If completed: sandbox is ready for another `restore()` + `call_run()`.
+    /// - If still paused: the sandbox is poisoned (must restore from snapshot).
+    pub fn into_sandbox(self) -> Sandbox {
+        let inner = self.inner.into_sandbox();
+        Sandbox {
+            inner,
+            snapshot: None,
+            initrd_path: self.initrd_path,
+            exit_code: self.exit_code,
+            socket_table: self.socket_table,
+            sleep_cancel: self.sleep_cancel,
+        }
+    }
+
+    /// Get the interrupt handle for pausing or killing from another thread.
+    pub fn interrupt_handle(&self) -> Arc<dyn InterruptHandle> {
+        self.inner.sandbox().interrupt_handle()
+    }
+
+    /// Get the sleep-cancellation token.
+    pub fn sleep_cancel(&self) -> SleepCancel {
+        self.sleep_cancel.clone()
+    }
+
+    /// Read the exit code reported by the guest so far.
+    pub fn last_exit_code(&self) -> i32 {
+        self.exit_code.load(Ordering::Relaxed)
+    }
+
+    /// Resume a sandbox from a mid-execution (paused) snapshot.
+    ///
+    /// The snapshot must contain register state (taken while paused).
+    /// Returns a `PendingRun` ready to resume via `poll()`.
+    pub fn from_paused_snapshot(sandbox: Sandbox, snapshot: Arc<Snapshot>) -> Result<Self> {
+        let inner =
+            hyperlight_host::sandbox::pending_call::PendingCallOwned::<()>::from_paused_snapshot(
+                sandbox.inner,
+                snapshot,
+            )?;
+        Ok(Self {
+            inner,
+            initrd_path: sandbox.initrd_path,
+            exit_code: sandbox.exit_code,
+            socket_table: sandbox.socket_table,
+            sleep_cancel: sandbox.sleep_cancel,
         })
     }
 }
@@ -3921,6 +4283,8 @@ mod tests {
                 .insert(HostSocket {
                     socket: sock,
                     sock_type: 1,
+                    bound_addr: None,
+                    listen_backlog: None,
                 })
                 .unwrap();
         }
@@ -3928,7 +4292,9 @@ mod tests {
         assert!(table
             .insert(HostSocket {
                 socket: sock,
-                sock_type: 1
+                sock_type: 1,
+                bound_addr: None,
+                listen_backlog: None,
             })
             .is_err());
     }
@@ -3941,12 +4307,71 @@ mod tests {
             .insert(HostSocket {
                 socket: sock,
                 sock_type: 1,
+                bound_addr: None,
+                listen_backlog: None,
             })
             .unwrap();
         assert_eq!(table.sockets.len(), 1);
         table.clear();
         assert_eq!(table.sockets.len(), 0);
         assert_eq!(table.next_id, 1);
+    }
+
+    /// A listening socket survives an export/restore round-trip: it is
+    /// re-created under its original fd, bound and listening on the same
+    /// port, and `next_id` is preserved. Non-listening sockets are not
+    /// exported (they cannot be revived across a restore).
+    #[test]
+    fn listener_export_restore_round_trip() {
+        let (export, port, listener_id) = {
+            let mut table = SocketTable::new();
+
+            // A bound, listening socket — this must be re-created.
+            let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            listener.set_reuse_address(true).unwrap();
+            let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            listener.bind(&bind_addr.into()).unwrap();
+            listener.listen(128).unwrap();
+            let local = listener.local_addr().unwrap().as_socket().unwrap();
+            let listener_id = table
+                .insert(HostSocket {
+                    socket: listener,
+                    sock_type: 1,
+                    bound_addr: Some(local),
+                    listen_backlog: Some(128),
+                })
+                .unwrap();
+
+            // A plain (non-listening) socket — this must NOT be exported.
+            let other = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            table
+                .insert(HostSocket {
+                    socket: other,
+                    sock_type: 1,
+                    bound_addr: None,
+                    listen_backlog: None,
+                })
+                .unwrap();
+
+            let export = table.export_listeners();
+            // Drop the table (and the original listener) so its port is
+            // freed before we rebind it on restore.
+            (export, local.port(), listener_id)
+        };
+
+        let listeners = export["listeners"].as_array().unwrap();
+        assert_eq!(listeners.len(), 1, "only the listener should be exported");
+        assert_eq!(listeners[0]["id"].as_u64().unwrap(), listener_id);
+        assert_eq!(listeners[0]["port"].as_u64().unwrap() as u16, port);
+
+        let mut restored = SocketTable::new();
+        restored.restore_listeners(&export).unwrap();
+
+        // The listener is back under its original fd, on the same port.
+        let sock = restored.get_socket(listener_id).unwrap();
+        let local = sock.local_addr().unwrap().as_socket().unwrap();
+        assert_eq!(local.port(), port);
+        assert_eq!(restored.next_id, export["next_id"].as_u64().unwrap());
     }
 
     #[test]

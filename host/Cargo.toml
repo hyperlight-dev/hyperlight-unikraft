@@ -36,7 +36,7 @@ default = []
 wasm-host-fns = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dependencies]
-hyperlight-host = { version = "0.16.0", features = ["executable_heap", "hw-interrupts"] }
+hyperlight-host = { path = "../../hyperlight/src/hyperlight_host", features = ["executable_heap", "hw-interrupts"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 serde_json = "1"
