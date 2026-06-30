@@ -24,10 +24,6 @@ name = "multifn-test"
 path = "src/bin/multifn_test.rs"
 
 [[bin]]
-name = "pydriver-run"
-path = "src/bin/pydriver_run.rs"
-
-[[bin]]
 name = "pyhl"
 path = "src/bin/pyhl.rs"
 
