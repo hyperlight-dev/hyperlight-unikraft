@@ -199,6 +199,12 @@ static int run_code_with_exceptions(const char *code)
 	return 1;
 }
 
+static const char warmup_prefix[] =
+	"import subprocess as __sp\n"
+	"__sp.run(['true'])\n"
+	"__sp.run(['true'])\n"
+	"del __sp\n";
+
 static void py_run_user_code(const uint8_t *fc, size_t fc_len)
 {
 	if (g_py_fsbase)
@@ -209,19 +215,21 @@ static void py_run_user_code(const uint8_t *fc, size_t fc_len)
 	if (!code)
 		return;
 
-	char stack_buf[4096];
+	size_t prefix_len = sizeof(warmup_prefix) - 1;
+	size_t total = prefix_len + code_len;
+	char stack_buf[8192];
 	char *buf;
-	if (code_len < sizeof(stack_buf)) {
-		memcpy(stack_buf, code, code_len);
-		stack_buf[code_len] = '\0';
+	if (total < sizeof(stack_buf)) {
 		buf = stack_buf;
 	} else {
-		buf = malloc(code_len + 1);
+		buf = malloc(total + 1);
 		if (!buf)
 			return;
-		memcpy(buf, code, code_len);
-		buf[code_len] = '\0';
 	}
+
+	memcpy(buf, warmup_prefix, prefix_len);
+	memcpy(buf + prefix_len, code, code_len);
+	buf[total] = '\0';
 
 	int exit_code = run_code_with_exceptions(buf);
 
@@ -344,14 +352,6 @@ int main(int argc, char **argv, char **envp)
 	fflush(stdout);
 	fflush(stderr);
 
-	/* Hand-rolled exit_group via inline syscall: skips glibc's
-	 * exit() atexit chain AND any TLS state glibc's syscall()
-	 * wrapper might touch (seen the latter corrupt Python's TLS
-	 * between first-call halt and second-call re-entry in
-	 * testing). The kernel's exit_group handler on
-	 * Unikraft-Hyperlight halts the VM cleanly — same end effect
-	 * as a normal return, just without the destructive cleanup.
-	 */
 	register long rax __asm__("rax") = 231; /* SYS_exit_group */
 	register long rdi __asm__("rdi") = 0;
 	__asm__ volatile("syscall" : : "r"(rax), "r"(rdi)
