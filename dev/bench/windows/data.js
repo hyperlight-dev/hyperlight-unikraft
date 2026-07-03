@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782549947509,
+  "lastUpdate": 1783111119908,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -1935,6 +1935,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot (disk)",
             "value": 661,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "ca1a6fe79983713488258e03f06424c0907d9e73",
+          "message": "release: update Cargo.lock for v0.12.0\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-07-03T20:25:52Z",
+          "tree_id": "091097fa226fcbe483d42581b6c797d2dfe8aa1c",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/ca1a6fe79983713488258e03f06424c0907d9e73"
+        },
+        "date": 1783111116684,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 311,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 813,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 11,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 728,
             "unit": "MiB"
           }
         ]
