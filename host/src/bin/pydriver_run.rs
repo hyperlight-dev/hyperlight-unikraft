@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     let t_evolve = Instant::now();
     let mut sandbox = Sandbox::builder(&kernel)
         .initrd_file(&initrd)
-        .heap_size(1280 * 1024 * 1024)
+        .heap_size(2560 * 1024 * 1024)
         .build()?;
     eprintln!(
         "[timing] evolve={:.1}ms",

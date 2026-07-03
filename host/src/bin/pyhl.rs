@@ -463,7 +463,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
     {
         let mut builder = Sandbox::builder(&dst_kernel)
             .initrd_file(&dst_initrd)
-            .heap_size(1280 * 1024 * 1024);
+            .heap_size(2560 * 1024 * 1024);
         for p in &setup_preopens {
             builder = builder.preopen(p.clone());
         }
