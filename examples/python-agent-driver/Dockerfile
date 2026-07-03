@@ -106,9 +106,6 @@ RUN mkdir -p /rootfs/etc && \
 # /tmp for pip's temp files during install
 RUN mkdir -p /rootfs/tmp
 
-# Pre-downloaded wheels for the pip-install demo
-COPY --from=deps /wheels /rootfs/wheels
-
 # Busybox: use the static-PIE build from the shell-base image.
 # Alpine's busybox-static is ET_EXEC (non-PIE) which the elfloader
 # rejects; the shell-base image has a static-PIE (ET_DYN) build.
