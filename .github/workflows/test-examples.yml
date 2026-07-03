@@ -769,9 +769,12 @@ jobs:
               Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
               Write-Host "FAIL: timed out after ${Seconds}s"
               Get-Content $outFile -ErrorAction SilentlyContinue
+              Get-Content "$outFile.err" -ErrorAction SilentlyContinue
               exit 1
             }
-            $script:out = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+            $stdoutContent = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+            $stderrContent = Get-Content "$outFile.err" -Raw -ErrorAction SilentlyContinue
+            $script:out = "$stdoutContent$stderrContent".Trim()
             $script:rc = $proc.ExitCode
           }
 
