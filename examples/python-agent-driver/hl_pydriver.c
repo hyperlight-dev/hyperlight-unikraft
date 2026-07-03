@@ -110,18 +110,28 @@ static const char *fc_arg0_string(const uint8_t *fc, size_t fc_len,
  *                        FC-aware callback the kernel dispatches to
  *                        on every call after it's set
  */
+static uintptr_t parse_hex(const char *s)
+{
+	uintptr_t v = 0;
+	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+		s += 2;
+	for (; *s; s++) {
+		unsigned d;
+		if (*s >= '0' && *s <= '9')      d = *s - '0';
+		else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+		else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+		else break;
+		v = (v << 4) | d;
+	}
+	return v;
+}
+
 typedef void (*hl_dispatch_fn_t)(const uint8_t *fc, size_t fc_len);
 
 static const uint8_t   **g_fc_bytes_slot;
 static size_t           *g_fc_len_slot;
 static hl_dispatch_fn_t *g_v2_callback_slot;
 
-/* Saved FS_BASE value captured right after Py_Initialize / warm-up
- * finishes. Restored at the head of every v2-callback invocation so
- * Python's TLS pointer stays valid even if something in the dispatch
- * preamble (dispatch_prepare's MSR restore, Hyperlight's own
- * save/restore of segment state) leaves FS_BASE pointing elsewhere.
- */
 static uint64_t g_py_fsbase;
 
 static inline uint64_t rdmsr_fsbase(void)
@@ -158,7 +168,6 @@ static int run_code_with_exceptions(const char *code)
 	if (!m) return 1;
 	PyObject *d = PyModule_GetDict(m);
 	if (!d) return 1;
-
 	PyObject *result = PyRun_String(code, Py_file_input, d, d);
 	if (result) {
 		Py_DECREF(result);
@@ -307,14 +316,14 @@ int main(int argc, char **argv, char **envp)
 	if (!g_fc_bytes_slot) {
 		for (char **p = envp; p && *p; p++) {
 			if (!strncmp(*p, "HL_FC_BYTES_PTR=", 16))
-				g_fc_bytes_slot = (const uint8_t **)(uintptr_t)
-					strtoul(*p + 16, NULL, 16);
+				g_fc_bytes_slot = (const uint8_t **)
+					parse_hex(*p + 16);
 			else if (!strncmp(*p, "HL_FC_LEN_PTR=", 14))
-				g_fc_len_slot = (size_t *)(uintptr_t)
-					strtoul(*p + 14, NULL, 16);
+				g_fc_len_slot = (size_t *)
+					parse_hex(*p + 14);
 			else if (!strncmp(*p, "HL_V2_CALLBACK_PTR=", 19))
-				g_v2_callback_slot = (hl_dispatch_fn_t *)(uintptr_t)
-					strtoul(*p + 19, NULL, 16);
+				g_v2_callback_slot = (hl_dispatch_fn_t *)
+					parse_hex(*p + 19);
 		}
 		if (!g_fc_bytes_slot || !g_fc_len_slot
 		    || !g_v2_callback_slot) {
