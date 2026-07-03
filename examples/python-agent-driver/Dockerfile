@@ -48,8 +48,6 @@ RUN set -eux; \
     find /deps -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true; \
     find /deps -type f -name '*.pyc' -delete 2>/dev/null || true; \
     find /deps -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true
-# Download a small wheel for the pip-install demo
-RUN pip download --no-deps --dest /wheels six
 
 # Stage 2: build hl_pydriver against the SAME Python 3.12-from-source
 # that produces local-python-base, so the glibc/libpython3.12.so ABI
