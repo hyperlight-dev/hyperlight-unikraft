@@ -224,6 +224,9 @@ jobs:
             args: "--net -- /urllib_get.py"
             expect: "SUCCESS: urllib GET worked!"
           - example: networking-py
+            args: "--net -- /urllib_get_no_timeout.py"
+            expect: "SUCCESS: urllib GET \\(no timeout\\) worked!"
+          - example: networking-py
             args: "--port 8080 -- /echo_server_test.py"
             expect: "SUCCESS: bind\\+listen on port 8080 allowed"
           - example: go-http
@@ -614,6 +617,9 @@ jobs:
             args: "--net -- /urllib_get.py"
             expect: "SUCCESS: urllib GET worked!"
           - example: networking-py
+            args: "--net -- /urllib_get_no_timeout.py"
+            expect: "SUCCESS: urllib GET \\(no timeout\\) worked!"
+          - example: networking-py
             args: "--port 8080 -- /echo_server_test.py"
             expect: "SUCCESS: bind\\+listen on port 8080 allowed"
           - example: go-http
@@ -753,16 +759,33 @@ jobs:
             }
           }
 
+          # Helper: run a command with a per-test timeout (seconds).
+          function Invoke-WithTimeout {
+            param([int]$Seconds, [string]$Exe, [string[]]$ArgList)
+            $outFile = Join-Path $env:RUNNER_TEMP 'hl-test-out.log'
+            $proc = Start-Process -FilePath $Exe -ArgumentList $ArgList `
+              -NoNewWindow -RedirectStandardOutput $outFile -RedirectStandardError "$outFile.err" -PassThru
+            if (-not $proc.WaitForExit($Seconds * 1000)) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              Write-Host "FAIL: timed out after ${Seconds}s"
+              Get-Content $outFile -ErrorAction SilentlyContinue
+              Get-Content "$outFile.err" -ErrorAction SilentlyContinue
+              exit 1
+            }
+            $stdoutContent = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+            $stderrContent = Get-Content "$outFile.err" -Raw -ErrorAction SilentlyContinue
+            $script:out = "$stdoutContent$stderrContent".Trim()
+            $script:rc = $proc.ExitCode
+          }
+
           switch ($driver) {
             'multifn-test' {
-              $out = & multifn-test $kernel $cpio 2>&1
-              $rc = $LASTEXITCODE
+              Invoke-WithTimeout -Seconds 60 -Exe 'multifn-test' -ArgList @($kernel, $cpio)
             }
             'pydriver-run' {
               "print('hello from driver')" | Out-File -Encoding ascii tiny.py
               $tiny = (Resolve-Path "tiny.py").Path
-              $out = & pydriver-run $kernel $cpio $tiny 2>&1
-              $rc = $LASTEXITCODE
+              Invoke-WithTimeout -Seconds 120 -Exe 'pydriver-run' -ArgList @($kernel, $cpio, $tiny)
             }
             default {
               $argList = @()
@@ -773,16 +796,15 @@ jobs:
               if ($memory -ne '') {
                 $memArgs = @('-m', $memory)
               }
-              $out = & hyperlight-unikraft -q @memArgs `
-                $kernel --initrd $cpio @mountArgs @toolArgs @argList 2>&1
-              $rc = $LASTEXITCODE
+              Invoke-WithTimeout -Seconds 120 -Exe 'hyperlight-unikraft' `
+                -ArgList (@('-q') + $memArgs + @($kernel, '--initrd', $cpio) + $mountArgs + $toolArgs + $argList)
             }
           }
 
-          $outStr = ($out | Out-String)
+          if ($null -eq $out) { $out = '' }
           Write-Host "=== output (exit=$rc) ==="
-          Write-Host $outStr
-          if (-not ($outStr -match $expect)) {
+          Write-Host $out
+          if (-not ($out -match $expect)) {
             Write-Host "FAIL: did not match /$expect/"
             exit 1
           }
@@ -943,6 +965,32 @@ jobs:
             Write-Host "PASS: --repeat produced $hits pandas_ok lines"
           } else {
             Write-Error "FAIL: expected >=5 pandas_ok lines, got $hits"
+            exit 1
+          }
+
+      - name: pyhl run (busybox subprocess demo)
+        if: runner.os == 'Windows' || steps.kvm_check.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $out = pyhl run examples/python-agent-driver/demo_busybox.py 2>&1
+          Write-Host $out
+          if ($out -match 'hello from hyperlight guest') {
+            Write-Host "PASS: busybox subprocess demo"
+          } else {
+            Write-Error "FAIL: did not match /hello from hyperlight guest/"
+            exit 1
+          }
+
+      - name: pyhl run (pip install subprocess demo)
+        if: runner.os == 'Windows' || steps.kvm_check.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $out = pyhl run --net examples/python-agent-driver/demo_pip_install.py 2>&1
+          Write-Host $out
+          if ($out -match 'Installed and imported six') {
+            Write-Host "PASS: pip install subprocess demo"
+          } else {
+            Write-Error "FAIL: did not match /Installed and imported six/"
             exit 1
           }
 

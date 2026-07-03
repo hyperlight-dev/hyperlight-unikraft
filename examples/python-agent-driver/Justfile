@@ -30,6 +30,10 @@ run-5:
 
 [unix]
 rootfs:
+    docker build --target base -t local-python-base-dev:latest \
+        -f ../../runtimes/python.Dockerfile ../../runtimes/
+    docker build -t local-python-base:latest \
+        -f ../../runtimes/python.Dockerfile ../../runtimes/
     docker build --platform linux/amd64 --build-arg BASE=local-python-base:latest \
         --target cpio -t {{image}}-cpio .
     - docker rm -f {{image}}-tmp

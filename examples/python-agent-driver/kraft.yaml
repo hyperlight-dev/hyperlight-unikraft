@@ -79,7 +79,9 @@ unikraft:
     CONFIG_LIBCONTEXT: 'y'
     CONFIG_LIBCONTEXT_CLEAR_TBSS: 'y'
 
-    CONFIG_LIBPOSIX_FDTAB_MULTITAB: 'n'
+    CONFIG_LIBPOSIX_FDTAB_MULTITAB: 'y'
+
+    CONFIG_LIBPOSIX_PROCESS_BRK: 'y'
 
 libraries:
   app-elfloader:
