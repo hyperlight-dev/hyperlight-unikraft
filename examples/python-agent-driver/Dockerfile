@@ -48,6 +48,8 @@ RUN set -eux; \
     find /deps -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true; \
     find /deps -type f -name '*.pyc' -delete 2>/dev/null || true; \
     find /deps -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true
+# Download a small wheel for the pip-install demo
+RUN pip download --no-deps --dest /wheels six
 
 # Stage 2: build hl_pydriver against the SAME Python 3.12-from-source
 # that produces local-python-base, so the glibc/libpython3.12.so ABI
@@ -71,6 +73,17 @@ COPY --from=deps         /deps            /usr/local/lib/python3.12/site-package
 COPY --from=driver-build /src/hl_pydriver /bin/hl_pydriver
 COPY pydoc_stub.py /usr/local/lib/python3.12/pydoc.py
 
+# pip: the python-base image strips pip for size; bring it back from the
+# deps stage (python:3.12-slim) so `python3 -m pip install` works as a
+# subprocess.
+COPY --from=deps /usr/local/lib/python3.12/site-packages/pip \
+     /usr/local/lib/python3.12/site-packages/pip
+
+# stdlib modules that python-base strips but pip needs at runtime
+COPY --from=deps /usr/local/lib/python3.12/xmlrpc \
+     /usr/local/lib/python3.12/xmlrpc
+
+
 # Stage 4: pack CPIO.
 FROM alpine:3.20 AS cpio
 RUN apk add --no-cache cpio findutils ca-certificates
@@ -87,5 +100,26 @@ RUN mkdir -p /rootfs/etc && \
 RUN mkdir -p /rootfs/etc/ssl/certs /rootfs/usr/lib/ssl && \
     cp /etc/ssl/certs/ca-certificates.crt /rootfs/etc/ssl/certs/ && \
     ln -sf /etc/ssl/certs/ca-certificates.crt /rootfs/usr/lib/ssl/cert.pem
+
+# pip configuration: disable version-check (no internet during warm-up)
+RUN mkdir -p /rootfs/etc && \
+    printf '[global]\ndisable-pip-version-check = true\n' > /rootfs/etc/pip.conf
+
+# /tmp for pip's temp files during install
+RUN mkdir -p /rootfs/tmp
+
+# Pre-downloaded wheels for the pip-install demo
+COPY --from=deps /wheels /rootfs/wheels
+
+# Busybox: use the static-PIE build from the shell-base image.
+# Alpine's busybox-static is ET_EXEC (non-PIE) which the elfloader
+# rejects; the shell-base image has a static-PIE (ET_DYN) build.
+COPY --from=ghcr.io/hyperlight-dev/hyperlight-unikraft/shell-base:latest \
+     /bin/busybox /rootfs/bin/busybox
+RUN for cmd in sh echo ls cat grep find wc head tail sort cut sed awk \
+               cp mv rm mkdir rmdir ln basename dirname env sleep date \
+               hostname id uname whoami which test true tr uniq tee xargs; do \
+        ln -sf busybox /rootfs/bin/$cmd; \
+    done
 
 RUN cd /rootfs && find . | cpio -o -H newc > /output.cpio 2>/dev/null
