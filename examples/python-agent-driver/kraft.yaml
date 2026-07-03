@@ -2,8 +2,8 @@ specification: '0.6'
 name: python-agent-driver-hyperlight
 
 unikraft:
-  source: https://github.com/unikraft/unikraft.git
-  version: plat-hyperlight
+  source: https://github.com/danbugs/unikraft.git
+  version: feat/subprocess-support
   kconfig:
     CONFIG_PLAT_HYPERLIGHT: 'y'
     CONFIG_PAGING: 'n'
@@ -79,12 +79,14 @@ unikraft:
     CONFIG_LIBCONTEXT: 'y'
     CONFIG_LIBCONTEXT_CLEAR_TBSS: 'y'
 
-    CONFIG_LIBPOSIX_FDTAB_MULTITAB: 'n'
+    CONFIG_LIBPOSIX_FDTAB_MULTITAB: 'y'
+
+    CONFIG_LIBPOSIX_PROCESS_BRK: 'y'
 
 libraries:
   app-elfloader:
-    source: https://github.com/unikraft/app-elfloader.git
-    version: plat-hyperlight
+    source: https://github.com/danbugs/app-elfloader.git
+    version: feat/subprocess-support
   libelf:
     source: https://github.com/unikraft/lib-libelf.git
     version: staging

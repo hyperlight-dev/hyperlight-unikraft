@@ -3,7 +3,7 @@ specification: '0.6'
 name: shell-hyperlight
 
 unikraft:
-  source: https://github.com/unikraft/unikraft.git
+  source: https://github.com/danbugs/unikraft.git
   version: plat-hyperlight
   kconfig:
     # Platform
