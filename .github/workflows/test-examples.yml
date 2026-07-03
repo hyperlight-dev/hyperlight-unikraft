@@ -759,16 +759,30 @@ jobs:
             }
           }
 
+          # Helper: run a command with a per-test timeout (seconds).
+          function Invoke-WithTimeout {
+            param([int]$Seconds, [string]$Exe, [string[]]$ArgList)
+            $outFile = Join-Path $env:RUNNER_TEMP 'hl-test-out.log'
+            $proc = Start-Process -FilePath $Exe -ArgumentList $ArgList `
+              -NoNewWindow -RedirectStandardOutput $outFile -RedirectStandardError "$outFile.err" -PassThru
+            if (-not $proc.WaitForExit($Seconds * 1000)) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              Write-Host "FAIL: timed out after ${Seconds}s"
+              Get-Content $outFile -ErrorAction SilentlyContinue
+              exit 1
+            }
+            $script:out = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+            $script:rc = $proc.ExitCode
+          }
+
           switch ($driver) {
             'multifn-test' {
-              $out = & multifn-test $kernel $cpio 2>&1
-              $rc = $LASTEXITCODE
+              Invoke-WithTimeout -Seconds 60 -Exe 'multifn-test' -ArgList @($kernel, $cpio)
             }
             'pydriver-run' {
               "print('hello from driver')" | Out-File -Encoding ascii tiny.py
               $tiny = (Resolve-Path "tiny.py").Path
-              $out = & pydriver-run $kernel $cpio $tiny 2>&1
-              $rc = $LASTEXITCODE
+              Invoke-WithTimeout -Seconds 120 -Exe 'pydriver-run' -ArgList @($kernel, $cpio, $tiny)
             }
             default {
               $argList = @()
@@ -779,16 +793,15 @@ jobs:
               if ($memory -ne '') {
                 $memArgs = @('-m', $memory)
               }
-              $out = & hyperlight-unikraft -q @memArgs `
-                $kernel --initrd $cpio @mountArgs @toolArgs @argList 2>&1
-              $rc = $LASTEXITCODE
+              Invoke-WithTimeout -Seconds 120 -Exe 'hyperlight-unikraft' `
+                -ArgList (@('-q') + $memArgs + @($kernel, '--initrd', $cpio) + $mountArgs + $toolArgs + $argList)
             }
           }
 
-          $outStr = ($out | Out-String)
+          if ($null -eq $out) { $out = '' }
           Write-Host "=== output (exit=$rc) ==="
-          Write-Host $outStr
-          if (-not ($outStr -match $expect)) {
+          Write-Host $out
+          if (-not ($out -match $expect)) {
             Write-Host "FAIL: did not match /$expect/"
             exit 1
           }
