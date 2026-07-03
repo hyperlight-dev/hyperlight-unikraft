@@ -946,6 +946,32 @@ jobs:
             exit 1
           }
 
+      - name: pyhl run (busybox subprocess demo)
+        if: runner.os == 'Windows' || steps.kvm_check.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $out = pyhl run examples/python-agent-driver/demo_busybox.py 2>&1
+          Write-Host $out
+          if ($out -match 'hello from hyperlight guest') {
+            Write-Host "PASS: busybox subprocess demo"
+          } else {
+            Write-Error "FAIL: did not match /hello from hyperlight guest/"
+            exit 1
+          }
+
+      - name: pyhl run (pip install subprocess demo)
+        if: runner.os == 'Windows' || steps.kvm_check.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $out = pyhl run --net examples/python-agent-driver/demo_pip_install.py 2>&1
+          Write-Host $out
+          if ($out -match 'Installed and imported six') {
+            Write-Host "PASS: pip install subprocess demo"
+          } else {
+            Write-Error "FAIL: did not match /Installed and imported six/"
+            exit 1
+          }
+
   test-examples-passed:
     if: always()
     needs:
