@@ -3,8 +3,8 @@ specification: '0.6'
 name: python-tools-hyperlight
 
 unikraft:
-  source: https://github.com/unikraft/unikraft.git
-  version: plat-hyperlight
+  source: https://github.com/danbugs/unikraft.git
+  version: fix/epoll-bypass-guard
   kconfig:
     # Platform
     CONFIG_PLAT_HYPERLIGHT: 'y'
