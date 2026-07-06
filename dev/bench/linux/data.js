@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783110916711,
+  "lastUpdate": 1783379614096,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -2111,6 +2111,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot (disk)",
             "value": 702,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "71c543b86924c65450848c5b036108ecaceb997a",
+          "message": "fix: bump install() heap to 2.5 GiB and version to 0.12.1\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-07-06T23:03:33Z",
+          "tree_id": "6259e670b65f99443bc72952f5bb191e8b05dbdc",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/71c543b86924c65450848c5b036108ecaceb997a"
+        },
+        "date": 1783379613065,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 12,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 701,
             "unit": "MiB"
           }
         ]
