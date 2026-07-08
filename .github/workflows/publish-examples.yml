@@ -7,6 +7,7 @@ on:
     tags: ['v*']
     paths:
       - 'examples/**'
+      - 'host/**'
       - 'runtimes/**'
       - '.github/workflows/publish-examples.yml'
 
@@ -226,6 +227,37 @@ jobs:
           docker push $IMAGE
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             VERSION_TAG=${{ env.IMAGE_BASE }}/hello-hyperlight-unikraft:${{ github.ref_name }}
+            docker tag $IMAGE $VERSION_TAG
+            docker push $VERSION_TAG
+          fi
+
+  # Publish a runnable pyhl container image (pyhl + kernel + initrd).
+  # Designed for the hyperlight-on-kubernetes device plugin — the pod
+  # gets /dev/kvm and pyhl handles VM lifecycle internally.
+  publish-pyhl:
+    needs: [publish-pyhl-initrd, publish-kernels]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push pyhl image
+        run: |
+          IMAGE=${{ env.IMAGE_BASE }}/pyhl:latest
+          docker build --platform linux/amd64 \
+            -f host/pyhl.Dockerfile -t $IMAGE .
+          docker push $IMAGE
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION_TAG=${{ env.IMAGE_BASE }}/pyhl:${{ github.ref_name }}
             docker tag $IMAGE $VERSION_TAG
             docker push $VERSION_TAG
           fi
