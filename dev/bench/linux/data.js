@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783535141095,
+  "lastUpdate": 1783535877752,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -2179,6 +2179,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/c7adf56ea33c3294c08fe605e6bcd0a5d6310fcf"
         },
         "date": 1783535140661,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 12,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 701,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "b316b19070c5ce1dce4347c4fc06ccba99fc56b6",
+          "message": "fix: use rust 1.89 in pyhl Dockerfile to match toolchain\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-07-08T18:26:37Z",
+          "tree_id": "043500b5bd56617a5234f95bc1ba50a61133a595",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/b316b19070c5ce1dce4347c4fc06ccba99fc56b6"
+        },
+        "date": 1783535877262,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
