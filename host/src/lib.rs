@@ -67,7 +67,7 @@ use hyperlight_host::{GuestBinary, HostFunctions, MultiUseSandbox, Uninitialized
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -107,6 +107,46 @@ const MAX_DISPATCH_PAYLOAD: usize = 64 * 1024 * 1024;
 
 /// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
 const MAX_SLEEP_NS: u64 = 60_000_000_000;
+
+/// Reserved high bit of the cooperative-poll deadline atomic used to signal
+/// that the guest process has explicitly exited (via `__hl_exit`, e.g. the
+/// Python driver's `report_exit_code`). Kept separate from the deadline so a
+/// late deadline report within the same `poll` call coexists with the exit
+/// signal.
+const POLL_EXITED_BIT: u64 = 1 << 63;
+
+/// Reserved bit of the cooperative-poll deadline atomic set by the guest's
+/// idle pump every time it yields the vCPU back to the host (via
+/// `__hl_poll_yield`). Its purpose is to distinguish a *genuine* scheduler
+/// idle-yield from a VM *halt* that returned control without yielding.
+///
+/// A normal C guest (pid ≤ 2) that returns from `main` exits via
+/// `exit_group` → `uk_pm_shutdown(SYSHALT)` → a direct port-108 HALT. That
+/// path never runs the idle pump, so it never calls `__hl_poll_yield` and
+/// never sets `__hl_exit`. Without this bit, such a run would be
+/// indistinguishable from a zero-deadline idle-yield and `poll_step` would
+/// loop forever reporting [`PollStatus::Idle`]. By clearing the atomic
+/// before each `poll` call and checking this bit afterwards, `poll_step`
+/// treats "the VM halted without yielding" as terminal ([`PollStatus::Done`]).
+const POLL_YIELDED_BIT: u64 = 1 << 62;
+
+/// Mask selecting the nanoseconds-until-next-wakeup deadline carried in the
+/// low bits of the cooperative-poll atomic (everything except the reserved
+/// [`POLL_EXITED_BIT`] and [`POLL_YIELDED_BIT`] flags).
+const POLL_DEADLINE_MASK: u64 = POLL_YIELDED_BIT - 1;
+
+/// Outcome of a single cooperative [`Sandbox::poll_step`] invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollStatus {
+    /// The guest process has exited; stop polling.
+    Done,
+    /// The guest went idle with a pending timer. Re-poll after this delay,
+    /// or sooner if external input (e.g. a cancelled sleep) arrives.
+    Wait(Duration),
+    /// The guest went idle with no pending timer. Re-poll when external
+    /// input becomes available.
+    Idle,
+}
 
 /// Shared cancellation primitive for `__hl_sleep`. Calling
 /// [`SleepCancel::cancel`] wakes up any in-progress sleep immediately so
@@ -1020,14 +1060,35 @@ fn build_tools(
 fn register_internal_tools(
     tools: &mut ToolRegistry,
     exit_code: &Arc<AtomicI32>,
+    poll_deadline: &Arc<AtomicU64>,
     sleep_cancel: &SleepCancel,
     network: Option<&NetworkPolicy>,
     listen_ports: Option<&ListenPorts>,
 ) -> Option<Arc<Mutex<SocketTable>>> {
     let ec = exit_code.clone();
+    let pd_exit = poll_deadline.clone();
     tools.register("__hl_exit", move |args| {
         let code = args["code"].as_i64().unwrap_or(1) as i32;
         ec.store(code, Ordering::Relaxed);
+        // Signal completion to the cooperative poll loop without losing a
+        // deadline that a later __hl_poll_yield (from the idle pump) may
+        // report within the same `poll` call: the exit bit is preserved
+        // separately from the nanosecond deadline. See POLL_EXITED_BIT.
+        pd_exit.fetch_or(POLL_EXITED_BIT, Ordering::Relaxed);
+        Ok(serde_json::json!({}))
+    });
+    // Cooperative poll model: the guest reports the nanoseconds until its
+    // next scheduler wakeup (0 = no pending timer) right before it yields
+    // the vCPU back to the host. `poll_step` reads this to decide how long
+    // to wait before the next `poll`. See plat/hyperlight/poll.c.
+    let pd = poll_deadline.clone();
+    tools.register("__hl_poll_yield", move |args| {
+        let ns = args["ns"].as_u64().unwrap_or(0) & POLL_DEADLINE_MASK;
+        // Preserve the exit bit if __hl_exit already fired this call, and set
+        // the yielded bit so poll_step can tell a real idle-yield apart from a
+        // bare HALT (see POLL_YIELDED_BIT).
+        let cur = pd.load(Ordering::Relaxed) & POLL_EXITED_BIT;
+        pd.store(cur | POLL_YIELDED_BIT | ns, Ordering::Relaxed);
         Ok(serde_json::json!({}))
     });
     // Create socket table early so __hl_sleep can poll sockets while sleeping.
@@ -1824,7 +1885,9 @@ fn hl_sleep_poll_sockets(
         .values()
         .map(|hs| libc::pollfd {
             fd: hs.socket.as_raw_fd(),
-            events: libc::POLLIN | libc::POLLOUT | libc::POLLERR,
+            // Readability/errors only — see wait_for_socket_event: POLLOUT is
+            // ~always ready on a connected socket and would spin the caller.
+            events: libc::POLLIN | libc::POLLERR,
             revents: 0,
         })
         .collect();
@@ -1862,7 +1925,7 @@ fn hl_sleep_poll_sockets(
 ) -> Result<serde_json::Value> {
     use serde_json::json;
     use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, POLLWRNORM, WSAPOLLFD};
+    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, WSAPOLLFD};
 
     let tbl = table.lock().unwrap();
     let mut pollfds: Vec<WSAPOLLFD> = tbl
@@ -1870,8 +1933,10 @@ fn hl_sleep_poll_sockets(
         .values()
         .map(|hs| WSAPOLLFD {
             fd: hs.socket.as_raw_socket() as usize,
-            // POLLERR is output-only on Windows; setting it in events causes WSAEINVAL
-            events: (POLLRDNORM | POLLWRNORM) as i16,
+            // Readability only. POLLWRNORM is ~always ready on a connected
+            // socket and would spin the caller; the guest only parks on
+            // readable events (accept/recv). POLLERR is output-only on Windows.
+            events: POLLRDNORM as i16,
             revents: 0,
         })
         .collect();
@@ -2303,6 +2368,9 @@ pub struct Sandbox {
     /// overwrites the region with the snapshot's original memory.
     initrd_path: Option<std::path::PathBuf>,
     exit_code: Arc<AtomicI32>,
+    /// Last next-wakeup deadline (ns) reported by the guest `poll`
+    /// function via `__hl_poll_yield`. 0 means "no pending timer".
+    poll_deadline: Arc<AtomicU64>,
     /// Shared socket table — cleared on [`Sandbox::restore`] so that
     /// host-side fds don't leak across guest restore cycles.
     socket_table: Option<Arc<Mutex<SocketTable>>>,
@@ -2527,17 +2595,24 @@ impl Sandbox {
         let mut usbox = UninitializedSandbox::new(env, Some(config.sandbox_config()))?;
 
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
-        let socket_table =
-            register_internal_tools(&mut tools, &exit_code, &sleep_cancel, network, listen_ports);
+        let socket_table = register_internal_tools(
+            &mut tools,
+            &exit_code,
+            &poll_deadline,
+            &sleep_cancel,
+            network,
+            listen_ports,
+        );
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
         usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(usbox, None, exit_code, sleep_cancel, socket_table)
+        Self::finish_evolve(usbox, None, exit_code, poll_deadline, sleep_cancel, socket_table)
     }
 
     /// Low-level: boot with a zero-copy mapped initrd file. Prefer the builder.
@@ -2586,23 +2661,38 @@ impl Sandbox {
         };
 
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
-        let socket_table =
-            register_internal_tools(&mut tools, &exit_code, &sleep_cancel, network, listen_ports);
+        let socket_table = register_internal_tools(
+            &mut tools,
+            &exit_code,
+            &poll_deadline,
+            &sleep_cancel,
+            network,
+            listen_ports,
+        );
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
         usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(usbox, initrd_owned, exit_code, sleep_cancel, socket_table)
+        Self::finish_evolve(
+            usbox,
+            initrd_owned,
+            exit_code,
+            poll_deadline,
+            sleep_cancel,
+            socket_table,
+        )
     }
 
     fn finish_evolve(
         usbox: UninitializedSandbox,
         initrd_path: Option<std::path::PathBuf>,
         exit_code: Arc<AtomicI32>,
+        poll_deadline: Arc<AtomicU64>,
         sleep_cancel: SleepCancel,
         socket_table: Option<Arc<Mutex<SocketTable>>>,
     ) -> Result<Self> {
@@ -2613,6 +2703,7 @@ impl Sandbox {
             snapshot,
             initrd_path,
             exit_code,
+            poll_deadline,
             socket_table,
             sleep_cancel,
         })
@@ -2646,6 +2737,341 @@ impl Sandbox {
         // to the guest (it ignores it and just runs the app).
         let _: () = self.inner.call("run", ())?;
         Ok(())
+    }
+
+    /// Run one cooperative poll step.
+    ///
+    /// Invokes the guest `poll` function, which pumps the unikernel
+    /// scheduler until it would go idle, then yields the vCPU back to the
+    /// host (a HALT), reporting the nanoseconds until its next scheduled
+    /// wakeup. Guest memory persists across the HALT/re-entry boundary, so
+    /// repeatedly calling `poll_step` drives the guest forward
+    /// cooperatively.
+    ///
+    /// The returned [`PollStatus`] tells the caller what to do next:
+    /// - [`PollStatus::Done`] — the guest exited; stop polling.
+    /// - [`PollStatus::Wait`] — re-poll after the given delay (or sooner if
+    ///   external input arrives, e.g. via [`SleepCancel::cancel`]).
+    /// - [`PollStatus::Idle`] — no pending timer; re-poll when external
+    ///   input is available.
+    ///
+    /// Requires a prior `restore()` to reset guest state before the first
+    /// step of a fresh run.
+    pub fn poll_step(&mut self) -> Result<PollStatus> {
+        // Clear the deadline atomic so a stale value from a previous step
+        // can't be misread; the guest sets it during this call via
+        // __hl_poll_yield / __hl_exit.
+        self.poll_deadline.store(0, Ordering::Relaxed);
+        let _: () = self.inner.call("poll", ())?;
+        let raw = self.poll_deadline.load(Ordering::Relaxed);
+        // Explicit exit (e.g. the Python driver's __hl_exit) is terminal.
+        if raw & POLL_EXITED_BIT != 0 {
+            return Ok(PollStatus::Done);
+        }
+        // The idle pump sets POLL_YIELDED_BIT every time it hands the vCPU
+        // back cooperatively. If the poll returned without it, the guest
+        // halted (a normal C app exiting via SYSHALT, or an abort) — treat
+        // that as terminal too.
+        if raw & POLL_YIELDED_BIT == 0 {
+            return Ok(PollStatus::Done);
+        }
+        let ns = raw & POLL_DEADLINE_MASK;
+        Ok(if ns == 0 {
+            PollStatus::Idle
+        } else {
+            PollStatus::Wait(Duration::from_nanos(ns))
+        })
+    }
+
+    /// Wait for the next cooperative-poll event after a [`Sandbox::poll_step`].
+    ///
+    /// Drives the inter-step wait in a way that is aware of host-proxied
+    /// sockets, so a guest thread parked on a blocking `recv`/`accept` (which
+    /// yields cooperatively rather than blocking the vCPU) is re-driven
+    /// promptly. Behaviour by [`PollStatus`]:
+    ///
+    /// - [`PollStatus::Wait`] — sleep until the guest's next timer deadline,
+    ///   but return **early** as soon as any host socket becomes readable,
+    ///   writable, or errored.
+    /// - [`PollStatus::Idle`] — the guest has no pending timer; block until a
+    ///   host socket becomes ready (bounded by [`SOCKET_TIMEOUT`]) or, if no
+    ///   sockets are open, until `sleep_cancel` fires.
+    /// - [`PollStatus::Done`] — returns immediately.
+    ///
+    /// After this returns, call [`Sandbox::poll_step`] again: the guest's poll
+    /// pump rescans socket readiness on entry and wakes any parked thread.
+    ///
+    /// Callers serving sockets from a polled guest should use this between
+    /// steps instead of a plain sleep; a bare `sleep(deadline)` would only
+    /// re-check a socket-parked guest on the next timer tick.
+    pub fn poll_wait(&self, status: &PollStatus) {
+        let timeout = match status {
+            PollStatus::Done => return,
+            PollStatus::Wait(d) => Some(*d),
+            PollStatus::Idle => None,
+        };
+        self.wait_for_socket_event(timeout);
+    }
+
+    /// Block until a host socket is ready, `timeout` elapses (`None` = the
+    /// [`SOCKET_TIMEOUT`] cap), or — when no sockets are open — `sleep_cancel`
+    /// fires. Returns immediately if there is nothing to watch and no timeout.
+    #[cfg(unix)]
+    fn wait_for_socket_event(&self, timeout: Option<Duration>) {
+        use std::os::unix::io::AsRawFd;
+
+        let fds: Vec<i32> = match &self.socket_table {
+            Some(t) => t
+                .lock()
+                .unwrap()
+                .sockets
+                .values()
+                .map(|hs| hs.socket.as_raw_fd())
+                .collect(),
+            None => Vec::new(),
+        };
+
+        if fds.is_empty() {
+            // Nothing to watch: fall back to a cancellable sleep so external
+            // input (via SleepCancel::cancel) can still wake the loop.
+            self.sleep_cancel.wait(timeout.unwrap_or(SOCKET_TIMEOUT));
+            return;
+        }
+
+        // Only wait on readability/errors, never POLLOUT. A connected TCP
+        // socket is almost always writable, so including POLLOUT here would
+        // make `poll` return immediately on every iteration while the guest is
+        // parked in `accept`/`recv` (which only care about POLLIN) — a busy
+        // loop. Writability never needs an inter-step wait in this design:
+        // host sockets are blocking, so guest `send`s always complete via a
+        // synchronous `net_send` hcall and the guest never parks on POLLOUT.
+        // Any genuine POLLOUT readiness is satisfied in-step by
+        // hostsock_rescan_events during the next `poll`.
+        let mut pollfds: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|&fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN | libc::POLLERR,
+                revents: 0,
+            })
+            .collect();
+
+        // Idle (no guest timer): block up to the socket cap, then re-poll.
+        let timeout_ms = match timeout {
+            Some(d) => (d.as_millis() as i64).clamp(0, SOCKET_TIMEOUT.as_millis() as i64),
+            None => SOCKET_TIMEOUT.as_millis() as i64,
+        } as libc::c_int;
+
+        let ret = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                // A poll failure shouldn't wedge the loop; fall back to a
+                // short sleep so the caller re-polls the guest.
+                self.sleep_cancel.wait(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Windows fallback: socket readiness integration for the poll loop is
+    /// handled through the `__hl_sleep` path (see `hl_sleep_poll_sockets`);
+    /// here we just honour the guest's timer deadline.
+    #[cfg(windows)]
+    fn wait_for_socket_event(&self, timeout: Option<Duration>) {
+        self.sleep_cancel.wait(timeout.unwrap_or(SOCKET_TIMEOUT));
+    }
+
+    /// Async counterpart to [`Sandbox::poll_wait`], for callers driving the
+    /// cooperative poll loop from a Tokio runtime.
+    ///
+    /// `poll_step` stays synchronous and CPU-bound — it runs the vCPU via a
+    /// blocking `KVM_RUN`, so run it on a blocking thread (e.g.
+    /// [`tokio::task::spawn_blocking`] or a dedicated owner thread). This
+    /// method covers the *other* half — the idle wait for host-socket I/O —
+    /// without blocking the executor. Behaviour by [`PollStatus`]:
+    ///
+    /// - [`PollStatus::Wait`] — sleep until the guest's timer deadline, but
+    ///   return **early** as soon as any host socket becomes readable.
+    /// - [`PollStatus::Idle`] — the guest has no pending timer; wait (bounded
+    ///   by [`SOCKET_TIMEOUT`]) until a host socket becomes readable.
+    /// - [`PollStatus::Done`] — returns immediately.
+    ///
+    /// External cancellation composes naturally: wrap the call in a
+    /// [`tokio::select!`] against your own shutdown/wakeup signal — there is
+    /// no internal cancel token (unlike the sync path's `SleepCancel`).
+    ///
+    /// Only read readiness (`POLLIN`) is watched, matching [`Sandbox::poll_wait`]
+    /// — a connected socket is almost always writable, so watching `POLLOUT`
+    /// would spuriously wake every iteration (see `wait_for_socket_event`).
+    ///
+    /// The watched host sockets need **not** be non-blocking:
+    /// [`tokio::io::unix::AsyncFd`] is used purely as a readiness notifier
+    /// (it never performs I/O and never closes the fd), so `O_NONBLOCK` is not
+    /// required. The actual `recv`/`accept` runs inside the guest on the next
+    /// `poll_step`, gated by the guest's own readiness pre-check.
+    #[cfg(feature = "tokio")]
+    pub async fn poll_wait_async(&self, status: &PollStatus) {
+        let timeout = match status {
+            PollStatus::Done => return,
+            PollStatus::Wait(d) => Some(*d),
+            PollStatus::Idle => None,
+        };
+        let fds: Vec<i32> = self.socket_raw_fds();
+        // Idle (no timer) is bounded by the socket cap, matching the sync path.
+        Self::wait_readable_or_timeout(fds, timeout.unwrap_or(SOCKET_TIMEOUT)).await;
+    }
+
+    /// Drive the guest to completion cooperatively from a Tokio runtime,
+    /// returning its exit code — the async, poll-driven analog of
+    /// [`Sandbox::call_run`].
+    ///
+    /// (Named `poll_run_async` rather than `call_run_async` because the latter
+    /// already exists for a different purpose — a pausable/snapshotable run
+    /// handle. This method instead runs the cooperative *poll* loop.)
+    ///
+    /// This is the full poll loop as a single `async fn`. Each iteration runs
+    /// the two halves of the cooperative model:
+    ///
+    /// - **CPU half** — [`Sandbox::poll_step`] runs the vCPU via a blocking
+    ///   `KVM_RUN`. It is called inline here, so it briefly occupies the
+    ///   current worker thread for the (bounded) duration of one scheduler
+    ///   pump. On a multi-threaded runtime other tasks continue on other
+    ///   workers; if that inline blocking is undesirable, drive `poll_step` on
+    ///   a dedicated owner thread and use [`Sandbox::poll_wait_async`] alone.
+    /// - **I/O half** — [`Sandbox::poll_wait_async`] `await`s host-socket
+    ///   readiness (or the guest's timer deadline) on the reactor, so the task
+    ///   yields instead of busy-looping while the guest is parked on
+    ///   `accept`/`recv`.
+    ///
+    /// Requires a prior [`Sandbox::restore`] to reset guest state before the
+    /// first step of a fresh run (same contract as `poll_step`). The exit code
+    /// is the value the guest reported via `__hl_exit` (0 if it halted without
+    /// an explicit code); read it again later with [`Sandbox::last_exit_code`].
+    ///
+    /// Cancellation composes: drop the returned future (e.g. via
+    /// [`tokio::time::timeout`] or a `select!`) to stop driving the guest
+    /// between steps. A step already in progress runs to its next yield first,
+    /// since `poll_step` is synchronous.
+    #[cfg(feature = "tokio")]
+    pub async fn poll_run_async(&mut self) -> Result<i32> {
+        loop {
+            // CPU half: blocking KVM_RUN for one cooperative pump.
+            let status = self.poll_step()?;
+            if let PollStatus::Done = status {
+                return Ok(self.last_exit_code());
+            }
+            // I/O half: yield to the reactor until the guest can make progress.
+            self.poll_wait_async(&status).await;
+        }
+    }
+
+    /// Snapshot the raw fds of all currently-open host sockets.
+    #[cfg(all(feature = "tokio", unix))]
+    fn socket_raw_fds(&self) -> Vec<i32> {
+        use std::os::unix::io::AsRawFd;
+        match &self.socket_table {
+            Some(t) => t
+                .lock()
+                .unwrap()
+                .sockets
+                .values()
+                .map(|hs| hs.socket.as_raw_fd())
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    #[cfg(all(feature = "tokio", not(unix)))]
+    fn socket_raw_fds(&self) -> Vec<i32> {
+        Vec::new()
+    }
+
+    /// Wait until any of `fds` becomes readable, or `timeout` elapses.
+    ///
+    /// Each fd is *borrowed*: it is wrapped in an [`AsyncFd`] purely to observe
+    /// read readiness via the Tokio reactor. `AsyncFd<RawFd>` never performs
+    /// I/O and never closes the fd (dropping an `i32` is a no-op), so the
+    /// sockets may stay blocking. A fresh registration is built per call so
+    /// the changing socket set is always reflected, and already-readable fds
+    /// are reported immediately (epoll delivers current readiness at
+    /// registration). If registration fails we fall back to the timer so the
+    /// caller can't wedge.
+    #[cfg(all(feature = "tokio", unix))]
+    async fn wait_readable_or_timeout(fds: Vec<i32>, timeout: Duration) {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        use tokio::io::{unix::AsyncFd, Interest};
+
+        let sleep = tokio::time::sleep(timeout);
+
+        if fds.is_empty() {
+            sleep.await;
+            return;
+        }
+
+        let guards: Vec<AsyncFd<i32>> = {
+            let mut v = Vec::with_capacity(fds.len());
+            for fd in fds {
+                match AsyncFd::with_interest(fd, Interest::READABLE) {
+                    Ok(g) => v.push(g),
+                    Err(_) => {
+                        sleep.await;
+                        return;
+                    }
+                }
+            }
+            v
+        };
+
+        let mut readable: Vec<_> = guards.iter().map(|g| Box::pin(g.readable())).collect();
+        // Resolve as soon as *any* socket is readable. The ready-guard is
+        // dropped without clearing readiness on purpose: the pending
+        // recv/accept is serviced inside the guest on the next poll_step, and
+        // the following wait builds a fresh AsyncFd.
+        let any_readable = poll_fn(|cx| {
+            for fut in readable.iter_mut() {
+                if let Poll::Ready(res) = fut.as_mut().poll(cx) {
+                    return Poll::Ready(res.map(|_| ()));
+                }
+            }
+            Poll::Pending
+        });
+
+        tokio::select! {
+            _ = any_readable => {}
+            _ = sleep => {}
+        }
+    }
+
+    /// Windows fallback: socket readiness for the async poll loop is not wired
+    /// through `AsyncFd`; honour the timer deadline (socket wakeups still flow
+    /// through the guest's `__hl_sleep` path, as in the sync case).
+    #[cfg(all(feature = "tokio", not(unix)))]
+    async fn wait_readable_or_timeout(_fds: Vec<i32>, timeout: Duration) {
+        tokio::time::sleep(timeout).await;
+    }
+
+    /// Read the nanoseconds-until-next-wakeup reported by the most recent
+    /// `poll_step`. Returns `None` if the guest has exited.
+    pub fn last_poll_deadline(&self) -> Option<u64> {
+        let raw = self.poll_deadline.load(Ordering::Relaxed);
+        if raw & POLL_EXITED_BIT != 0 {
+            None
+        } else {
+            Some(raw & POLL_DEADLINE_MASK)
+        }
+    }
+
+    /// Reset the cooperative-poll deadline/exit state to its initial value.
+    /// Call before starting a fresh poll-driven run.
+    pub fn reset_poll_deadline(&self) {
+        self.poll_deadline.store(0, Ordering::Relaxed);
     }
 
     /// Call a named guest function with typed parameters.
@@ -2801,10 +3227,17 @@ impl Sandbox {
         let arc = Arc::new(loaded);
 
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(None, preopens)?.unwrap_or_default();
-        let socket_table =
-            register_internal_tools(&mut tools, &exit_code, &sleep_cancel, network, listen_ports);
+        let socket_table = register_internal_tools(
+            &mut tools,
+            &exit_code,
+            &poll_deadline,
+            &sleep_cancel,
+            network,
+            listen_ports,
+        );
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
 
@@ -2825,6 +3258,7 @@ impl Sandbox {
             snapshot: Some(arc),
             initrd_path: initrd,
             exit_code,
+            poll_deadline,
             socket_table,
             sleep_cancel,
         })
@@ -3067,6 +3501,51 @@ fn sparsify_file(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Async `wait_readable_or_timeout` behaviour, proving two things:
+    /// 1. It returns via the timer when no fd is readable (idle wait).
+    /// 2. It returns promptly once an fd becomes readable — using a *blocking*
+    ///    `UnixStream`, demonstrating that `AsyncFd` needs no `O_NONBLOCK`.
+    #[cfg(all(feature = "tokio", unix))]
+    #[tokio::test]
+    async fn wait_readable_or_timeout_wakes_on_readable_blocking_fd() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        // Blocking by default — intentionally not set to non-blocking, to
+        // prove AsyncFd needs no O_NONBLOCK for readiness.
+        let (rx, mut tx) = UnixStream::pair().unwrap();
+
+        // (1) Nothing to read yet: the ~100ms timer should elapse.
+        let start = std::time::Instant::now();
+        Sandbox::wait_readable_or_timeout(vec![rx.as_raw_fd()], Duration::from_millis(100)).await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(80),
+            "expected to wait out the timeout, elapsed {:?}",
+            start.elapsed()
+        );
+
+        // (2) Peer writes → fd becomes readable → return well before the cap.
+        tx.write_all(b"x").unwrap();
+        tx.flush().unwrap();
+        let start = std::time::Instant::now();
+        Sandbox::wait_readable_or_timeout(vec![rx.as_raw_fd()], Duration::from_secs(5)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "expected a prompt readable wake, elapsed {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// With no sockets, the wait is purely the timer.
+    #[cfg(all(feature = "tokio", unix))]
+    #[tokio::test]
+    async fn wait_readable_or_timeout_empty_honours_timer() {
+        let start = std::time::Instant::now();
+        Sandbox::wait_readable_or_timeout(Vec::new(), Duration::from_millis(80)).await;
+        assert!(start.elapsed() >= Duration::from_millis(60));
+    }
 
     fn tmpdir(label: &str) -> std::path::PathBuf {
         let p =
@@ -3684,11 +4163,13 @@ mod tests {
     fn net_tools_registered_with_blocklist() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sc = SleepCancel::new();
         let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
         register_internal_tools(
             &mut tools,
             &exit_code,
+            &poll_deadline,
             &sc,
             Some(&NetworkPolicy::BlockList(bl)),
             None,
@@ -3703,8 +4184,9 @@ mod tests {
     fn net_tools_not_registered_without_policy() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sc = SleepCancel::new();
-        register_internal_tools(&mut tools, &exit_code, &sc, None, None);
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
         let resp = tools.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
@@ -3715,10 +4197,12 @@ mod tests {
     fn net_tools_registered_with_allow_all() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sc = SleepCancel::new();
         register_internal_tools(
             &mut tools,
             &exit_code,
+            &poll_deadline,
             &sc,
             Some(&NetworkPolicy::AllowAll),
             None,
@@ -3748,10 +4232,12 @@ mod tests {
     fn net_bind_denied_without_listen_ports() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sc = SleepCancel::new();
         register_internal_tools(
             &mut tools,
             &exit_code,
+            &poll_deadline,
             &sc,
             Some(&NetworkPolicy::AllowAll),
             None,
@@ -3777,11 +4263,13 @@ mod tests {
     fn net_bind_allowed_with_matching_port() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sc = SleepCancel::new();
         let lp = ListenPorts::from_ports([8080]);
         register_internal_tools(
             &mut tools,
             &exit_code,
+            &poll_deadline,
             &sc,
             Some(&NetworkPolicy::AllowAll),
             Some(&lp),
@@ -3803,11 +4291,13 @@ mod tests {
     fn net_bind_denied_with_wrong_port() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sc = SleepCancel::new();
         let lp = ListenPorts::from_ports([8080]);
         register_internal_tools(
             &mut tools,
             &exit_code,
+            &poll_deadline,
             &sc,
             Some(&NetworkPolicy::AllowAll),
             Some(&lp),
@@ -3848,8 +4338,9 @@ mod tests {
 
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sc = SleepCancel::new();
-        register_internal_tools(&mut tools, &exit_code, &sc, None, None);
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
         let req = br#"{"name":"__hl_sleep","args":{"ns":0}}"#;
         let resp = tools.dispatch(req);
@@ -3858,11 +4349,64 @@ mod tests {
     }
 
     #[test]
+    fn test_poll_yield_reports_deadline() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
+
+        // A yield with a pending timer reports the nanosecond deadline in
+        // the low bits, sets the yielded bit, and leaves the exit bit clear.
+        let resp = tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":1234}}"#);
+        assert!(!std::str::from_utf8(&resp).unwrap().contains("\"error\""));
+        let raw = poll_deadline.load(Ordering::Relaxed);
+        assert_eq!(raw & POLL_EXITED_BIT, 0, "exit bit must be clear");
+        assert_ne!(raw & POLL_YIELDED_BIT, 0, "yielded bit must be set");
+        assert_eq!(raw & POLL_DEADLINE_MASK, 1234);
+    }
+
+    #[test]
+    fn test_poll_yield_zero_sets_yielded_bit() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
+
+        // A zero-deadline idle-yield must still set the yielded bit so it is
+        // distinguishable from a bare HALT (which sets nothing). poll_step
+        // maps the former to Idle and the latter to Done.
+        tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0}}"#);
+        let raw = poll_deadline.load(Ordering::Relaxed);
+        assert_ne!(raw & POLL_YIELDED_BIT, 0, "yielded bit must be set on ns=0");
+        assert_eq!(raw & POLL_DEADLINE_MASK, 0);
+    }
+
+    #[test]
+    fn test_exit_bit_survives_late_poll_yield() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
+
+        // The app exits first, then the idle pump yields within the same
+        // `poll` call. The exit signal must not be lost.
+        tools.dispatch(br#"{"name":"__hl_exit","args":{"code":0}}"#);
+        tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0}}"#);
+
+        let raw = poll_deadline.load(Ordering::Relaxed);
+        assert_ne!(raw & POLL_EXITED_BIT, 0, "exit bit must survive a later yield");
+    }
+
+    #[test]
     fn test_sleep_cancel_wakes_immediately() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sc = SleepCancel::new();
-        register_internal_tools(&mut tools, &exit_code, &sc, None, None);
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
         let sc2 = sc.clone();
         let handle = std::thread::spawn(move || {
@@ -4045,10 +4589,12 @@ mod tests {
     fn net_socket_has_default_timeout() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
         let sc = SleepCancel::new();
         let table = register_internal_tools(
             &mut tools,
             &exit_code,
+            &poll_deadline,
             &sc,
             Some(&NetworkPolicy::AllowAll),
             None,

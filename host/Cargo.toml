@@ -34,6 +34,9 @@ path = "src/bin/pyhl.rs"
 [features]
 default = []
 wasm-host-fns = ["dep:wasmtime", "dep:wasmtime-wasi"]
+# Async (Tokio) driver helpers, e.g. `Sandbox::poll_wait_async`. All Tokio
+# dependencies are gated behind this feature; the default build stays sync-only.
+tokio = ["dep:tokio"]
 
 [dependencies]
 hyperlight-host = { version = "0.16.0", features = ["executable_heap", "hw-interrupts"] }
@@ -47,6 +50,7 @@ flate2 = "1"
 tar = "0.4"
 wasmtime = { version = "36.0.2", optional = true, default-features = false, features = ["cranelift", "runtime", "std"] }
 wasmtime-wasi = { version = "36.0.2", optional = true, default-features = false, features = ["preview1"] }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["fs"] }
