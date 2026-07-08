@@ -1,0 +1,44 @@
+# poll-recv-c on Hyperlight (cooperative poll model, host-proxied sockets)
+#
+# just rootfs   - Build rootfs via Docker (cross-platform)
+# just build    - Build the poll-enabled kernel via kraft
+# just clean    - Remove build artifacts
+#
+# The kernel is built with CONFIG_HYPERLIGHT_POLL=y and CONFIG_LIBHOSTSOCK=y
+# (see kraft.yaml). The host-side live test `host/tests/poll_recv.rs` drives
+# this guest via `Sandbox::poll_step` + `Sandbox::poll_wait` under KVM while a
+# client connects and sends a payload, exercising the cooperative (non-vCPU-
+# blocking) accept()/recv() paths.
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+export DOCKER_BUILDKIT := "0"
+
+kernel := ".unikraft/build/poll-recv-hyperlight_hyperlight-x86_64"
+initrd := "poll-recv-initrd.cpio"
+image  := "poll-recv-c-hyperlight"
+
+# Build rootfs via Docker (cross-platform)
+rootfs:
+    docker build --platform linux/amd64 --target cpio -t {{image}}-cpio .
+    - docker rm -f {{image}}-tmp
+    docker create --name {{image}}-tmp {{image}}-cpio /bin/true
+    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
+    docker rm -f {{image}}-tmp
+
+# Build kernel via kraft (Linux)
+[unix]
+build:
+    -kraft-hyperlight build --plat hyperlight --arch x86_64
+
+# Clean + rebuild everything
+rebuild: clean build rootfs
+
+# Clean build artifacts
+[unix]
+clean:
+    rm -rf .unikraft {{initrd}}
+
+[windows]
+clean:
+    if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
+    if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }
