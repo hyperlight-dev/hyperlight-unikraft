@@ -12,7 +12,8 @@
 #   docker run --rm --device /dev/kvm pyhl /path/to/script.py
 #   echo 'print("hi")' | docker run --rm -i --device /dev/kvm pyhl -
 
-FROM rust:1.87-bookworm AS builder
+FROM rust:1.89-bookworm AS builder
+COPY rust-toolchain.toml /src/
 COPY host/ /src/host/
 WORKDIR /src/host
 RUN cargo build --release --bin pyhl
