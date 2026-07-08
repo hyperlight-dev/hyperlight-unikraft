@@ -3,7 +3,7 @@ specification: '0.6'
 name: python-tools-hyperlight
 
 unikraft:
-  source: https://github.com/unikraft/unikraft.git
+  source: ../../../unikraft
   version: plat-hyperlight
   kconfig:
     # Platform
@@ -66,7 +66,7 @@ unikraft:
 
 libraries:
   app-elfloader:
-    source: https://github.com/unikraft/app-elfloader.git
+    source: ../../../app-elfloader
     version: plat-hyperlight
   libelf:
     source: https://github.com/unikraft/lib-libelf.git
