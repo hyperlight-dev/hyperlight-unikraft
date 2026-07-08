@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783379614096,
+  "lastUpdate": 1783535141095,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -2135,6 +2135,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/71c543b86924c65450848c5b036108ecaceb997a"
         },
         "date": 1783379613065,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 110,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 12,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 701,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c7adf56ea33c3294c08fe605e6bcd0a5d6310fcf",
+          "message": "feat: add pyhl container image for device plugin deployments (#109)\n\n* feat: add pyhl container image for device plugin deployments\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* ci: publish pyhl container image to GHCR\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* feat: add --setup-only flag to entrypoint for init container use\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n* fix: use POSIX sh and add EXIT trap in entrypoint\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>\n\n---------\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-07-08T11:16:06-07:00",
+          "tree_id": "7c574506770f6e1cbb74cab7b98a25ed3338b255",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/c7adf56ea33c3294c08fe605e6bcd0a5d6310fcf"
+        },
+        "date": 1783535140661,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
