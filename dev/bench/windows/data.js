@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783536111332,
+  "lastUpdate": 1783976391204,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Windows Benchmarks": [
@@ -2057,6 +2057,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "pandas (median)",
             "value": 910,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 11,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 727,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f2004ea61ce940bb5b0b2e47fa870bae4618456f",
+          "message": "Merge pull request #110 from jsturtevant/agent-framework-examples\n\nAdd Agent Framework examples",
+          "timestamp": "2026-07-13T13:45:51-07:00",
+          "tree_id": "ae951ff4f42f4b644804ea201a503efade0361f4",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/f2004ea61ce940bb5b0b2e47fa870bae4618456f"
+        },
+        "date": 1783976383629,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 270,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 804,
             "unit": "ms"
           },
           {
