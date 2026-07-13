@@ -1,0 +1,61 @@
+# agent-framework-remote on Hyperlight (python-agent-driver / pyhl stack)
+#
+# A Microsoft Agent Framework agent that calls a REMOTE hosted model
+# (GitHub Models, OpenAI-compatible) over the network from inside a micro-VM,
+# using the shipped python-agent-driver + `pyhl` stack (warmed-interpreter
+# snapshot + host-proxied sockets). The driver kernel/rootfs already include
+# networking + hostfs, so no custom kernel build is needed.
+#
+# Uses the in-repo `pyhl` by default via `cargo run`; set PYHL=/path/to/pyhl to
+# use an installed binary instead.
+#
+# just build   - Fetch the shipped driver kernel from GHCR
+# just rootfs  - Build the initrd: shipped driver rootfs + agent-framework-core
+# just setup   - One-time: warm a Python snapshot (pyhl setup)
+# just run     - Run agent.py inside the micro-VM (needs a token; see below)
+# just clean   - Remove build artifacts
+#
+# Token: `just run` uses $GITHUB_TOKEN when set, otherwise `gh auth token`.
+# pyhl passes it into the guest with `--env GITHUB_TOKEN` without writing it to disk.
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+export DOCKER_BUILDKIT := "0"
+
+kernel      := ".unikraft/build/agent-framework-remote-driver_hyperlight-x86_64"
+initrd      := "agent-framework-remote-initrd.cpio"
+image       := "agent-framework-remote-cpio"
+home        := ".pyhl"
+pyhl        := env_var_or_default("PYHL", "cargo run --manifest-path ../../host/Cargo.toml --bin pyhl --")
+ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-agent-driver-kernel:latest"
+
+# Fetch the shipped driver kernel from GHCR (has networking + hostfs).
+build:
+    mkdir -p {{parent_directory(kernel)}}
+    - docker rm -f {{image}}-kernel-tmp
+    docker create --name {{image}}-kernel-tmp {{ghcr_kernel}} /kernel
+    docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
+    docker rm -f {{image}}-kernel-tmp
+
+# Augment the shipped driver rootfs with agent-framework-core.
+rootfs:
+    docker build --platform linux/amd64 --pull --target cpio -t {{image}} .
+    - docker rm -f {{image}}-tmp
+    docker create --name {{image}}-tmp {{image}} /bin/true
+    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
+    docker rm -f {{image}}-tmp
+
+# One-time: warm up + persist a Python snapshot (pyhl setup).
+[unix]
+setup:
+    {{pyhl}} setup --from . --dest {{home}} --force
+
+# Run the agent (restores the warm snapshot, ~2 s).
+[unix]
+run:
+    if [ -z "${GITHUB_TOKEN:-}" ]; then export GITHUB_TOKEN="$(gh auth token)"; fi; {{pyhl}} run --dest {{home}} agent.py --net-allow models.github.ai --env GITHUB_TOKEN --env GITHUB_MODELS_MODEL --env GITHUB_MODELS_MAX_COMPLETION_TOKENS --env GITHUB_MODELS_REASONING_EFFORT
+
+rebuild: clean build rootfs setup
+
+[unix]
+clean:
+    rm -rf .unikraft {{initrd}} {{home}}

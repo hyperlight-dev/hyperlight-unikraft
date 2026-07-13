@@ -1,7 +1,7 @@
 # https://github.com/revsys/optimized-python-docker/blob/master/Dockerfile
 # https://github.com/docker-library/python/blob/master/3.12/slim-bullseye/Dockerfile
 
-FROM ubuntu:22.04 as base
+FROM ubuntu:22.04 as python-dev
 
 ENV PATH /usr/local/bin:$PATH
 ENV DEBIAN_FRONTEND=noninteractive
@@ -33,7 +33,10 @@ RUN set -xe ; \
 
 RUN set -xe ; \
 	make -j $(( 1 * $( egrep '^processor[[:space:]]+:' /proc/cpuinfo | wc -l ) )) ; \
-	make install
+	make install ; \
+	ldconfig
+
+FROM python-dev as base
 
 RUN set -xe ; \
 	find /usr/local -type f -name "*.so" -exec strip --strip-unneeded {} + ; \

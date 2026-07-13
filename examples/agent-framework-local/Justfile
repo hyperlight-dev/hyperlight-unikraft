@@ -1,0 +1,65 @@
+# agent-framework-local on Hyperlight
+#
+# A Microsoft Agent Framework agent doing REAL, fully offline inference with a
+# small GGUF model (llama-cpp-python) baked into the image — no network, no keys.
+#
+# just build     - Fetch the (shared python-agent) kernel from GHCR
+# just rootfs    - Build the initrd CPIO (installs llama-cpp-python + model)
+# just run       - Execute agent.py inside the micro-VM
+# just clean     - Remove build artifacts
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+export DOCKER_BUILDKIT := "0"
+
+kernel      := ".unikraft/build/agent-framework-local-hyperlight_hyperlight-x86_64"
+initrd      := "agent-framework-local-initrd.cpio"
+memory      := "3Gi"
+image       := "agent-framework-local-hyperlight"
+base        := "local-python-base:latest"
+deps_base   := "local-python-base-dev:latest"
+ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-agent-kernel:latest"
+
+run:
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} -- /agent.py
+
+rootfs: python-base
+    docker build --platform linux/amd64 --build-arg BASE={{base}} --build-arg DEPS_BASE={{deps_base}} --target cpio -t {{image}}-cpio .
+    - docker rm -f {{image}}-tmp
+    docker create --name {{image}}-tmp {{image}}-cpio /bin/true
+    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
+    docker rm -f {{image}}-tmp
+
+# Build matching Ubuntu 22.04 / glibc 2.35 Python dev/runtime base images locally.
+python-base:
+    docker build --platform linux/amd64 --target python-dev -t {{deps_base}} -f ../../runtimes/python.Dockerfile ../../runtimes
+    docker build --platform linux/amd64 -t {{base}} -f ../../runtimes/python.Dockerfile ../../runtimes
+
+# Fetch the prebuilt kernel from GHCR (reused from the python-agent example).
+[unix]
+build:
+    docker pull {{ghcr_kernel}}
+    - docker rm -f {{image}}-kernel-tmp
+    docker create --name {{image}}-kernel-tmp {{ghcr_kernel}} /kernel
+    mkdir -p $(dirname {{kernel}})
+    docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
+    docker rm -f {{image}}-kernel-tmp
+
+[windows]
+build:
+    docker pull {{ghcr_kernel}}
+    - docker rm -f {{image}}-kernel-tmp
+    docker create --name {{image}}-kernel-tmp {{ghcr_kernel}} /kernel
+    New-Item -ItemType Directory -Force -Path (Split-Path {{kernel}}) | Out-Null
+    docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
+    docker rm -f {{image}}-kernel-tmp
+
+rebuild: clean build rootfs
+
+[unix]
+clean:
+    rm -rf .unikraft {{initrd}}
+
+[windows]
+clean:
+    if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
+    if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }

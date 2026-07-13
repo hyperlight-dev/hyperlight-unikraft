@@ -37,6 +37,46 @@ fn parse_mount(spec: &str) -> Result<Preopen> {
     Preopen::parse_cli(spec).map_err(|e| anyhow!("invalid --mount {:?}: {}", spec, e))
 }
 
+/// Parse a `--env NAME[=VALUE]` argument. `NAME` copies from the host
+/// environment when set; `NAME=VALUE` injects an explicit value.
+fn parse_env(spec: &str) -> Result<Option<(String, String)>> {
+    let (name, value) = match spec.split_once('=') {
+        Some((name, value)) => (name, Some(value.to_string())),
+        None => match std::env::var(spec) {
+            Ok(value) => (spec, Some(value)),
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("host environment variable {:?} is not valid UTF-8", spec)
+            }
+        },
+    };
+
+    if name.is_empty() || name.contains('=') || name.contains('\0') {
+        bail!("invalid environment variable name {:?}", name);
+    }
+
+    let value = value.expect("value is always present after match");
+    if value.contains('\0') {
+        bail!("environment variable {:?} contains a NUL byte", name);
+    }
+
+    Ok(Some((name.to_string(), value)))
+}
+
+fn env_prelude(env_vars: &[(String, String)]) -> Result<String> {
+    if env_vars.is_empty() {
+        return Ok(String::new());
+    }
+
+    let encoded = serde_json::to_string(env_vars).context("encode --env values")?;
+    Ok(format!(
+        "import os as _pyhl_os\n\
+         for _pyhl_k, _pyhl_v in {encoded}:\n\
+         \x20   _pyhl_os.environ[_pyhl_k] = _pyhl_v\n\
+         del _pyhl_os, _pyhl_k, _pyhl_v\n"
+    ))
+}
+
 fn build_network_policy(
     net: bool,
     net_allow: &[String],
@@ -254,6 +294,12 @@ struct RunArgs {
     /// remappable per-run.
     #[arg(long = "mount", value_name = "HOST[:GUEST]")]
     mounts: Vec<String>,
+
+    /// Set an environment variable inside the guest Python process.
+    /// Use NAME to copy NAME from the host when set, or NAME=VALUE to
+    /// pass an explicit value. Repeatable.
+    #[arg(short = 'e', long = "env", value_name = "NAME[=VALUE]")]
+    env: Vec<String>,
 
     /// Enable guest networking.
     #[arg(long)]
@@ -569,6 +615,13 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         &args.net_block,
         listen_ports.is_some(),
     )?;
+    let mut env_vars = Vec::new();
+    for spec in &args.env {
+        if let Some(env_var) = parse_env(spec)? {
+            env_vars.push(env_var);
+        }
+    }
+    let env_prelude = env_prelude(&env_vars)?;
 
     let t_load = Instant::now();
     let initrd = home.join(INITRD_FILE);
@@ -604,11 +657,12 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         // asked for bit-for-bit reproducibility across calls. Every run
         // picks up a new seed so np.random.randint / random.random
         // match python3's "different result every invocation" behavior.
-        let payload = if args.deterministic {
-            code.clone()
-        } else {
-            let mut full = String::with_capacity(code.len() + 256);
-            full.push_str(&reseed_prelude());
+        let payload = {
+            let mut full = String::with_capacity(code.len() + env_prelude.len() + 256);
+            full.push_str(&env_prelude);
+            if !args.deterministic {
+                full.push_str(&reseed_prelude());
+            }
             full.push_str(&code);
             full
         };
@@ -690,5 +744,31 @@ fn main() -> Result<()> {
     match cli.cmd {
         Command::Setup(args) => cmd_setup(args),
         Command::Run(args) => cmd_run(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_env_accepts_explicit_value() {
+        assert_eq!(
+            parse_env("GITHUB_TOKEN=abc=123").unwrap(),
+            Some(("GITHUB_TOKEN".to_string(), "abc=123".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_env_rejects_empty_name() {
+        let err = parse_env("=secret").unwrap_err().to_string();
+        assert!(err.contains("invalid environment variable name"));
+    }
+
+    #[test]
+    fn env_prelude_json_escapes_values() {
+        let prelude = env_prelude(&[("A".to_string(), "quoted \" value".to_string())]).unwrap();
+        assert!(prelude.contains("os.environ"));
+        assert!(prelude.contains("quoted \\\" value"));
     }
 }
