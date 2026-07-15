@@ -31,9 +31,11 @@ COPY --from=download /opt/vscode-server /opt/vscode-server
 # Replace bundled glibc Node.js with musl PIE Node.js
 COPY --from=node /usr/local/bin/node /opt/vscode-server/node
 
-# Minimal /bin/sh (busybox) for child-process spawning (VS Code resolves
-# the user's shell environment via "sh -ilc ..." on first connection).
-COPY --from=node /bin/busybox /bin/busybox
+# Busybox: use the static-PIE build from the shell-base image.
+# Alpine's busybox-static is ET_EXEC (non-PIE) which the elfloader
+# rejects; the shell-base image has a static-PIE (ET_DYN) build.
+COPY --from=ghcr.io/hyperlight-dev/hyperlight-unikraft/shell-base:latest \
+     /bin/busybox /bin/busybox
 
 # Stage 4: Pack CPIO.
 FROM alpine:3.20 AS cpio
@@ -52,8 +54,12 @@ RUN mkdir -p /rootfs/etc/ssl/certs /rootfs/usr/lib/ssl && \
     cp /etc/ssl/certs/ca-certificates.crt /rootfs/etc/ssl/certs/ && \
     ln -sf /etc/ssl/certs/ca-certificates.crt /rootfs/usr/lib/ssl/cert.pem
 
-# sh symlink for child-process spawning
-RUN ln -s busybox /rootfs/bin/sh
+# Busybox applet symlinks
+RUN for cmd in sh echo ls cat grep find wc head tail sort cut sed awk \
+               cp mv rm mkdir rmdir ln basename dirname env sleep date \
+               hostname id uname whoami which test true tr uniq tee xargs; do \
+        ln -sf busybox /rootfs/bin/$cmd; \
+    done
 
 # Writable directories
 RUN mkdir -p /rootfs/tmp /rootfs/data
