@@ -1,0 +1,60 @@
+# vscode-server on Hyperlight
+#
+# just run       - Start VS Code Server (open http://localhost:8000 in browser)
+# just rootfs    - Build rootfs via Docker (cross-platform)
+# just build     - Build/pull kernel
+# just clean     - Remove build artifacts
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+export DOCKER_BUILDKIT := "0"
+
+kernel      := ".unikraft/build/vscode-server-hyperlight_hyperlight-x86_64"
+initrd      := "initrd.cpio"
+memory      := "2Gi"
+image       := "vscode-server-hyperlight"
+
+# Start VS Code Server (browse to http://localhost:8000)
+run:
+    mkdir -p data
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
+        --net --port 8000 \
+        --mount ./data:/data \
+        -- /opt/vscode-server/out/server-main.js \
+           --port 8000 \
+           --host 0.0.0.0 \
+           --without-connection-token \
+           --server-data-dir /data \
+           --extensions-dir /data/extensions \
+           --accept-server-license-terms
+
+# Build rootfs via Docker (cross-platform)
+rootfs:
+    docker build --platform linux/amd64 --target cpio -t {{image}}-cpio .
+    - docker rm -f {{image}}-tmp
+    docker create --name {{image}}-tmp {{image}}-cpio /bin/true
+    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
+    docker rm -f {{image}}-tmp
+
+# Build kernel via kraft (Linux)
+[unix]
+build:
+    -kraft-hyperlight build --plat hyperlight --arch x86_64
+
+# Pull pre-built kernel from GHCR (Windows — no kernel published yet)
+[windows]
+build:
+    Write-Host "No pre-built kernel for vscode-server yet. Build on Linux first."
+
+# Clean + rebuild everything
+rebuild: clean build rootfs
+
+# Clean build artifacts
+[unix]
+clean:
+    rm -rf .unikraft {{initrd}} data
+
+[windows]
+clean:
+    if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
+    if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }
+    if (Test-Path data) { Remove-Item -Recurse -Force data }
