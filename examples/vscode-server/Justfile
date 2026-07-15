@@ -26,7 +26,8 @@ run:
            --without-connection-token \
            --server-data-dir /data \
            --extensions-dir /data/extensions \
-           --accept-server-license-terms
+           --accept-server-license-terms \
+           --force-disable-user-env
 
 # Build rootfs via Docker
 rootfs:
@@ -60,7 +61,8 @@ test: build rootfs
            --without-connection-token \
            --server-data-dir /data \
            --extensions-dir /data/extensions \
-           --accept-server-license-terms &
+           --accept-server-license-terms \
+           --force-disable-user-env &
     PID=$!
     trap "kill $PID 2>/dev/null" EXIT
     until curl -s -o /dev/null -w '' http://localhost:{{port}}/version 2>/dev/null; do sleep 2; done

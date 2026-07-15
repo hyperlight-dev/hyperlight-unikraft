@@ -15,6 +15,22 @@
 #    running. This kills the VS Code Server when a worker thread exits.
 #    Fix: only halt when the calling thread is the last one in the process.
 #
+# 3. time.c — monotonic clock overflows after ~7 seconds
+#    ukplat_monotonic_clock() computes (tsc_delta * 10^9) / tsc_freq,
+#    but tsc_delta * 10^9 overflows uint64 after ~7.4s at 2.5 GHz.
+#    This causes the clock to wrap, breaking Node.js timer assertions.
+#    Fix: split into secs + remainder to keep intermediates in range.
+#
+# 4. hostsock.c — writev drops all but the first iovec; stack overflow
+#    hostsock_write() only sends iov[0], silently dropping the rest.
+#    Node.js uses writev for chunked HTTP responses, so static assets
+#    (CSS, JS) arrive as 0-byte bodies.  Also, hostsock_sendmsg() and
+#    hostsock_recvmsg() allocate 32 KB on the stack for multi-iovec
+#    flattening, which overflows the 64 KB thread stacks used by the
+#    cooperative scheduler.
+#    Fix: iterate iovecs in write(); use a static buffer in sendmsg/
+#    recvmsg instead of stack allocation.
+#
 # Usage: Run from examples/vscode-server/ after kraft fetches the source.
 #   bash patches/apply.sh
 
@@ -27,7 +43,9 @@ if [ ! -d "$UNIKRAFT" ]; then
     exit 1
 fi
 
-cp patches/epoll.c.patched "$UNIKRAFT/lib/posix-poll/epoll.c"
-cp patches/exit.c.patched  "$UNIKRAFT/lib/posix-process/exit.c"
+cp patches/epoll.c.patched    "$UNIKRAFT/lib/posix-poll/epoll.c"
+cp patches/exit.c.patched     "$UNIKRAFT/lib/posix-process/exit.c"
+cp patches/time.c.patched     "$UNIKRAFT/plat/hyperlight/x86/time.c"
+cp patches/hostsock.c.patched "$UNIKRAFT/lib/hostsock/hostsock.c"
 
 echo "Patches applied. Rebuild with: kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64"
