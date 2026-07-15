@@ -36,7 +36,9 @@ rootfs:
 # Build kernel via kraft (Linux)
 [unix]
 build:
-    -kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64
+    kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64 || true
+    bash patches/apply.sh
+    kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64
 
 # Pull pre-built kernel from GHCR (Windows — no kernel published yet)
 [windows]
