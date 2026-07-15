@@ -57,3 +57,6 @@ windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+hyperlight-host = { git = "https://github.com/danbugs/hyperlight.git", branch = "feat/pv-timer-pthread-kick" }

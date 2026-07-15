@@ -1139,8 +1139,7 @@ dependencies = [
 [[package]]
 name = "hyperlight-common"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "436dac5cc08da3db27de38b174a9b22498ab6443aaffd83b97f66a5d2f1d74cc"
+source = "git+https://github.com/danbugs/hyperlight.git?branch=feat%2Fpv-timer-pthread-kick#dabdf35b528d91d024a85df7f3270b930aa6cd58"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -1159,8 +1158,7 @@ dependencies = [
 [[package]]
 name = "hyperlight-host"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef3edc7875e70a3b5cc291a17f78cfc352e24c9a665a5a1bbdbc46ada3df43b5"
+source = "git+https://github.com/danbugs/hyperlight.git?branch=feat%2Fpv-timer-pthread-kick#dabdf35b528d91d024a85df7f3270b930aa6cd58"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
