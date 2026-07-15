@@ -31,6 +31,10 @@ COPY --from=download /opt/vscode-server /opt/vscode-server
 # Replace bundled glibc Node.js with musl PIE Node.js
 COPY --from=node /usr/local/bin/node /opt/vscode-server/node
 
+# Minimal /bin/sh (busybox) for child-process spawning (VS Code resolves
+# the user's shell environment via "sh -ilc ..." on first connection).
+COPY --from=node /bin/busybox /bin/busybox
+
 # Stage 4: Pack CPIO.
 FROM alpine:3.20 AS cpio
 RUN apk add --no-cache cpio findutils ca-certificates
@@ -47,6 +51,9 @@ RUN mkdir -p /rootfs/etc && \
 RUN mkdir -p /rootfs/etc/ssl/certs /rootfs/usr/lib/ssl && \
     cp /etc/ssl/certs/ca-certificates.crt /rootfs/etc/ssl/certs/ && \
     ln -sf /etc/ssl/certs/ca-certificates.crt /rootfs/usr/lib/ssl/cert.pem
+
+# sh symlink for child-process spawning
+RUN ln -s busybox /rootfs/bin/sh
 
 # Writable directories
 RUN mkdir -p /rootfs/tmp /rootfs/data
