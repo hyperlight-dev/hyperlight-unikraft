@@ -37,9 +37,10 @@ unikraft:
     CONFIG_LIBHOSTFS: 'y'
     CONFIG_LIBHOSTFS_AUTOMOUNT: 'y'
 
-    # Networking: host-proxied sockets
+    # Networking: host-proxied sockets + AF_UNIX (IPC)
     CONFIG_LIBPOSIX_SOCKET: 'y'
     CONFIG_LIBHOSTSOCK: 'y'
+    CONFIG_LIBPOSIX_UNIXSOCKET: 'y'
 
     # FD infrastructure
     CONFIG_LIBPOSIX_FDIO: 'y'
