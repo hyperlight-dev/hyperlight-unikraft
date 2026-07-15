@@ -36,7 +36,7 @@ default = []
 wasm-host-fns = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dependencies]
-hyperlight-host = { version = "0.16.0", features = ["executable_heap", "hw-interrupts"] }
+hyperlight-host = { git = "https://github.com/danbugs/hyperlight.git", branch = "feat/pv-timer-pthread-kick", features = ["executable_heap", "hw-interrupts"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 serde_json = "1"
@@ -57,6 +57,3 @@ windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32
 
 [dev-dependencies]
 tempfile = "3"
-
-[patch.crates-io]
-hyperlight-host = { git = "https://github.com/danbugs/hyperlight.git", branch = "feat/pv-timer-pthread-kick" }
