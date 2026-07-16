@@ -587,10 +587,12 @@ impl VmConfig {
         // Scratch holds page tables + CoW copies of writable pages touched at
         // runtime.  pt_estimate covers page tables; the base covers kernel
         // boot, CPIO extraction, ELF loading, and language runtime startup.
-        // Use 25% of heap as base: large guests (e.g. Node.js) load 100+ MB
-        // ELF binaries whose PT_LOAD segments trigger per-page CoW copies.
+        // Use 75% of heap as base: guests like VS Code Server spawn a child
+        // process (extension host) via vfork/CLONE_VM, sharing the same
+        // address space and scratch pool. Two V8 instances need substantial
+        // scratch for demand-paged heap, JIT code, and sandbox cage pages.
         let pt_estimate = ((self.heap_size as usize / (2 * 1024 * 1024)) + 16) * PAGE_SIZE;
-        let base = std::cmp::max(self.heap_size as usize / 4, 64 * 1024 * 1024);
+        let base = std::cmp::max(self.heap_size as usize * 3 / 4, 64 * 1024 * 1024);
         let scratch = (pt_estimate + base).next_multiple_of(PAGE_SIZE);
         cfg.set_scratch_size(scratch);
         cfg
