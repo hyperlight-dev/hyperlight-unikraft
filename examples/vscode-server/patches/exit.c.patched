@@ -171,11 +171,7 @@ void pprocess_exit(struct posix_process *pprocess,
 	parent_process = pprocess->parent;
 
 #if CONFIG_LIBPOSIX_PROCESS_SIGNAL
-#if CONFIG_PLAT_HYPERLIGHT
-	if (parent_process && pprocess->pid <= 2) {
-#else
 	if (parent_process) {
-#endif
 		ret = signal_exit(parent_process);
 		if (ret > 0) {
 			uk_pr_info("Parent ignores SIGHLD, terminating\n");

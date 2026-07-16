@@ -610,6 +610,19 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 				revp = &p->revents;
 
 			revents = uk_exchange_n(revp, 0);
+
+			if (!IS_EDGEPOLL(p)
+#if CONFIG_LIBVFSCORE
+			    && !p->legacy
+#endif
+			) {
+				unsigned int mask;
+
+				mask = events2mask(p->event.events);
+				revents |= uk_file_poll_immediate(p->f,
+								  mask);
+			}
+
 			if (revents) {
 				events[nout].events = revents;
 				events[nout].data = p->event.data;
