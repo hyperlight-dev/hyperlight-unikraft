@@ -1327,9 +1327,11 @@ fn handle_net_bind(
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
     let addr = parse_sockaddr(args)?;
-    match listen_ports {
-        Some(ports) => ports.check(addr.port())?,
-        None => return Err(anyhow!("Permission denied: no --port specified for bind")),
+    if addr.port() != 0 {
+        match listen_ports {
+            Some(ports) => ports.check(addr.port())?,
+            None => return Err(anyhow!("Permission denied: no --port specified for bind")),
+        }
     }
     let sa: SockAddr = addr.into();
     let tbl = table.lock().unwrap();
@@ -1893,6 +1895,37 @@ fn hl_sleep_poll_sockets(
     Ok(json!({"socket_ready": ret > 0}))
 }
 
+fn handle_net_getaddrinfo(args: &serde_json::Value) -> Result<serde_json::Value> {
+    use serde_json::json;
+    use std::net::ToSocketAddrs;
+
+    let host = args["host"]
+        .as_str()
+        .ok_or_else(|| anyhow!("net_getaddrinfo: missing 'host'"))?;
+    let port = args["port"].as_u64().unwrap_or(0) as u16;
+
+    let results: Vec<serde_json::Value> = (host, port)
+        .to_socket_addrs()?
+        .map(|sa| match sa {
+            std::net::SocketAddr::V4(v4) => json!({
+                "family": 2,
+                "addr": v4.ip().to_string(),
+                "port": v4.port(),
+            }),
+            std::net::SocketAddr::V6(v6) => json!({
+                "family": 10,
+                "addr": v6.ip().to_string(),
+                "port": v6.port(),
+            }),
+        })
+        .collect();
+
+    if results.is_empty() {
+        return Err(anyhow!("net_getaddrinfo: no results for {:?}", host));
+    }
+    Ok(json!({ "addrs": results }))
+}
+
 // ---------------------------------------------------------------------------
 
 fn register_net_tools(
@@ -1970,6 +2003,8 @@ fn register_net_tools(
         let t = table.clone();
         tools.register("net_poll", move |args| handle_net_poll(&t, &args));
     }
+
+    tools.register("net_getaddrinfo", |args| handle_net_getaddrinfo(&args));
 }
 
 /// Routes incoming fs_* tool calls to the matching `FsSandbox` by
