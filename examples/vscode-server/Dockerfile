@@ -42,6 +42,25 @@ FROM alpine:3.20 AS cpio
 RUN apk add --no-cache cpio findutils ca-certificates
 COPY --from=rootfs / /rootfs/
 
+# Patch VS Code Server JS for single-vCPU cooperative scheduling:
+# 1. Gallery manifest barrier bypass: fall back to product.json config
+#    instead of blocking forever on browser IPC that can't arrive during
+#    extension host init.
+RUN sed -i 's|async getExtensionGalleryManifest(){return await this.barrier.wait(),this._extensionGalleryManifest??null}|async getExtensionGalleryManifest(){if(!this.barrier.isOpen()){let _f=await super.getExtensionGalleryManifest();if(_f){this._extensionGalleryManifest=_f;this.barrier.open()}}return this._extensionGalleryManifest??null}|g' \
+        /rootfs/opt/vscode-server/out/server-main.js
+# 2. WebSocket heartbeat timeout 20s -> 120s (server-side)
+RUN sed -i \
+        -e 's|e>=2e4\&\&n>=2e4\&\&o>=2e4\&\&!this._loadEstimator|e>=12e4\&\&n>=12e4\&\&o>=12e4\&\&!this._loadEstimator|g' \
+        -e 's|e>=2e4\&\&n>=2e4\&\&!this._loadEstimator|e>=12e4\&\&n>=12e4\&\&!this._loadEstimator|g' \
+        -e 's|Math.max(2e4-e,2e4-n,2e4-o,500)|Math.max(12e4-e,12e4-n,12e4-o,500)|g' \
+        /rootfs/opt/vscode-server/out/server-main.js
+# 3. WebSocket heartbeat timeout 20s -> 120s (browser-side)
+RUN sed -i \
+        -e 's|e>=2e4\&\&t>=2e4\&\&i>=2e4\&\&!this._loadEstimator|e>=12e4\&\&t>=12e4\&\&i>=12e4\&\&!this._loadEstimator|g' \
+        -e 's|e>=2e4\&\&t>=2e4\&\&!this._loadEstimator|e>=12e4\&\&t>=12e4\&\&!this._loadEstimator|g' \
+        -e 's|Math.max(2e4-e,2e4-t,2e4-i,500)|Math.max(12e4-e,12e4-t,12e4-i,500)|g' \
+        /rootfs/opt/vscode-server/out/vs/code/browser/workbench/workbench.js
+
 # DNS configuration
 RUN mkdir -p /rootfs/etc && \
     echo "nameserver 8.8.8.8" > /rootfs/etc/resolv.conf && \
