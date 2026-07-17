@@ -84,8 +84,8 @@ unikraft:
 
 libraries:
   app-elfloader:
-    source: https://github.com/unikraft/app-elfloader.git
-    version: plat-hyperlight
+    source: https://github.com/danbugs/app-elfloader.git
+    version: feat/vscode-server-fixes
   libelf:
     source: https://github.com/unikraft/lib-libelf.git
     version: staging
