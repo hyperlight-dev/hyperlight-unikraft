@@ -56,5 +56,7 @@ cp patches/mmap.c.patched     "$UNIKRAFT/lib/ukmmap/mmap.c"
 cp patches/system_error.c.patched "$UNIKRAFT/lib/posix-process/signal/system_error.c"
 cp patches/deliver.c.patched     "$UNIKRAFT/lib/posix-process/signal/deliver.c"
 cp patches/uk_syscall_binary.c.patched "$UNIKRAFT/lib/syscall_shim/uk_syscall_binary.c"
+cp patches/cpu_vectors_x86_64.S.patched "$UNIKRAFT/plat/hyperlight/x86/cpu_vectors_x86_64.S"
+cp patches/ukintctlr.c.patched "$UNIKRAFT/drivers/ukintctlr/hyperlight/ukintctlr.c"
 
 echo "Patches applied. Rebuild with: kraft-hyperlight --no-prompt build --plat hyperlight --arch x86_64"
