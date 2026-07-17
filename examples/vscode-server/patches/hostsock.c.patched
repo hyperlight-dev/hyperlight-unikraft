@@ -975,10 +975,9 @@ int hostsock_rescan_events(void)
 			events |= UKFD_POLLIN;
 		if (revents & 4)
 			events |= UKFD_POLLOUT;
-		if (events) {
-			posix_sock_event_set(sock, events);
+		posix_sock_event_assign(sock, events);
+		if (events)
 			woke = 1;
-		}
 	}
 	return woke;
 }

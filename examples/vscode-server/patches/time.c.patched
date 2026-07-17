@@ -14,6 +14,7 @@
 #include <uk/arch/x86_64.h>
 #include <hyperlight-x86/setup.h>
 #include <hyperlight-x86/hcall.h>
+#include <uk/sched.h>
 
 /* TSC frequency in Hz - will be calibrated at init */
 static __u64 tsc_freq;
@@ -122,27 +123,18 @@ extern int hostsock_rescan_events(void);
 
 /* Block CPU until the specified time or pending events.
  *
- * Uses __hl_sleep instead of bare HLT so the host can simultaneously
- * poll sockets and wake us early when network I/O is ready.
+ * Yield to other runnable threads instead of sleeping the VM so that
+ * vfork children (e.g. the VS Code extension host) keep making
+ * progress while the parent polls for network I/O.
  */
 void time_block_until(__snsec until)
 {
-	while ((__snsec) ukplat_monotonic_clock() < until) {
-		__snsec remaining = until - (__snsec)ukplat_monotonic_clock();
-		if (remaining <= 0)
-			break;
-
-		/* Cap each sleep at 100 ms to keep poll latency bounded. */
-		__u64 sleep_ns = (__u64)remaining;
-		if (sleep_ns > 100000000ULL)
-			sleep_ns = 100000000ULL;
-
-		if (hyperlight_sleep_ns(sleep_ns)) {
+	while ((__snsec)ukplat_monotonic_clock() < until) {
+		uk_sched_yield();
 #ifdef CONFIG_LIBHOSTSOCK
-			if (hostsock_rescan_events())
-				break;
+		if (hostsock_rescan_events())
+			break;
 #endif
-		}
 	}
 }
 #else
