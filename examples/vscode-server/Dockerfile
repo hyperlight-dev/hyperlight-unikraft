@@ -48,17 +48,17 @@ COPY --from=rootfs / /rootfs/
 #    extension host init.
 RUN sed -i 's|async getExtensionGalleryManifest(){return await this.barrier.wait(),this._extensionGalleryManifest??null}|async getExtensionGalleryManifest(){if(!this.barrier.isOpen()){let _f=await super.getExtensionGalleryManifest();if(_f){this._extensionGalleryManifest=_f;this.barrier.open()}}return this._extensionGalleryManifest??null}|g' \
         /rootfs/opt/vscode-server/out/server-main.js
-# 2. WebSocket heartbeat timeout 20s -> 120s (server-side)
+# 2. WebSocket heartbeat timeout 20s -> 600s (server-side)
 RUN sed -i \
-        -e 's|e>=2e4\&\&n>=2e4\&\&o>=2e4\&\&!this._loadEstimator|e>=12e4\&\&n>=12e4\&\&o>=12e4\&\&!this._loadEstimator|g' \
-        -e 's|e>=2e4\&\&n>=2e4\&\&!this._loadEstimator|e>=12e4\&\&n>=12e4\&\&!this._loadEstimator|g' \
-        -e 's|Math.max(2e4-e,2e4-n,2e4-o,500)|Math.max(12e4-e,12e4-n,12e4-o,500)|g' \
+        -e 's|e>=2e4\&\&n>=2e4\&\&o>=2e4\&\&!this._loadEstimator|e>=6e5\&\&n>=6e5\&\&o>=6e5\&\&!this._loadEstimator|g' \
+        -e 's|e>=2e4\&\&n>=2e4\&\&!this._loadEstimator|e>=6e5\&\&n>=6e5\&\&!this._loadEstimator|g' \
+        -e 's|Math.max(2e4-e,2e4-n,2e4-o,500)|Math.max(6e5-e,6e5-n,6e5-o,500)|g' \
         /rootfs/opt/vscode-server/out/server-main.js
-# 3. WebSocket heartbeat timeout 20s -> 120s (browser-side)
+# 3. WebSocket heartbeat timeout 20s -> 600s (browser-side)
 RUN sed -i \
-        -e 's|e>=2e4\&\&t>=2e4\&\&i>=2e4\&\&!this._loadEstimator|e>=12e4\&\&t>=12e4\&\&i>=12e4\&\&!this._loadEstimator|g' \
-        -e 's|e>=2e4\&\&t>=2e4\&\&!this._loadEstimator|e>=12e4\&\&t>=12e4\&\&!this._loadEstimator|g' \
-        -e 's|Math.max(2e4-e,2e4-t,2e4-i,500)|Math.max(12e4-e,12e4-t,12e4-i,500)|g' \
+        -e 's|e>=2e4\&\&t>=2e4\&\&i>=2e4\&\&!this._loadEstimator|e>=6e5\&\&t>=6e5\&\&i>=6e5\&\&!this._loadEstimator|g' \
+        -e 's|e>=2e4\&\&t>=2e4\&\&!this._loadEstimator|e>=6e5\&\&t>=6e5\&\&!this._loadEstimator|g' \
+        -e 's|Math.max(2e4-e,2e4-t,2e4-i,500)|Math.max(6e5-e,6e5-t,6e5-i,500)|g' \
         /rootfs/opt/vscode-server/out/vs/code/browser/workbench/workbench.js
 
 # DNS configuration
