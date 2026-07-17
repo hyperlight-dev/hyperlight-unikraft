@@ -21,6 +21,7 @@ run:
         --net --port {{port}} \
         --mount ./data:/data \
         -- --max-old-space-size=384 \
+           --require /opt/vscode-server/keepalive.cjs \
            /opt/vscode-server/out/server-main.js \
            --port {{port}} \
            --host 0.0.0.0 \
@@ -55,6 +56,7 @@ test: build rootfs
         --net --port {{port}} \
         --mount ./data:/data \
         -- --max-old-space-size=384 \
+           --require /opt/vscode-server/keepalive.cjs \
            /opt/vscode-server/out/server-main.js \
            --port {{port}} \
            --host 0.0.0.0 \

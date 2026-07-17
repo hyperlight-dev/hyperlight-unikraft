@@ -84,6 +84,12 @@ RUN for cmd in sh echo ls cat grep find wc head tail sort cut sed awk \
 # process.  Normally created at runtime, but cpiovfs is read-only.
 RUN ln -sf ../../node /rootfs/opt/vscode-server/bin/remote-cli/node
 
+# Keepalive timer: prevents the Node.js event loop from blocking
+# indefinitely on epoll_wait.  On the cooperative scheduler the server
+# thread is removed from the run queue while blocked; a short timer
+# gives it a wakeup_time so the scheduler re-queues it periodically.
+RUN echo 'setInterval(()=>{},100);' > /rootfs/opt/vscode-server/keepalive.cjs
+
 # Writable directories
 RUN mkdir -p /rootfs/tmp /rootfs/data
 
