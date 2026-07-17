@@ -61,6 +61,10 @@ RUN for cmd in sh echo ls cat grep find wc head tail sort cut sed awk \
         ln -sf busybox /rootfs/bin/$cmd; \
     done
 
+# VS Code Server expects bin/remote-cli/node for the extension host
+# process.  Normally created at runtime, but cpiovfs is read-only.
+RUN ln -sf ../../node /rootfs/opt/vscode-server/bin/remote-cli/node
+
 # Writable directories
 RUN mkdir -p /rootfs/tmp /rootfs/data
 
