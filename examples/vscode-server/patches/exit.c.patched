@@ -246,11 +246,17 @@ UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 	UK_ASSERT(this_pthread);
 	UK_ASSERT(this_pthread->process);
 
+	uk_pr_crit("EXIT_DIAG: _exit(status=%d) pid=%d last_thread=%d\n",
+		   status, this_pthread->process->pid,
+		   uk_list_is_singular(&this_pthread->process->threads));
+
 	/* Last thread, exit the process */
 	if (uk_list_is_singular(&this_pthread->process->threads)) {
 #if CONFIG_PLAT_HYPERLIGHT
-		if (this_pthread->process->pid <= 2)
+		if (this_pthread->process->pid == 1) {
+			uk_pr_crit("EXIT_DIAG: PID 1 _exit → SYSHALT\n");
 			uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+		}
 #endif
 		pprocess_exit(this_pthread->process, POSIX_PROCESS_EXITED,
 			      status);
@@ -268,9 +274,14 @@ UK_LLSYSCALL_R_DEFINE(int, exit_group, int, status)
 	pprocess = uk_pprocess_current();
 	UK_ASSERT(pprocess);
 
+	uk_pr_crit("EXIT_DIAG: exit_group(status=%d) pid=%d\n",
+		   status, pprocess->pid);
+
 #if CONFIG_PLAT_HYPERLIGHT
-	if (pprocess->pid <= 2)
+	if (pprocess->pid == 1) {
+		uk_pr_crit("EXIT_DIAG: PID 1 exit_group → SYSHALT\n");
 		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+	}
 #endif
 
 	pprocess_exit(pprocess, POSIX_PROCESS_EXITED, status);
