@@ -70,6 +70,10 @@ switch_ctx:
 		  execenv_new,
 		  uk_lcpu_regs_get(execenv_new->regs, RIP),
 		  uk_lcpu_regs_get(execenv_new->regs, RSP));
+	{
+		extern int child_syscall_trace_enabled;
+		child_syscall_trace_enabled = 1;
+	}
 	ukarch_execenv_load((long)execenv_new);
 }
 
@@ -111,6 +115,19 @@ UK_SYSCALL_R_E_DEFINE(int, execve, const char *, pathname,
 	UK_ASSERT(pathname);
 
 	uk_pr_crit("EXECVE_DIAG: execve(\"%s\")\n", pathname);
+	if (argv) {
+		for (int _i = 0; argv[_i]; _i++)
+			uk_pr_crit("EXECVE_DIAG:   argv[%d]=\"%s\"\n", _i,
+				   argv[_i]);
+	}
+	if (envp) {
+		for (int _i = 0; envp[_i]; _i++) {
+			if (strstr(envp[_i], "VSCODE") ||
+			    strstr(envp[_i], "NODE_CHANNEL"))
+				uk_pr_crit("EXECVE_DIAG:   env: %s\n",
+					   envp[_i]);
+		}
+	}
 
 	this_thread = uk_thread_current();
 	UK_ASSERT(this_thread);
