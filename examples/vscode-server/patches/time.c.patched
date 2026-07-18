@@ -25,8 +25,8 @@ unsigned long sched_have_pending_events;
 
 /* PV timer preemption state — single vCPU, no locking needed */
 volatile __u64 pv_timer_saved_rip;
+volatile __u64 pv_timer_return_rip;
 volatile int pv_timer_preempt_pending;
-volatile int pv_timer_preempt_active;
 
 void pv_timer_yield(void)
 {
@@ -64,8 +64,7 @@ __nsec ukplat_wall_clock(void)
 
 static int timer_handler(void *arg __unused)
 {
-	if (!pv_timer_preempt_active)
-		pv_timer_preempt_pending = 1;
+	pv_timer_preempt_pending = 1;
 	return 1;
 }
 

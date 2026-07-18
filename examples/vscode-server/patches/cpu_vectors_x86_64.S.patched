@@ -269,6 +269,13 @@ pv_timer_trampoline:
 	pushq %r10
 	pushq %r11
 
+	/* Copy the global saved_rip onto THIS thread's stack so it
+	 * survives across uk_sched_yield() even if another thread
+	 * gets preempted and overwrites the global.  r11 is already
+	 * saved above so we can use it as scratch. */
+	movq  pv_timer_saved_rip(%rip), %r11
+	pushq %r11
+
 	subq  $256, %rsp
 	movups %xmm0,  0x00(%rsp)
 	movups %xmm1,  0x10(%rsp)
@@ -307,6 +314,12 @@ pv_timer_trampoline:
 	movups 0xf0(%rsp), %xmm15
 	addq  $256, %rsp
 
+	/* Pop the per-thread saved RIP into scratch r11, then park
+	 * it in the return_rip global for the final jmpq.  r11 is
+	 * immediately restored from the stack right after this. */
+	popq  %r11
+	movq  %r11, pv_timer_return_rip(%rip)
+
 	popq  %r11
 	popq  %r10
 	popq  %r9
@@ -319,5 +332,4 @@ pv_timer_trampoline:
 	popfq				/* restore original RFLAGS */
 
 	leaq  128(%rsp), %rsp		/* restore over red zone without modifying flags */
-	movl  $0, pv_timer_preempt_active(%rip)
-	jmpq  *pv_timer_saved_rip(%rip)
+	jmpq  *pv_timer_return_rip(%rip)
