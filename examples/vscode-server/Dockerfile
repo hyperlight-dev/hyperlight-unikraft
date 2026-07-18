@@ -68,6 +68,16 @@ RUN python3 /tmp/server-patches.py
 COPY patches/workbench-patches.py /tmp/workbench-patches.py
 RUN python3 /tmp/workbench-patches.py
 
+# 6. Pre-install TOML syntax highlighting (grammar-only, no language server)
+COPY patches/toml-extension /rootfs/opt/vscode-server/extensions/toml
+# 7. TextMate resource pre-cache: eagerly fetches Oniguruma WASM, vscode-textmate,
+#    and grammar JSON while the server is alive, then monkey-patches fetch() and
+#    the AMD script loader so the TextMate service uses cached copies after the
+#    extension host starves the single vCPU.
+COPY patches/precache.js /rootfs/opt/vscode-server/out/precache.js
+RUN sed -i '/<script type="module" src="{{WORKBENCH_WEB_BASE_URL}}\/out\/vs\/code\/browser\/workbench\/workbench.js">/i\<script type="module" src="{{WORKBENCH_WEB_BASE_URL}}/out/precache.js"></script>' \
+        /rootfs/opt/vscode-server/out/vs/code/browser/workbench/workbench.html
+
 # DNS configuration
 RUN mkdir -p /rootfs/etc && \
     echo "nameserver 8.8.8.8" > /rootfs/etc/resolv.conf && \
@@ -95,6 +105,12 @@ RUN ln -sf ../../node /rootfs/opt/vscode-server/bin/remote-cli/node
 # DT_NEEDED lists libc.musl-x86_64.so.1; the second-instance dynamic
 # linker must find it by that name.
 RUN ln -sf ld-musl-x86_64.so.1 /rootfs/lib/libc.musl-x86_64.so.1
+
+# node_modules.asar symlink: VS Code workbench resolves static assets
+# (Oniguruma WASM, TextMate worker) under node_modules.asar/ which is an
+# Electron convention. The server distribution ships plain node_modules/.
+RUN ln -sf node_modules /rootfs/opt/vscode-server/node_modules.asar
+RUN ln -sf node_modules /rootfs/opt/vscode-server/node_modules.asar.unpacked
 
 # Keepalive timer: prevents the Node.js event loop from blocking
 # indefinitely on epoll_wait.  On the cooperative scheduler the server
