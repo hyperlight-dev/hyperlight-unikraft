@@ -543,6 +543,25 @@ int uk_sys_epoll_ctl(const struct uk_file *epf, int op, int fd,
 	default:
 		ret = -EINVAL;
 	}
+
+#if defined(CONFIG_HYPERLIGHT_HCALL) && CONFIG_LIBHOSTSOCK
+	{
+		extern const void *hostsock_get_vol_marker(void);
+		const void *_hvm = hostsock_get_vol_marker();
+		if (op == 1 && ret == 0 && _hvm &&
+		    esf.file->vol == _hvm) {
+			extern struct uk_thread *_hostsock_listener_tid;
+			extern int _hostsock_listener_pid;
+			if (!_hostsock_listener_tid) {
+				_hostsock_listener_tid =
+					uk_thread_current();
+				_hostsock_listener_pid =
+					uk_sys_getpid();
+			}
+		}
+	}
+#endif
+
 	uk_file_wunlock(epf);
 
 #if CONFIG_LIBVFSCORE
@@ -588,8 +607,6 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 	}
 
 
-	uk_sched_yield();
-
 	for (;;) {
 		int nout = 0;
 
@@ -621,6 +638,16 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 				mask = events2mask(p->event.events);
 				revents |= uk_file_poll_immediate(p->f,
 								  mask);
+#if CONFIG_LIBHOSTSOCK
+				{
+					extern unsigned int
+					hostsock_lookup_file_events(
+						const struct uk_file *f);
+					revents |=
+						(hostsock_lookup_file_events(
+							p->f) & mask);
+				}
+#endif
 			}
 
 			if (revents) {

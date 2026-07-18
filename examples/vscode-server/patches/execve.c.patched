@@ -70,10 +70,6 @@ switch_ctx:
 		  execenv_new,
 		  uk_lcpu_regs_get(execenv_new->regs, RIP),
 		  uk_lcpu_regs_get(execenv_new->regs, RSP));
-	{
-		extern int child_syscall_trace_enabled;
-		child_syscall_trace_enabled = 1;
-	}
 	ukarch_execenv_load((long)execenv_new);
 }
 

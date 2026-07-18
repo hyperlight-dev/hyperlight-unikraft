@@ -78,6 +78,13 @@ COPY patches/precache.js /rootfs/opt/vscode-server/out/precache.js
 RUN sed -i '/<script type="module" src="{{WORKBENCH_WEB_BASE_URL}}\/out\/vs\/code\/browser\/workbench\/workbench.js">/i\<script type="module" src="{{WORKBENCH_WEB_BASE_URL}}/out/precache.js"></script>' \
         /rootfs/opt/vscode-server/out/vs/code/browser/workbench/workbench.html
 
+# 8. Prevent server shutdown on browser disconnect — stay alive for
+#    reconnection.  The cooperative scheduler cannot survive the
+#    process.exit path (V8 heap corruption from shared-address-space
+#    vfork), so we simply remove the exit call.
+RUN sed -i 's|console.log("All consumers inactive, shutting down"),this._logService.info("ServerLifetime: all consumers inactive, shutting down"),this.dispose(),process.exit(0)|console.log("All consumers inactive, staying alive (Hyperlight)"),this._logService.info("ServerLifetime: all consumers inactive, NOT shutting down (Hyperlight)")|g' \
+        /rootfs/opt/vscode-server/out/server-main.js
+
 # DNS configuration
 RUN mkdir -p /rootfs/etc && \
     echo "nameserver 8.8.8.8" > /rootfs/etc/resolv.conf && \
@@ -112,11 +119,10 @@ RUN ln -sf ld-musl-x86_64.so.1 /rootfs/lib/libc.musl-x86_64.so.1
 RUN ln -sf node_modules /rootfs/opt/vscode-server/node_modules.asar
 RUN ln -sf node_modules /rootfs/opt/vscode-server/node_modules.asar.unpacked
 
-# Keepalive timer: prevents the Node.js event loop from blocking
-# indefinitely on epoll_wait.  On the cooperative scheduler the server
-# thread is removed from the run queue while blocked; a short timer
-# gives it a wakeup_time so the scheduler re-queues it periodically.
-RUN echo 'setInterval(()=>{},100);' > /rootfs/opt/vscode-server/keepalive.cjs
+# Keepalive + vfork safety: periodic timer for the cooperative scheduler,
+# child_process blocking (vfork shares address space → V8 corruption),
+# process.abort() suppression, and uncaught-exception guard.
+COPY patches/keepalive.cjs /rootfs/opt/vscode-server/keepalive.cjs
 
 # Writable directories
 RUN mkdir -p /rootfs/tmp /rootfs/data

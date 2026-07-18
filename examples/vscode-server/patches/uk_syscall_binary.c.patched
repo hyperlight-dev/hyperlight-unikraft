@@ -42,6 +42,7 @@
 #include <uk/essentials.h>
 #include <uk/prio.h>
 #include <uk/thread.h>
+#include <uk/sched.h>
 #if CONFIG_LIBSYSCALL_SHIM_STRACE
 #include <uk/print.h>
 #endif /* CONFIG_LIBSYSCALL_SHIM_STRACE */
@@ -64,9 +65,6 @@ struct uk_syscall_ctx {
 	struct ukarch_execenv execenv;
 	__uptr auxsp;
 };
-
-int child_syscall_trace_enabled;
-static int child_syscall_trace_count;
 
 void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 {
@@ -100,40 +98,6 @@ void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 	UK_ASSERT(t->uktlsp == ukarch_auxspcb_get_uktlsp(auxspcb));
 #endif /* CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS */
 
-	if (child_syscall_trace_enabled) {
-		unsigned long sn = _UK_EXECENV_REGS_GET(execenv,
-							__syscall_rsyscall);
-		unsigned long a0 = _UK_EXECENV_REGS_GET(execenv,
-							__syscall_rarg0);
-		unsigned long a1 = _UK_EXECENV_REGS_GET(execenv,
-							__syscall_rarg1);
-		unsigned long a2 = _UK_EXECENV_REGS_GET(execenv,
-							__syscall_rarg2);
-		unsigned long ip = _UK_EXECENV_REGS_GET(execenv,
-							__syscall_rip);
-		if (sn == 2 || sn == 257) {
-			const char *p = (const char *)(sn == 257 ? a1 : a0);
-			uk_pr_crit("CHILD_STRACE[%d]: open(\"%s\") "
-				   "ip=0x%lx\n",
-				   child_syscall_trace_count, p, ip);
-		} else if (sn == 1 && (a0 == 1 || a0 == 2)) {
-			uk_pr_crit("CHILD_STRACE[%d]: write(fd=%lu, "
-				   "buf=0x%lx, len=%lu) ip=0x%lx\n",
-				   child_syscall_trace_count, a0, a1, a2, ip);
-		} else if (sn == 60 || sn == 231) {
-			uk_pr_crit("CHILD_STRACE[%d]: %s(status=%lu) "
-				   "ip=0x%lx\n",
-				   child_syscall_trace_count,
-				   sn == 60 ? "exit" : "exit_group",
-				   a0, ip);
-		} else if (child_syscall_trace_count < 200) {
-			uk_pr_crit("CHILD_STRACE[%d]: nr=%lu a0=0x%lx "
-				   "a1=0x%lx ip=0x%lx\n",
-				   child_syscall_trace_count, sn, a0, a1, ip);
-		}
-		child_syscall_trace_count++;
-	}
-
 	uk_syscall_nested_depth++;
 	uk_syscall_enter_ctx_init(&enter_ctx,
 				  execenv, uk_syscall_nested_depth,
@@ -143,17 +107,9 @@ void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 	_UK_EXECENV_REGS_SET(execenv, __syscall_rret0,
 			     uk_syscall6_do_e(execenv));
 
-	if (child_syscall_trace_enabled &&
-	    child_syscall_trace_count > 0 &&
-	    child_syscall_trace_count <= 200) {
-		unsigned long sn = _UK_EXECENV_REGS_GET(execenv,
-							__syscall_rsyscall);
-		long ret = (long)_UK_EXECENV_REGS_GET(execenv,
-						      __syscall_rret0);
-		if (sn == 2 || sn == 257 || sn == 9 || sn == 1)
-			uk_pr_crit("CHILD_STRACE: nr=%lu ret=0x%lx (%ld)\n",
-				   sn, (unsigned long)ret, ret);
-	}
+#ifdef CONFIG_HYPERLIGHT_HCALL
+	uk_sched_yield();
+#endif
 
 	uk_syscall_exit_ctx_init(&exit_ctx,
 				 execenv, uk_syscall_nested_depth,
