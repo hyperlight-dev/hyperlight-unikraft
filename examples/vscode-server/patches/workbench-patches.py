@@ -92,7 +92,57 @@ if ci_old in d:
 else:
     print("WARNING: remoteExtensions.canInstall pattern not found", file=sys.stderr)
 
-# 4. Bypass workbench installFromGallery (CORS blocks browser-side manifest fetch).
+# 4. Non-blocking remote extension scan: don't block UI on slow IPC.
+#    On single-vCPU, the remote scanExtensions IPC hangs because PID 15
+#    (extension host) starves PID 1. Add a timeout so web+builtin extension
+#    contributions (languages, grammars) register even when the IPC is slow.
+rscan_old = 'let[t,i]=await Promise.all([this._scanWebExtensions(),this._remoteExtensionsScannerService.scanExtensions()]);i.length&&e.emitOne(new wft(i)),e.emitOne(new Ift(t))'
+rscan_new = (
+    'let t=await this._scanWebExtensions();'
+    'let i=[];'
+    'try{i=await Promise.race(['
+    'this._remoteExtensionsScannerService.scanExtensions(),'
+    'new Promise(r=>setTimeout(()=>r([]),15000))'
+    '])}catch(x){console.warn("Remote ext scan failed:",x)}'
+    'i.length&&e.emitOne(new wft(i)),e.emitOne(new Ift(t))'
+)
+
+# 4b. Register TOML extension as a web builtin.
+#     The TOML extension lives at /opt/vscode-server/extensions/toml/ (same
+#     base dir as the other builtins), but isn't in the hardcoded list that
+#     the web scanner reads.  Inject it so the browser discovers it via HTTP
+#     without relying on the broken remote-scan IPC.
+toml_anchor = 'if(o.isBuilt)l=[{extensionPath:"TypeScriptTeam.jsts-chat-features"'
+toml_entry = (
+    'if(o.isBuilt)l=[{extensionPath:"toml",packageJSON:{'
+    'name:"even-better-toml",displayName:"Even Better TOML",'
+    'description:"TOML syntax highlighting",version:"0.21.2",'
+    'publisher:"tamasfe",engines:{vscode:"*"},'
+    'categories:["Programming Languages"],'
+    'contributes:{grammars:[{language:"toml",scopeName:"source.toml",'
+    'path:"./toml.tmLanguage.json"},{scopeName:"markdown.toml.frontmatter.codeblock",'
+    'path:"./toml.frontmatter.tmLanguage.json",injectTo:["text.html.markdown"]},'
+    '{scopeName:"markdown.toml.codeblock",path:"./toml.markdown.tmLanguage.json",'
+    'injectTo:["text.html.markdown"],embeddedLanguages:{"meta.embedded.block.toml":"toml"}}],'
+    'languages:[{id:"toml",aliases:["TOML"],extensions:[".toml"],'
+    'filenames:["Cargo.lock","uv.lock"],configuration:"./language-configuration.json"}]}'
+    '}},{extensionPath:"TypeScriptTeam.jsts-chat-features"'
+)
+if rscan_old in d:
+    d = d.replace(rscan_old, rscan_new, 1)
+    print("Patched remote extension scan timeout")
+    count += 1
+else:
+    print("WARNING: remote extension scan timeout pattern not found", file=sys.stderr)
+
+if toml_anchor in d:
+    d = d.replace(toml_anchor, toml_entry, 1)
+    print("Patched TOML web builtin extension registration")
+    count += 1
+else:
+    print("WARNING: TOML web builtin registration pattern not found", file=sys.stderr)
+
+# 5. Bypass workbench installFromGallery (CORS blocks browser-side manifest fetch).
 #    The workbench service's installFromGallery fetches the manifest from the CDN
 #    via browser fetch, which fails due to CORS. It also runs trust/workspace checks
 #    that hang or show dialogs. Bypass all of it and delegate directly to the remote

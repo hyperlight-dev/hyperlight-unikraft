@@ -1,0 +1,38 @@
+{
+  "name": "even-better-toml",
+  "displayName": "Even Better TOML",
+  "description": "TOML syntax highlighting",
+  "version": "0.21.2",
+  "publisher": "tamasfe",
+  "engines": { "vscode": "*" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "grammars": [
+      {
+        "language": "toml",
+        "scopeName": "source.toml",
+        "path": "./toml.tmLanguage.json"
+      },
+      {
+        "scopeName": "markdown.toml.frontmatter.codeblock",
+        "path": "./toml.frontmatter.tmLanguage.json",
+        "injectTo": ["text.html.markdown"]
+      },
+      {
+        "scopeName": "markdown.toml.codeblock",
+        "path": "./toml.markdown.tmLanguage.json",
+        "injectTo": ["text.html.markdown"],
+        "embeddedLanguages": { "meta.embedded.block.toml": "toml" }
+      }
+    ],
+    "languages": [
+      {
+        "id": "toml",
+        "aliases": ["TOML"],
+        "extensions": [".toml"],
+        "filenames": ["Cargo.lock", "uv.lock"],
+        "configuration": "./language-configuration.json"
+      }
+    ]
+  }
+}

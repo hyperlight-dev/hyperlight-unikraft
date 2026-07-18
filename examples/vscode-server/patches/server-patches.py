@@ -6,8 +6,6 @@ d = open(f).read()
 count = 0
 
 # 1. Bypass getExtensionsControlManifest (fetches from CDN, blocks single-vCPU).
-#    Same approach as the workbench.js patch: return empty manifest immediately.
-#    Patch the gallery service async implementation:
 old_ecm = 'async getExtensionsControlManifest(){if(!await'
 new_ecm = 'async getExtensionsControlManifest(){return{malicious:[],deprecated:{},search:[],autoUpdate:{}}}async _ecm_disabled(){if(!await'
 if old_ecm in d:
@@ -17,7 +15,6 @@ if old_ecm in d:
 else:
     print("WARNING: server getExtensionsControlManifest pattern not found", file=sys.stderr)
 
-#    Also patch the J7 cached version to always return the empty manifest:
 old_j7 = 'getExtensionsControlManifest(){let e=new Date'
 new_j7 = 'getExtensionsControlManifest(){return Promise.resolve({malicious:[],deprecated:{},search:[],autoUpdate:{}})}__ecm_cached(){let e=new Date'
 if old_j7 in d:
