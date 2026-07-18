@@ -61,7 +61,10 @@ RUN sed -i \
         -e 's|e>=2e4\&\&n>=2e4\&\&!this._loadEstimator|e>=6e5\&\&n>=6e5\&\&!this._loadEstimator|g' \
         -e 's|Math.max(2e4-e,2e4-n,2e4-o,500)|Math.max(6e5-e,6e5-n,6e5-o,500)|g' \
         /rootfs/opt/vscode-server/out/server-main.js
-# 4. Workbench patches: common headers, heartbeat, diagnostics
+# 4. Server-side patches: bypass IPC-blocking calls in install flow
+COPY patches/server-patches.py /tmp/server-patches.py
+RUN python3 /tmp/server-patches.py
+# 5. Workbench patches: common headers, heartbeat, install flow
 COPY patches/workbench-patches.py /tmp/workbench-patches.py
 RUN python3 /tmp/workbench-patches.py
 
