@@ -62,9 +62,14 @@ __nsec ukplat_wall_clock(void)
 	return hyperlight_wall_boot_ns_from_host() + ukplat_monotonic_clock();
 }
 
+static volatile int timer_fire_count;
+
 static int timer_handler(void *arg __unused)
 {
 	pv_timer_preempt_pending = 1;
+	timer_fire_count++;
+	if (timer_fire_count <= 3)
+		uk_pr_crit("PV_TIMER: IRQ fired (%d)\n", timer_fire_count);
 	return 1;
 }
 
@@ -143,9 +148,7 @@ static void pv_timer_init_once(void)
 	if (done)
 		return;
 	done = 1;
-	__u32 period_us = 10000;
-	__asm__ volatile("outl %0, %1"
-			 : : "a"(period_us), "Nd"((__u16)107));
+	uk_pr_crit("PV_TIMER: disabled (using syscall-boundary yield)\n");
 }
 
 void time_block_until(__snsec until)
@@ -153,11 +156,14 @@ void time_block_until(__snsec until)
 	pv_timer_init_once();
 
 	while ((__snsec)ukplat_monotonic_clock() < until) {
-		uk_sched_yield();
+		/* Brief host-side poll so inbound connections get proxied. */
+		if (hyperlight_sleep_ns(100000))  /* 100 µs */
+			break;
 #ifdef CONFIG_LIBHOSTSOCK
 		if (hostsock_rescan_events())
 			break;
 #endif
+		uk_sched_yield();
 	}
 }
 #else

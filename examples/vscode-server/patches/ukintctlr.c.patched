@@ -79,6 +79,8 @@ extern void pv_timer_trampoline(void);
 
 #define ELF_BASE 0x8200000ULL
 
+static volatile int preempt_diag_count;
+
 static int hyperlight_handle_irq_event(void *data)
 {
 	struct uk_lcpu_except_irq_ctx *ctx = data;
@@ -88,20 +90,7 @@ static int hyperlight_handle_irq_event(void *data)
 	uk_intctlr_irq_handle(ctx);
 	pic_eoi(irq);
 
-	if (pv_timer_preempt_pending) {
-		struct uk_lcpu_regs *regs;
-		__u64 rip;
-
-		pv_timer_preempt_pending = 0;
-		regs = uk_lcpu_except_irq_ctx_get_regs(ctx);
-		rip = uk_lcpu_regs_get(regs, RIP);
-
-		if (rip >= ELF_BASE) {
-			pv_timer_saved_rip = rip;
-			uk_lcpu_regs_set(regs, RIP,
-					 (__u64)(__uptr)pv_timer_trampoline);
-		}
-	}
+	(void)pv_timer_preempt_pending;
 
 	return UK_EVENT_HANDLED;
 }
