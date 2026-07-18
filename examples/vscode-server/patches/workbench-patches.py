@@ -80,6 +80,39 @@ if ecm_n > 0:
 else:
     print("WARNING: extensionManagementService.getExtensionsControlManifest calls not found", file=sys.stderr)
 
+# 3. Bypass remoteExtensions.canInstall IPC (hangs on single-vCPU).
+#    getTargetPlatform() is proxied via channel.call("getTargetPlatform")
+#    inside the J7 base class canInstall → isExtensionPlatformCompatible.
+ci_old = 'canInstall(e){return this.server.extensionManagementService.canInstall(e)}'
+ci_new = 'canInstall(e){return Promise.resolve(!0)}'
+if ci_old in d:
+    d = d.replace(ci_old, ci_new, 1)
+    print("Patched remoteExtensions.canInstall bypass")
+    count += 1
+else:
+    print("WARNING: remoteExtensions.canInstall pattern not found", file=sys.stderr)
+
+# 4. Bypass workbench installFromGallery (CORS blocks browser-side manifest fetch).
+#    The workbench service's installFromGallery fetches the manifest from the CDN
+#    via browser fetch, which fails due to CORS. It also runs trust/workspace checks
+#    that hang or show dialogs. Bypass all of it and delegate directly to the remote
+#    server's installFromGallery (server-side, no CORS issues).
+ifg_old = 'async installFromGallery(e,t,i){let n=await this.extensionGalleryService.getManifest'
+ifg_new = (
+    'async installFromGallery(e,t,i){'
+    'let s=this.extensionManagementServerService.remoteExtensionManagementServer'
+    '||this.extensionManagementServerService.localExtensionManagementServer;'
+    'if(!s)throw new Error("No server");'
+    'return s.extensionManagementService.installFromGallery(e,t||{})'
+    '}async _installFromGallery_orig(e,t,i){let n=await this.extensionGalleryService.getManifest'
+)
+if ifg_old in d:
+    d = d.replace(ifg_old, ifg_new, 1)
+    print("Patched installFromGallery bypass (skip CORS manifest fetch)")
+    count += 1
+else:
+    print("WARNING: installFromGallery pattern not found", file=sys.stderr)
+
 assert count >= 1, "No patches applied to workbench.js"
 open(f, "w").write(d)
 print(f"Total: {count} patches applied")
