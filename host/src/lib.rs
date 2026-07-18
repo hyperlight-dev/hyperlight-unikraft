@@ -875,7 +875,7 @@ fn normalize_fs_error(s: &str) -> String {
 /// pointing outside) is rejected.
 ///
 /// Phase A deliberately exposes an explicit RPC surface: the guest calls
-/// `fs_read` / `fs_write` / `fs_list` / `fs_stat` / `fs_mkdir` / `fs_unlink`
+/// `fs_read` / `fs_write` / `fs_list` / `fs_stat` / `fs_mkdir` / `fs_unlink` / `fs_rename`
 /// by name. Phase B will add a transparent POSIX shim in Unikraft that
 /// forwards VFS operations to these same host handlers.
 #[derive(Clone)]
@@ -2317,6 +2317,26 @@ impl FsRouter {
                 std::fs::remove_file(&target)
             }
             .map_err(|e| anyhow!("fs_unlink {:?}: {}", path, e))?;
+            Ok(json!({}))
+        });
+
+        let r = self.clone();
+        registry.register("fs_rename", move |args| {
+            let src = args["src"]
+                .as_str()
+                .ok_or_else(|| anyhow!("fs_rename: missing 'src'"))?;
+            let dst = args["dst"]
+                .as_str()
+                .ok_or_else(|| anyhow!("fs_rename: missing 'dst'"))?;
+            let (fs_src, rel_src) = r.require_writable(src)?;
+            let (fs_dst, rel_dst) = r.require_writable(dst)?;
+            if fs_src.root() != fs_dst.root() {
+                return Err(anyhow!("fs_rename: cross-mount rename not supported"));
+            }
+            let target_src = fs_src.resolve(rel_src)?;
+            let target_dst = fs_dst.resolve(rel_dst)?;
+            std::fs::rename(&target_src, &target_dst)
+                .map_err(|e| anyhow!("fs_rename {:?} -> {:?}: {}", src, dst, e))?;
             Ok(json!({}))
         });
     }
