@@ -68,9 +68,7 @@ RUN python3 /tmp/server-patches.py
 COPY patches/workbench-patches.py /tmp/workbench-patches.py
 RUN python3 /tmp/workbench-patches.py
 
-# 6. Pre-install TOML syntax highlighting (grammar-only, no language server)
-COPY patches/toml-extension /rootfs/opt/vscode-server/extensions/toml
-# 7. TextMate resource pre-cache: eagerly fetches Oniguruma WASM, vscode-textmate,
+# 6. TextMate resource pre-cache: eagerly fetches Oniguruma WASM, vscode-textmate,
 #    and grammar JSON while the server is alive, then monkey-patches fetch() and
 #    the AMD script loader so the TextMate service uses cached copies after the
 #    extension host starves the single vCPU.
