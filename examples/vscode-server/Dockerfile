@@ -39,27 +39,31 @@ COPY --from=ghcr.io/hyperlight-dev/hyperlight-unikraft/shell-base:latest \
 
 # Stage 4: Pack CPIO.
 FROM alpine:3.20 AS cpio
-RUN apk add --no-cache cpio findutils ca-certificates
+RUN apk add --no-cache cpio findutils ca-certificates python3
 COPY --from=rootfs / /rootfs/
 
 # Patch VS Code Server JS for single-vCPU cooperative scheduling:
-# 1. Gallery manifest barrier bypass: fall back to product.json config
-#    instead of blocking forever on browser IPC that can't arrive during
-#    extension host init.
-RUN sed -i 's|async getExtensionGalleryManifest(){return await this.barrier.wait(),this._extensionGalleryManifest??null}|async getExtensionGalleryManifest(){if(!this.barrier.isOpen()){let _f=await super.getExtensionGalleryManifest();if(_f){this._extensionGalleryManifest=_f;this.barrier.open()}}return this._extensionGalleryManifest??null}|g' \
+# 1. Gallery manifest barrier bypass: construct manifest inline instead of
+#    blocking forever on browser IPC that can't arrive on single-vCPU.
+#    The manifest is a static capabilities descriptor identical to what the
+#    base class builds from product.json — no network calls required.
+RUN sed -i 's|async getExtensionGalleryManifest(){return await this.barrier.wait(),this._extensionGalleryManifest??null}|async getExtensionGalleryManifest(){if(!this._extensionGalleryManifest){let _g=this.productService?.extensionsGallery;if(!_g){try{_g=(await super.getExtensionGalleryManifest())?.extensionsGallery}catch{}}let _s=_g?.serviceUrl??"https://marketplace.visualstudio.com/_apis/public/gallery";let _r=[{id:_s+"/extensionquery",type:"ExtensionQueryService"},{id:_s+"/vscode/{publisher}/{name}/latest",type:"ExtensionLatestVersionUriTemplate"},{id:_s+"/publishers/{publisher}/extensions/{name}/{version}/stats?statType={statTypeName}",type:"ExtensionStatisticsUriTemplate"}];this._extensionGalleryManifest={version:"",resources:_r,capabilities:{extensionQuery:{filtering:[{name:"Tag",value:1},{name:"ExtensionId",value:4},{name:"Category",value:5},{name:"ExtensionName",value:7},{name:"Target",value:8},{name:"Featured",value:9},{name:"SearchText",value:10},{name:"ExcludeWithFlags",value:12}],sorting:[{name:"NoneOrRelevance",value:0},{name:"LastUpdatedDate",value:1},{name:"Title",value:2},{name:"PublisherName",value:3},{name:"InstallCount",value:4},{name:"AverageRating",value:6},{name:"PublishedDate",value:10},{name:"WeightedRating",value:12}],flags:[{name:"None",value:0},{name:"IncludeVersions",value:1},{name:"IncludeFiles",value:2},{name:"IncludeCategoryAndTags",value:4},{name:"IncludeSharedAccounts",value:8},{name:"IncludeVersionProperties",value:16},{name:"ExcludeNonValidated",value:32},{name:"IncludeInstallationTargets",value:64},{name:"IncludeAssetUri",value:128},{name:"IncludeStatistics",value:256},{name:"IncludeLatestVersionOnly",value:512},{name:"Unpublished",value:4096},{name:"IncludeNameConflictInfo",value:32768},{name:"IncludeLatestPrereleaseAndStableVersionOnly",value:65536}]},signing:{allPublicRepositorySigned:true}}};this.barrier.open()}return this._extensionGalleryManifest}|g' \
         /rootfs/opt/vscode-server/out/server-main.js
-# 2. WebSocket heartbeat timeout 20s -> 600s (server-side)
+# 2. Gallery config: always pass extensionsGallery to the browser.
+#    The original code gates it on _webExtensionResourceUrlTemplate (a
+#    resource-proxy URL), which may be unset in our environment.  The
+#    browser just needs the serviceUrl to query the marketplace.
+COPY patches/gallery-config.py /tmp/gallery-config.py
+RUN python3 /tmp/gallery-config.py
+# 3. WebSocket heartbeat timeout 20s -> 600s (server-side)
 RUN sed -i \
         -e 's|e>=2e4\&\&n>=2e4\&\&o>=2e4\&\&!this._loadEstimator|e>=6e5\&\&n>=6e5\&\&o>=6e5\&\&!this._loadEstimator|g' \
         -e 's|e>=2e4\&\&n>=2e4\&\&!this._loadEstimator|e>=6e5\&\&n>=6e5\&\&!this._loadEstimator|g' \
         -e 's|Math.max(2e4-e,2e4-n,2e4-o,500)|Math.max(6e5-e,6e5-n,6e5-o,500)|g' \
         /rootfs/opt/vscode-server/out/server-main.js
-# 3. WebSocket heartbeat timeout 20s -> 600s (browser-side)
-RUN sed -i \
-        -e 's|e>=2e4\&\&t>=2e4\&\&i>=2e4\&\&!this._loadEstimator|e>=6e5\&\&t>=6e5\&\&i>=6e5\&\&!this._loadEstimator|g' \
-        -e 's|e>=2e4\&\&t>=2e4\&\&!this._loadEstimator|e>=6e5\&\&t>=6e5\&\&!this._loadEstimator|g' \
-        -e 's|Math.max(2e4-e,2e4-t,2e4-i,500)|Math.max(6e5-e,6e5-t,6e5-i,500)|g' \
-        /rootfs/opt/vscode-server/out/vs/code/browser/workbench/workbench.js
+# 4. Workbench patches: common headers, heartbeat, diagnostics
+COPY patches/workbench-patches.py /tmp/workbench-patches.py
+RUN python3 /tmp/workbench-patches.py
 
 # DNS configuration
 RUN mkdir -p /rootfs/etc && \
@@ -83,6 +87,11 @@ RUN for cmd in sh echo ls cat grep find wc head tail sort cut sed awk \
 # VS Code Server expects bin/remote-cli/node for the extension host
 # process.  Normally created at runtime, but cpiovfs is read-only.
 RUN ln -sf ../../node /rootfs/opt/vscode-server/bin/remote-cli/node
+
+# musl libc SONAME symlink: ld-musl-x86_64.so.1 IS the libc but Node.js
+# DT_NEEDED lists libc.musl-x86_64.so.1; the second-instance dynamic
+# linker must find it by that name.
+RUN ln -sf ld-musl-x86_64.so.1 /rootfs/lib/libc.musl-x86_64.so.1
 
 # Keepalive timer: prevents the Node.js event loop from blocking
 # indefinitely on epoll_wait.  On the cooperative scheduler the server
