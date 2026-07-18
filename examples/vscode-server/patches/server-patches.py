@@ -24,6 +24,37 @@ if old_j7 in d:
 else:
     print("WARNING: server J7 cached getExtensionsControlManifest pattern not found", file=sys.stderr)
 
+# 2. Add installFromBuffer IPC handler: accepts base64-encoded VSIX from
+#    browser, writes to temp file, installs locally.  Avoids the server
+#    having to download from the marketplace CDN while CPU-starved.
+ifb_old = 'case"installFromGallery":return this.service.installFromGallery(n[0],ef(n[1],o));case"installGalleryExtensions"'
+ifb_new = (
+    'case"installFromBuffer":{'
+    'console.log("[installFromBuffer] entered, payload length:",n[0]?.length);'
+    'try{'
+    'let _b=Buffer.from(n[0],"base64");'
+    'console.log("[installFromBuffer] decoded",_b.length,"bytes");'
+    'let _p=require("path").join(require("os").tmpdir(),"_ext"+Date.now()+".vsix");'
+    'require("fs").writeFileSync(_p,_b);'
+    'console.log("[installFromBuffer] wrote to",_p);'
+    'let _r=await this.service.install(I.file(_p));'
+    'console.log("[installFromBuffer] install OK");'
+    'try{require("fs").unlinkSync(_p)}catch(_e){}'
+    'return _r'
+    '}catch(_err){'
+    'console.error("[installFromBuffer] ERROR:",_err?.message||_err);'
+    'throw _err'
+    '}'
+    '}'
+    'case"installFromGallery":return this.service.installFromGallery(n[0],ef(n[1],o));case"installGalleryExtensions"'
+)
+if ifb_old in d:
+    d = d.replace(ifb_old, ifb_new, 1)
+    print("Patched installFromBuffer IPC handler")
+    count += 1
+else:
+    print("WARNING: installFromBuffer anchor pattern not found", file=sys.stderr)
+
 assert count >= 1, "No patches applied to server-main.js"
 open(f, "w").write(d)
 print(f"Total: {count} server-main.js patches applied")

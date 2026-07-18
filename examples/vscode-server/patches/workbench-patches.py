@@ -142,17 +142,51 @@ if toml_anchor in d:
 else:
     print("WARNING: TOML web builtin registration pattern not found", file=sys.stderr)
 
-# 5. Bypass workbench installFromGallery (CORS blocks browser-side manifest fetch).
-#    The workbench service's installFromGallery fetches the manifest from the CDN
-#    via browser fetch, which fails due to CORS. It also runs trust/workspace checks
-#    that hang or show dialogs. Bypass all of it and delegate directly to the remote
-#    server's installFromGallery (server-side, no CORS issues).
+# 5. Browser-side VSIX download + server-side local install.
+#    The marketplace CDN allows CORS (Access-Control-Allow-Origin: *), so
+#    the browser can download the VSIX directly.  This avoids the server
+#    having to fetch from the CDN while CPU-starved by the extension host.
+#    The browser downloads the VSIX, base64-encodes it, and sends via IPC
+#    to the server's installFromBuffer handler which writes to a temp file
+#    and installs locally (fast, no network needed).
 ifg_old = 'async installFromGallery(e,t,i){let n=await this.extensionGalleryService.getManifest'
 ifg_new = (
     'async installFromGallery(e,t,i){'
     'let s=this.extensionManagementServerService.remoteExtensionManagementServer'
     '||this.extensionManagementServerService.localExtensionManagementServer;'
     'if(!s)throw new Error("No server");'
+    'console.log("[install] server:",s?.id||"unknown");'
+    'console.log("[install] svc:",typeof s?.extensionManagementService);'
+    'console.log("[install] channel:",typeof s?.extensionManagementService?.channel);'
+    'console.log("[install] call:",typeof s?.extensionManagementService?.channel?.call);'
+    'let url=e.assets?.download?.uri;'
+    'if(url){'
+    'try{'
+    'console.log("[install] testing IPC channel health...");'
+    'let _tp=await Promise.race(['
+    's.extensionManagementService.channel.call("getTargetPlatform"),'
+    'new Promise((_,r)=>setTimeout(()=>r(new Error("IPC health check timeout")),10000))'
+    ']);'
+    'console.log("[install] IPC alive, platform:",_tp);'
+    'console.log("[install] downloading VSIX from CDN:",url.substring(0,80));'
+    'let resp=await fetch(url);'
+    'let buf=await resp.arrayBuffer();'
+    'console.log("[install] downloaded",buf.byteLength,"bytes, encoding...");'
+    'let bytes=new Uint8Array(buf);'
+    'let chunks=[];'
+    'for(let j=0;j<bytes.length;j+=8192)'
+    'chunks.push(String.fromCharCode.apply(null,bytes.subarray(j,Math.min(j+8192,bytes.length))));'
+    'let b64=btoa(chunks.join(""));'
+    'console.log("[install] sending",b64.length,"base64 chars via IPC...");'
+    'let result=await Promise.race(['
+    's.extensionManagementService.channel.call("installFromBuffer",[b64,t||{}]),'
+    'new Promise((_,r)=>setTimeout(()=>r(new Error("installFromBuffer timeout after 60s")),60000))'
+    ']);'
+    'console.log("[install] server responded:",JSON.stringify(result)?.substring(0,200));'
+    'return result'
+    '}catch(err){console.warn("[install] browser install failed:",err)}'
+    '}'
+    'console.log("[install] falling back to server-side download");'
     'return s.extensionManagementService.installFromGallery(e,t||{})'
     '}async _installFromGallery_orig(e,t,i){let n=await this.extensionGalleryService.getManifest'
 )
