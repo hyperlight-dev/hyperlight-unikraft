@@ -30,10 +30,13 @@ run:
            --accept-server-license-terms \
            --force-disable-user-env
 
-# Build rootfs via Docker
+# Build rootfs via Docker and extract static files for hostfs
 rootfs:
     docker build --platform linux/amd64 -t {{image}} .
     docker run --rm {{image}} cat /output.cpio > {{initrd}}
+    mkdir -p data/static
+    docker run --rm {{image}} cat /static-files/workbench.js > data/static/workbench.js
+    docker run --rm {{image}} cat /static-files/workbench.web.main.internal.js > data/static/workbench.web.main.internal.js
 
 # Build kernel via kraft (Linux)
 [unix]
