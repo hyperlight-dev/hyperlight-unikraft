@@ -92,19 +92,23 @@ if ci_old in d:
 else:
     print("WARNING: remoteExtensions.canInstall pattern not found", file=sys.stderr)
 
-# 4. Non-blocking remote extension scan: don't block UI on slow IPC.
-#    On single-vCPU, the remote scanExtensions IPC hangs because PID 15
-#    (extension host) starves PID 1. Add a timeout so web+builtin extension
-#    contributions (languages, grammars) register even when the IPC is slow.
+# 4. Non-blocking remote extension scan with extension activation support.
+#    On single-vCPU, the remote scanExtensions IPC can hang. Add a 60s timeout
+#    so web+builtin contributions register even when IPC is slow. Mark remote
+#    extensions as isUnderDevelopment to bypass enablement filtering, and emit
+#    via wft (not yft) so they participate in the standard running-location
+#    assignment and aren't removed by the post-scan cleanup.
 rscan_old = 'let[t,i]=await Promise.all([this._scanWebExtensions(),this._remoteExtensionsScannerService.scanExtensions()]);i.length&&e.emitOne(new wft(i)),e.emitOne(new Ift(t))'
 rscan_new = (
     'let t=await this._scanWebExtensions();'
     'let i=[];'
     'try{i=await Promise.race(['
     'this._remoteExtensionsScannerService.scanExtensions(),'
-    'new Promise(r=>setTimeout(()=>r([]),15000))'
+    'new Promise(r=>setTimeout(()=>r([]),60000))'
     '])}catch(x){console.warn("Remote ext scan failed:",x)}'
-    'i.length&&e.emitOne(new wft(i)),e.emitOne(new Ift(t))'
+    'i.forEach(x=>{x.isUnderDevelopment=true});'
+    'if(i.length)e.emitOne(new wft(i));'
+    'e.emitOne(new Ift(t))'
 )
 
 # 4b. (removed — TOML extension no longer pre-bundled)
@@ -143,15 +147,7 @@ ifg_new = (
     'console.log("[install] downloaded",bytes.length,"bytes");'
     # Upload VSIX to server, then use standard install(uri) for proper events
     'let vsixPath;'
-    'if(bytes.length<262144){'
-    # Small VSIX (<256KB): send in one shot
-    'let chunks=[];'
-    'for(let j=0;j<bytes.length;j+=8192)'
-    'chunks.push(String.fromCharCode.apply(null,bytes.subarray(j,Math.min(j+8192,bytes.length))));'
-    'let b64=btoa(chunks.join(""));'
-    'let r=await ch.call("installFromBuffer",[b64]);'
-    'vsixPath=r.path;'
-    '}else{'
+    '{'
     # Large VSIX: chunked upload (32KB chunks = ~43KB base64 per IPC call)
     'console.log("[install] chunked upload,",bytes.length,"bytes...");'
     'await Promise.race([ch.call("installChunkStart",[]),new Promise((_,r)=>setTimeout(()=>r(new Error("chunkStart timeout")),15000))]);'
@@ -171,16 +167,21 @@ ifg_new = (
     'new Promise((_,r)=>setTimeout(()=>r(new Error("upload timeout")),30000))'
     ']);'
     'vsixPath=r.path;'
+    'var _installResult=r;'
     '}'
-    # Use standard install(uri) so events fire through channel proxy
-    'console.log("[install] uploaded to:",vsixPath,", installing via standard path...");'
-    'let fileUri={scheme:"file",authority:"",path:vsixPath,query:"",fragment:""};'
-    'let result=await Promise.race(['
-    's.extensionManagementService.install(fileUri),'
-    'new Promise((_,r)=>setTimeout(()=>r(new Error("install timeout")),120000))'
-    ']);'
-    'console.log("[install] done, extension installed");'
-    'return result'
+    'let extDir=_installResult.path;let vsixFile=_installResult.vsix;'
+    'console.log("[install] extracted to:",extDir,"vsix:",vsixFile);'
+    'console.log("[install] triggering server install for events...");'
+    'let vsixUri={"$mid":1,scheme:"file",path:vsixFile,authority:"",query:"",fragment:""};'
+    'ch.call("install",[vsixUri]).then(()=>{'
+    'console.log("[install] server install done, reloading...");'
+    'setTimeout(()=>window.location.reload(),500);'
+    '}).catch(e=>{'
+    'console.log("[install] server install error:",e?.message?.substring(0,120));'
+    'console.log("[install] reloading anyway...");'
+    'setTimeout(()=>window.location.reload(),500);'
+    '});'
+    'return{}'
     '}catch(err){console.warn("[install] browser install failed:",err)}'
     '}'
     'return s.extensionManagementService.installFromGallery(e,t||{})'
