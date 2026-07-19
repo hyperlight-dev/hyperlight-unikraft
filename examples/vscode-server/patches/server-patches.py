@@ -31,22 +31,18 @@ else:
 ifb_old = 'case"installFromGallery":return this.service.installFromGallery(n[0],ef(n[1],o));case"installGalleryExtensions"'
 ifb_new = (
     'case"installFromBuffer":{'
-    'console.log("[installFromBuffer] entered, payload length:",n[0]?.length);'
     'let _fs=await import("node:fs");'
     'let _path=await import("node:path");'
     'let _b=Buffer.from(n[0],"base64");'
     'let _p=_path.join("/data","_ext"+Date.now()+".vsix");'
     '_fs.writeFileSync(_p,_b);'
-    'console.log("[installFromBuffer] wrote",_b.length,"bytes to",_p);'
     'return{path:_p}'
     '}'
     'case"installChunkStart":{'
     'let _fs=await import("node:fs");'
-    'let _os=await import("node:os");'
     'let _path=await import("node:path");'
     'let _p=_path.join("/data","_ext_chunked_"+Date.now()+".vsix");'
     'this.__chunkPath=_p;this.__chunkFd=_fs.openSync(_p,"w");'
-    'console.log("[installChunk] start:",_p);'
     'return{path:_p}'
     '}'
     'case"installChunkData":{'
@@ -59,7 +55,6 @@ ifb_new = (
     'let _fs=await import("node:fs");'
     'let _path=await import("node:path");'
     '_fs.closeSync(this.__chunkFd);'
-    'console.log("[installChunk] end, extracting:",this.__chunkPath);'
     'let _p=this.__chunkPath;'
     'delete this.__chunkPath;delete this.__chunkFd;'
     'let yauzl=(await import("/opt/vscode-server/node_modules/yauzl/index.js")).default;'
@@ -121,9 +116,8 @@ ifb_new = (
     '_fs.writeFileSync(ejPath,JSON.stringify(exts));'
     'try{let cacheDir="/data/data/CachedProfilesData/__default__profile__";'
     'for(let cf of["extensions.user.cache","extensions.builtin.cache"])'
-    '{let cp=_path.join(cacheDir,cf);try{_fs.unlinkSync(cp);console.log("[installChunk] cleared cache:",cp)}catch{}}'
+    '{let cp=_path.join(cacheDir,cf);try{_fs.unlinkSync(cp)}catch{}}'
     '}catch{}'
-    'console.log("[installChunk] installed to:",installed.dest);'
     'return{path:installed.dest,id:installed.id,vsix:_p}'
     '}'
     'case"installFromGallery":return this.service.installFromGallery(n[0],ef(n[1],o));case"installGalleryExtensions"'
@@ -162,16 +156,6 @@ if sig2_old in d:
     count += 1
 else:
     print("WARNING: signature verification bypass (verify call) pattern not found", file=sys.stderr)
-
-# 4. Log scanExtensions IPC calls for debugging
-scan_old = 'case"scanExtensions":{let i=n[0],'
-scan_new = 'case"scanExtensions":{console.log("[scanExtensions] IPC called");let i=n[0],'
-if scan_old in d:
-    d = d.replace(scan_old, scan_new, 1)
-    print("Patched scanExtensions logging")
-    count += 1
-else:
-    print("WARNING: scanExtensions logging pattern not found", file=sys.stderr)
 
 assert count >= 1, "No patches applied to server-main.js"
 open(f, "w").write(d)

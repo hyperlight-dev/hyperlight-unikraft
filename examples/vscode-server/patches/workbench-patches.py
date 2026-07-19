@@ -101,22 +101,29 @@ else:
 rscan_old = 'let[t,i]=await Promise.all([this._scanWebExtensions(),this._remoteExtensionsScannerService.scanExtensions()]);i.length&&e.emitOne(new wft(i)),e.emitOne(new Ift(t))'
 rscan_new = (
     'let t=await this._scanWebExtensions();'
-    'console.log("[ext-scan] web extensions:",t.length);'
     'let i=[];'
     'try{'
-    'console.log("[ext-scan] starting remote scan...");'
     'i=await Promise.race(['
     'this._remoteExtensionsScannerService.scanExtensions(),'
-    'new Promise(r=>setTimeout(()=>{console.log("[ext-scan] remote scan TIMEOUT (60s)");r([])},60000))'
+    'new Promise(r=>setTimeout(()=>r([]),60000))'
     '])'
-    '}catch(x){console.warn("[ext-scan] remote scan FAILED:",x)}'
-    'console.log("[ext-scan] remote extensions found:",i.length,i.map(x=>x.identifier?.id||x.id).join(","));'
-    'i.forEach(x=>{x.isUnderDevelopment=true});'
-    'if(i.length)e.emitOne(new wft(i));'
-    'e.emitOne(new Ift(t))'
+    '}catch(x){}'
+    'let decl=[];let remote=[];'
+    'i.forEach(x=>{'
+    'x.isUnderDevelopment=true;'
+    'if(!x.identifier||!x.identifier._lower)x.identifier={id:x.id,uuid:x.uuid,value:x.id,_lower:x.id.toLowerCase()};'
+    'let hasGrammar=x.contributes&&(x.contributes.grammars||x.contributes.languages||x.contributes.themes);'
+    'if(hasGrammar){'
+    'delete x.main;x.browser="./browser.js";'
+    'x.extensionKind=["web"];'
+    'if(x.extensionLocation&&x.extensionLocation.with)x.extensionLocation=x.extensionLocation.with({scheme:"extension"});'
+    'decl.push(x)'
+    '}else{remote.push(x)}'
+    '});'
+    'if(remote.length)e.emitOne(new wft(remote));'
+    'e.emitOne(new Ift(t.concat(decl)))'
 )
 
-# 4b. (removed — TOML extension no longer pre-bundled)
 if rscan_old in d:
     d = d.replace(rscan_old, rscan_new, 1)
     print("Patched remote extension scan timeout")
@@ -145,27 +152,19 @@ ifg_new = (
     'ch.call("getTargetPlatform"),'
     'new Promise((_,r)=>setTimeout(()=>r(new Error("IPC timeout")),10000))'
     ']);'
-    'console.log("[install] downloading VSIX:",url.substring(0,80));'
     'let resp=await fetch(url);'
     'let buf=await resp.arrayBuffer();'
     'let bytes=new Uint8Array(buf);'
-    'console.log("[install] downloaded",bytes.length,"bytes");'
-    # Upload VSIX to server, then use standard install(uri) for proper events
     'let vsixPath;'
     '{'
-    # Large VSIX: chunked upload (32KB chunks = ~43KB base64 per IPC call)
-    'console.log("[install] chunked upload,",bytes.length,"bytes...");'
     'await Promise.race([ch.call("installChunkStart",[]),new Promise((_,r)=>setTimeout(()=>r(new Error("chunkStart timeout")),15000))]);'
     'const CHUNK=32768;'
-    'let sent=0;'
     'for(let off=0;off<bytes.length;off+=CHUNK){'
     'let slice=bytes.subarray(off,Math.min(off+CHUNK,bytes.length));'
     'let c=[];for(let j=0;j<slice.length;j+=8192)'
     'c.push(String.fromCharCode.apply(null,slice.subarray(j,Math.min(j+8192,slice.length))));'
     'let b64=btoa(c.join(""));'
     'await Promise.race([ch.call("installChunkData",[b64]),new Promise((_,r)=>setTimeout(()=>r(new Error("chunk timeout")),15000))]);'
-    'sent+=slice.length;'
-    'if(sent%(CHUNK*10)<CHUNK)console.log("[install] sent",sent,"/",bytes.length);'
     '}'
     'let r=await Promise.race(['
     'ch.call("installChunkEnd",[]),'
@@ -174,20 +173,15 @@ ifg_new = (
     'vsixPath=r.path;'
     'var _installResult=r;'
     '}'
-    'let extDir=_installResult.path;let vsixFile=_installResult.vsix;'
-    'console.log("[install] extracted to:",extDir,"vsix:",vsixFile);'
-    'console.log("[install] triggering server install for events...");'
+    'let vsixFile=_installResult.vsix;'
     'let vsixUri={"$mid":1,scheme:"file",path:vsixFile,authority:"",query:"",fragment:""};'
     'ch.call("install",[vsixUri]).then(()=>{'
-    'console.log("[install] server install done, reloading...");'
     'setTimeout(()=>window.location.reload(),500);'
     '}).catch(e=>{'
-    'console.log("[install] server install error:",e?.message?.substring(0,120));'
-    'console.log("[install] reloading anyway...");'
     'setTimeout(()=>window.location.reload(),500);'
     '});'
     'return{}'
-    '}catch(err){console.warn("[install] browser install failed:",err)}'
+    '}catch(err){}'
     '}'
     'return s.extensionManagementService.installFromGallery(e,t||{})'
     '}async _installFromGallery_orig(e,t,i){let n=await this.extensionGalleryService.getManifest'
@@ -198,6 +192,37 @@ if ifg_old in d:
     count += 1
 else:
     print("WARNING: installFromGallery pattern not found", file=sys.stderr)
+
+# 6. Patch readExtensionResource to use HTTP for installed extensions.
+#    On single-vCPU, the IPC file read (via _fileService.readFile) hangs
+#    because the server is CPU-starved. The server's /vscode-remote-resource
+#    endpoint CAN serve these files via HTTP without IPC contention.
+rer_old = (
+    'var Jft=class extends rLt{'
+    'constructor(o,e,t,i,n,r,s){super(o,e,t,i,n,r,s)}'
+    'async readExtensionResource(o){'
+    'if(o=Cn.uriToBrowserUri(o),o.scheme!==X.http&&o.scheme!==X.https&&o.scheme!==X.data)'
+    'return(await this._fileService.readFile(o)).value.toString()'
+)
+rer_new = (
+    'var Jft=class extends rLt{'
+    'constructor(o,e,t,i,n,r,s){super(o,e,t,i,n,r,s)}'
+    'async readExtensionResource(o){'
+    'let _p=typeof o?.path==="string"?o.path:"";'
+    'if(_p.startsWith("/data/extensions/")){try{'
+    'let _r=await fetch("/vscode-remote-resource?path="+encodeURIComponent(_p));'
+    'if(_r.ok)return await _r.text()'
+    '}catch(_e){}}'
+    'if(o=Cn.uriToBrowserUri(o),o.scheme!==X.http&&o.scheme!==X.https&&o.scheme!==X.data)'
+    'return(await this._fileService.readFile(o)).value.toString()'
+)
+if rer_old in d:
+    d = d.replace(rer_old, rer_new, 1)
+    print("Patched readExtensionResource HTTP bypass for installed extensions")
+    count += 1
+else:
+    print("WARNING: readExtensionResource pattern not found", file=sys.stderr)
+
 
 assert count >= 1, "No patches applied to workbench.js"
 open(f, "w").write(d)
