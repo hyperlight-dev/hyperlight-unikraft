@@ -1,0 +1,31 @@
+# Build artifacts
+.unikraft/
+initrd.cpio
+rootfs.cpio
+data/
+
+# Docker rootfs extraction artifacts
+etc/
+lib/
+sbin/
+usr/
+var/
+tmp/
+bin/
+opt/
+proc/
+sys/
+dev/
+run/
+srv/
+mnt/
+media/
+home/
+root/
+rootfs/
+
+# Node.js / test dependencies
+node_modules/
+package.json
+package-lock.json
+browser_test.cjs
