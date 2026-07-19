@@ -74,6 +74,8 @@ RUN python3 /tmp/workbench-patches.py
 #    extension host starves the single vCPU.
 COPY patches/precache.js /rootfs/opt/vscode-server/out/precache.js
 RUN sed -i '/<script type="module" src="{{WORKBENCH_WEB_BASE_URL}}\/out\/vs\/code\/browser\/workbench\/workbench.js">/i\<script type="module" src="{{WORKBENCH_WEB_BASE_URL}}/out/precache.js"></script>' \
+        /rootfs/opt/vscode-server/out/vs/code/browser/workbench/workbench.html && \
+    sed -i '/WORKBENCH_NLS_URL/d' \
         /rootfs/opt/vscode-server/out/vs/code/browser/workbench/workbench.html
 
 # 8. Prevent server shutdown on browser disconnect — stay alive for
@@ -122,7 +124,23 @@ RUN ln -sf node_modules /rootfs/opt/vscode-server/node_modules.asar.unpacked
 # process.abort() suppression, and uncaught-exception guard.
 COPY patches/keepalive.cjs /rootfs/opt/vscode-server/keepalive.cjs
 
+# Strip bundled extensions, Copilot native binaries, large unused SDKs,
+# and source maps to keep initrd under cpiovfs corruption threshold
+RUN rm -rf /rootfs/opt/vscode-server/extensions && \
+    mkdir -p /rootfs/opt/vscode-server/extensions && \
+    rm -rf /rootfs/opt/vscode-server/node_modules/@github/copilot-linux-x64 && \
+    rm -rf /rootfs/opt/vscode-server/node_modules/@microsoft/mxc-sdk && \
+    find /rootfs/opt/vscode-server/node_modules -name '*.map' -delete && \
+    find /rootfs/opt/vscode-server/node_modules -name '*.md' -not -name 'LICENSE*' -delete && \
+    find /rootfs/opt/vscode-server/node_modules -name 'CHANGELOG*' -delete
+
 # Writable directories
 RUN mkdir -p /rootfs/tmp /rootfs/data
+
+# Extract large JS files (>5MB) to a separate output for hostfs serving.
+# cpiovfs corrupts these files; keepalive.cjs redirects reads to /data/static/.
+RUN mkdir -p /static-files && \
+    cp /rootfs/opt/vscode-server/out/vs/code/browser/workbench/workbench.js /static-files/workbench.js && \
+    cp /rootfs/opt/vscode-server/out/vs/workbench/workbench.web.main.internal.js /static-files/workbench.web.main.internal.js
 
 RUN cd /rootfs && find . | cpio -o -H newc > /output.cpio 2>/dev/null
