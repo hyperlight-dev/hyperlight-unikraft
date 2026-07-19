@@ -24,9 +24,10 @@ if old_j7 in d:
 else:
     print("WARNING: server J7 cached getExtensionsControlManifest pattern not found", file=sys.stderr)
 
-# 2. Add installFromBuffer IPC handler: accepts base64-encoded VSIX from
-#    browser, writes to temp file, installs locally.  Avoids the server
-#    having to download from the marketplace CDN while CPU-starved.
+# 2. Add chunked install IPC handlers: the browser downloads the VSIX,
+#    sends it in 512KB base64 chunks, then triggers the install.
+#    This avoids the WebSocket message-size limit (~1MB) that blocks
+#    large extensions from being sent in a single IPC call.
 ifb_old = 'case"installFromGallery":return this.service.installFromGallery(n[0],ef(n[1],o));case"installGalleryExtensions"'
 ifb_new = (
     'case"installFromBuffer":{'
@@ -48,6 +49,31 @@ ifb_new = (
     'console.error("[installFromBuffer] ERROR:",_err?.message||_err);'
     'throw _err'
     '}'
+    '}'
+    'case"installChunkStart":{'
+    'let _fs=await import("node:fs");'
+    'let _os=await import("node:os");'
+    'let _path=await import("node:path");'
+    'let _p=_path.join(_os.tmpdir(),"_ext_chunked_"+Date.now()+".vsix");'
+    'this.__chunkPath=_p;this.__chunkFd=_fs.openSync(_p,"w");'
+    'console.log("[installChunk] start:",_p);'
+    'return{path:_p}'
+    '}'
+    'case"installChunkData":{'
+    'let _fs=await import("node:fs");'
+    'let _b=Buffer.from(n[0],"base64");'
+    '_fs.writeSync(this.__chunkFd,_b);'
+    'return{ok:true,written:_b.length}'
+    '}'
+    'case"installChunkEnd":{'
+    'let _fs=await import("node:fs");'
+    '_fs.closeSync(this.__chunkFd);'
+    'console.log("[installChunk] end, installing from:",this.__chunkPath);'
+    'let _r=await this.service.install(I.file(this.__chunkPath));'
+    'console.log("[installChunk] install OK");'
+    'try{_fs.unlinkSync(this.__chunkPath)}catch(_e){}'
+    'delete this.__chunkPath;delete this.__chunkFd;'
+    'return _r'
     '}'
     'case"installFromGallery":return this.service.installFromGallery(n[0],ef(n[1],o));case"installGalleryExtensions"'
 )

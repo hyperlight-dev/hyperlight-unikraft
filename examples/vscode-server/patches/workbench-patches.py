@@ -107,40 +107,13 @@ rscan_new = (
     'i.length&&e.emitOne(new wft(i)),e.emitOne(new Ift(t))'
 )
 
-# 4b. Register TOML extension as a web builtin.
-#     The TOML extension lives at /opt/vscode-server/extensions/toml/ (same
-#     base dir as the other builtins), but isn't in the hardcoded list that
-#     the web scanner reads.  Inject it so the browser discovers it via HTTP
-#     without relying on the broken remote-scan IPC.
-toml_anchor = 'if(o.isBuilt)l=[{extensionPath:"TypeScriptTeam.jsts-chat-features"'
-toml_entry = (
-    'if(o.isBuilt)l=[{extensionPath:"toml",packageJSON:{'
-    'name:"even-better-toml",displayName:"Even Better TOML",'
-    'description:"TOML syntax highlighting",version:"0.21.2",'
-    'publisher:"tamasfe",engines:{vscode:"*"},'
-    'categories:["Programming Languages"],'
-    'contributes:{grammars:[{language:"toml",scopeName:"source.toml",'
-    'path:"./toml.tmLanguage.json"},{scopeName:"markdown.toml.frontmatter.codeblock",'
-    'path:"./toml.frontmatter.tmLanguage.json",injectTo:["text.html.markdown"]},'
-    '{scopeName:"markdown.toml.codeblock",path:"./toml.markdown.tmLanguage.json",'
-    'injectTo:["text.html.markdown"],embeddedLanguages:{"meta.embedded.block.toml":"toml"}}],'
-    'languages:[{id:"toml",aliases:["TOML"],extensions:[".toml"],'
-    'filenames:["Cargo.lock","uv.lock"],configuration:"./language-configuration.json"}]}'
-    '}},{extensionPath:"TypeScriptTeam.jsts-chat-features"'
-)
+# 4b. (removed — TOML extension no longer pre-bundled)
 if rscan_old in d:
     d = d.replace(rscan_old, rscan_new, 1)
     print("Patched remote extension scan timeout")
     count += 1
 else:
     print("WARNING: remote extension scan timeout pattern not found", file=sys.stderr)
-
-if toml_anchor in d:
-    d = d.replace(toml_anchor, toml_entry, 1)
-    print("Patched TOML web builtin extension registration")
-    count += 1
-else:
-    print("WARNING: TOML web builtin registration pattern not found", file=sys.stderr)
 
 # 5. Browser-side VSIX download + server-side local install.
 #    The marketplace CDN allows CORS (Access-Control-Allow-Origin: *), so
@@ -155,38 +128,54 @@ ifg_new = (
     'let s=this.extensionManagementServerService.remoteExtensionManagementServer'
     '||this.extensionManagementServerService.localExtensionManagementServer;'
     'if(!s)throw new Error("No server");'
-    'console.log("[install] server:",s?.id||"unknown");'
-    'console.log("[install] svc:",typeof s?.extensionManagementService);'
-    'console.log("[install] channel:",typeof s?.extensionManagementService?.channel);'
-    'console.log("[install] call:",typeof s?.extensionManagementService?.channel?.call);'
+    'let ch=s.extensionManagementService.channel;'
     'let url=e.assets?.download?.uri;'
-    'if(url){'
+    'if(url&&ch){'
     'try{'
-    'console.log("[install] testing IPC channel health...");'
-    'let _tp=await Promise.race(['
-    's.extensionManagementService.channel.call("getTargetPlatform"),'
-    'new Promise((_,r)=>setTimeout(()=>r(new Error("IPC health check timeout")),10000))'
+    'await Promise.race(['
+    'ch.call("getTargetPlatform"),'
+    'new Promise((_,r)=>setTimeout(()=>r(new Error("IPC timeout")),10000))'
     ']);'
-    'console.log("[install] IPC alive, platform:",_tp);'
-    'console.log("[install] downloading VSIX from CDN:",url.substring(0,80));'
+    'console.log("[install] downloading VSIX:",url.substring(0,80));'
     'let resp=await fetch(url);'
     'let buf=await resp.arrayBuffer();'
-    'console.log("[install] downloaded",buf.byteLength,"bytes, encoding...");'
     'let bytes=new Uint8Array(buf);'
+    'console.log("[install] downloaded",bytes.length,"bytes");'
+    # Small VSIX (<256KB): send in one shot
+    'if(bytes.length<262144){'
     'let chunks=[];'
     'for(let j=0;j<bytes.length;j+=8192)'
     'chunks.push(String.fromCharCode.apply(null,bytes.subarray(j,Math.min(j+8192,bytes.length))));'
     'let b64=btoa(chunks.join(""));'
-    'console.log("[install] sending",b64.length,"base64 chars via IPC...");'
-    'let result=await Promise.race(['
-    's.extensionManagementService.channel.call("installFromBuffer",[b64,t||{}]),'
-    'new Promise((_,r)=>setTimeout(()=>r(new Error("installFromBuffer timeout after 60s")),60000))'
-    ']);'
-    'console.log("[install] server responded:",JSON.stringify(result)?.substring(0,200));'
+    'let result=await ch.call("installFromBuffer",[b64]);'
+    'console.log("[install] done (single)");'
     'return result'
+    '}else{'
+    # Large VSIX: chunked upload (32KB chunks = ~43KB base64 per IPC call)
+    'console.log("[install] chunked upload,",bytes.length,"bytes...");'
+    'await Promise.race([ch.call("installChunkStart",[]),new Promise((_,r)=>setTimeout(()=>r(new Error("chunkStart timeout")),15000))]);'
+    'console.log("[install] chunk session started");'
+    'const CHUNK=32768;'
+    'let sent=0;'
+    'for(let off=0;off<bytes.length;off+=CHUNK){'
+    'let slice=bytes.subarray(off,Math.min(off+CHUNK,bytes.length));'
+    'let c=[];for(let j=0;j<slice.length;j+=8192)'
+    'c.push(String.fromCharCode.apply(null,slice.subarray(j,Math.min(j+8192,slice.length))));'
+    'let b64=btoa(c.join(""));'
+    'await Promise.race([ch.call("installChunkData",[b64]),new Promise((_,r)=>setTimeout(()=>r(new Error("chunk timeout")),15000))]);'
+    'sent+=slice.length;'
+    'if(sent%(CHUNK*10)<CHUNK)console.log("[install] sent",sent,"/",bytes.length);'
+    '}'
+    'console.log("[install] all chunks sent, finishing...");'
+    'let result=await Promise.race(['
+    'ch.call("installChunkEnd",[]),'
+    'new Promise((_,r)=>setTimeout(()=>r(new Error("install timeout")),120000))'
+    ']);'
+    'console.log("[install] done (chunked)");'
+    'return result'
+    '}'
     '}catch(err){console.warn("[install] browser install failed:",err)}'
     '}'
-    'console.log("[install] falling back to server-side download");'
     'return s.extensionManagementService.installFromGallery(e,t||{})'
     '}async _installFromGallery_orig(e,t,i){let n=await this.extensionGalleryService.getManifest'
 )
