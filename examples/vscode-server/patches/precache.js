@@ -13,17 +13,12 @@ const themeNames = [
 ];
 
 const [textmateJs, onigurumaJs, wasmBuf,
-       tomlGrammar, tomlConfig, tomlFm, tomlMd,
        tmWorker,
        ...themeTexts] =
   await Promise.all([
     fetch(base + '/node_modules.asar/vscode-textmate/release/main.js').then(r => r.text()),
     fetch(base + '/node_modules.asar/vscode-oniguruma/release/main.js').then(r => r.text()),
     fetch(base + '/node_modules.asar.unpacked/vscode-oniguruma/release/onig.wasm').then(r => r.arrayBuffer()),
-    fetch(base + '/extensions/toml/toml.tmLanguage.json').then(r => r.text()),
-    fetch(base + '/extensions/toml/language-configuration.json').then(r => r.text()),
-    fetch(base + '/extensions/toml/toml.frontmatter.tmLanguage.json').then(r => r.text()),
-    fetch(base + '/extensions/toml/toml.markdown.tmLanguage.json').then(r => r.text()),
     fetch(base + '/out/vs/workbench/services/textMate/browser/backgroundTokenization/worker/textMateTokenizationWorker.workerMain.js').then(r => r.text()),
     ...themeNames.map(n =>
       fetch(base + '/extensions/theme-defaults/themes/' + n).then(r => r.text())),
@@ -52,16 +47,6 @@ window.fetch = function (url, ...rest) {
   // Pre-cached: Oniguruma WASM
   if (s.includes('onig.wasm'))
     return Promise.resolve(new Response(wasmBuf.slice(0)));
-
-  // Pre-cached: TOML grammars & config
-  if (s.includes('toml.tmLanguage.json') && !s.includes('frontmatter') && !s.includes('markdown'))
-    return Promise.resolve(new Response(tomlGrammar, { headers: { 'content-type': 'application/json' } }));
-  if (s.includes('toml.frontmatter.tmLanguage.json'))
-    return Promise.resolve(new Response(tomlFm, { headers: { 'content-type': 'application/json' } }));
-  if (s.includes('toml.markdown.tmLanguage.json'))
-    return Promise.resolve(new Response(tomlMd, { headers: { 'content-type': 'application/json' } }));
-  if (s.includes('language-configuration.json') && s.includes('toml'))
-    return Promise.resolve(new Response(tomlConfig, { headers: { 'content-type': 'application/json' } }));
 
   // Pre-cached: theme files
   for (const [name, content] of Object.entries(themeCache)) {
