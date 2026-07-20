@@ -156,7 +156,7 @@ ifg_proxy_new = (
     'this.channel.call("installChunkStart",[]),'
     'new Promise((_,r)=>setTimeout(()=>r(new Error("timeout")),15000))'
     ']);'
-    'const _CHUNK=32768;'
+    'const _CHUNK=524288;'
     'for(let _off=0;_off<_bytes.length;_off+=_CHUNK){'
     'let _sl=_bytes.subarray(_off,Math.min(_off+_CHUNK,_bytes.length));'
     'let _c=[];for(let _j=0;_j<_sl.length;_j+=8192)'
