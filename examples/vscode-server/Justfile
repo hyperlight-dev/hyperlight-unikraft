@@ -1,7 +1,7 @@
 # vscode-server on Hyperlight
 #
 # just build     - Build kernel + rootfs
-# just run       - Start VS Code Server (open http://localhost:8000 in browser)
+# just run       - Start VS Code Server (open http://localhost:8080 in browser)
 # just test      - Build, run, and verify HTTP 200
 # just clean     - Remove build artifacts
 
@@ -12,11 +12,11 @@ kernel      := ".unikraft/build/vscode-server-hyperlight_hyperlight-x86_64"
 initrd      := "initrd.cpio"
 memory      := "3840Mi"
 image       := "vscode-server-hyperlight"
-port        := "8000"
+port        := "8080"
 
-# Start VS Code Server (browse to http://localhost:8000)
+# Start VS Code Server (browse to http://localhost:8080)
 run:
-    mkdir -p data
+    @test -f data/static/workbench.js || { echo "error: run 'just rootfs' first (data/static/ missing)"; exit 1; }
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
         --net --port {{port}} \
         --mount ./data:/data \
@@ -53,7 +53,6 @@ build:
 test: build rootfs
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p data
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
         --net --port {{port}} \
         --mount ./data:/data \
