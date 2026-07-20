@@ -16,8 +16,10 @@ port        := "8080"
 
 # Start VS Code Server (browse to http://localhost:8080)
 run:
+    mkdir -p data
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
         --net --port {{port}} \
+        --mount ./data:/data \
         -- --require /opt/vscode-server/keepalive.cjs \
            /opt/vscode-server/out/server-main.js \
            --port {{port}} \
@@ -48,8 +50,10 @@ build:
 test: build rootfs
     #!/usr/bin/env bash
     set -euo pipefail
+    mkdir -p data
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
         --net --port {{port}} \
+        --mount ./data:/data \
         -- --require /opt/vscode-server/keepalive.cjs \
            /opt/vscode-server/out/server-main.js \
            --port {{port}} \
@@ -72,9 +76,10 @@ rebuild: clean build rootfs
 # Clean build artifacts
 [unix]
 clean:
-    rm -rf .unikraft {{initrd}}
+    rm -rf .unikraft {{initrd}} data
 
 [windows]
 clean:
     if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
     if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }
+    if (Test-Path data) { Remove-Item -Recurse -Force data }
