@@ -124,10 +124,13 @@ RUN ln -sf node_modules /rootfs/opt/vscode-server/node_modules.asar.unpacked
 # process.abort() suppression, and uncaught-exception guard.
 COPY patches/keepalive.cjs /rootfs/opt/vscode-server/keepalive.cjs
 
-# Strip bundled extensions, Copilot native binaries, large unused SDKs,
-# and source maps to keep the initrd small
-RUN rm -rf /rootfs/opt/vscode-server/extensions && \
-    mkdir -p /rootfs/opt/vscode-server/extensions && \
+# Strip extensions that need glibc native modules (copilot) or are
+# disproportionately large for the value (mermaid 59MB, shared
+# node_modules 18MB). Keep everything else (~40MB): themes, syntax
+# highlighting, git, markdown, language features.
+RUN rm -rf /rootfs/opt/vscode-server/extensions/copilot \
+           /rootfs/opt/vscode-server/extensions/mermaid-markdown-features \
+           /rootfs/opt/vscode-server/extensions/node_modules && \
     rm -rf /rootfs/opt/vscode-server/node_modules/@github/copilot-linux-x64 && \
     rm -rf /rootfs/opt/vscode-server/node_modules/@microsoft/mxc-sdk && \
     find /rootfs/opt/vscode-server/node_modules -name '*.map' -delete && \
