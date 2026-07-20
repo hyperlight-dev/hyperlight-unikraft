@@ -51,6 +51,16 @@ unikraft:
     CONFIG_LIBUKBOOT_MAINTHREAD: 'y'
     CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL: 'y'
     CONFIG_LIBPOSIX_PROCESS_MULTITHREADING: 'y'
+    CONFIG_LIBUKSCHED: 'y'
+    CONFIG_LIBUKSCHEDCOOP: 'y'
+
+    # Cooperative poll model: run the scheduler to idle, then yield the vCPU
+    # back to the host reporting the next-wakeup deadline, instead of blocking
+    # the vCPU in-guest (time_block_until/__hl_sleep). Required for the host
+    # `poll_step` driver to reach a clean checkpoint boundary — without it the
+    # idle path never returns to the host and checkpoint/restore stalls.
+    # See plat/hyperlight/poll.c, lib/ukschedcoop, and the host `poll_step` API.
+    CONFIG_HYPERLIGHT_POLL: 'y'
 
     # Signal and futex support (needed for Go runtime)
     CONFIG_LIBPOSIX_PROCESS_SIGNAL: 'y'
