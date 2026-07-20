@@ -187,10 +187,12 @@ if ifg_old in d:
 else:
     print("WARNING: installFromGallery pattern not found", file=sys.stderr)
 
-# 6. Patch readExtensionResource to use HTTP for installed extensions.
+# 6. Patch readExtensionResource to use HTTP for all extensions.
 #    On single-vCPU, the IPC file read (via _fileService.readFile) hangs
 #    because the server is CPU-starved. The server's /vscode-remote-resource
 #    endpoint CAN serve these files via HTTP without IPC contention.
+#    Covers both user-installed (/data/extensions/) and built-in
+#    (/opt/vscode-server/extensions/) extension resources.
 rer_old = (
     'var Jft=class extends rLt{'
     'constructor(o,e,t,i,n,r,s){super(o,e,t,i,n,r,s)}'
@@ -203,7 +205,7 @@ rer_new = (
     'constructor(o,e,t,i,n,r,s){super(o,e,t,i,n,r,s)}'
     'async readExtensionResource(o){'
     'let _p=typeof o?.path==="string"?o.path:"";'
-    'if(_p.startsWith("/data/extensions/")){try{'
+    'if(_p.startsWith("/data/extensions/")||_p.startsWith("/opt/vscode-server/extensions/")){try{'
     'let _r=await fetch("/vscode-remote-resource?path="+encodeURIComponent(_p));'
     'if(_r.ok)return await _r.text()'
     '}catch(_e){}}'
