@@ -18,7 +18,6 @@ port        := "8080"
 run:
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
         --net --port {{port}} \
-        --mount ./data:/data \
         -- --require /opt/vscode-server/keepalive.cjs \
            /opt/vscode-server/out/server-main.js \
            --port {{port}} \
@@ -51,7 +50,6 @@ test: build rootfs
     set -euo pipefail
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
         --net --port {{port}} \
-        --mount ./data:/data \
         -- --require /opt/vscode-server/keepalive.cjs \
            /opt/vscode-server/out/server-main.js \
            --port {{port}} \
@@ -74,10 +72,9 @@ rebuild: clean build rootfs
 # Clean build artifacts
 [unix]
 clean:
-    rm -rf .unikraft {{initrd}} data
+    rm -rf .unikraft {{initrd}}
 
 [windows]
 clean:
     if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
     if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }
-    if (Test-Path data) { Remove-Item -Recurse -Force data }
