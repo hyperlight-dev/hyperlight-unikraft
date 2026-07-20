@@ -58,6 +58,11 @@
 pub mod pyhl;
 pub mod stderr_capture;
 
+/// Re-export of Hyperlight's interrupt handle, returned by
+/// [`Sandbox::interrupt_handle`]. Re-exported so downstream crates can name
+/// the type without taking a direct dependency on `hyperlight-host`.
+pub use hyperlight_host::hypervisor::InterruptHandle;
+
 use anyhow::{anyhow, Result};
 use hyperlight_host::func::Registerable;
 use hyperlight_host::sandbox::snapshot::{OciTag, Snapshot};
@@ -69,7 +74,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Magic header for cmdline embedded in initrd: "HLCMDLN\0"
 const CMDLINE_MAGIC: &[u8; 8] = b"HLCMDLN\0";
@@ -124,29 +129,17 @@ const POLL_EXITED_BIT: u64 = 1 << 63;
 /// `exit_group` → `uk_pm_shutdown(SYSHALT)` → a direct port-108 HALT. That
 /// path never runs the idle pump, so it never calls `__hl_poll_yield` and
 /// never sets `__hl_exit`. Without this bit, such a run would be
-/// indistinguishable from a zero-deadline idle-yield and `poll_step` would
-/// loop forever reporting [`PollStatus::Idle`]. By clearing the atomic
-/// before each `poll` call and checking this bit afterwards, `poll_step`
-/// treats "the VM halted without yielding" as terminal ([`PollStatus::Done`]).
+/// indistinguishable from a zero-deadline idle-yield and [`Sandbox::poll`]
+/// would loop forever reporting [`Poll::Pending`](core::task::Poll::Pending).
+/// By clearing the atomic before each `poll` call and checking this bit
+/// afterwards, [`Sandbox::poll`] treats "the VM halted without yielding" as
+/// terminal ([`Poll::Ready`](core::task::Poll::Ready)).
 const POLL_YIELDED_BIT: u64 = 1 << 62;
 
 /// Mask selecting the nanoseconds-until-next-wakeup deadline carried in the
 /// low bits of the cooperative-poll atomic (everything except the reserved
 /// [`POLL_EXITED_BIT`] and [`POLL_YIELDED_BIT`] flags).
 const POLL_DEADLINE_MASK: u64 = POLL_YIELDED_BIT - 1;
-
-/// Outcome of a single cooperative [`Sandbox::poll_step`] invocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PollStatus {
-    /// The guest process has exited; stop polling.
-    Done,
-    /// The guest went idle with a pending timer. Re-poll after this delay,
-    /// or sooner if external input (e.g. a cancelled sleep) arrives.
-    Wait(Duration),
-    /// The guest went idle with no pending timer. Re-poll when external
-    /// input becomes available.
-    Idle,
-}
 
 /// Shared cancellation primitive for `__hl_sleep`. Calling
 /// [`SleepCancel::cancel`] wakes up any in-progress sleep immediately so
@@ -758,6 +751,11 @@ pub fn prepend_cmdline_to_initrd(
 pub struct ToolRegistry {
     tools:
         HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value> + Send + Sync>>,
+    /// Optional async-tool dispatch side (populated when the builder registers
+    /// any [`SandboxBuilder::tool_async`] handler). Async tools return a yield
+    /// completion token immediately; their futures are driven off the vCPU
+    /// thread by [`Sandbox::drive_host_functions`].
+    async_side: Option<AsyncDispatch>,
 }
 
 impl ToolRegistry {
@@ -766,6 +764,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            async_side: None,
         }
     }
 
@@ -778,6 +777,86 @@ impl ToolRegistry {
         F: Fn(serde_json::Value) -> Result<serde_json::Value> + Send + Sync + 'static,
     {
         self.tools.insert(name.to_string(), Box::new(handler));
+    }
+
+    /// Get (creating if necessary) the async-dispatch side of this registry.
+    ///
+    /// The async side is shared (via `Arc`) with the [`AsyncToolState`] driver
+    /// installed on the [`Sandbox`], so tools registered here are driven off
+    /// the vCPU thread by [`Sandbox::drive_host_functions`].
+    fn async_side_mut(&mut self) -> &mut AsyncDispatch {
+        self.async_side.get_or_insert_with(|| AsyncDispatch {
+            factories: HashMap::new(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            next_token: Arc::new(AtomicU64::new(1)),
+        })
+    }
+
+    /// Register an async tool factory. On invocation the tool returns a yield
+    /// completion token immediately (off-loading any blocking work), and its
+    /// future is driven by [`Sandbox::drive_host_functions`]. Used for the
+    /// networking tools (natively async on the Tokio reactor), `__hl_sleep`,
+    /// and user [`SandboxBuilder::tool_async`] handlers.
+    fn register_async_factory(&mut self, name: &str, factory: ToolFactory) {
+        self.async_side_mut()
+            .factories
+            .insert(name.to_string(), factory);
+    }
+
+    /// Build the driver-side [`AsyncToolState`] that shares this registry's
+    /// pending/queue maps, or `None` if no async tools are registered.
+    fn make_async_state(&self) -> Option<AsyncToolState> {
+        self.async_side.as_ref().map(|a| AsyncToolState {
+            pending: a.pending.clone(),
+            queue: a.queue.clone(),
+            join_set: tokio::task::JoinSet::new(),
+            factories: a.factories.clone(),
+        })
+    }
+
+    /// Test helper: dispatch a request and, if the tool yielded an async
+    /// completion token, drive its queued future to completion on a temporary
+    /// runtime and return the resolved response in the same
+    /// `{"result": …}` / `{"error": …}` shape the guest receives when the
+    /// completion is delivered in the next `poll` batch. Lets synchronous unit
+    /// tests exercise the now-async tools (e.g. `net_send`) without a full poll
+    /// loop.
+    #[cfg(test)]
+    fn dispatch_drive(&self, payload: &[u8]) -> Vec<u8> {
+        let resp = self.dispatch(payload);
+        let parsed: serde_json::Value = match serde_json::from_slice(&resp) {
+            Ok(v) => v,
+            Err(_) => return resp,
+        };
+        let token = parsed
+            .get("result")
+            .and_then(|r| r.get("__hl_yield__"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string());
+        let Some(token) = token else { return resp };
+        let Some(asy) = &self.async_side else {
+            return resp;
+        };
+        let fut = asy.queue.lock().unwrap().pop_front();
+        if let Some((tok, fut)) = fut {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let res = rt.block_on(fut);
+            if let Some(task) = asy.pending.lock().unwrap().get_mut(&tok) {
+                task.state = PendingState::Ready(res.map_err(|e| e.to_string()));
+            }
+        }
+        // The completion is delivered to the guest in the next poll batch as
+        // {"result": …} / {"error": …}; reproduce that shape here.
+        let value = match asy.pending.lock().unwrap().remove(&token).map(|t| t.state) {
+            Some(PendingState::Ready(Ok(v))) => serde_json::json!({ "result": v }),
+            Some(PendingState::Ready(Err(e))) => serde_json::json!({ "error": e }),
+            _ => return resp,
+        };
+        serde_json::to_vec(&value).unwrap()
     }
 
     /// Decode a guest-side `__dispatch` request, look up the handler by
@@ -820,6 +899,16 @@ impl ToolRegistry {
                 .as_str()
                 .ok_or_else(|| anyhow!("missing 'name'"))?;
             let args = req.get("args").cloned().unwrap_or(serde_json::Value::Null);
+            // Async tools are handled off the sync tool table: dispatch_async
+            // returns Some(sentinel) when it owns the call (a yield sentinel
+            // while the future runs) and None to fall through to the sync
+            // tools. The resolved result is later delivered to the guest in the
+            // next `poll` batch, not through this dispatch path.
+            if let Some(asy) = &self.async_side {
+                if let Some(v) = asy.dispatch_async(name, &args)? {
+                    return Ok(v);
+                }
+            }
             let handler = self
                 .tools
                 .get(name)
@@ -860,6 +949,223 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A boxed, `Send` future produced by an async tool handler.
+type ToolFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>>;
+
+/// A boxed async-tool factory: called with the guest's `args`, returns the
+/// future that computes the result. `Arc`-wrapped so the same factory can be
+/// shared with the off-vCPU driver ([`AsyncToolState`]) and re-invoked to
+/// resume a *pending* task after a snapshot restore (see
+/// [`Sandbox::restore_async_tasks`]).
+type ToolFactory = Arc<dyn Fn(serde_json::Value) -> ToolFuture + Send + Sync>;
+
+/// Build an async-tool factory from a synchronous, potentially-blocking
+/// handler by running it on Tokio's blocking thread pool
+/// ([`tokio::task::spawn_blocking`]). Used for `__hl_sleep`, whose timer wait
+/// (and socket-readiness poll) is a genuinely blocking operation: the guest
+/// call yields a completion token immediately and the wait runs off the vCPU
+/// thread, so it never stalls the host executor.
+///
+/// The networking tools no longer use this — they are natively async on
+/// Tokio's `net` reactor (see [`register_net_tools`]).
+///
+/// The handler must be `Clone` (it is re-invoked once per call) and must not
+/// hold any lock across the blocking call.
+fn blocking_tool_factory<H>(handler: H) -> ToolFactory
+where
+    H: Fn(serde_json::Value) -> Result<serde_json::Value> + Clone + Send + Sync + 'static,
+{
+    Arc::new(move |args| {
+        let h = handler.clone();
+        Box::pin(async move {
+            match tokio::task::spawn_blocking(move || h(args)).await {
+                Ok(res) => res,
+                Err(e) => Err(anyhow!("blocking tool task failed: {e}")),
+            }
+        })
+    })
+}
+
+/// State of an in-flight async tool call, keyed by its completion token.
+#[derive(Debug)]
+enum PendingState {
+    /// The future is still being driven by `drive_host_functions`.
+    Running,
+    /// The future has resolved; the next `poll` batch delivers this to the
+    /// guest (`Ok` → `{"result": …}`, `Err` → `{"error": …}`).
+    Ready(std::result::Result<serde_json::Value, String>),
+}
+
+/// A tracked async task: the originating tool `name` and `args` plus its
+/// current [`PendingState`]. Held in the shared `pending` map so a checkpoint
+/// can capture every in-flight (`Running`) and completed-but-undelivered
+/// (`Ready`) task, including enough information to resume or re-deliver it on
+/// restore (see [`Sandbox::export_async_tasks`] /
+/// [`Sandbox::restore_async_tasks`]).
+struct PendingTask {
+    /// The async tool that was invoked (e.g. `net_recv`).
+    name: String,
+    /// The JSON arguments the guest passed — enough to re-invoke the tool.
+    args: serde_json::Value,
+    /// Whether the task is still running or has a result waiting for delivery.
+    state: PendingState,
+}
+
+/// The registry-side (synchronous, vCPU-thread) half of async tool support.
+///
+/// Lives inside [`ToolRegistry`] so [`ToolRegistry::dispatch`] can, entirely
+/// synchronously, turn a call to an async tool into a fresh completion token +
+/// a queued future + a yield sentinel. It never blocks on a future — the
+/// futures are driven off-thread by [`Sandbox::drive_host_functions`], which
+/// shares `pending`/`queue`; their results are delivered to the guest in the
+/// next `poll` batch (see [`Sandbox::drain_completion_batch`]).
+struct AsyncDispatch {
+    factories: HashMap<String, ToolFactory>,
+    pending: Arc<Mutex<HashMap<String, PendingTask>>>,
+    queue: Arc<Mutex<std::collections::VecDeque<(String, ToolFuture)>>>,
+    next_token: Arc<AtomicU64>,
+}
+
+impl AsyncDispatch {
+    /// Returns `Some(sentinel)` if `name` is a registered async tool: mints a
+    /// completion token, queues the future to be driven off-thread, and returns
+    /// the yield sentinel `{"__hl_yield__": token}`. The guest parks on the
+    /// token; once the future resolves, the result is delivered in the next
+    /// `poll` batch (see [`Sandbox::drain_completion_batch`]). Returns `None`
+    /// for any other name so it falls through to the synchronous tool table.
+    fn dispatch_async(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        if let Some(factory) = self.factories.get(name) {
+            // First call: mint a token, queue the future, park via a yield.
+            let token = format!(
+                "__hlasync-{}",
+                self.next_token.fetch_add(1, Ordering::Relaxed)
+            );
+            let fut = factory(args.clone());
+            self.queue.lock().unwrap().push_back((token.clone(), fut));
+            self.pending.lock().unwrap().insert(
+                token.clone(),
+                PendingTask {
+                    name: name.to_string(),
+                    args: args.clone(),
+                    state: PendingState::Running,
+                },
+            );
+            Ok(Some(serde_json::json!({ "__hl_yield__": token })))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// The sandbox-side (async, off-vCPU) half of async tool support: owns the
+/// running futures. Shares `pending`/`queue` with the [`AsyncDispatch`] in the
+/// registry. Driven by [`Sandbox::drive_host_functions`].
+struct AsyncToolState {
+    pending: Arc<Mutex<HashMap<String, PendingTask>>>,
+    queue: Arc<Mutex<std::collections::VecDeque<(String, ToolFuture)>>>,
+    join_set: tokio::task::JoinSet<(String, Result<serde_json::Value>)>,
+    /// Clone of the registry's async-tool factories, so a task that was still
+    /// `Running` at snapshot time can be re-invoked (with its saved args) to
+    /// resume on restore (see [`Sandbox::restore_async_tasks`]).
+    factories: HashMap<String, ToolFactory>,
+}
+
+impl AsyncToolState {
+    /// Serialize every tracked task (pending + completed-but-undelivered) into
+    /// `{"tasks": [ … ]}`. Backing implementation of
+    /// [`Sandbox::export_async_tasks`] — see that method for the entry shapes.
+    fn export_tasks(&self) -> serde_json::Value {
+        use serde_json::json;
+        let pending = self.pending.lock().unwrap();
+        let tasks: Vec<serde_json::Value> = pending
+            .iter()
+            .map(|(token, task)| match &task.state {
+                PendingState::Running => json!({
+                    "token": token,
+                    "name": task.name,
+                    "args": task.args,
+                    "status": "pending",
+                }),
+                PendingState::Ready(Ok(v)) => json!({
+                    "token": token,
+                    "name": task.name,
+                    "args": task.args,
+                    "status": "completed",
+                    "result": v,
+                }),
+                PendingState::Ready(Err(e)) => json!({
+                    "token": token,
+                    "name": task.name,
+                    "args": task.args,
+                    "status": "completed",
+                    "error": e,
+                }),
+            })
+            .collect();
+        json!({ "tasks": tasks })
+    }
+
+    /// Repopulate the tracker from an [`export_tasks`](Self::export_tasks)
+    /// value. Backing implementation of [`Sandbox::restore_async_tasks`] — see
+    /// that method for the per-task restore rules.
+    fn restore_tasks(&mut self, data: &serde_json::Value) -> Result<()> {
+        let tasks = data["tasks"]
+            .as_array()
+            .ok_or_else(|| anyhow!("task snapshot missing 'tasks' array"))?;
+
+        for entry in tasks {
+            let token = entry["token"]
+                .as_str()
+                .ok_or_else(|| anyhow!("task entry missing 'token'"))?
+                .to_string();
+            let name = entry["name"].as_str().unwrap_or("").to_string();
+            let args = entry
+                .get("args")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let status = entry["status"].as_str().unwrap_or("pending");
+
+            let state = if status == "completed" {
+                // Result already computed pre-checkpoint — restore it verbatim
+                // so the next poll batch re-delivers it.
+                if let Some(err) = entry.get("error").and_then(|e| e.as_str()) {
+                    PendingState::Ready(Err(err.to_string()))
+                } else {
+                    let result = entry
+                        .get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    PendingState::Ready(Ok(result))
+                }
+            } else if let Some(factory) = self.factories.get(&name) {
+                // Pending and the tool still exists — re-invoke it with the
+                // saved args so the work resumes off the vCPU thread.
+                let fut = factory(args.clone());
+                self.queue.lock().unwrap().push_back((token.clone(), fut));
+                PendingState::Running
+            } else {
+                // Pending but the tool can't be re-driven after restore
+                // (e.g. a user async tool, not re-registered): deliver an error
+                // so the guest unparks rather than hanging on a dead token.
+                PendingState::Ready(Err(format!(
+                    "async task '{name}' could not be resumed after restore"
+                )))
+            };
+
+            self.pending
+                .lock()
+                .unwrap()
+                .insert(token, PendingTask { name, args, state });
+        }
+        Ok(())
     }
 }
 
@@ -1079,13 +1385,13 @@ fn register_internal_tools(
     });
     // Cooperative poll model: the guest reports the nanoseconds until its
     // next scheduler wakeup (0 = no pending timer) right before it yields
-    // the vCPU back to the host. `poll_step` reads this to decide how long
+    // the vCPU back to the host. `poll` reads this to decide how long
     // to wait before the next `poll`. See plat/hyperlight/poll.c.
     let pd = poll_deadline.clone();
     tools.register("__hl_poll_yield", move |args| {
         let ns = args["ns"].as_u64().unwrap_or(0) & POLL_DEADLINE_MASK;
         // Preserve the exit bit if __hl_exit already fired this call, and set
-        // the yielded bit so poll_step can tell a real idle-yield apart from a
+        // the yielded bit so `poll` can tell a real idle-yield apart from a
         // bare HALT (see POLL_YIELDED_BIT).
         let cur = pd.load(Ordering::Relaxed) & POLL_EXITED_BIT;
         pd.store(cur | POLL_YIELDED_BIT | ns, Ordering::Relaxed);
@@ -1096,16 +1402,23 @@ fn register_internal_tools(
 
     let sc = sleep_cancel.clone();
     let st_for_sleep = socket_table.clone();
-    tools.register("__hl_sleep", move |args| {
-        let ns = args["ns"].as_u64().unwrap_or(0).min(MAX_SLEEP_NS);
-        if ns > 0 {
-            if let Some(ref table) = st_for_sleep {
-                return hl_sleep_poll_sockets(&sc, table, ns);
+    // Async: the sleep runs off the vCPU thread (blocking pool via
+    // `spawn_blocking`) and is driven to completion by
+    // `Sandbox::drive_host_functions`. Requires the cooperative poll / yield
+    // driver loop — there is no synchronous fallback.
+    tools.register_async_factory(
+        "__hl_sleep",
+        blocking_tool_factory(move |args| {
+            let ns = args["ns"].as_u64().unwrap_or(0).min(MAX_SLEEP_NS);
+            if ns > 0 {
+                if let Some(ref table) = st_for_sleep {
+                    return hl_sleep_poll_sockets(&sc, table, ns);
+                }
+                sc.wait(Duration::from_nanos(ns));
             }
-            sc.wait(Duration::from_nanos(ns));
-        }
-        Ok(serde_json::json!({}))
-    });
+            Ok(serde_json::json!({}))
+        }),
+    );
 
     if let (Some(policy), Some(ref table)) = (network, &socket_table) {
         register_net_tools(tools, policy, listen_ports, table.clone());
@@ -1119,10 +1432,96 @@ fn register_internal_tools(
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::SocketAddr;
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
+
+/// A connected/bound socket wrapped in the appropriate Tokio type for
+/// datagram-vs-stream I/O. Built on demand from a `socket2` dup by
+/// [`dup_into_tokio`].
+enum TokioSock {
+    Tcp(TcpStream),
+    Udp(UdpSocket),
+}
+
+/// Duplicate the socket behind `fd` out of the table and return the dup plus
+/// its recorded `sock_type`, dropping the table lock before the caller awaits.
+///
+/// Every dup shares the same underlying kernel socket object, so connection
+/// state established on a dup (connect, the accepted stream, a UDP peer) is
+/// reflected on the table's original fd, and closing the dup afterwards leaves
+/// the socket open as long as the table still references it. Only one I/O op
+/// per socket is ever in flight (single guest thread), so the dup can't race.
+fn dup_socket(table: &Mutex<SocketTable>, fd: u64) -> Result<(Socket, i32)> {
+    let tbl = table.lock().unwrap();
+    let sock = tbl.get_socket(fd)?.try_clone()?;
+    let sock_type = tbl.get_sock_type(fd)?;
+    Ok((sock, sock_type))
+}
+
+/// Convert a `socket2` dup into a Tokio stream/datagram socket for async I/O.
+/// Sets the dup non-blocking (a prerequisite for the Tokio reactor); this only
+/// affects the shared kernel socket's blocking mode, not its socket options.
+fn dup_into_tokio(sock: Socket, sock_type: i32) -> std::io::Result<TokioSock> {
+    sock.set_nonblocking(true)?;
+    // SOCK_DGRAM = 2
+    if sock_type == 2 {
+        let std: std::net::UdpSocket = sock.into();
+        Ok(TokioSock::Udp(UdpSocket::from_std(std)?))
+    } else {
+        let std: std::net::TcpStream = sock.into();
+        Ok(TokioSock::Tcp(TcpStream::from_std(std)?))
+    }
+}
+
+/// Convert a `socket2` dup into a not-yet-connected Tokio [`TcpSocket`] so an
+/// async `connect` preserves any binds/sockopts already applied to the socket.
+fn dup_into_tcp_socket(sock: Socket) -> std::io::Result<TcpSocket> {
+    sock.set_nonblocking(true)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        Ok(unsafe { TcpSocket::from_raw_fd(sock.into_raw_fd()) })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+        Ok(unsafe { TcpSocket::from_raw_socket(sock.into_raw_socket()) })
+    }
+}
+
+/// Await a socket I/O future bounded by [`SOCKET_TIMEOUT`], mapping an expiry
+/// to a `WouldBlock` error so the guest sees the same error class it did under
+/// the previous `SO_*TIMEO`-based blocking implementation.
+async fn io_timeout<T>(fut: impl std::future::Future<Output = std::io::Result<T>>) -> Result<T> {
+    match tokio::time::timeout(SOCKET_TIMEOUT, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(anyhow!(std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        ))),
+    }
+}
 
 struct HostSocket {
     socket: Socket,
     sock_type: i32,
+    /// Address this socket is bound to, if it has been `bind()`-ed.
+    /// Recorded so listening sockets can be re-created on restore (the
+    /// host socket table is not part of the guest snapshot).
+    bound_addr: Option<SocketAddr>,
+    /// `listen()` backlog, set once the socket becomes a listener.
+    /// `Some` marks this entry as a listener for [`SocketTable::export_listeners`].
+    listen_backlog: Option<i32>,
+}
+
+impl HostSocket {
+    fn new(socket: Socket, sock_type: i32) -> Self {
+        Self {
+            socket,
+            sock_type,
+            bound_addr: None,
+            listen_backlog: None,
+        }
+    }
 }
 
 /// Maximum number of IPs learned from DNS responses for AllowList policy.
@@ -1170,6 +1569,109 @@ impl SocketTable {
 
     fn get_sock_type(&self, fd: u64) -> Result<i32> {
         Ok(self.get(fd)?.sock_type)
+    }
+
+    fn get_mut(&mut self, fd: u64) -> Result<&mut HostSocket> {
+        self.sockets
+            .get_mut(&fd)
+            .ok_or_else(|| anyhow!("bad_fd: {}", fd))
+    }
+
+    /// Serialize the currently-listening sockets (and the id counter)
+    /// to JSON so they can be re-created on the host after a restore.
+    ///
+    /// Only listening sockets are exported: a checkpoint of an idle
+    /// server has just its listener(s) open, and established/accepted
+    /// connections cannot be revived across a restore anyway. The guest
+    /// keeps using the same fd (= table id) for its listener, so we must
+    /// re-create each listener under its original id.
+    fn export_listeners(&self) -> serde_json::Value {
+        use serde_json::json;
+        let listeners: Vec<serde_json::Value> = self
+            .sockets
+            .iter()
+            .filter_map(|(id, sock)| {
+                let backlog = sock.listen_backlog?;
+                let addr = sock.bound_addr?;
+                let family: i32 = match addr {
+                    SocketAddr::V4(_) => 2,
+                    SocketAddr::V6(_) => 10,
+                };
+                Some(json!({
+                    "id": id,
+                    "family": family,
+                    "sock_type": sock.sock_type,
+                    "addr": addr.ip().to_string(),
+                    "port": addr.port(),
+                    "backlog": backlog,
+                }))
+            })
+            .collect();
+        json!({ "next_id": self.next_id, "listeners": listeners })
+    }
+
+    /// Re-create listening sockets described by [`Self::export_listeners`]
+    /// and re-insert them under their original ids, restoring `next_id`.
+    /// Called on restore, before the guest resumes, so the resumed guest
+    /// finds its listener fds backed by real, bound, listening sockets.
+    fn restore_listeners(&mut self, data: &serde_json::Value) -> Result<()> {
+        let listeners = data["listeners"]
+            .as_array()
+            .ok_or_else(|| anyhow!("listener snapshot missing 'listeners' array"))?;
+        for entry in listeners {
+            let id = entry["id"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("listener entry missing 'id'"))?;
+            let family = entry["family"].as_i64().unwrap_or(2) as i32;
+            let sock_type = entry["sock_type"].as_i64().unwrap_or(1) as i32;
+            let backlog = entry["backlog"].as_i64().unwrap_or(128) as i32;
+            let addr = parse_sockaddr(entry)?;
+
+            let domain = match family {
+                2 => Domain::IPV4,
+                10 => Domain::IPV6,
+                _ => {
+                    return Err(anyhow!(
+                        "unsupported family {} in listener snapshot",
+                        family
+                    ))
+                }
+            };
+            let stype = match sock_type {
+                1 => Type::STREAM,
+                2 => Type::DGRAM,
+                _ => {
+                    return Err(anyhow!(
+                        "unsupported type {} in listener snapshot",
+                        sock_type
+                    ))
+                }
+            };
+            let sock = Socket::new(domain, stype, None)?;
+            // The original listener's host port may still be in TIME_WAIT
+            // from the torn-down VM; allow rebinding it immediately.
+            sock.set_reuse_address(true)?;
+            sock.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+            sock.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+            let sa: SockAddr = addr.into();
+            sock.bind(&sa)
+                .map_err(|e| anyhow!("re-binding restored listener to {addr}: {e}"))?;
+            sock.listen(backlog)
+                .map_err(|e| anyhow!("re-listening restored listener on {addr}: {e}"))?;
+            self.sockets.insert(
+                id,
+                HostSocket {
+                    socket: sock,
+                    sock_type,
+                    bound_addr: Some(addr),
+                    listen_backlog: Some(backlog),
+                },
+            );
+        }
+        if let Some(next_id) = data["next_id"].as_u64() {
+            self.next_id = self.next_id.max(next_id);
+        }
+        Ok(())
     }
 
     fn remove(&mut self, fd: u64) -> Result<()> {
@@ -1355,27 +1857,37 @@ fn handle_net_socket(
     let sock = Socket::new(domain, stype, proto)?;
     sock.set_read_timeout(Some(SOCKET_TIMEOUT))?;
     sock.set_write_timeout(Some(SOCKET_TIMEOUT))?;
-    let fd = table.lock().unwrap().insert(HostSocket {
-        socket: sock,
-        sock_type,
-    })?;
+    let fd = table
+        .lock()
+        .unwrap()
+        .insert(HostSocket::new(sock, sock_type))?;
     Ok(json!({ "fd": fd }))
 }
 
-fn handle_net_connect(
-    table: &Mutex<SocketTable>,
-    policy: &NetworkPolicy,
-    args: &serde_json::Value,
+async fn handle_net_connect(
+    table: Arc<Mutex<SocketTable>>,
+    policy: Arc<NetworkPolicy>,
+    args: serde_json::Value,
 ) -> Result<serde_json::Value> {
     use serde_json::json;
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-    let addr = parse_sockaddr(args)?;
+    let addr = parse_sockaddr(&args)?;
     policy.check(&addr)?;
-    let sa: SockAddr = addr.into();
-    let tbl = table.lock().unwrap();
-    let sock = tbl.get_socket(fd)?;
-    sock.connect_timeout(&sa, SOCKET_TIMEOUT)?;
+    // Dup the socket out and drop the table lock before the async connect, so
+    // the lock is never held across an await. The dup shares the kernel socket,
+    // so the connection it establishes is visible on the table's fd.
+    let (sock, sock_type) = dup_socket(&table, fd)?;
+    if sock_type == 2 {
+        // UDP connect just records the default peer; it returns immediately
+        // and needs no reactor round-trip.
+        sock.connect(&addr.into())?;
+        return Ok(json!({}));
+    }
+    let tsock = dup_into_tcp_socket(sock)?;
+    // The returned TcpStream is dropped: closing the dup leaves the connection
+    // open on the shared kernel socket (still referenced by the table's fd).
+    io_timeout(tsock.connect(addr)).await?;
     Ok(json!({}))
 }
 
@@ -1393,9 +1905,19 @@ fn handle_net_bind(
         None => return Err(anyhow!("Permission denied: no --port specified for bind")),
     }
     let sa: SockAddr = addr.into();
-    let tbl = table.lock().unwrap();
-    let sock = tbl.get_socket(fd)?;
-    sock.bind(&sa)?;
+    let mut tbl = table.lock().unwrap();
+    let hs = tbl.get_mut(fd)?;
+    hs.socket.bind(&sa)?;
+    // Record the actual bound address so this listener can be re-created
+    // under the same fd on restore. Prefer the kernel-assigned local
+    // address (handles ephemeral port 0) and fall back to the request.
+    let local = hs
+        .socket
+        .local_addr()
+        .ok()
+        .and_then(|a| a.as_socket())
+        .unwrap_or(addr);
+    hs.bound_addr = Some(local);
     Ok(json!({}))
 }
 
@@ -1407,47 +1929,54 @@ fn handle_net_listen(
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
     let backlog = args["backlog"].as_i64().unwrap_or(128) as i32;
-    let tbl = table.lock().unwrap();
-    let sock = tbl.get_socket(fd)?;
-    sock.listen(backlog)?;
+    let mut tbl = table.lock().unwrap();
+    let hs = tbl.get_mut(fd)?;
+    hs.socket.listen(backlog)?;
+    hs.listen_backlog = Some(backlog);
     Ok(json!({}))
 }
 
-fn handle_net_accept(
-    table: &Mutex<SocketTable>,
-    args: &serde_json::Value,
+async fn handle_net_accept(
+    table: Arc<Mutex<SocketTable>>,
+    args: serde_json::Value,
 ) -> Result<serde_json::Value> {
     use serde_json::json;
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-    let (new_sock, peer, parent_type) = {
-        let tbl = table.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        let (s, p) = sock.accept()?;
-        let st = tbl.get_sock_type(fd)?;
-        (s, p, st)
-    };
+    // Dup the listener out and drop the table lock before the async accept.
+    let (listener_sock, parent_type) = dup_socket(&table, fd)?;
+    listener_sock.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = listener_sock.into();
+    let listener = TcpListener::from_std(std_listener)?;
+    // No artificial timeout: a server parked on accept waits indefinitely and
+    // is woken by the reactor when a connection arrives. Cancellation happens
+    // naturally if the driving future is dropped.
+    let (stream, peer) = listener.accept().await?;
+    // Hand the accepted connection to the table as a blocking socket2 socket so
+    // the sync handlers (getpeername, setsockopt, …) keep working on it.
+    let std_stream = stream.into_std()?;
+    let new_sock = Socket::from(std_stream);
+    new_sock.set_nonblocking(false)?;
     new_sock.set_read_timeout(Some(SOCKET_TIMEOUT))?;
     new_sock.set_write_timeout(Some(SOCKET_TIMEOUT))?;
-    let peer_addr: Option<SocketAddr> = peer.as_socket();
-    let new_fd = table.lock().unwrap().insert(HostSocket {
-        socket: new_sock,
-        sock_type: parent_type,
-    })?;
-    let mut resp = json!({ "fd": new_fd });
-    if let Some(pa) = peer_addr {
-        resp["addr"] = json!(pa.ip().to_string());
-        resp["port"] = json!(pa.port());
-    }
-    Ok(resp)
+    let new_fd = table
+        .lock()
+        .unwrap()
+        .insert(HostSocket::new(new_sock, parent_type))?;
+    Ok(json!({
+        "fd": new_fd,
+        "addr": peer.ip().to_string(),
+        "port": peer.port(),
+    }))
 }
 
-fn handle_net_send(
-    table: &Mutex<SocketTable>,
-    args: &serde_json::Value,
+async fn handle_net_send(
+    table: Arc<Mutex<SocketTable>>,
+    args: serde_json::Value,
 ) -> Result<serde_json::Value> {
     use base64::Engine;
     use serde_json::json;
+    use tokio::io::AsyncWriteExt;
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
     let data_b64 = args["data"]
@@ -1463,19 +1992,22 @@ fn handle_net_send(
             MAX_NET_SEND
         ));
     }
-    let tbl = table.lock().unwrap();
-    let sock = tbl.get_socket(fd)?;
-    let sent = sock.send(&data)?;
+    let (sock, sock_type) = dup_socket(&table, fd)?;
+    let sent = match dup_into_tokio(sock, sock_type)? {
+        TokioSock::Tcp(mut s) => io_timeout(s.write(&data)).await?,
+        TokioSock::Udp(u) => io_timeout(u.send(&data)).await?,
+    };
     Ok(json!({ "sent": sent }))
 }
 
-fn handle_net_sendto(
-    table: &Mutex<SocketTable>,
-    policy: &NetworkPolicy,
-    args: &serde_json::Value,
+async fn handle_net_sendto(
+    table: Arc<Mutex<SocketTable>>,
+    policy: Arc<NetworkPolicy>,
+    args: serde_json::Value,
 ) -> Result<serde_json::Value> {
     use base64::Engine;
     use serde_json::json;
+    use tokio::io::AsyncWriteExt;
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
     let data_b64 = args["data"]
@@ -1491,76 +2023,85 @@ fn handle_net_sendto(
             MAX_NET_SEND
         ));
     }
-    let addr = parse_sockaddr(args)?;
+    let addr = parse_sockaddr(&args)?;
     policy.check(&addr)?;
-    let sa: SockAddr = addr.into();
-    let tbl = table.lock().unwrap();
-    let sock = tbl.get_socket(fd)?;
-    let sent = sock.send_to(&data, &sa)?;
+    let (sock, sock_type) = dup_socket(&table, fd)?;
+    // The guest uses `sendto` generically: for a connected stream socket the
+    // destination is implicit (send to the peer), for a datagram socket it is
+    // the supplied address.
+    let sent = match dup_into_tokio(sock, sock_type)? {
+        TokioSock::Tcp(mut s) => io_timeout(s.write(&data)).await?,
+        TokioSock::Udp(u) => io_timeout(u.send_to(&data, addr)).await?,
+    };
     Ok(json!({ "sent": sent }))
 }
 
-fn handle_net_recv(
-    table: &Mutex<SocketTable>,
-    args: &serde_json::Value,
+async fn handle_net_recv(
+    table: Arc<Mutex<SocketTable>>,
+    args: serde_json::Value,
 ) -> Result<serde_json::Value> {
     use base64::Engine;
     use serde_json::json;
+    use tokio::io::AsyncReadExt;
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-    let len = args["len"].as_u64().unwrap_or(4096) as usize;
-    let mut buf = vec![std::mem::MaybeUninit::uninit(); len.min(65536)];
-    let tbl = table.lock().unwrap();
-    let sock = tbl.get_socket(fd)?;
-    let n = sock.recv(&mut buf)?;
-    let data: Vec<u8> = buf[..n]
-        .iter()
-        .map(|b| unsafe { b.assume_init() })
-        .collect();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+    let len = (args["len"].as_u64().unwrap_or(4096) as usize).min(65536);
+    let (sock, sock_type) = dup_socket(&table, fd)?;
+    let mut buf = vec![0u8; len];
+    // No artificial timeout: a guest parked on recv waits indefinitely for
+    // data and is woken by the reactor; the driving future can be dropped to
+    // cancel.
+    let n = match dup_into_tokio(sock, sock_type)? {
+        TokioSock::Tcp(mut s) => s.read(&mut buf).await?,
+        TokioSock::Udp(u) => u.recv(&mut buf).await?,
+    };
+    buf.truncate(n);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
     Ok(json!({ "data": encoded, "len": n }))
 }
 
-fn handle_net_recvfrom(
-    table: &Mutex<SocketTable>,
-    policy: &NetworkPolicy,
-    args: &serde_json::Value,
+async fn handle_net_recvfrom(
+    table: Arc<Mutex<SocketTable>>,
+    policy: Arc<NetworkPolicy>,
+    args: serde_json::Value,
 ) -> Result<serde_json::Value> {
     use base64::Engine;
     use serde_json::json;
+    use tokio::io::AsyncReadExt;
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-    let len = args["len"].as_u64().unwrap_or(4096) as usize;
-    let mut buf = vec![0u8; len.min(65536)];
-
-    let buf_init =
-        unsafe { &mut *(buf.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) };
-
-    let (n, peer) = {
-        let tbl = table.lock().unwrap();
-        let sock = tbl.get_socket(fd)?;
-        sock.recv_from(buf_init)?
+    let len = (args["len"].as_u64().unwrap_or(4096) as usize).min(65536);
+    let (sock, sock_type) = dup_socket(&table, fd)?;
+    let mut buf = vec![0u8; len];
+    // The guest uses `recvfrom` generically: for a connected stream socket the
+    // source is the peer, for a datagram socket it comes from `recv_from`.
+    // No artificial timeout (see handle_net_recv).
+    let (n, peer) = match dup_into_tokio(sock, sock_type)? {
+        TokioSock::Tcp(mut s) => {
+            let peer = s.peer_addr()?;
+            let n = s.read(&mut buf).await?;
+            (n, peer)
+        }
+        TokioSock::Udp(u) => u.recv_from(&mut buf).await?,
     };
     buf.truncate(n);
 
     // Learn IPs from DNS responses so AllowList stays current with
     // anycast/CDN rotation (guest may resolve via a different DNS
     // server than the host, getting different IPs for the same name).
-    if let Some(pa) = peer.as_socket() {
-        if pa.port() == 53 {
-            if let NetworkPolicy::AllowList(al) = policy {
-                learn_ips_from_dns_response(&buf, al);
-            }
+    if peer.port() == 53 {
+        if let NetworkPolicy::AllowList(al) = &*policy {
+            learn_ips_from_dns_response(&buf, al);
         }
     }
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
-    let mut resp = json!({ "data": encoded, "len": n });
-    if let Some(pa) = peer.as_socket() {
-        resp["addr"] = json!(pa.ip().to_string());
-        resp["port"] = json!(pa.port());
-    }
-    Ok(resp)
+    Ok(json!({
+        "data": encoded,
+        "len": n,
+        "addr": peer.ip().to_string(),
+        "port": peer.port(),
+    }))
 }
 
 fn handle_net_close(
@@ -1885,7 +2426,7 @@ fn hl_sleep_poll_sockets(
         .values()
         .map(|hs| libc::pollfd {
             fd: hs.socket.as_raw_fd(),
-            // Readability/errors only — see wait_for_socket_event: POLLOUT is
+            // Readability/errors only — see wait_readable_or_timeout: POLLOUT is
             // ~always ready on a connected socket and would spin the caller.
             events: libc::POLLIN | libc::POLLERR,
             revents: 0,
@@ -1973,9 +2514,13 @@ fn register_net_tools(
 
     let t = table.clone();
     let pol = policy.clone();
-    tools.register("net_connect", move |args| {
-        handle_net_connect(&t, &pol, &args)
-    });
+    tools.register_async_factory(
+        "net_connect",
+        Arc::new(move |args| {
+            let (t, pol) = (t.clone(), pol.clone());
+            Box::pin(handle_net_connect(t, pol, args))
+        }),
+    );
 
     let t = table.clone();
     let lp = listen_ports.cloned().map(Arc::new);
@@ -1987,23 +2532,51 @@ fn register_net_tools(
     tools.register("net_listen", move |args| handle_net_listen(&t, &args));
 
     let t = table.clone();
-    tools.register("net_accept", move |args| handle_net_accept(&t, &args));
+    tools.register_async_factory(
+        "net_accept",
+        Arc::new(move |args| {
+            let t = t.clone();
+            Box::pin(handle_net_accept(t, args))
+        }),
+    );
 
     let t = table.clone();
-    tools.register("net_send", move |args| handle_net_send(&t, &args));
+    tools.register_async_factory(
+        "net_send",
+        Arc::new(move |args| {
+            let t = t.clone();
+            Box::pin(handle_net_send(t, args))
+        }),
+    );
 
     let t = table.clone();
     let pol = policy.clone();
-    tools.register("net_sendto", move |args| handle_net_sendto(&t, &pol, &args));
+    tools.register_async_factory(
+        "net_sendto",
+        Arc::new(move |args| {
+            let (t, pol) = (t.clone(), pol.clone());
+            Box::pin(handle_net_sendto(t, pol, args))
+        }),
+    );
 
     let t = table.clone();
-    tools.register("net_recv", move |args| handle_net_recv(&t, &args));
+    tools.register_async_factory(
+        "net_recv",
+        Arc::new(move |args| {
+            let t = t.clone();
+            Box::pin(handle_net_recv(t, args))
+        }),
+    );
 
     let t = table.clone();
     let pol = policy.clone();
-    tools.register("net_recvfrom", move |args| {
-        handle_net_recvfrom(&t, &pol, &args)
-    });
+    tools.register_async_factory(
+        "net_recvfrom",
+        Arc::new(move |args| {
+            let (t, pol) = (t.clone(), pol.clone());
+            Box::pin(handle_net_recvfrom(t, pol, args))
+        }),
+    );
 
     let t = table.clone();
     tools.register("net_close", move |args| handle_net_close(&t, &args));
@@ -2371,11 +2944,23 @@ pub struct Sandbox {
     /// Last next-wakeup deadline (ns) reported by the guest `poll`
     /// function via `__hl_poll_yield`. 0 means "no pending timer".
     poll_deadline: Arc<AtomicU64>,
+    /// Absolute deadline derived from `poll_deadline` at the end of each
+    /// [`Sandbox::poll`]: `Some(instant)` when the guest reported a pending
+    /// timer, `None` for an indefinite park (no timer) or exit. Consumed by
+    /// [`Sandbox::drive_host_functions`] as the inter-step wait bound and
+    /// surfaced to callers via [`Sandbox::next_wakeup`]. Storing it as an
+    /// *absolute* instant means any time spent between the two calls is
+    /// subtracted, so the guest's timer still fires on schedule.
+    next_wakeup_at: Option<Instant>,
     /// Shared socket table — cleared on [`Sandbox::restore`] so that
     /// host-side fds don't leak across guest restore cycles.
     socket_table: Option<Arc<Mutex<SocketTable>>>,
     /// Cancellation token for in-progress `__hl_sleep` host calls.
     sleep_cancel: SleepCancel,
+    /// Off-vCPU driver state for async tools (see
+    /// [`SandboxBuilder::tool_async`] / [`Sandbox::drive_host_functions`]).
+    /// `None` unless async tools were registered.
+    async_state: Option<AsyncToolState>,
 }
 
 /// Where the initrd comes from — either a file (zero-copy `map_file_cow`)
@@ -2411,6 +2996,8 @@ pub struct SandboxBuilder {
     listen_ports: Option<ListenPorts>,
     tools: ToolRegistry,
     has_tools: bool,
+    /// Async tool factories registered via [`SandboxBuilder::tool_async`].
+    async_tools: HashMap<String, ToolFactory>,
 }
 
 impl SandboxBuilder {
@@ -2502,13 +3089,67 @@ impl SandboxBuilder {
         self
     }
 
+    /// Register an **async** host function callable from the guest.
+    ///
+    /// Unlike [`tool`](Self::tool), the handler returns a future. When the
+    /// guest calls the tool, the host immediately answers with a yield
+    /// completion token (the guest's calling thread cooperatively parks) and
+    /// the future is driven off the vCPU thread by
+    /// [`Sandbox::drive_host_functions`]. Once it resolves, its result is
+    /// delivered to the guest in the next [`Sandbox::poll`] batch, and the
+    /// original guest call returns — all transparently to guest code.
+    ///
+    /// This enables the target driving loop:
+    /// ```no_run
+    /// # use hyperlight_unikraft::Sandbox;
+    /// # use core::task::Poll;
+    /// # async fn run(mut sandbox: Sandbox) -> anyhow::Result<()> {
+    /// loop {
+    ///     match sandbox.poll()? {
+    ///         Poll::Ready(()) => break,
+    ///         Poll::Pending => sandbox.drive_host_functions().await,
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// The handler must be `Send + Sync + 'static` and its future `Send`, so it
+    /// can be driven on a multi-threaded Tokio runtime.
+    pub fn tool_async<F, Fut>(mut self, name: &str, handler: F) -> Self
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<serde_json::Value>> + Send + 'static,
+    {
+        self.async_tools.insert(
+            name.to_string(),
+            Arc::new(move |args| Box::pin(handler(args))),
+        );
+        self.has_tools = true;
+        self
+    }
+
     /// Boot the VM, run init, and take a post-init snapshot.
-    pub fn build(self) -> Result<Sandbox> {
+    pub fn build(mut self) -> Result<Sandbox> {
         let config = VmConfig {
             heap_size: self.heap_size.unwrap_or(512 * 1024 * 1024),
             stack_size: self.stack_size.unwrap_or(8 * 1024 * 1024),
             io_buffer_size: self.io_buffer_size.unwrap_or(DEFAULT_IO_BUFFER_SIZE),
         };
+
+        // Fold any user async tools (from `tool_async`) into the registry's
+        // async side. The internal tools (`register_internal_tools`, called
+        // inside evolve) add the blocking networking factories to the same
+        // async side, and evolve builds the shared driver state
+        // (`AsyncToolState`) from it — so a single `drive_host_functions`
+        // drives both user and internal async tools.
+        if !self.async_tools.is_empty() {
+            let asy = self.tools.async_side_mut();
+            for (name, factory) in std::mem::take(&mut self.async_tools) {
+                asy.factories.insert(name, factory);
+            }
+            self.has_tools = true;
+        }
+
         let tools = if self.has_tools {
             Some(self.tools)
         } else {
@@ -2516,7 +3157,7 @@ impl SandboxBuilder {
         };
         let net = self.network.as_ref();
         let lp = self.listen_ports.as_ref();
-        match self.initrd {
+        let sandbox = match self.initrd {
             Some(InitrdSource::File(path)) => Sandbox::evolve_mapped(
                 &self.kernel,
                 Some(&path),
@@ -2547,7 +3188,8 @@ impl SandboxBuilder {
                 net,
                 lp,
             ),
-        }
+        }?;
+        Ok(sandbox)
     }
 }
 
@@ -2567,6 +3209,7 @@ impl Sandbox {
             listen_ports: None,
             tools: ToolRegistry::new(),
             has_tools: false,
+            async_tools: HashMap::new(),
         }
     }
 
@@ -2606,13 +3249,22 @@ impl Sandbox {
             network,
             listen_ports,
         );
+        let async_state = tools.make_async_state();
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
         usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(usbox, None, exit_code, poll_deadline, sleep_cancel, socket_table)
+        Self::finish_evolve(
+            usbox,
+            None,
+            exit_code,
+            poll_deadline,
+            sleep_cancel,
+            socket_table,
+            async_state,
+        )
     }
 
     /// Low-level: boot with a zero-copy mapped initrd file. Prefer the builder.
@@ -2672,6 +3324,7 @@ impl Sandbox {
             network,
             listen_ports,
         );
+        let async_state = tools.make_async_state();
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
         usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
@@ -2685,6 +3338,7 @@ impl Sandbox {
             poll_deadline,
             sleep_cancel,
             socket_table,
+            async_state,
         )
     }
 
@@ -2695,6 +3349,7 @@ impl Sandbox {
         poll_deadline: Arc<AtomicU64>,
         sleep_cancel: SleepCancel,
         socket_table: Option<Arc<Mutex<SocketTable>>>,
+        async_state: Option<AsyncToolState>,
     ) -> Result<Self> {
         let mut inner = usbox.evolve()?;
         let snapshot = inner.snapshot().ok();
@@ -2704,8 +3359,10 @@ impl Sandbox {
             initrd_path,
             exit_code,
             poll_deadline,
+            next_wakeup_at: None,
             socket_table,
             sleep_cancel,
+            async_state,
         })
     }
 
@@ -2724,6 +3381,7 @@ impl Sandbox {
         if let Some(ref table) = self.socket_table {
             table.lock().unwrap().clear();
         }
+        self.next_wakeup_at = None;
         Ok(())
     }
 
@@ -2739,192 +3397,213 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Run one cooperative poll step.
+    /// Run one cooperative poll step, reported as a [`core::task::Poll`].
     ///
-    /// Invokes the guest `poll` function, which pumps the unikernel
-    /// scheduler until it would go idle, then yields the vCPU back to the
-    /// host (a HALT), reporting the nanoseconds until its next scheduled
-    /// wakeup. Guest memory persists across the HALT/re-entry boundary, so
-    /// repeatedly calling `poll_step` drives the guest forward
-    /// cooperatively.
+    /// Invokes the guest `poll` function, which pumps the unikernel scheduler
+    /// until it would go idle, then yields the vCPU back to the host (a HALT),
+    /// reporting the nanoseconds until its next scheduled wakeup. Guest memory
+    /// persists across the HALT/re-entry boundary, so repeatedly calling `poll`
+    /// drives the guest forward cooperatively.
     ///
-    /// The returned [`PollStatus`] tells the caller what to do next:
-    /// - [`PollStatus::Done`] — the guest exited; stop polling.
-    /// - [`PollStatus::Wait`] — re-poll after the given delay (or sooner if
-    ///   external input arrives, e.g. via [`SleepCancel::cancel`]).
-    /// - [`PollStatus::Idle`] — no pending timer; re-poll when external
-    ///   input is available.
+    /// - [`Poll::Ready(())`](core::task::Poll::Ready) — the guest exited; stop
+    ///   polling.
+    /// - [`Poll::Pending`](core::task::Poll::Pending) — the guest yielded and
+    ///   should be driven again after [`Sandbox::drive_host_functions`]. Query
+    ///   [`Sandbox::next_wakeup`] for the time until its pending timer (if any).
+    ///
+    /// This is the ergonomic entry point for the async-tools driving loop; see
+    /// [`SandboxBuilder::tool_async`] for the full loop shape.
     ///
     /// Requires a prior `restore()` to reset guest state before the first
     /// step of a fresh run.
-    pub fn poll_step(&mut self) -> Result<PollStatus> {
+    /// Drain every resolved async-tool result into the JSON batch object the
+    /// guest `poll` function receives as its argument:
+    /// `{"<token>": {"result": …} | {"error": …}, …}`. Each entry is removed
+    /// from the shared pending map as it is drained (delivered exactly once).
+    /// Returns `"{}"` when nothing has completed or no async tools exist. The
+    /// per-token value shape matches what the guest kernel copies verbatim into
+    /// the parked op's response buffer (see `hyperlight_hcall_deliver_batch`).
+    fn drain_completion_batch(&mut self) -> String {
+        let mut map = serde_json::Map::new();
+        if let Some(st) = self.async_state.as_ref() {
+            let mut pending = st.pending.lock().unwrap();
+            let ready: Vec<String> = pending
+                .iter()
+                .filter(|(_, t)| matches!(t.state, PendingState::Ready(_)))
+                .map(|(t, _)| t.clone())
+                .collect();
+            for token in ready {
+                if let Some(PendingTask {
+                    state: PendingState::Ready(res),
+                    ..
+                }) = pending.remove(&token)
+                {
+                    let value = match res {
+                        Ok(v) => serde_json::json!({ "result": v }),
+                        Err(e) => serde_json::json!({ "error": e }),
+                    };
+                    map.insert(token, value);
+                }
+            }
+        }
+        serde_json::Value::Object(map).to_string()
+    }
+
+    pub fn poll(&mut self) -> Result<core::task::Poll<()>> {
+        use core::task::Poll;
         // Clear the deadline atomic so a stale value from a previous step
         // can't be misread; the guest sets it during this call via
         // __hl_poll_yield / __hl_exit.
         self.poll_deadline.store(0, Ordering::Relaxed);
-        let _: () = self.inner.call("poll", ())?;
+        // Pass the batch of completed/errored async host tasks as the guest
+        // `poll` function's argument. The guest kernel routes each token's
+        // result to the matching parked host call (see
+        // plat/hyperlight/poll.c `hyperlight_poll_deliver_arg` and
+        // hcall.c `hyperlight_hcall_deliver_batch`), so a parked call resumes
+        // without ever issuing a follow-up host function. Empty (`{}`) when
+        // nothing has completed since the last step.
+        let batch = self.drain_completion_batch();
+        let _: () = self.inner.call("poll", batch)?;
         let raw = self.poll_deadline.load(Ordering::Relaxed);
+        // Default: no pending host-side timer (exit or indefinite park).
+        // Overwritten below once we know the guest reported a real deadline.
+        self.next_wakeup_at = None;
         // Explicit exit (e.g. the Python driver's __hl_exit) is terminal.
-        if raw & POLL_EXITED_BIT != 0 {
-            return Ok(PollStatus::Done);
-        }
-        // The idle pump sets POLL_YIELDED_BIT every time it hands the vCPU
-        // back cooperatively. If the poll returned without it, the guest
-        // halted (a normal C app exiting via SYSHALT, or an abort) — treat
-        // that as terminal too.
-        if raw & POLL_YIELDED_BIT == 0 {
-            return Ok(PollStatus::Done);
+        // The idle pump also sets POLL_YIELDED_BIT every time it hands the vCPU
+        // back cooperatively; if the poll returned without it, the guest halted
+        // (a normal C app exiting via SYSHALT, or an abort) — terminal too.
+        if raw & POLL_EXITED_BIT != 0 || raw & POLL_YIELDED_BIT == 0 {
+            return Ok(Poll::Ready(()));
         }
         let ns = raw & POLL_DEADLINE_MASK;
-        Ok(if ns == 0 {
-            PollStatus::Idle
-        } else {
-            PollStatus::Wait(Duration::from_nanos(ns))
-        })
-    }
-
-    /// Wait for the next cooperative-poll event after a [`Sandbox::poll_step`].
-    ///
-    /// Drives the inter-step wait in a way that is aware of host-proxied
-    /// sockets, so a guest thread parked on a blocking `recv`/`accept` (which
-    /// yields cooperatively rather than blocking the vCPU) is re-driven
-    /// promptly. Behaviour by [`PollStatus`]:
-    ///
-    /// - [`PollStatus::Wait`] — sleep until the guest's next timer deadline,
-    ///   but return **early** as soon as any host socket becomes readable,
-    ///   writable, or errored.
-    /// - [`PollStatus::Idle`] — the guest has no pending timer; block until a
-    ///   host socket becomes ready (bounded by [`SOCKET_TIMEOUT`]) or, if no
-    ///   sockets are open, until `sleep_cancel` fires.
-    /// - [`PollStatus::Done`] — returns immediately.
-    ///
-    /// After this returns, call [`Sandbox::poll_step`] again: the guest's poll
-    /// pump rescans socket readiness on entry and wakes any parked thread.
-    ///
-    /// Callers serving sockets from a polled guest should use this between
-    /// steps instead of a plain sleep; a bare `sleep(deadline)` would only
-    /// re-check a socket-parked guest on the next timer tick.
-    pub fn poll_wait(&self, status: &PollStatus) {
-        let timeout = match status {
-            PollStatus::Done => return,
-            PollStatus::Wait(d) => Some(*d),
-            PollStatus::Idle => None,
-        };
-        self.wait_for_socket_event(timeout);
-    }
-
-    /// Block until a host socket is ready, `timeout` elapses (`None` = the
-    /// [`SOCKET_TIMEOUT`] cap), or — when no sockets are open — `sleep_cancel`
-    /// fires. Returns immediately if there is nothing to watch and no timeout.
-    #[cfg(unix)]
-    fn wait_for_socket_event(&self, timeout: Option<Duration>) {
-        use std::os::unix::io::AsRawFd;
-
-        let fds: Vec<i32> = match &self.socket_table {
-            Some(t) => t
-                .lock()
-                .unwrap()
-                .sockets
-                .values()
-                .map(|hs| hs.socket.as_raw_fd())
-                .collect(),
-            None => Vec::new(),
-        };
-
-        if fds.is_empty() {
-            // Nothing to watch: fall back to a cancellable sleep so external
-            // input (via SleepCancel::cancel) can still wake the loop.
-            self.sleep_cancel.wait(timeout.unwrap_or(SOCKET_TIMEOUT));
-            return;
+        if ns != 0 {
+            // Capture the deadline as an absolute instant *now* (right after
+            // the poll call), so drive_host_functions() waits only the time
+            // actually remaining even if the caller did work in between.
+            self.next_wakeup_at = Some(Instant::now() + Duration::from_nanos(ns));
         }
+        Ok(Poll::Pending)
+    }
 
-        // Only wait on readability/errors, never POLLOUT. A connected TCP
-        // socket is almost always writable, so including POLLOUT here would
-        // make `poll` return immediately on every iteration while the guest is
-        // parked in `accept`/`recv` (which only care about POLLIN) — a busy
-        // loop. Writability never needs an inter-step wait in this design:
-        // host sockets are blocking, so guest `send`s always complete via a
-        // synchronous `net_send` hcall and the guest never parks on POLLOUT.
-        // Any genuine POLLOUT readiness is satisfied in-step by
-        // hostsock_rescan_events during the next `poll`.
-        let mut pollfds: Vec<libc::pollfd> = fds
-            .iter()
-            .map(|&fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN | libc::POLLERR,
-                revents: 0,
-            })
-            .collect();
+    /// Time remaining until the guest's next scheduled wakeup, as captured by
+    /// the most recent [`Sandbox::poll`].
+    ///
+    /// - `Some(d)` — the guest is parked on a timer; re-poll within `d` (or
+    ///   sooner if external input arrives, e.g. via [`SleepCancel::cancel`]).
+    ///   [`Duration::ZERO`] means the deadline has already elapsed.
+    /// - `None` — after a [`Poll::Pending`](core::task::Poll::Pending) poll,
+    ///   the guest went idle with **no** pending timer (re-poll when external
+    ///   input becomes available); after a
+    ///   [`Poll::Ready`](core::task::Poll::Ready) poll, the guest has exited.
+    pub fn next_wakeup(&self) -> Option<Duration> {
+        self.next_wakeup_at
+            .map(|at| at.saturating_duration_since(Instant::now()))
+    }
 
-        // Idle (no guest timer): block up to the socket cap, then re-poll.
-        let timeout_ms = match timeout {
-            Some(d) => (d.as_millis() as i64).clamp(0, SOCKET_TIMEOUT.as_millis() as i64),
-            None => SOCKET_TIMEOUT.as_millis() as i64,
-        } as libc::c_int;
+    /// Drive host-side async work between [`Sandbox::poll`] steps: registered
+    /// async tools (see [`SandboxBuilder::tool_async`] and the blocking
+    /// networking tools) *and* the inter-step wait for host-socket readiness
+    /// and the guest's next-wakeup timer — all off the vCPU thread.
+    ///
+    /// Call this whenever [`Sandbox::poll`] returns
+    /// [`Poll::Pending`](core::task::Poll::Pending); the canonical loop is:
+    ///
+    /// ```no_run
+    /// # async fn f(mut sbox: hyperlight_unikraft::Sandbox) -> anyhow::Result<()> {
+    /// use core::task::Poll;
+    /// loop {
+    ///     match sbox.poll()? {
+    ///         Poll::Ready(()) => break,
+    ///         Poll::Pending => sbox.drive_host_functions().await,
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Behaviour:
+    ///   1. If any async-tool futures are in flight, absorb newly-submitted
+    ///      ones onto the `JoinSet` and `await` one completion (bounded by the
+    ///      guest's timer deadline), recording the result so the next
+    ///      [`Sandbox::poll`] batch delivers it and the parked guest call
+    ///      resumes.
+    ///   2. Otherwise, `await` until any host socket becomes readable or the
+    ///      guest's timer deadline elapses (the folded-in async inter-step
+    ///      wait), so a guest parked on `accept`/`recv` is re-driven promptly.
+    ///   3. If there is nothing to wait on (indefinite idle, no sockets, no
+    ///      in-flight work), fall back to a bounded sleep so the loop never
+    ///      busy-spins.
+    ///
+    /// Note on sleeping: in the cooperative poll model the guest never issues a
+    /// blocking `__hl_sleep`; it parks on the scheduler and reports its next
+    /// deadline, which step 1/2 above `await` via [`tokio::time::sleep`]. So a
+    /// guest sleep is serviced asynchronously here without ever blocking a host
+    /// thread.
+    pub async fn drive_host_functions(&mut self) {
+        // Time remaining until the guest's next-wakeup deadline captured by the
+        // last poll (`None` = indefinite park / no pending timer). Derived from
+        // the absolute instant, so any time already spent since the poll is
+        // subtracted and the guest's timer still fires on schedule.
+        let remaining = self.next_wakeup();
 
-        let ret = unsafe {
-            libc::poll(
-                pollfds.as_mut_ptr(),
-                pollfds.len() as libc::nfds_t,
-                timeout_ms,
-            )
-        };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EINTR) {
-                // A poll failure shouldn't wedge the loop; fall back to a
-                // short sleep so the caller re-polls the guest.
-                self.sleep_cancel.wait(Duration::from_millis(1));
+        // Step 1: drive in-flight async tool futures, if any.
+        if let Some(st) = self.async_state.as_mut() {
+            // Absorb futures queued by dispatch since the last drive.
+            loop {
+                let next = st.queue.lock().unwrap().pop_front();
+                match next {
+                    Some((token, fut)) => {
+                        st.join_set.spawn(async move { (token, fut.await) });
+                    }
+                    None => break,
+                }
+            }
+
+            if !st.join_set.is_empty() {
+                // Await one completion, bounded by the guest's timer deadline
+                // (if any) so a pending guest timer still fires on time.
+                let completed = match remaining {
+                    None => st.join_set.join_next().await,
+                    Some(dur) => tokio::select! {
+                        out = st.join_set.join_next() => out,
+                        _ = tokio::time::sleep(dur) => None,
+                    },
+                };
+                if let Some(Ok((token, res))) = completed {
+                    let mut pending = st.pending.lock().unwrap();
+                    let state = PendingState::Ready(res.map_err(|e| e.to_string()));
+                    match pending.get_mut(&token) {
+                        // Normal path: flip the tracked task to Ready, keeping
+                        // its recorded name/args for a possible snapshot.
+                        Some(task) => task.state = state,
+                        // No tracked entry (shouldn't happen) — record it so the
+                        // result is still delivered on the next poll batch.
+                        None => {
+                            pending.insert(
+                                token,
+                                PendingTask {
+                                    name: String::new(),
+                                    args: serde_json::Value::Null,
+                                    state,
+                                },
+                            );
+                        }
+                    }
+                }
+                return;
             }
         }
-    }
 
-    /// Windows fallback: socket readiness integration for the poll loop is
-    /// handled through the `__hl_sleep` path (see `hl_sleep_poll_sockets`);
-    /// here we just honour the guest's timer deadline.
-    #[cfg(windows)]
-    fn wait_for_socket_event(&self, timeout: Option<Duration>) {
-        self.sleep_cancel.wait(timeout.unwrap_or(SOCKET_TIMEOUT));
-    }
-
-    /// Async counterpart to [`Sandbox::poll_wait`], for callers driving the
-    /// cooperative poll loop from a Tokio runtime.
-    ///
-    /// `poll_step` stays synchronous and CPU-bound — it runs the vCPU via a
-    /// blocking `KVM_RUN`, so run it on a blocking thread (e.g.
-    /// [`tokio::task::spawn_blocking`] or a dedicated owner thread). This
-    /// method covers the *other* half — the idle wait for host-socket I/O —
-    /// without blocking the executor. Behaviour by [`PollStatus`]:
-    ///
-    /// - [`PollStatus::Wait`] — sleep until the guest's timer deadline, but
-    ///   return **early** as soon as any host socket becomes readable.
-    /// - [`PollStatus::Idle`] — the guest has no pending timer; wait (bounded
-    ///   by [`SOCKET_TIMEOUT`]) until a host socket becomes readable.
-    /// - [`PollStatus::Done`] — returns immediately.
-    ///
-    /// External cancellation composes naturally: wrap the call in a
-    /// [`tokio::select!`] against your own shutdown/wakeup signal — there is
-    /// no internal cancel token (unlike the sync path's `SleepCancel`).
-    ///
-    /// Only read readiness (`POLLIN`) is watched, matching [`Sandbox::poll_wait`]
-    /// — a connected socket is almost always writable, so watching `POLLOUT`
-    /// would spuriously wake every iteration (see `wait_for_socket_event`).
-    ///
-    /// The watched host sockets need **not** be non-blocking:
-    /// [`tokio::io::unix::AsyncFd`] is used purely as a readiness notifier
-    /// (it never performs I/O and never closes the fd), so `O_NONBLOCK` is not
-    /// required. The actual `recv`/`accept` runs inside the guest on the next
-    /// `poll_step`, gated by the guest's own readiness pre-check.
-    #[cfg(feature = "tokio")]
-    pub async fn poll_wait_async(&self, status: &PollStatus) {
-        let timeout = match status {
-            PollStatus::Done => return,
-            PollStatus::Wait(d) => Some(*d),
-            PollStatus::Idle => None,
-        };
-        let fds: Vec<i32> = self.socket_raw_fds();
-        // Idle (no timer) is bounded by the socket cap, matching the sync path.
-        Self::wait_readable_or_timeout(fds, timeout.unwrap_or(SOCKET_TIMEOUT)).await;
+        // Step 2: no async futures in flight — wait for host-socket readiness
+        // and/or the guest's timer deadline (the async inter-step wait).
+        let fds = self.socket_raw_fds();
+        if !fds.is_empty() || remaining.is_some() {
+            let dur = remaining.unwrap_or(SOCKET_TIMEOUT);
+            Self::wait_readable_or_timeout(fds, dur).await;
+        } else {
+            // Step 3: indefinite idle with no wake source — bounded fallback so
+            // the poll loop can't busy-spin.
+            tokio::time::sleep(SOCKET_TIMEOUT).await;
+        }
     }
 
     /// Drive the guest to completion cooperatively from a Tokio runtime,
@@ -2935,44 +3614,44 @@ impl Sandbox {
     /// already exists for a different purpose — a pausable/snapshotable run
     /// handle. This method instead runs the cooperative *poll* loop.)
     ///
-    /// This is the full poll loop as a single `async fn`. Each iteration runs
-    /// the two halves of the cooperative model:
+    /// This is the full poll loop as a single `async fn`, built on the unified
+    /// [`Sandbox::poll`] / [`Sandbox::drive_host_functions`] pair (the same
+    /// shape as the [`SandboxBuilder::tool_async`] example):
     ///
-    /// - **CPU half** — [`Sandbox::poll_step`] runs the vCPU via a blocking
+    /// - **CPU step** — [`Sandbox::poll`] runs the vCPU via a blocking
     ///   `KVM_RUN`. It is called inline here, so it briefly occupies the
     ///   current worker thread for the (bounded) duration of one scheduler
     ///   pump. On a multi-threaded runtime other tasks continue on other
-    ///   workers; if that inline blocking is undesirable, drive `poll_step` on
-    ///   a dedicated owner thread and use [`Sandbox::poll_wait_async`] alone.
-    /// - **I/O half** — [`Sandbox::poll_wait_async`] `await`s host-socket
-    ///   readiness (or the guest's timer deadline) on the reactor, so the task
-    ///   yields instead of busy-looping while the guest is parked on
-    ///   `accept`/`recv`.
+    ///   workers. [`Poll::Ready(())`](core::task::Poll::Ready) ends the loop.
+    /// - **Drive step** — on [`Poll::Pending`](core::task::Poll::Pending),
+    ///   [`Sandbox::drive_host_functions`] makes host-side progress: it drives
+    ///   any in-flight async-tool futures (e.g. `net_connect`/`send`/`sendto`,
+    ///   `sleep`) off the vCPU thread, and otherwise `await`s host-socket
+    ///   readiness and/or the guest's timer deadline on the reactor — so the
+    ///   task yields instead of busy-looping while the guest is parked on
+    ///   `accept`/`recv` or awaiting an async host function.
     ///
     /// Requires a prior [`Sandbox::restore`] to reset guest state before the
-    /// first step of a fresh run (same contract as `poll_step`). The exit code
-    /// is the value the guest reported via `__hl_exit` (0 if it halted without
-    /// an explicit code); read it again later with [`Sandbox::last_exit_code`].
+    /// first step of a fresh run (same contract as [`Sandbox::poll`]). The exit
+    /// code is the value the guest reported via `__hl_exit` (0 if it halted
+    /// without an explicit code); read it again later with
+    /// [`Sandbox::last_exit_code`].
     ///
     /// Cancellation composes: drop the returned future (e.g. via
     /// [`tokio::time::timeout`] or a `select!`) to stop driving the guest
     /// between steps. A step already in progress runs to its next yield first,
-    /// since `poll_step` is synchronous.
-    #[cfg(feature = "tokio")]
+    /// since [`Sandbox::poll`] is synchronous.
     pub async fn poll_run_async(&mut self) -> Result<i32> {
         loop {
-            // CPU half: blocking KVM_RUN for one cooperative pump.
-            let status = self.poll_step()?;
-            if let PollStatus::Done = status {
-                return Ok(self.last_exit_code());
+            match self.poll()? {
+                core::task::Poll::Ready(()) => return Ok(self.last_exit_code()),
+                core::task::Poll::Pending => self.drive_host_functions().await,
             }
-            // I/O half: yield to the reactor until the guest can make progress.
-            self.poll_wait_async(&status).await;
         }
     }
 
     /// Snapshot the raw fds of all currently-open host sockets.
-    #[cfg(all(feature = "tokio", unix))]
+    #[cfg(unix)]
     fn socket_raw_fds(&self) -> Vec<i32> {
         use std::os::unix::io::AsRawFd;
         match &self.socket_table {
@@ -2987,7 +3666,7 @@ impl Sandbox {
         }
     }
 
-    #[cfg(all(feature = "tokio", not(unix)))]
+    #[cfg(not(unix))]
     fn socket_raw_fds(&self) -> Vec<i32> {
         Vec::new()
     }
@@ -3002,7 +3681,7 @@ impl Sandbox {
     /// are reported immediately (epoll delivers current readiness at
     /// registration). If registration fails we fall back to the timer so the
     /// caller can't wedge.
-    #[cfg(all(feature = "tokio", unix))]
+    #[cfg(unix)]
     async fn wait_readable_or_timeout(fds: Vec<i32>, timeout: Duration) {
         use std::future::{poll_fn, Future};
         use std::task::Poll;
@@ -3032,7 +3711,7 @@ impl Sandbox {
         let mut readable: Vec<_> = guards.iter().map(|g| Box::pin(g.readable())).collect();
         // Resolve as soon as *any* socket is readable. The ready-guard is
         // dropped without clearing readiness on purpose: the pending
-        // recv/accept is serviced inside the guest on the next poll_step, and
+        // recv/accept is serviced inside the guest on the next poll, and
         // the following wait builds a fresh AsyncFd.
         let any_readable = poll_fn(|cx| {
             for fut in readable.iter_mut() {
@@ -3052,20 +3731,9 @@ impl Sandbox {
     /// Windows fallback: socket readiness for the async poll loop is not wired
     /// through `AsyncFd`; honour the timer deadline (socket wakeups still flow
     /// through the guest's `__hl_sleep` path, as in the sync case).
-    #[cfg(all(feature = "tokio", not(unix)))]
+    #[cfg(not(unix))]
     async fn wait_readable_or_timeout(_fds: Vec<i32>, timeout: Duration) {
         tokio::time::sleep(timeout).await;
-    }
-
-    /// Read the nanoseconds-until-next-wakeup reported by the most recent
-    /// `poll_step`. Returns `None` if the guest has exited.
-    pub fn last_poll_deadline(&self) -> Option<u64> {
-        let raw = self.poll_deadline.load(Ordering::Relaxed);
-        if raw & POLL_EXITED_BIT != 0 {
-            None
-        } else {
-            Some(raw & POLL_DEADLINE_MASK)
-        }
     }
 
     /// Reset the cooperative-poll deadline/exit state to its initial value.
@@ -3129,6 +3797,77 @@ impl Sandbox {
     pub fn snapshot_now(&mut self) -> Result<()> {
         let snap = self.inner.snapshot()?;
         self.snapshot = Some(snap);
+        Ok(())
+    }
+
+    /// Serialize the guest's currently-listening host sockets so they can
+    /// be persisted alongside a snapshot and re-created on restore.
+    ///
+    /// The host socket table lives in host-process memory and is *not*
+    /// part of the guest snapshot, so a restored guest would otherwise
+    /// find its listener fds dangling. Persist this value next to the
+    /// snapshot and pass it back to [`Sandbox::restore_listeners`] before
+    /// resuming the guest. Returns `None` when the sandbox has no socket
+    /// table (i.e. no network policy configured).
+    pub fn export_listeners(&self) -> Option<serde_json::Value> {
+        self.socket_table
+            .as_ref()
+            .map(|t| t.lock().unwrap().export_listeners())
+    }
+
+    /// Re-create listening host sockets previously produced by
+    /// [`Sandbox::export_listeners`], re-inserting them under their
+    /// original fds. Call before the guest resumes so its listener fds
+    /// are backed by real, bound, listening sockets.
+    pub fn restore_listeners(&mut self, data: &serde_json::Value) -> Result<()> {
+        if let Some(ref table) = self.socket_table {
+            table.lock().unwrap().restore_listeners(data)?;
+        }
+        Ok(())
+    }
+
+    /// Serialize every async host-tool task the sandbox is currently tracking
+    /// so it can be folded into a checkpoint alongside the guest memory image.
+    ///
+    /// The guest parks on a completion token when it calls an async tool; the
+    /// work runs off the vCPU thread and its result is handed back in the next
+    /// [`Sandbox::poll`] batch. A checkpoint can land while tasks are still
+    /// **pending** (work in flight) or **completed-but-undelivered** (the result
+    /// is computed but the guest hasn't polled for it yet). Both kinds live only
+    /// in host-process memory — *not* in the guest snapshot — so without this a
+    /// restored guest would wait forever for tokens it can never be told about.
+    ///
+    /// Returns `{"tasks": [ … ]}`, one object per tracked task:
+    /// - pending: `{"token","name","args","status":"pending"}`
+    /// - completed: `{"token","name","args","status":"completed","result":…}`
+    ///   or `{…,"status":"completed","error":"…"}`
+    ///
+    /// Pass the value to [`Sandbox::restore_async_tasks`] on the restored
+    /// sandbox before resuming the guest. Returns `None` when no async tools are
+    /// configured (nothing to track).
+    pub fn export_async_tasks(&self) -> Option<serde_json::Value> {
+        self.async_state.as_ref().map(|st| st.export_tasks())
+    }
+
+    /// Repopulate the async-task tracker from a value produced by
+    /// [`Sandbox::export_async_tasks`], so a restored guest resumes exactly
+    /// where the checkpoint was taken. Call before the guest is polled.
+    ///
+    /// Per task:
+    /// - **completed** — the saved `result`/`error` is re-queued for delivery;
+    ///   the next [`Sandbox::poll`] batch hands it to the parked guest call,
+    ///   which then returns as if the checkpoint never happened.
+    /// - **pending, tool re-registered** — the tool is re-invoked with the saved
+    ///   `args` so the work resumes off the vCPU thread and completes normally.
+    /// - **pending, tool NOT re-registered** — (e.g. a user `tool_async` handler,
+    ///   which is not restored) an error result is delivered for that token so
+    ///   the guest unparks and can handle it instead of hanging forever.
+    ///
+    /// Does nothing when no async tools are configured.
+    pub fn restore_async_tasks(&mut self, data: &serde_json::Value) -> Result<()> {
+        if let Some(st) = self.async_state.as_mut() {
+            st.restore_tasks(data)?;
+        }
         Ok(())
     }
 
@@ -3238,6 +3977,7 @@ impl Sandbox {
             network,
             listen_ports,
         );
+        let async_state = tools.make_async_state();
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
 
@@ -3259,8 +3999,10 @@ impl Sandbox {
             initrd_path: initrd,
             exit_code,
             poll_deadline,
+            next_wakeup_at: None,
             socket_table,
             sleep_cancel,
+            async_state,
         })
     }
 }
@@ -3506,7 +4248,7 @@ mod tests {
     /// 1. It returns via the timer when no fd is readable (idle wait).
     /// 2. It returns promptly once an fd becomes readable — using a *blocking*
     ///    `UnixStream`, demonstrating that `AsyncFd` needs no `O_NONBLOCK`.
-    #[cfg(all(feature = "tokio", unix))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn wait_readable_or_timeout_wakes_on_readable_blocking_fd() {
         use std::io::Write;
@@ -3539,12 +4281,119 @@ mod tests {
     }
 
     /// With no sockets, the wait is purely the timer.
-    #[cfg(all(feature = "tokio", unix))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn wait_readable_or_timeout_empty_honours_timer() {
         let start = std::time::Instant::now();
         Sandbox::wait_readable_or_timeout(Vec::new(), Duration::from_millis(80)).await;
         assert!(start.elapsed() >= Duration::from_millis(60));
+    }
+
+    /// Build an [`AsyncToolState`] with the given factories, wired to fresh
+    /// shared maps — enough to unit-test export/restore without a real VM.
+    #[cfg(test)]
+    fn async_state_with(factories: HashMap<String, ToolFactory>) -> AsyncToolState {
+        AsyncToolState {
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            join_set: tokio::task::JoinSet::new(),
+            factories,
+        }
+    }
+
+    /// A pending task whose tool is still registered is re-queued (re-driven)
+    /// on restore; a completed task's result/error is restored verbatim for
+    /// re-delivery; and a pending task whose tool is gone becomes an error so
+    /// the guest can't hang on it.
+    #[test]
+    fn async_task_export_restore_roundtrip() {
+        // Source state: one running task (net_recv), one completed-ok task,
+        // one completed-error task.
+        let src = async_state_with(HashMap::new());
+        {
+            let mut p = src.pending.lock().unwrap();
+            p.insert(
+                "__hlasync-1".into(),
+                PendingTask {
+                    name: "net_recv".into(),
+                    args: serde_json::json!({ "fd": 4, "len": 16 }),
+                    state: PendingState::Running,
+                },
+            );
+            p.insert(
+                "__hlasync-2".into(),
+                PendingTask {
+                    name: "net_recv".into(),
+                    args: serde_json::json!({ "fd": 5 }),
+                    state: PendingState::Ready(Ok(serde_json::json!({ "data": "aGk=" }))),
+                },
+            );
+            p.insert(
+                "__hlasync-3".into(),
+                PendingTask {
+                    name: "user_tool".into(),
+                    args: serde_json::Value::Null,
+                    state: PendingState::Ready(Err("boom".into())),
+                },
+            );
+        }
+
+        let snapshot = src.export_tasks();
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 3);
+
+        // Restore into a fresh state that only re-registers `net_recv`
+        // (a re-invokable factory) — `user_tool` is intentionally absent.
+        let mut factories: HashMap<String, ToolFactory> = HashMap::new();
+        factories.insert(
+            "net_recv".into(),
+            Arc::new(|_args| Box::pin(async { Ok(serde_json::json!("resumed")) })),
+        );
+        let mut dst = async_state_with(factories);
+        dst.restore_tasks(&snapshot).unwrap();
+
+        let p = dst.pending.lock().unwrap();
+        assert_eq!(p.len(), 3);
+
+        // (1) Running task with a live factory → re-queued as Running, and its
+        //     future was pushed onto the drive queue.
+        assert!(matches!(p["__hlasync-1"].state, PendingState::Running));
+        assert_eq!(p["__hlasync-1"].name, "net_recv");
+        assert_eq!(dst.queue.lock().unwrap().len(), 1);
+
+        // (2) Completed-ok task → result restored verbatim for re-delivery.
+        match &p["__hlasync-2"].state {
+            PendingState::Ready(Ok(v)) => assert_eq!(v["data"], "aGk="),
+            other => panic!("expected Ready(Ok), got {other:?}"),
+        }
+
+        // (3) Completed-error task → error restored verbatim.
+        match &p["__hlasync-3"].state {
+            PendingState::Ready(Err(e)) => assert_eq!(e, "boom"),
+            other => panic!("expected Ready(Err), got {other:?}"),
+        }
+    }
+
+    /// A task that was *pending* on a tool no longer registered after restore
+    /// becomes a delivered error, so the resumed guest unparks instead of
+    /// hanging forever on a token that can never be fulfilled.
+    #[test]
+    fn pending_task_without_factory_becomes_error_on_restore() {
+        let snapshot = serde_json::json!({
+            "tasks": [
+                { "token": "__hlasync-9", "name": "gone_tool", "args": {}, "status": "pending" }
+            ]
+        });
+        let mut dst = async_state_with(HashMap::new());
+        dst.restore_tasks(&snapshot).unwrap();
+
+        let p = dst.pending.lock().unwrap();
+        match &p["__hlasync-9"].state {
+            PendingState::Ready(Err(e)) => assert!(e.contains("could not be resumed")),
+            other => panic!("expected Ready(Err), got {other:?}"),
+        }
+        // Nothing to re-drive.
+        assert!(dst.queue.lock().unwrap().is_empty());
     }
 
     fn tmpdir(label: &str) -> std::path::PathBuf {
@@ -4343,7 +5192,7 @@ mod tests {
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
         let req = br#"{"name":"__hl_sleep","args":{"ns":0}}"#;
-        let resp = tools.dispatch(req);
+        let resp = tools.dispatch_drive(req);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(!s.contains("\"error\""), "sleep(0) should succeed: {s}");
     }
@@ -4375,8 +5224,8 @@ mod tests {
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
         // A zero-deadline idle-yield must still set the yielded bit so it is
-        // distinguishable from a bare HALT (which sets nothing). poll_step
-        // maps the former to Idle and the latter to Done.
+        // distinguishable from a bare HALT (which sets nothing). `poll` maps
+        // the former to Pending (idle) and the latter to Ready (done).
         tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0}}"#);
         let raw = poll_deadline.load(Ordering::Relaxed);
         assert_ne!(raw & POLL_YIELDED_BIT, 0, "yielded bit must be set on ns=0");
@@ -4397,7 +5246,11 @@ mod tests {
         tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0}}"#);
 
         let raw = poll_deadline.load(Ordering::Relaxed);
-        assert_ne!(raw & POLL_EXITED_BIT, 0, "exit bit must survive a later yield");
+        assert_ne!(
+            raw & POLL_EXITED_BIT,
+            0,
+            "exit bit must survive a later yield"
+        );
     }
 
     #[test]
@@ -4416,7 +5269,10 @@ mod tests {
 
         let start = std::time::Instant::now();
         let req = br#"{"name":"__hl_sleep","args":{"ns":60000000000}}"#;
-        let resp = tools.dispatch(req);
+        // Drive the now-async sleep future to completion (as the poll loop's
+        // drive_host_functions would); the cancel from the other thread should
+        // make the blocking sleep return promptly.
+        let resp = tools.dispatch_drive(req);
         let elapsed = start.elapsed();
         handle.join().unwrap();
         sc.reset();
@@ -4461,36 +5317,57 @@ mod tests {
         let mut table = SocketTable::new();
         for _ in 0..MAX_SOCKETS {
             let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-            table
-                .insert(HostSocket {
-                    socket: sock,
-                    sock_type: 1,
-                })
-                .unwrap();
+            table.insert(HostSocket::new(sock, 1)).unwrap();
         }
         let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-        assert!(table
-            .insert(HostSocket {
-                socket: sock,
-                sock_type: 1
-            })
-            .is_err());
+        assert!(table.insert(HostSocket::new(sock, 1)).is_err());
     }
 
     #[test]
     fn socket_table_clear() {
         let mut table = SocketTable::new();
         let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-        table
-            .insert(HostSocket {
-                socket: sock,
-                sock_type: 1,
-            })
-            .unwrap();
+        table.insert(HostSocket::new(sock, 1)).unwrap();
         assert_eq!(table.sockets.len(), 1);
         table.clear();
         assert_eq!(table.sockets.len(), 0);
         assert_eq!(table.next_id, 1);
+    }
+
+    #[test]
+    fn export_restore_listeners_roundtrip() {
+        // Bind + listen a real socket, record it as a listener the way
+        // handle_net_bind/handle_net_listen now do, then export, clear, and
+        // restore — verifying the listener comes back under its original fd.
+        let mut table = SocketTable::new();
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        sock.set_reuse_address(true).unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        sock.bind(&addr.into()).unwrap();
+        sock.listen(128).unwrap();
+        let local = sock.local_addr().unwrap().as_socket().unwrap();
+        let fd = table.insert(HostSocket::new(sock, 1)).unwrap();
+        {
+            let hs = table.get_mut(fd).unwrap();
+            hs.bound_addr = Some(local);
+            hs.listen_backlog = Some(128);
+        }
+
+        let exported = table.export_listeners();
+        assert_eq!(exported["listeners"].as_array().unwrap().len(), 1);
+        let saved_next = table.next_id;
+
+        // Simulate teardown/restore: the guest keeps using `fd`, but the
+        // host table starts empty.
+        table.clear();
+        assert!(table.get(fd).is_err());
+
+        table.restore_listeners(&exported).unwrap();
+
+        let hs = table.get(fd).expect("listener fd must be re-created");
+        assert_eq!(hs.listen_backlog, Some(128));
+        assert_eq!(hs.bound_addr.map(|a| a.port()), Some(local.port()));
+        assert_eq!(table.next_id, saved_next, "next_id must be preserved");
     }
 
     #[test]
@@ -4549,7 +5426,7 @@ mod tests {
         let big_payload = vec![0u8; MAX_NET_SEND + 1];
         let b64 = base64::engine::general_purpose::STANDARD.encode(&big_payload);
         let req = format!(r#"{{"name":"net_send","args":{{"fd":{fd},"data":"{b64}"}}}}"#);
-        let resp = std::str::from_utf8(&reg.dispatch(req.as_bytes()))
+        let resp = std::str::from_utf8(&reg.dispatch_drive(req.as_bytes()))
             .unwrap()
             .to_string();
         assert!(
@@ -4561,7 +5438,7 @@ mod tests {
         let req = format!(
             r#"{{"name":"net_sendto","args":{{"fd":{fd},"data":"{b64}","addr":"127.0.0.1","port":9999}}}}"#
         );
-        let resp = std::str::from_utf8(&reg.dispatch(req.as_bytes()))
+        let resp = std::str::from_utf8(&reg.dispatch_drive(req.as_bytes()))
             .unwrap()
             .to_string();
         assert!(
