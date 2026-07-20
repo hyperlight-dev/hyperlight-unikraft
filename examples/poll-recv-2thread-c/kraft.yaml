@@ -1,0 +1,103 @@
+specification: '0.6'
+name: poll-recv-2thread-hyperlight
+
+unikraft:
+  source: ../../../unikraft
+  version: plat-hyperlight
+  kconfig:
+    CONFIG_PLAT_HYPERLIGHT: 'y'
+    CONFIG_PAGING: 'n'
+    CONFIG_LIBUKVMEM: 'n'
+    CONFIG_LIBUKINTCTLR_HYPERLIGHT: 'y'
+    CONFIG_HYPERLIGHT_MAX_GUEST_LOG_LEVEL: 7
+
+    # Cooperative poll model: run the scheduler to idle, then yield the vCPU
+    # back to the host reporting the next-wakeup deadline. See
+    # plat/hyperlight/poll.c and the host poll API.
+    CONFIG_HYPERLIGHT_POLL: 'y'
+
+    # Suppress kernel logging for performance (CRIT is the quietest level).
+    CONFIG_LIBUKPRINT_KLVL_CRIT: 'y'
+    CONFIG_LIBUKPRINT_PRINT_TIME: 'n'
+    CONFIG_LIBUKPRINT_PRINT_SRCNAME: 'n'
+    CONFIG_LIBUKBOOT_BANNER_NONE: 'y'
+    CONFIG_OPTIMIZE_SIZE: 'y'
+    CONFIG_OPTIMIZE_PIE: 'y'
+
+    # VFS + initrd (cpiovfs for zero-copy mount)
+    CONFIG_LIBVFSCORE: 'y'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI: 'y'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI_CUSTOM: 'y'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_MP: '/'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_DRIVER: 'cpiovfs'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_UKOPTS_IFINITRD0: 'y'
+    CONFIG_LIBCPIOVFS: 'y'
+    CONFIG_LIBUKCPIO: 'y'
+
+    # ELF loader: run the poll-recv-2thread C app
+    CONFIG_APPELFLOADER: 'y'
+    CONFIG_APPELFLOADER_VFSEXEC: 'y'
+    CONFIG_APPELFLOADER_CUSTOMAPPNAME: 'n'
+    CONFIG_APPELFLOADER_VFSEXEC_ENVPATH: 'n'
+    CONFIG_APPELFLOADER_VFSEXEC_PATH: '/bin/poll'
+    CONFIG_LIBPOSIX_ENVIRON_ENVP0: '"PATH=/bin"'
+    CONFIG_LIBELF: 'y'
+
+    # Random number support
+    CONFIG_LIBUKRANDOM_CMDLINE_SEED: 'y'
+    CONFIG_LIBUKRANDOM_GETRANDOM: 'y'
+
+    # Threading + scheduler (cooperative; the poll idle hook lives in
+    # ukschedcoop's idle path — see plat/hyperlight/poll.c). This app spawns two
+    # worker threads (pthreads), so multithreading + FUTEX are required: musl's
+    # pthread_create/pthread_join coordinate via the futex syscall.
+    CONFIG_LIBPOSIX_PROCESS_MULTITHREADING: 'y'
+    CONFIG_LIBPOSIX_FUTEX: 'y'
+    CONFIG_LIBUKSCHED: 'y'
+    CONFIG_LIBUKSCHEDCOOP: 'y'
+    CONFIG_LIBUKMPI: 'y'
+    # musl's pthread_create allocates each thread's stack + guard page via
+    # mmap(MAP_ANONYMOUS); without ukmmap the mapping fails and thread creation
+    # returns an error.
+    CONFIG_LIBUKMMAP: 'y'
+    CONFIG_LIBUKLOCK: 'y'
+    CONFIG_LIBUKLOCK_SEMAPHORE: 'y'
+    CONFIG_LIBUKLOCK_MUTEX: 'y'
+    CONFIG_LIBUKBOOT_MAINTHREAD: 'y'
+    CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL: 'y'
+
+    # TLS (each thread gets its own thread-local storage block)
+    CONFIG_LIBCONTEXT: 'y'
+    CONFIG_LIBCONTEXT_CLEAR_TBSS: 'y'
+
+    # Global fd table for dispatch compatibility (both threads share one fd
+    # namespace, matching the host-side per-sandbox SocketTable).
+    CONFIG_LIBPOSIX_FDTAB_MULTITAB: 'n'
+
+    # devfs + /dev/hcall (required for host-proxied networking)
+    CONFIG_LIBDEVFS: 'y'
+    CONFIG_LIBDEVFS_AUTOMOUNT: 'y'
+    CONFIG_HYPERLIGHT_HCALL: 'y'
+
+    # Networking: host-proxied sockets + cooperative poll layer.
+    # accept()/recv() park on the posix-poll waitq (uk_file_poll), which yields
+    # to the scheduler so the poll pump can return to the host. Two threads park
+    # concurrently here, so the host drives two net futures at once.
+    CONFIG_LIBPOSIX_SOCKET: 'y'
+    CONFIG_LIBHOSTSOCK: 'y'
+    CONFIG_LIBPOSIX_POLL: 'y'
+    CONFIG_LIBPOSIX_FDIO: 'y'
+    CONFIG_LIBPOSIX_FDTAB: 'y'
+    CONFIG_LIBUKFILE: 'y'
+
+libraries:
+  app-elfloader:
+    source: ../../../app-elfloader
+    version: plat-hyperlight
+  libelf:
+    source: https://github.com/unikraft/lib-libelf.git
+    version: staging
+
+targets:
+  - architecture: x86_64
+    platform: hyperlight

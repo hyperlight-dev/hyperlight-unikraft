@@ -8,11 +8,11 @@
 //! non-blocking readiness pre-check, and the Unikraft posix-socket layer
 //! parks the thread on the poll waitq via `uk_file_poll()` — a cooperative
 //! scheduler yield. The scheduler then reaches idle and the poll pump hands
-//! the vCPU back to the host, so [`Sandbox::poll_step`] keeps making forward
+//! the vCPU back to the host, so [`Sandbox::poll`] keeps making forward
 //! progress even while the guest is "blocked" in accept/recv.
 //!
-//! The host drives the guest with [`Sandbox::poll_step`] +
-//! [`Sandbox::poll_wait`]. `poll_wait` `poll()`s the host-side socket fds
+//! The host drives the guest with [`Sandbox::poll`] +
+//! [`Sandbox::drive_host_functions`]. `drive_host_functions` `poll()`s the host-side socket fds
 //! during the inter-step wait, so when the client below connects/sends the
 //! loop re-enters `poll` promptly; the guest poll pump then rescans socket
 //! readiness (`hostsock_rescan_events`) and wakes the parked accept/recv
@@ -34,7 +34,8 @@
 //! build` in that directory (its `kraft.yaml` enables CONFIG_HYPERLIGHT_POLL
 //! and CONFIG_LIBHOSTSOCK).
 
-use hyperlight_unikraft::{ListenPorts, NetworkPolicy, PollStatus, Sandbox};
+use core::task::Poll;
+use hyperlight_unikraft::{ListenPorts, NetworkPolicy, Sandbox};
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -127,7 +128,7 @@ fn setup() -> Option<(PathBuf, PathBuf)> {
 /// but data-less, the guest is parked in `recv()` waiting for POLLIN, but the
 /// accepted socket is already writable (POLLOUT), so a host inter-step wait
 /// that watched POLLOUT would return instantly on every iteration and spin
-/// `poll_step`. With the wait restricted to readability the host blocks for
+/// `poll`. With the wait restricted to readability the host blocks for
 /// the whole pause and the loop stays idle.
 fn client_connect_and_send(payload: &[u8], deadline: Instant) -> bool {
     let addr = format!("127.0.0.1:{GUEST_PORT}");
@@ -159,9 +160,9 @@ fn client_connect_and_send(payload: &[u8], deadline: Instant) -> bool {
 /// connects and sends. Asserts the poll loop makes forward progress and
 /// terminates with `Done` — proving `accept()`/`recv()` yielded the vCPU
 /// cooperatively (a blocking host recv would have frozen the VM instead of
-/// letting `poll_step` return).
-#[test]
-fn poll_recv_reaches_done_under_kvm() {
+/// letting `poll` return).
+#[tokio::test]
+async fn poll_recv_reaches_done_under_kvm() {
     let Some((kernel, initrd)) = setup() else {
         return;
     };
@@ -183,7 +184,7 @@ fn poll_recv_reaches_done_under_kvm() {
     const MAX_STEPS: usize = 2000;
     const MAX_WALL: Duration = Duration::from_secs(30);
     // With a busy loop, the ~300ms data-less pause between connect and send
-    // would spin `poll_step` thousands of times (toward MAX_STEPS). With the
+    // would spin `poll` thousands of times (toward MAX_STEPS). With the
     // inter-step wait restricted to readability, the host blocks for the whole
     // pause, so a correct run reaches Done in a small number of steps.
     const MAX_EXPECTED_STEPS: usize = 100;
@@ -201,9 +202,8 @@ fn poll_recv_reaches_done_under_kvm() {
 
     while steps < MAX_STEPS && start.elapsed() < MAX_WALL {
         steps += 1;
-        let status = sbox.poll_step().expect("poll_step");
-        match status {
-            PollStatus::Done => {
+        match sbox.poll().expect("poll") {
+            Poll::Ready(()) => {
                 println!(
                     "poll_recv reached Done after {steps} steps / {:?}",
                     start.elapsed()
@@ -211,18 +211,15 @@ fn poll_recv_reaches_done_under_kvm() {
                 done = true;
                 break;
             }
-            PollStatus::Wait(_) | PollStatus::Idle => {
-                println!("poll_recv step {steps} / {:?}: {status:?}", start.elapsed());
+            Poll::Pending => {
+                println!("poll_recv step {steps} / {:?}: Pending", start.elapsed());
                 saw_wait_or_idle = true;
-                // Socket-aware wait: returns early when the client's
-                // connect/send makes a host socket readable, so the guest's
-                // parked accept/recv is re-driven on the next step. Cap the
-                // wait so a bogus deadline can't stall the test.
-                let capped = match status {
-                    PollStatus::Wait(d) => PollStatus::Wait(d.min(Duration::from_millis(50))),
-                    other => other,
-                };
-                sbox.poll_wait(&capped);
+                // Drive host-side async work (the parked accept/recv future and
+                // the inter-step socket-readiness wait) off the vCPU thread, so
+                // the guest's parked accept/recv is resolved and re-driven on
+                // the next step. Bounded so a missed wakeup can't hang the run.
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), sbox.drive_host_functions()).await;
             }
         }
     }
@@ -237,7 +234,7 @@ fn poll_recv_reaches_done_under_kvm() {
         saw_wait_or_idle,
         "expected the guest to yield cooperatively (Wait/Idle) while parked \
          in accept()/recv() — a blocking host call would never have returned \
-         control to poll_step"
+         control to poll"
     );
     assert!(
         done,
@@ -249,7 +246,20 @@ fn poll_recv_reaches_done_under_kvm() {
         steps <= MAX_EXPECTED_STEPS,
         "poll-recv reached Done but took {steps} steps (> {MAX_EXPECTED_STEPS}); \
          the data-less pause between connect and send should have blocked the \
-         host inter-step wait, not spun poll_step — a POLLOUT-driven busy loop \
+         host inter-step wait, not spun poll — a POLLOUT-driven busy loop \
          has regressed"
+    );
+    // The guest reports the number of bytes it recv'd via an explicit __hl_exit
+    // hcall. "hello-poll-recv" is 15 bytes, so a successful accept+recv yields
+    // exit code 15; the guest's failure paths report distinct codes 101-105.
+    // This turns a functional regression (e.g. "accept failed") into a hard
+    // test failure instead of a silently-passing Done.
+    let exit_code = sbox.last_exit_code();
+    assert_eq!(
+        exit_code,
+        b"hello-poll-recv".len() as i32,
+        "guest exit code {exit_code} != 15; the async accept()/recv() path did \
+         not deliver the payload to the guest (101=socket 102=bind 103=listen \
+         104=accept 105=recv failure)"
     );
 }

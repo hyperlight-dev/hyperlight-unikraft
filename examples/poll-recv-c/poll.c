@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -20,6 +21,28 @@
 
 #define PORT 34567
 
+/* Report the process exit code to the host via the __hl_exit hcall.
+ *
+ * A normal main() return only HALTs the VM (the host records exit code 0); to
+ * hand a meaningful value back to the driving test we issue an explicit
+ * __hl_exit host call over /dev/hcall, mirroring poll-await-c / poll-epoll-c.
+ * The host test asserts this value, so a functional regression (e.g. the guest
+ * failing to accept or recv the payload) surfaces as a distinct exit code
+ * rather than a silently-passing run. */
+static void report_exit_code(int code) {
+    char req[80];
+    int fd = open("/dev/hcall", O_RDWR);
+    if (fd < 0)
+        return;
+    int len = snprintf(req, sizeof(req),
+                       "{\"name\":\"__hl_exit\",\"args\":{\"code\":%d}}", code);
+    if (len > 0)
+        (void)!write(fd, req, (size_t)len);
+    char resp[64];
+    (void)!read(fd, resp, sizeof(resp));
+    close(fd);
+}
+
 int main(void) {
     printf("poll-recv: start\n");
     fflush(stdout);
@@ -28,6 +51,7 @@ int main(void) {
     if (lfd < 0) {
         printf("poll-recv: socket failed\n");
         fflush(stdout);
+        report_exit_code(101);
         return 1;
     }
 
@@ -43,12 +67,14 @@ int main(void) {
     if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         printf("poll-recv: bind failed\n");
         fflush(stdout);
+        report_exit_code(102);
         return 1;
     }
 
     if (listen(lfd, 1) < 0) {
         printf("poll-recv: listen failed\n");
         fflush(stdout);
+        report_exit_code(103);
         return 1;
     }
 
@@ -59,6 +85,7 @@ int main(void) {
     if (cfd < 0) {
         printf("poll-recv: accept failed\n");
         fflush(stdout);
+        report_exit_code(104);
         return 1;
     }
 
@@ -70,6 +97,7 @@ int main(void) {
     if (n < 0) {
         printf("poll-recv: recv failed\n");
         fflush(stdout);
+        report_exit_code(105);
         return 1;
     }
     buf[n] = '\0';
@@ -81,5 +109,6 @@ int main(void) {
 
     printf("poll-recv: done\n");
     fflush(stdout);
+    report_exit_code((int)n);
     return 0;
 }

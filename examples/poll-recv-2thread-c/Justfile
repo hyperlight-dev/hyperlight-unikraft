@@ -1,0 +1,48 @@
+# poll-recv-2thread-c on Hyperlight (cooperative poll model, two threads each
+# reading one socket)
+#
+# just rootfs   - Build rootfs (the /bin/poll two-thread app) via Docker
+# just build    - Build the poll-enabled kernel via kraft
+# just clean    - Remove build artifacts
+#
+# The guest spawns TWO worker threads, each owning its own host-proxied
+# listening socket, so both threads park in a blocking recv() concurrently (see
+# poll.c). Its kernel needs the same base config as poll-recv-c
+# (CONFIG_HYPERLIGHT_POLL=y, CONFIG_LIBHOSTSOCK=y, CONFIG_LIBPOSIX_POLL=y) PLUS
+# CONFIG_LIBPOSIX_PROCESS_MULTITHREADING=y and CONFIG_LIBPOSIX_FUTEX=y — musl's
+# pthread_create/pthread_join coordinate via the futex syscall. Because those
+# extra options aren't in the poll-recv-c kernel, this test needs its OWN kernel
+# build (host/tests/poll_recv_2thread.rs does not fall back to poll-recv-c's).
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+export DOCKER_BUILDKIT := "0"
+
+kernel := ".unikraft/build/poll-recv-2thread-hyperlight_hyperlight-x86_64"
+initrd := "poll-recv-2thread-initrd.cpio"
+image  := "poll-recv-2thread-c-hyperlight"
+
+# Build rootfs via Docker (cross-platform)
+rootfs:
+    docker build --platform linux/amd64 --target cpio -t {{image}}-cpio .
+    - docker rm -f {{image}}-tmp
+    docker create --name {{image}}-tmp {{image}}-cpio /bin/true
+    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
+    docker rm -f {{image}}-tmp
+
+# Build kernel via kraft (Linux)
+[unix]
+build:
+    -kraft-hyperlight build --plat hyperlight --arch x86_64
+
+# Clean + rebuild everything
+rebuild: clean build rootfs
+
+# Clean build artifacts
+[unix]
+clean:
+    rm -rf .unikraft {{initrd}}
+
+[windows]
+clean:
+    if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
+    if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }

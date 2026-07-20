@@ -1,0 +1,47 @@
+# poll-epoll-c on Hyperlight (cooperative poll model, epoll over two sockets)
+#
+# just rootfs   - Build rootfs (the /bin/poll epoll app) via Docker
+# just build    - Build the poll-enabled kernel via kraft
+# just clean    - Remove build artifacts
+#
+# The guest multiplexes TWO host-proxied listening sockets with a single epoll
+# set (see poll.c). Its kernel needs exactly the same config as poll-recv-c:
+# CONFIG_HYPERLIGHT_POLL=y, CONFIG_LIBHOSTSOCK=y and CONFIG_LIBPOSIX_POLL=y
+# (posix-poll provides epoll). Because the kernel is an app-agnostic ELF loader
+# (the app is loaded from the initrd at /bin/poll), the host test can also run
+# this initrd against the already-built poll-recv-c kernel — see
+# host/tests/poll_epoll.rs, which discovers a dedicated kernel here first and
+# falls back to poll-recv-c's.
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+export DOCKER_BUILDKIT := "0"
+
+kernel := ".unikraft/build/poll-epoll-hyperlight_hyperlight-x86_64"
+initrd := "poll-epoll-initrd.cpio"
+image  := "poll-epoll-c-hyperlight"
+
+# Build rootfs via Docker (cross-platform)
+rootfs:
+    docker build --platform linux/amd64 --target cpio -t {{image}}-cpio .
+    - docker rm -f {{image}}-tmp
+    docker create --name {{image}}-tmp {{image}}-cpio /bin/true
+    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
+    docker rm -f {{image}}-tmp
+
+# Build kernel via kraft (Linux)
+[unix]
+build:
+    -kraft-hyperlight build --plat hyperlight --arch x86_64
+
+# Clean + rebuild everything
+rebuild: clean build rootfs
+
+# Clean build artifacts
+[unix]
+clean:
+    rm -rf .unikraft {{initrd}}
+
+[windows]
+clean:
+    if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
+    if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }

@@ -4,16 +4,17 @@
 //! entry, the cooperative *poll* model runs the unikernel scheduler only up
 //! to the point it would go idle, then yields the vCPU back to the host
 //! (a HALT) reporting the nanoseconds until its next scheduled wakeup. The
-//! host re-enters (`poll_step`) to drive the guest forward. Guest memory —
+//! host re-enters ([`Sandbox::poll`]) to drive the guest forward. Guest memory —
 //! including all scheduler/thread state — persists across the HALT/re-entry
 //! boundary, so no `restore()` happens between steps.
 //!
 //! This test boots the dedicated `poll-c` guest, which sleeps a few short
 //! intervals (each drives the scheduler idle with a pending timer) and then
 //! returns from `main` (a normal `exit_group` → SYSHALT). Driving it with
-//! [`Sandbox::poll_step`] should therefore:
-//!   - observe one or more [`PollStatus::Wait`] steps (the sleeps), then
-//!   - observe [`PollStatus::Done`] once the app exits,
+//! [`Sandbox::poll`] should therefore:
+//!   - observe one or more `Poll::Pending` steps with a pending timer
+//!     ([`Sandbox::next_wakeup`] returns `Some`), i.e. the sleeps, then
+//!   - observe `Poll::Ready(())` once the app exits,
 //!
 //! all within a bounded number of steps.
 //!
@@ -27,7 +28,8 @@
 //! `kraft.yaml` sets it). Populate with `just rootfs` and a
 //! `kraft-hyperlight build` in that directory.
 
-use hyperlight_unikraft::{PollStatus, Sandbox};
+use core::task::Poll;
+use hyperlight_unikraft::Sandbox;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -147,20 +149,23 @@ fn poll_run_reaches_done_under_kvm() {
 
     while steps < MAX_STEPS && start.elapsed() < MAX_WALL {
         steps += 1;
-        match sbox.poll_step().expect("poll_step") {
-            PollStatus::Done => {
+        match sbox.poll().expect("poll") {
+            Poll::Ready(()) => {
                 done = true;
                 break;
             }
-            PollStatus::Wait(d) => {
-                saw_wait = true;
-                std::thread::sleep(d.min(WAIT_CAP));
-            }
-            PollStatus::Idle => {
-                // No pending timer. In this closed test there is no external
-                // input source, so just yield briefly and re-poll.
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            Poll::Pending => match sbox.next_wakeup() {
+                Some(d) => {
+                    // The guest is parked on a timer (a sleep).
+                    saw_wait = true;
+                    std::thread::sleep(d.min(WAIT_CAP));
+                }
+                None => {
+                    // No pending timer. In this closed test there is no external
+                    // input source, so just yield briefly and re-poll.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            },
         }
     }
 
@@ -172,8 +177,8 @@ fn poll_run_reaches_done_under_kvm() {
     );
     assert!(
         saw_wait,
-        "expected at least one PollStatus::Wait from the guest's nanosleep \
-         calls before it exited"
+        "expected at least one timer-parked poll (next_wakeup() == Some) from \
+         the guest's nanosleep calls before it exited"
     );
     // A well-behaved cooperative run takes more than a single step: the guest
     // yields on each sleep and is re-entered. If it finished in one step the
