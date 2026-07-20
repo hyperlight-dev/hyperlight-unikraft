@@ -16,7 +16,6 @@ port        := "8080"
 
 # Start VS Code Server (browse to http://localhost:8080)
 run:
-    @test -f data/static/workbench.js || { echo "error: run 'just rootfs' first (data/static/ missing)"; exit 1; }
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
         --net --port {{port}} \
         --mount ./data:/data \
@@ -30,13 +29,10 @@ run:
            --accept-server-license-terms \
            --force-disable-user-env
 
-# Build rootfs via Docker and extract static files for hostfs
+# Build rootfs via Docker
 rootfs:
     docker build --platform linux/amd64 -t {{image}} .
     docker run --rm {{image}} cat /output.cpio > {{initrd}}
-    mkdir -p data/static
-    docker run --rm {{image}} cat /static-files/workbench.js > data/static/workbench.js
-    docker run --rm {{image}} cat /static-files/workbench.web.main.internal.js > data/static/workbench.web.main.internal.js
 
 # Build kernel via kraft (Linux)
 [unix]

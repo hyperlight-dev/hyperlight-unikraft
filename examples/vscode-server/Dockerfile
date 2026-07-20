@@ -125,7 +125,7 @@ RUN ln -sf node_modules /rootfs/opt/vscode-server/node_modules.asar.unpacked
 COPY patches/keepalive.cjs /rootfs/opt/vscode-server/keepalive.cjs
 
 # Strip bundled extensions, Copilot native binaries, large unused SDKs,
-# and source maps to keep initrd under cpiovfs corruption threshold
+# and source maps to keep the initrd small
 RUN rm -rf /rootfs/opt/vscode-server/extensions && \
     mkdir -p /rootfs/opt/vscode-server/extensions && \
     rm -rf /rootfs/opt/vscode-server/node_modules/@github/copilot-linux-x64 && \
@@ -136,11 +136,5 @@ RUN rm -rf /rootfs/opt/vscode-server/extensions && \
 
 # Writable directories
 RUN mkdir -p /rootfs/tmp /rootfs/data
-
-# Extract large JS files (>5MB) to a separate output for hostfs serving.
-# cpiovfs corrupts these files; keepalive.cjs redirects reads to /data/static/.
-RUN mkdir -p /static-files && \
-    cp /rootfs/opt/vscode-server/out/vs/code/browser/workbench/workbench.js /static-files/workbench.js && \
-    cp /rootfs/opt/vscode-server/out/vs/workbench/workbench.web.main.internal.js /static-files/workbench.web.main.internal.js
 
 RUN cd /rootfs && find . | cpio -o -H newc > /output.cpio 2>/dev/null
