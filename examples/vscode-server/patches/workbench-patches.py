@@ -131,67 +131,87 @@ if rscan_old in d:
 else:
     print("WARNING: remote extension scan timeout pattern not found", file=sys.stderr)
 
-# 5. Browser-side VSIX download + server-side local install.
-#    The marketplace CDN allows CORS (Access-Control-Allow-Origin: *), so
-#    the browser can download the VSIX directly.  This avoids the server
-#    having to fetch from the CDN while CPU-starved by the extension host.
-#    The browser downloads the VSIX, base64-encodes it, and sends via IPC
-#    to the server's installFromBuffer handler which writes to a temp file
-#    and installs locally (fast, no network needed).
-ifg_old = 'async installFromGallery(e,t,i){let n=await this.extensionGalleryService.getManifest'
-ifg_new = (
-    'async installFromGallery(e,t,i){'
-    'let s=this.extensionManagementServerService.remoteExtensionManagementServer'
-    '||this.extensionManagementServerService.localExtensionManagementServer;'
-    'if(!s)throw new Error("No server");'
-    'let ch=s.extensionManagementService.channel;'
-    'let url=e.assets?.download?.uri;'
-    'if(url&&ch){'
-    'try{'
-    'await Promise.race(['
-    'ch.call("getTargetPlatform"),'
-    'new Promise((_,r)=>setTimeout(()=>r(new Error("IPC timeout")),10000))'
-    ']);'
-    'let resp=await fetch(url);'
-    'let buf=await resp.arrayBuffer();'
-    'let bytes=new Uint8Array(buf);'
-    'let vsixPath;'
-    '{'
-    'await Promise.race([ch.call("installChunkStart",[]),new Promise((_,r)=>setTimeout(()=>r(new Error("chunkStart timeout")),15000))]);'
-    'const CHUNK=32768;'
-    'for(let off=0;off<bytes.length;off+=CHUNK){'
-    'let slice=bytes.subarray(off,Math.min(off+CHUNK,bytes.length));'
-    'let c=[];for(let j=0;j<slice.length;j+=8192)'
-    'c.push(String.fromCharCode.apply(null,slice.subarray(j,Math.min(j+8192,slice.length))));'
-    'let b64=btoa(c.join(""));'
-    'await Promise.race([ch.call("installChunkData",[b64]),new Promise((_,r)=>setTimeout(()=>r(new Error("chunk timeout")),15000))]);'
-    '}'
-    'let r=await Promise.race(['
-    'ch.call("installChunkEnd",[]),'
-    'new Promise((_,r)=>setTimeout(()=>r(new Error("upload timeout")),30000))'
-    ']);'
-    'vsixPath=r.path;'
-    'var _installResult=r;'
-    '}'
-    'let _local={identifier:e.identifier,type:1,isBuiltin:false,'
-    'manifest:_installResult.manifest||{name:e.identifier.id,version:"0.0.0",engines:{vscode:"*"}},'
-    'location:{scheme:"file",authority:"",path:_installResult.dest,query:"",fragment:""},'
-    'isApplicationScoped:false,isMachineScoped:false,isPreReleaseVersion:false,'
-    'hadPreReleaseVersion:false,updated:false,pinned:false};'
-    'let _evt=[{identifier:e.identifier,source:e,local:_local,operation:2,profileLocation:this.userDataProfileService?.currentProfile?.extensionsResource}];'
-    'if(this._onDidInstallExtensions)this._onDidInstallExtensions.fire(_evt);'
-    'return _local'
-    '}catch(err){console.error("[Hyperlight] install error:",err)}'
-    '}'
-    'return s.extensionManagementService.installFromGallery(e,t||{})'
-    '}async _installFromGallery_orig(e,t,i){let n=await this.extensionGalleryService.getManifest'
+# 5. Browser-side VSIX download via IPC proxy bypass.
+#    The install flow routes through the aggregator's 3-arg installFromGallery,
+#    which calls getManifest + checks, then delegates to the IPC proxy's
+#    installFromGallery(e,t).  The proxy calls channel.call("installFromGallery")
+#    which hangs on single-vCPU.  Replace the IPC proxy's installFromGallery
+#    with browser-side VSIX download + chunked upload.
+ifg_proxy_old = (
+    'installFromGallery(e,t){'
+    'return Promise.resolve(this.channel.call("installFromGallery",[e,t]))'
+    '.then(i=>Xj(i,null))}'
 )
-if ifg_old in d:
-    d = d.replace(ifg_old, ifg_new, 1)
-    print("Patched installFromGallery bypass (skip CORS manifest fetch)")
+ifg_proxy_new = (
+    'async installFromGallery(e,t){'
+    'let _url=e?.assets?.download?.uri;'
+    'if(_url){'
+    'try{'
+    'console.log("[Hyperlight] Browser-side install:",e.identifier?.id);'
+    'let _resp=await fetch(_url);'
+    'if(!_resp.ok)throw new Error("Fetch "+_resp.status);'
+    'let _buf=await _resp.arrayBuffer();'
+    'let _bytes=new Uint8Array(_buf);'
+    'await Promise.race(['
+    'this.channel.call("installChunkStart",[]),'
+    'new Promise((_,r)=>setTimeout(()=>r(new Error("timeout")),15000))'
+    ']);'
+    'const _CHUNK=32768;'
+    'for(let _off=0;_off<_bytes.length;_off+=_CHUNK){'
+    'let _sl=_bytes.subarray(_off,Math.min(_off+_CHUNK,_bytes.length));'
+    'let _c=[];for(let _j=0;_j<_sl.length;_j+=8192)'
+    '_c.push(String.fromCharCode.apply(null,_sl.subarray(_j,Math.min(_j+8192,_sl.length))));'
+    'let _b64=btoa(_c.join(""));'
+    'await Promise.race(['
+    'this.channel.call("installChunkData",[_b64]),'
+    'new Promise((_,r)=>setTimeout(()=>r(new Error("timeout")),15000))'
+    ']);'
+    '}'
+    'let _r=await Promise.race(['
+    'this.channel.call("installChunkEnd",[]),'
+    'new Promise((_,r)=>setTimeout(()=>r(new Error("timeout")),30000))'
+    ']);'
+    'let _local={identifier:e.identifier,type:1,isBuiltin:false,'
+    'manifest:_r.manifest||{name:e.identifier?.id,version:"0.0.0",engines:{vscode:"*"}},'
+    'location:{scheme:"file",authority:"",path:_r.dest,query:"",fragment:""},'
+    'isApplicationScoped:false,isMachineScoped:!!t?.isMachineScoped,'
+    'isPreReleaseVersion:false,hadPreReleaseVersion:false,updated:false,pinned:false};'
+    'this._onDidInstallExtensions.fire([{identifier:e.identifier,source:e,local:_local,'
+    'operation:2,profileLocation:t?.profileLocation}]);'
+    'console.log("[Hyperlight] Install complete:",e.identifier?.id);'
+    'return _local'
+    '}catch(_err){console.error("[Hyperlight] Install error:",_err);throw _err}'
+    '}'
+    'return Promise.resolve(this.channel.call("installFromGallery",[e,t]))'
+    '.then(i=>Xj(i,null))}'
+)
+if ifg_proxy_old in d:
+    d = d.replace(ifg_proxy_old, ifg_proxy_new, 1)
+    print("Patched IPC proxy installFromGallery (browser-side download)")
     count += 1
 else:
-    print("WARNING: installFromGallery pattern not found", file=sys.stderr)
+    print("WARNING: IPC proxy installFromGallery pattern not found", file=sys.stderr)
+
+# 5b. Bypass the aggregator's 3-arg installFromGallery.
+#     It calls getManifest on the gallery service which routes through the
+#     WebSocket proxy and hangs on single-vCPU.  Skip all checks and go
+#     directly to the server's installFromGallery (our patched IPC proxy).
+agg3_old = 'async installFromGallery(e,t,i){let n=await this.extensionGalleryService.getManifest(e,ye.None)'
+agg3_new = (
+    'async installFromGallery(e,t,i){'
+    'let _s=this.extensionManagementServerService.remoteExtensionManagementServer'
+    '||this.extensionManagementServerService.localExtensionManagementServer;'
+    'if(_s&&e?.assets?.download?.uri){'
+    'console.log("[Hyperlight] aggregator: bypassing getManifest, direct to proxy");'
+    'return _s.extensionManagementService.installFromGallery(e,t||{})}'
+    'let n=await this.extensionGalleryService.getManifest(e,ye.None)'
+)
+if agg3_old in d:
+    d = d.replace(agg3_old, agg3_new, 1)
+    print("Patched aggregator 3-arg installFromGallery bypass")
+    count += 1
+else:
+    print("WARNING: aggregator 3-arg installFromGallery bypass not found", file=sys.stderr)
 
 # 6. Patch readExtensionResource to use HTTP for all extensions.
 #    On single-vCPU, the IPC file read (via _fileService.readFile) hangs
