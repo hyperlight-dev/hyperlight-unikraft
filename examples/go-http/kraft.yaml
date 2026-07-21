@@ -57,9 +57,9 @@ unikraft:
     # Cooperative poll model: run the scheduler to idle, then yield the vCPU
     # back to the host reporting the next-wakeup deadline, instead of blocking
     # the vCPU in-guest (time_block_until/__hl_sleep). Required for the host
-    # `poll_step` driver to reach a clean checkpoint boundary — without it the
+    # `poll` driver to reach a clean checkpoint boundary — without it the
     # idle path never returns to the host and checkpoint/restore stalls.
-    # See plat/hyperlight/poll.c, lib/ukschedcoop, and the host `poll_step` API.
+    # See plat/hyperlight/poll.c, lib/ukschedcoop, and the host `poll` API.
     CONFIG_HYPERLIGHT_POLL: 'y'
 
     # Signal and futex support (needed for Go runtime)

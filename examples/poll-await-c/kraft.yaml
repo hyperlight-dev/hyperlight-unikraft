@@ -13,7 +13,7 @@ unikraft:
 
     # Cooperative poll model: run the scheduler to idle, then yield the vCPU
     # back to the host reporting the next-wakeup deadline. See
-    # plat/hyperlight/poll.c and the host `poll_step` API.
+    # plat/hyperlight/poll.c and the host `poll` API.
     CONFIG_HYPERLIGHT_POLL: 'y'
 
     # Suppress kernel logging for performance (CRIT is the quietest level).
@@ -69,7 +69,7 @@ unikraft:
     CONFIG_LIBPOSIX_FDTAB_MULTITAB: 'n'
 
     # devfs + /dev/hcall: the app issues host function calls from user space,
-    # which is where the yield/await-token round-trips are driven.
+    # which is where async request-ID completion is driven.
     CONFIG_LIBDEVFS: 'y'
     CONFIG_LIBDEVFS_AUTOMOUNT: 'y'
     CONFIG_HYPERLIGHT_HCALL: 'y'

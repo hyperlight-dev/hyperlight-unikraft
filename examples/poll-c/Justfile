@@ -6,7 +6,7 @@
 #
 # The kernel is built with CONFIG_HYPERLIGHT_POLL=y (see kraft.yaml). The
 # host-side live test `host/tests/poll_run.rs` drives this guest via
-# `Sandbox::poll_step` under KVM.
+# `Sandbox::poll` under KVM.
 
 set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 export DOCKER_BUILDKIT := "0"

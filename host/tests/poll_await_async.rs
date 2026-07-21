@@ -6,8 +6,8 @@
 //! across the guest's cooperative park/resume:
 //!
 //!   - the tool is registered with `.tool_async("async_add", |args| async { … })`,
-//!   - on the guest's call the framework mints a completion token, parks the
-//!     guest (returns the yield sentinel) and queues the future,
+//!   - the guest supplies a numeric request ID; the host echoes it in the yield
+//!     sentinel and queues the future while the guest parks,
 //!   - the future is driven **off the vCPU thread** by
 //!     `sandbox.drive_host_functions().await`,
 //!   - once the future resolves, its result is delivered to the guest in the
@@ -128,7 +128,7 @@ fn setup() -> Option<(PathBuf, PathBuf)> {
 // ---------------------------------------------------------------------------
 
 /// Drive the poll-await guest to completion using the async-tools API and
-/// assert the framework's yield/await-token handling behaves end-to-end: the
+/// assert the framework's async request-ID handling behaves end-to-end: the
 /// `async` handler runs once, off the vCPU thread, and the final value reaches
 /// the guest intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -225,7 +225,7 @@ async fn poll_await_async_tool_roundtrip_under_kvm() {
     assert!(
         pending_steps > 0,
         "expected at least one Pending step that drove host functions (the \
-         guest awaits its completion token)"
+         guest awaits its request ID)"
     );
     // The non-idempotent async handler must run exactly once; the completion is
     // delivered to the guest in a single poll batch.

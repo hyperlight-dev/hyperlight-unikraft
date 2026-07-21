@@ -109,6 +109,7 @@ const MAX_TRUNCATE_LEN: u64 = 1024 * 1024 * 1024;
 
 /// Cap for incoming dispatch payload size (64 MiB).
 const MAX_DISPATCH_PAYLOAD: usize = 64 * 1024 * 1024;
+const MAX_PENDING_ASYNC_TASKS: usize = 1024;
 
 /// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
 const MAX_SLEEP_NS: u64 = 60_000_000_000;
@@ -753,7 +754,7 @@ pub struct ToolRegistry {
         HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value> + Send + Sync>>,
     /// Optional async-tool dispatch side (populated when the builder registers
     /// any [`SandboxBuilder::tool_async`] handler). Async tools return a yield
-    /// completion token immediately; their futures are driven off the vCPU
+    /// completion request ID immediately; their futures are driven off the vCPU
     /// thread by [`Sandbox::drive_host_functions`].
     async_side: Option<AsyncDispatch>,
 }
@@ -789,12 +790,11 @@ impl ToolRegistry {
             factories: HashMap::new(),
             pending: Arc::new(Mutex::new(HashMap::new())),
             queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            next_token: Arc::new(AtomicU64::new(1)),
         })
     }
 
     /// Register an async tool factory. On invocation the tool returns a yield
-    /// completion token immediately (off-loading any blocking work), and its
+    /// completion request ID immediately (off-loading any blocking work), and its
     /// future is driven by [`Sandbox::drive_host_functions`]. Used for the
     /// networking tools (natively async on the Tokio reactor), `__hl_sleep`,
     /// and user [`SandboxBuilder::tool_async`] handlers.
@@ -816,12 +816,15 @@ impl ToolRegistry {
     }
 
     /// Test helper: dispatch a request and, if the tool yielded an async
-    /// completion token, drive its queued future to completion on a temporary
+    /// completion request ID, drive its queued future to completion on a temporary
     /// runtime and return the resolved response in the same
     /// `{"result": …}` / `{"error": …}` shape the guest receives when the
     /// completion is delivered in the next `poll` batch. Lets synchronous unit
-    /// tests exercise the now-async tools (e.g. `net_send`) without a full poll
-    /// loop.
+    /// tests exercise the now-async tools (e.g. `__hl_sleep`) without a full
+    /// poll loop.
+    ///
+    /// The `payload` must use the cooperative format when the tool is async:
+    /// `{"__hl_request_id": <u64>, "request": {"name": "...", "args": ...}}`.
     #[cfg(test)]
     fn dispatch_drive(&self, payload: &[u8]) -> Vec<u8> {
         let resp = self.dispatch(payload);
@@ -829,12 +832,13 @@ impl ToolRegistry {
             Ok(v) => v,
             Err(_) => return resp,
         };
-        let token = parsed
+        let token_id: Option<u64> = parsed
             .get("result")
             .and_then(|r| r.get("__hl_yield__"))
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string());
-        let Some(token) = token else { return resp };
+            .and_then(|t| t.as_u64());
+        let Some(token_id) = token_id else {
+            return resp;
+        };
         let Some(asy) = &self.async_side else {
             return resp;
         };
@@ -851,7 +855,13 @@ impl ToolRegistry {
         }
         // The completion is delivered to the guest in the next poll batch as
         // {"result": …} / {"error": …}; reproduce that shape here.
-        let value = match asy.pending.lock().unwrap().remove(&token).map(|t| t.state) {
+        let value = match asy
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&token_id)
+            .map(|t| t.state)
+        {
             Some(PendingState::Ready(Ok(v))) => serde_json::json!({ "result": v }),
             Some(PendingState::Ready(Err(e))) => serde_json::json!({ "error": e }),
             _ => return resp,
@@ -862,10 +872,21 @@ impl ToolRegistry {
     /// Decode a guest-side `__dispatch` request, look up the handler by
     /// name, invoke it, and encode the response as JSON bytes.
     ///
-    /// The request shape is `{"name": "...", "args": <value>}`, and the
-    /// response is either `{"result": <value>}` or `{"error": "<msg>"}`.
-    /// Unknown tool names and JSON errors both become error responses;
-    /// this function never panics.
+    /// Two request formats are accepted:
+    ///
+    /// - **Cooperative (async):** `{"__hl_request_id": <u64>, "request": {"name": "...", "args": <value>}}`
+    ///   Required when calling an async tool. The u64 ID is guest-assigned, must be
+    ///   nonzero, and becomes the completion token; the yield sentinel
+    ///   `{"__hl_yield__": <u64>}` is returned immediately while the future runs off
+    ///   the vCPU thread.
+    ///
+    /// - **Legacy (sync):** `{"name": "...", "args": <value>}`
+    ///   Accepted for synchronous tools. Calling an async tool without `__hl_request_id`
+    ///   returns a protocol error.
+    ///
+    /// Responses are `{"result": <value>}` or `{"error": "<msg>"}`.
+    /// Unknown tool names, JSON errors, missing ID on async tools, a zero ID, and
+    /// duplicate in-flight IDs all become error responses; this function never panics.
     ///
     /// Set `HL_DISPATCH_DEBUG=1` in the environment to dump each call's
     /// payload and result to stderr — useful when diagnosing
@@ -895,18 +916,47 @@ impl ToolRegistry {
         }
         let result = (|| -> Result<serde_json::Value> {
             let req: serde_json::Value = serde_json::from_slice(payload)?;
-            let name = req["name"]
-                .as_str()
-                .ok_or_else(|| anyhow!("missing 'name'"))?;
-            let args = req.get("args").cloned().unwrap_or(serde_json::Value::Null);
-            // Async tools are handled off the sync tool table: dispatch_async
-            // returns Some(sentinel) when it owns the call (a yield sentinel
-            // while the future runs) and None to fall through to the sync
-            // tools. The resolved result is later delivered to the guest in the
-            // next `poll` batch, not through this dispatch path.
+            // Cooperative async requests carry a guest-supplied u64 ID:
+            //   {"__hl_request_id": <u64>, "request": {"name": "…", "args": …}}
+            // Legacy / sync-only requests omit the ID:
+            //   {"name": "…", "args": …}
+            let (name, args, request_id) = if let Some(id_val) = req.get("__hl_request_id") {
+                let request_id = id_val
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("'__hl_request_id' must be a u64 integer"))?;
+                if request_id == 0 {
+                    return Err(anyhow!("'__hl_request_id' must be a nonzero u64 integer"));
+                }
+                let inner = req
+                    .get("request")
+                    .ok_or_else(|| anyhow!("cooperative request missing 'request' field"))?;
+                let name = inner["name"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing 'name' in 'request'"))?;
+                let args = inner
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                (name, args, Some(request_id))
+            } else {
+                let name = req["name"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing 'name'"))?;
+                let args = req.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                (name, args, None)
+            };
+            // Async tools: require a cooperative request ID, then dispatch.
+            // Sync tools: fall through to the sync handler table below.
             if let Some(asy) = &self.async_side {
-                if let Some(v) = asy.dispatch_async(name, &args)? {
-                    return Ok(v);
+                if asy.factories.contains_key(name) {
+                    let id = request_id.ok_or_else(|| {
+                        anyhow!(
+                            "async tool '{}' requires '__hl_request_id' in the \
+                             cooperative request format",
+                            name
+                        )
+                    })?;
+                    return asy.dispatch_async(id, name, &args);
                 }
             }
             let handler = self
@@ -967,7 +1017,7 @@ type ToolFactory = Arc<dyn Fn(serde_json::Value) -> ToolFuture + Send + Sync>;
 /// handler by running it on Tokio's blocking thread pool
 /// ([`tokio::task::spawn_blocking`]). Used for `__hl_sleep`, whose timer wait
 /// (and socket-readiness poll) is a genuinely blocking operation: the guest
-/// call yields a completion token immediately and the wait runs off the vCPU
+/// call yields its guest-provided request ID immediately and the wait runs off the vCPU
 /// thread, so it never stalls the host executor.
 ///
 /// The networking tools no longer use this — they are natively async on
@@ -990,7 +1040,7 @@ where
     })
 }
 
-/// State of an in-flight async tool call, keyed by its completion token.
+/// State of an in-flight async tool call, keyed by its guest-provided request ID.
 #[derive(Debug)]
 enum PendingState {
     /// The future is still being driven by `drive_host_functions`.
@@ -1018,50 +1068,60 @@ struct PendingTask {
 /// The registry-side (synchronous, vCPU-thread) half of async tool support.
 ///
 /// Lives inside [`ToolRegistry`] so [`ToolRegistry::dispatch`] can, entirely
-/// synchronously, turn a call to an async tool into a fresh completion token +
+/// synchronously, turn a call to an async tool into a validated request ID +
 /// a queued future + a yield sentinel. It never blocks on a future — the
 /// futures are driven off-thread by [`Sandbox::drive_host_functions`], which
 /// shares `pending`/`queue`; their results are delivered to the guest in the
 /// next `poll` batch (see [`Sandbox::drain_completion_batch`]).
 struct AsyncDispatch {
     factories: HashMap<String, ToolFactory>,
-    pending: Arc<Mutex<HashMap<String, PendingTask>>>,
-    queue: Arc<Mutex<std::collections::VecDeque<(String, ToolFuture)>>>,
-    next_token: Arc<AtomicU64>,
+    pending: Arc<Mutex<HashMap<u64, PendingTask>>>,
+    queue: Arc<Mutex<std::collections::VecDeque<(u64, ToolFuture)>>>,
 }
 
 impl AsyncDispatch {
-    /// Returns `Some(sentinel)` if `name` is a registered async tool: mints a
-    /// completion token, queues the future to be driven off-thread, and returns
-    /// the yield sentinel `{"__hl_yield__": token}`. The guest parks on the
-    /// token; once the future resolves, the result is delivered in the next
-    /// `poll` batch (see [`Sandbox::drain_completion_batch`]). Returns `None`
-    /// for any other name so it falls through to the synchronous tool table.
+    /// Mints the yield sentinel for `request_id`, queues the future to be driven
+    /// off-thread, and returns `{"__hl_yield__": request_id}`. Returns
+    /// `Err` if `request_id` is already in-flight (duplicate rejection).
+    ///
+    /// The pending entry is established **before** the future is pushed to the
+    /// queue so that the driver can always find an entry for any token it
+    /// dequeues, even if it races with the dispatch thread.
     fn dispatch_async(
         &self,
+        request_id: u64,
         name: &str,
         args: &serde_json::Value,
-    ) -> Result<Option<serde_json::Value>> {
-        if let Some(factory) = self.factories.get(name) {
-            // First call: mint a token, queue the future, park via a yield.
-            let token = format!(
-                "__hlasync-{}",
-                self.next_token.fetch_add(1, Ordering::Relaxed)
-            );
-            let fut = factory(args.clone());
-            self.queue.lock().unwrap().push_back((token.clone(), fut));
-            self.pending.lock().unwrap().insert(
-                token.clone(),
-                PendingTask {
-                    name: name.to_string(),
-                    args: args.clone(),
-                    state: PendingState::Running,
-                },
-            );
-            Ok(Some(serde_json::json!({ "__hl_yield__": token })))
-        } else {
-            Ok(None)
+    ) -> Result<serde_json::Value> {
+        // self.factories.get(name) is guaranteed Some by the caller check.
+        let factory = self.factories.get(name).unwrap();
+        let mut pending = self.pending.lock().unwrap();
+        if pending.contains_key(&request_id) {
+            return Err(anyhow!(
+                "duplicate in-flight request ID {}: a task with this ID is already pending",
+                request_id
+            ));
         }
+        if pending.len() >= MAX_PENDING_ASYNC_TASKS {
+            return Err(anyhow!(
+                "too many in-flight async tasks (max {})",
+                MAX_PENDING_ASYNC_TASKS
+            ));
+        }
+        // Establish the pending entry BEFORE queuing the future so the driver
+        // always finds a record for every token it dequeues.
+        pending.insert(
+            request_id,
+            PendingTask {
+                name: name.to_string(),
+                args: args.clone(),
+                state: PendingState::Running,
+            },
+        );
+        drop(pending);
+        let fut = factory(args.clone());
+        self.queue.lock().unwrap().push_back((request_id, fut));
+        Ok(serde_json::json!({ "__hl_yield__": request_id }))
     }
 }
 
@@ -1069,9 +1129,9 @@ impl AsyncDispatch {
 /// running futures. Shares `pending`/`queue` with the [`AsyncDispatch`] in the
 /// registry. Driven by [`Sandbox::drive_host_functions`].
 struct AsyncToolState {
-    pending: Arc<Mutex<HashMap<String, PendingTask>>>,
-    queue: Arc<Mutex<std::collections::VecDeque<(String, ToolFuture)>>>,
-    join_set: tokio::task::JoinSet<(String, Result<serde_json::Value>)>,
+    pending: Arc<Mutex<HashMap<u64, PendingTask>>>,
+    queue: Arc<Mutex<std::collections::VecDeque<(u64, ToolFuture)>>>,
+    join_set: tokio::task::JoinSet<(u64, Result<serde_json::Value>)>,
     /// Clone of the registry's async-tool factories, so a task that was still
     /// `Running` at snapshot time can be re-invoked (with its saved args) to
     /// resume on restore (see [`Sandbox::restore_async_tasks`]).
@@ -1116,16 +1176,71 @@ impl AsyncToolState {
     /// Repopulate the tracker from an [`export_tasks`](Self::export_tasks)
     /// value. Backing implementation of [`Sandbox::restore_async_tasks`] — see
     /// that method for the per-task restore rules.
+    ///
+    /// The restore is **transactional**: the entire snapshot is validated
+    /// before any shared state is mutated. A snapshot is rejected (and nothing
+    /// is restored — no partial state is left behind) if any entry has a
+    /// non-`u64` or zero `token`, if two entries share a token, or if a token
+    /// collides with a task already in-flight in the current registry. Only
+    /// after full validation are the pending map and drive queue mutated, under
+    /// a single held lock so the commit is atomic against concurrent dispatch.
     fn restore_tasks(&mut self, data: &serde_json::Value) -> Result<()> {
         let tasks = data["tasks"]
             .as_array()
             .ok_or_else(|| anyhow!("task snapshot missing 'tasks' array"))?;
+        if tasks.len() > MAX_PENDING_ASYNC_TASKS {
+            return Err(anyhow!(
+                "task snapshot contains too many async tasks: {} (max {})",
+                tasks.len(),
+                MAX_PENDING_ASYNC_TASKS
+            ));
+        }
 
+        // Hold the pending lock across validate + commit so the duplicate check
+        // against the live registry and the eventual insert are one atomic step
+        // (no window for a concurrent dispatch to insert a colliding token).
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len().saturating_add(tasks.len()) > MAX_PENDING_ASYNC_TASKS {
+            return Err(anyhow!(
+                "restoring {} async tasks would exceed the per-sandbox limit of {}",
+                tasks.len(),
+                MAX_PENDING_ASYNC_TASKS
+            ));
+        }
+
+        // Phase 1 — validate every entry before touching `pending` or `queue`.
+        // On any error we return here, having mutated nothing.
+        let mut seen: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(tasks.len());
         for entry in tasks {
             let token = entry["token"]
-                .as_str()
-                .ok_or_else(|| anyhow!("task entry missing 'token'"))?
-                .to_string();
+                .as_u64()
+                .ok_or_else(|| anyhow!("task entry 'token' must be a u64 integer"))?;
+            if token == 0 {
+                return Err(anyhow!("task entry 'token' must be a nonzero u64 integer"));
+            }
+            if !seen.insert(token) {
+                return Err(anyhow!(
+                    "duplicate token {} within task snapshot: refusing partial restore",
+                    token
+                ));
+            }
+            if pending.contains_key(&token) {
+                return Err(anyhow!(
+                    "duplicate token {} in task snapshot: would overwrite an existing in-flight task",
+                    token
+                ));
+            }
+        }
+
+        // Phase 2 — all entries validated; build the pending records and any
+        // resume futures. Nothing below can fail, so there is no partial-restore
+        // window. Futures are collected first and pushed to the shared queue in
+        // one batch under the queue lock at the end.
+        let mut new_futures: Vec<(u64, ToolFuture)> = Vec::new();
+        for entry in tasks {
+            // `token` was validated as a nonzero u64 in phase 1.
+            let token = entry["token"].as_u64().unwrap();
             let name = entry["name"].as_str().unwrap_or("").to_string();
             let args = entry
                 .get("args")
@@ -1149,7 +1264,7 @@ impl AsyncToolState {
                 // Pending and the tool still exists — re-invoke it with the
                 // saved args so the work resumes off the vCPU thread.
                 let fut = factory(args.clone());
-                self.queue.lock().unwrap().push_back((token.clone(), fut));
+                new_futures.push((token, fut));
                 PendingState::Running
             } else {
                 // Pending but the tool can't be re-driven after restore
@@ -1160,10 +1275,14 @@ impl AsyncToolState {
                 )))
             };
 
-            self.pending
-                .lock()
-                .unwrap()
-                .insert(token, PendingTask { name, args, state });
+            pending.insert(token, PendingTask { name, args, state });
+        }
+
+        if !new_futures.is_empty() {
+            let mut queue = self.queue.lock().unwrap();
+            for (token, fut) in new_futures {
+                queue.push_back((token, fut));
+            }
         }
         Ok(())
     }
@@ -3418,31 +3537,34 @@ impl Sandbox {
     /// step of a fresh run.
     /// Drain every resolved async-tool result into the JSON batch object the
     /// guest `poll` function receives as its argument:
-    /// `{"<token>": {"result": …} | {"error": …}, …}`. Each entry is removed
-    /// from the shared pending map as it is drained (delivered exactly once).
-    /// Returns `"{}"` when nothing has completed or no async tools exist. The
-    /// per-token value shape matches what the guest kernel copies verbatim into
-    /// the parked op's response buffer (see `hyperlight_hcall_deliver_batch`).
+    /// `{"<id>": {"result": …} | {"error": …}, …}` where each key is the
+    /// decimal string form of the guest-supplied u64 request ID. Each entry is
+    /// removed from the shared pending map as it is drained (delivered exactly
+    /// once). Returns `"{}"` when nothing has completed or no async tools exist.
+    /// The per-entry value shape matches what the guest kernel copies verbatim
+    /// into the parked op's response buffer (see `hyperlight_hcall_deliver_batch`).
     fn drain_completion_batch(&mut self) -> String {
         let mut map = serde_json::Map::new();
         if let Some(st) = self.async_state.as_ref() {
             let mut pending = st.pending.lock().unwrap();
-            let ready: Vec<String> = pending
+            let ready: Vec<u64> = pending
                 .iter()
                 .filter(|(_, t)| matches!(t.state, PendingState::Ready(_)))
-                .map(|(t, _)| t.clone())
+                .map(|(id, _)| *id)
                 .collect();
-            for token in ready {
+            for id in ready {
                 if let Some(PendingTask {
                     state: PendingState::Ready(res),
                     ..
-                }) = pending.remove(&token)
+                }) = pending.remove(&id)
                 {
                     let value = match res {
                         Ok(v) => serde_json::json!({ "result": v }),
                         Err(e) => serde_json::json!({ "error": e }),
                     };
-                    map.insert(token, value);
+                    // Decimal string key for JSON-object compatibility with
+                    // the guest parser (hyperlight_hcall_deliver_batch).
+                    map.insert(id.to_string(), value);
                 }
             }
         }
@@ -4304,16 +4426,16 @@ mod tests {
     /// A pending task whose tool is still registered is re-queued (re-driven)
     /// on restore; a completed task's result/error is restored verbatim for
     /// re-delivery; and a pending task whose tool is gone becomes an error so
-    /// the guest can't hang on it.
+    /// the guest can't hang on it. Snapshot tokens are numeric u64 values.
     #[test]
     fn async_task_export_restore_roundtrip() {
         // Source state: one running task (net_recv), one completed-ok task,
-        // one completed-error task.
+        // one completed-error task. Keys are numeric u64 IDs (guest-supplied).
         let src = async_state_with(HashMap::new());
         {
             let mut p = src.pending.lock().unwrap();
             p.insert(
-                "__hlasync-1".into(),
+                1u64,
                 PendingTask {
                     name: "net_recv".into(),
                     args: serde_json::json!({ "fd": 4, "len": 16 }),
@@ -4321,7 +4443,7 @@ mod tests {
                 },
             );
             p.insert(
-                "__hlasync-2".into(),
+                2u64,
                 PendingTask {
                     name: "net_recv".into(),
                     args: serde_json::json!({ "fd": 5 }),
@@ -4329,7 +4451,7 @@ mod tests {
                 },
             );
             p.insert(
-                "__hlasync-3".into(),
+                3u64,
                 PendingTask {
                     name: "user_tool".into(),
                     args: serde_json::Value::Null,
@@ -4341,6 +4463,10 @@ mod tests {
         let snapshot = src.export_tasks();
         let tasks = snapshot["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 3);
+        assert!(
+            tasks.iter().all(|t| t["token"].is_number()),
+            "all snapshot token values must be numeric, got: {snapshot}"
+        );
 
         // Restore into a fresh state that only re-registers `net_recv`
         // (a re-invokable factory) — `user_tool` is intentionally absent.
@@ -4357,18 +4483,18 @@ mod tests {
 
         // (1) Running task with a live factory → re-queued as Running, and its
         //     future was pushed onto the drive queue.
-        assert!(matches!(p["__hlasync-1"].state, PendingState::Running));
-        assert_eq!(p["__hlasync-1"].name, "net_recv");
+        assert!(matches!(p[&1u64].state, PendingState::Running));
+        assert_eq!(p[&1u64].name, "net_recv");
         assert_eq!(dst.queue.lock().unwrap().len(), 1);
 
         // (2) Completed-ok task → result restored verbatim for re-delivery.
-        match &p["__hlasync-2"].state {
+        match &p[&2u64].state {
             PendingState::Ready(Ok(v)) => assert_eq!(v["data"], "aGk="),
             other => panic!("expected Ready(Ok), got {other:?}"),
         }
 
         // (3) Completed-error task → error restored verbatim.
-        match &p["__hlasync-3"].state {
+        match &p[&3u64].state {
             PendingState::Ready(Err(e)) => assert_eq!(e, "boom"),
             other => panic!("expected Ready(Err), got {other:?}"),
         }
@@ -4377,23 +4503,296 @@ mod tests {
     /// A task that was *pending* on a tool no longer registered after restore
     /// becomes a delivered error, so the resumed guest unparks instead of
     /// hanging forever on a token that can never be fulfilled.
+    /// Snapshot token must be a numeric u64.
     #[test]
     fn pending_task_without_factory_becomes_error_on_restore() {
         let snapshot = serde_json::json!({
             "tasks": [
-                { "token": "__hlasync-9", "name": "gone_tool", "args": {}, "status": "pending" }
+                { "token": 9u64, "name": "gone_tool", "args": {}, "status": "pending" }
             ]
         });
         let mut dst = async_state_with(HashMap::new());
         dst.restore_tasks(&snapshot).unwrap();
 
         let p = dst.pending.lock().unwrap();
-        match &p["__hlasync-9"].state {
+        match &p[&9u64].state {
             PendingState::Ready(Err(e)) => assert!(e.contains("could not be resumed")),
             other => panic!("expected Ready(Err), got {other:?}"),
         }
         // Nothing to re-drive.
         assert!(dst.queue.lock().unwrap().is_empty());
+    }
+
+    /// A cooperative request with a u64 ID dispatching an async tool yields
+    /// a numeric completion token (not a string).
+    #[test]
+    fn dispatch_async_numeric_id_yields_numeric_token() {
+        let mut tools = ToolRegistry::new();
+        tools.register_async_factory(
+            "echo_async",
+            Arc::new(|args| Box::pin(async move { Ok(args) })),
+        );
+
+        let req = br#"{"__hl_request_id":42,"request":{"name":"echo_async","args":"hi"}}"#;
+        let resp = tools.dispatch(req);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let token = &v["result"]["__hl_yield__"];
+        assert!(
+            token.is_number(),
+            "__hl_yield__ must be a numeric token, got: {v}"
+        );
+        assert_eq!(token.as_u64(), Some(42), "token must equal the request ID");
+    }
+
+    /// Calling an async tool without __hl_request_id returns a protocol error.
+    #[test]
+    fn dispatch_async_missing_id_returns_error() {
+        let mut tools = ToolRegistry::new();
+        tools.register_async_factory(
+            "echo_async",
+            Arc::new(|args| Box::pin(async move { Ok(args) })),
+        );
+
+        let req = br#"{"name":"echo_async","args":"hi"}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(
+            s.contains("\"error\""),
+            "missing ID should produce an error: {s}"
+        );
+        assert!(
+            s.contains("__hl_request_id"),
+            "error should mention __hl_request_id: {s}"
+        );
+    }
+
+    /// A cooperative request with `__hl_request_id` of 0 is rejected as a
+    /// protocol error (0 is never a valid guest request ID) and no task is
+    /// queued.
+    #[test]
+    fn dispatch_async_zero_id_returns_error() {
+        let mut tools = ToolRegistry::new();
+        tools.register_async_factory(
+            "echo_async",
+            Arc::new(|args| Box::pin(async move { Ok(args) })),
+        );
+
+        let req = br#"{"__hl_request_id":0,"request":{"name":"echo_async","args":"hi"}}"#;
+        let resp = tools.dispatch(req);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(
+            s.contains("\"error\""),
+            "zero ID should produce an error: {s}"
+        );
+        assert!(
+            s.contains("nonzero"),
+            "error should mention the ID must be nonzero: {s}"
+        );
+        let asy = tools.async_side.as_ref().unwrap();
+        assert!(
+            asy.pending.lock().unwrap().is_empty(),
+            "no task should be registered for a rejected zero ID"
+        );
+        assert!(
+            asy.queue.lock().unwrap().is_empty(),
+            "no future should be queued for a rejected zero ID"
+        );
+    }
+
+    /// A duplicate in-flight ID is rejected without overwriting the existing
+    /// pending task or queuing a second future.
+    #[test]
+    fn dispatch_async_duplicate_id_rejected_no_overwrite() {
+        let mut tools = ToolRegistry::new();
+        tools.register_async_factory(
+            "slow_async",
+            Arc::new(|_args| {
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    Ok(serde_json::Value::Null)
+                })
+            }),
+        );
+
+        let req1 = br#"{"__hl_request_id":99,"request":{"name":"slow_async","args":{"seq":1}}}"#;
+        let resp1 = tools.dispatch(req1);
+        let v1: serde_json::Value = serde_json::from_slice(&resp1).unwrap();
+        assert_eq!(
+            v1["result"]["__hl_yield__"].as_u64(),
+            Some(99),
+            "first dispatch should yield token 99: {v1}"
+        );
+
+        let req2 = br#"{"__hl_request_id":99,"request":{"name":"slow_async","args":{"seq":2}}}"#;
+        let resp2 = tools.dispatch(req2);
+        let s2 = std::str::from_utf8(&resp2).unwrap();
+        assert!(
+            s2.contains("\"error\""),
+            "duplicate ID should return an error: {s2}"
+        );
+        assert!(
+            s2.contains("duplicate") || s2.contains("already pending"),
+            "error should mention duplicate/pending: {s2}"
+        );
+
+        let asy = tools.async_side.as_ref().unwrap();
+        let pending = asy.pending.lock().unwrap();
+        let task = pending.get(&99u64).expect("original task must still exist");
+        assert_eq!(task.args["seq"], 1, "original args must be intact");
+        drop(pending);
+        assert_eq!(
+            asy.queue.lock().unwrap().len(),
+            1,
+            "only one future should have been queued"
+        );
+    }
+
+    /// Distinct guest IDs cannot grow the host's pending-task registry without
+    /// bound. Once the per-sandbox limit is reached, no additional future is
+    /// queued and the existing registry remains intact.
+    #[test]
+    fn dispatch_async_pending_limit_rejected() {
+        let mut tools = ToolRegistry::new();
+        tools.register_async_factory(
+            "async_tool",
+            Arc::new(|args| Box::pin(async move { Ok(args) })),
+        );
+        let asy = tools.async_side.as_ref().unwrap();
+        {
+            let mut pending = asy.pending.lock().unwrap();
+            for id in 1..=MAX_PENDING_ASYNC_TASKS as u64 {
+                pending.insert(
+                    id,
+                    PendingTask {
+                        name: "async_tool".into(),
+                        args: serde_json::Value::Null,
+                        state: PendingState::Running,
+                    },
+                );
+            }
+        }
+
+        let request_id = MAX_PENDING_ASYNC_TASKS as u64 + 1;
+        let req = format!(
+            r#"{{"__hl_request_id":{request_id},"request":{{"name":"async_tool","args":null}}}}"#
+        );
+        let resp = tools.dispatch(req.as_bytes());
+        let value: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("too many in-flight")),
+            "pending-limit rejection should be explicit: {value}"
+        );
+        assert_eq!(asy.pending.lock().unwrap().len(), MAX_PENDING_ASYNC_TASKS);
+        assert!(asy.queue.lock().unwrap().is_empty());
+    }
+
+    /// `restore_tasks` rejects a snapshot that contains a duplicate token and
+    /// commits **nothing** — the restore is transactional, so neither the first
+    /// nor the second colliding entry is left behind (no partial restore).
+    #[test]
+    fn snapshot_restore_rejects_duplicate_token() {
+        let snapshot = serde_json::json!({
+            "tasks": [
+                { "token": 5u64, "name": "tool_a", "args": {}, "status": "completed", "result": "first" },
+                { "token": 5u64, "name": "tool_b", "args": {}, "status": "completed", "result": "second" }
+            ]
+        });
+        let mut dst = async_state_with(HashMap::new());
+        let err = dst.restore_tasks(&snapshot).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate"),
+            "restore should reject duplicate token 5: {err}"
+        );
+        let p = dst.pending.lock().unwrap();
+        assert!(
+            p.is_empty(),
+            "a rejected snapshot must leave no partial state, got: {} entries",
+            p.len()
+        );
+        drop(p);
+        assert!(
+            dst.queue.lock().unwrap().is_empty(),
+            "a rejected snapshot must not queue any resume futures"
+        );
+    }
+
+    /// `restore_tasks` rejects a snapshot whose token collides with a task
+    /// already in-flight in the current registry, and commits nothing from the
+    /// snapshot — the pre-existing task is untouched and the other (non-
+    /// colliding) snapshot entry is NOT partially restored.
+    #[test]
+    fn snapshot_restore_rejects_collision_with_registry_no_partial() {
+        let mut dst = async_state_with(HashMap::new());
+        // Seed the live registry with an in-flight task under token 7.
+        dst.pending.lock().unwrap().insert(
+            7u64,
+            PendingTask {
+                name: "live_tool".into(),
+                args: serde_json::json!({ "keep": true }),
+                state: PendingState::Running,
+            },
+        );
+
+        // Snapshot: one fresh token (8) and one colliding token (7).
+        let snapshot = serde_json::json!({
+            "tasks": [
+                { "token": 8u64, "name": "tool_new", "args": {}, "status": "completed", "result": "x" },
+                { "token": 7u64, "name": "tool_dup", "args": {}, "status": "completed", "result": "y" }
+            ]
+        });
+        let err = dst.restore_tasks(&snapshot).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate"),
+            "restore should reject the registry collision on token 7: {err}"
+        );
+
+        let p = dst.pending.lock().unwrap();
+        // Pre-existing task intact.
+        let live = p.get(&7u64).expect("pre-existing task must survive");
+        assert_eq!(live.name, "live_tool", "existing task must be untouched");
+        assert_eq!(live.args["keep"], true);
+        // Non-colliding entry must NOT have been partially restored.
+        assert!(
+            p.get(&8u64).is_none(),
+            "no snapshot entry may be partially restored on rejection"
+        );
+        assert_eq!(p.len(), 1, "only the pre-existing task should remain");
+    }
+
+    /// `restore_tasks` rejects a zero token (never a valid guest request ID).
+    #[test]
+    fn snapshot_restore_rejects_zero_token() {
+        let snapshot = serde_json::json!({
+            "tasks": [
+                { "token": 0u64, "name": "tool_a", "args": {}, "status": "pending" }
+            ]
+        });
+        let mut dst = async_state_with(HashMap::new());
+        let err = dst.restore_tasks(&snapshot).unwrap_err();
+        assert!(
+            err.to_string().contains("nonzero"),
+            "restore should reject a zero token: {err}"
+        );
+        assert!(dst.pending.lock().unwrap().is_empty());
+    }
+
+    /// `restore_tasks` with a string token fails with a clear parse error
+    /// (string tokens are no longer valid).
+    #[test]
+    fn snapshot_restore_rejects_string_token() {
+        let snapshot = serde_json::json!({
+            "tasks": [
+                { "token": "__hlasync-1", "name": "tool_a", "args": {}, "status": "pending" }
+            ]
+        });
+        let mut dst = async_state_with(HashMap::new());
+        let err = dst.restore_tasks(&snapshot).unwrap_err();
+        assert!(
+            err.to_string().contains("u64"),
+            "restore should reject a string token: {err}"
+        );
     }
 
     fn tmpdir(label: &str) -> std::path::PathBuf {
@@ -5191,7 +5590,7 @@ mod tests {
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
-        let req = br#"{"name":"__hl_sleep","args":{"ns":0}}"#;
+        let req = br#"{"__hl_request_id":1,"request":{"name":"__hl_sleep","args":{"ns":0}}}"#;
         let resp = tools.dispatch_drive(req);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(!s.contains("\"error\""), "sleep(0) should succeed: {s}");
@@ -5268,7 +5667,8 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let req = br#"{"name":"__hl_sleep","args":{"ns":60000000000}}"#;
+        let req =
+            br#"{"__hl_request_id":1,"request":{"name":"__hl_sleep","args":{"ns":60000000000}}}"#;
         // Drive the now-async sleep future to completion (as the poll loop's
         // drive_host_functions would); the cancel from the other thread should
         // make the blocking sleep return promptly.
@@ -5425,7 +5825,10 @@ mod tests {
         // Create payload larger than MAX_NET_SEND (1 MiB)
         let big_payload = vec![0u8; MAX_NET_SEND + 1];
         let b64 = base64::engine::general_purpose::STANDARD.encode(&big_payload);
-        let req = format!(r#"{{"name":"net_send","args":{{"fd":{fd},"data":"{b64}"}}}}"#);
+        // net_send is async: use the cooperative request format with __hl_request_id.
+        let req = format!(
+            r#"{{"__hl_request_id":1,"request":{{"name":"net_send","args":{{"fd":{fd},"data":"{b64}"}}}}}}"#
+        );
         let resp = std::str::from_utf8(&reg.dispatch_drive(req.as_bytes()))
             .unwrap()
             .to_string();
@@ -5434,9 +5837,9 @@ mod tests {
             "expected 'too large' error for net_send, got: {resp}"
         );
 
-        // Also test net_sendto
+        // Also test net_sendto (also async — use cooperative format).
         let req = format!(
-            r#"{{"name":"net_sendto","args":{{"fd":{fd},"data":"{b64}","addr":"127.0.0.1","port":9999}}}}"#
+            r#"{{"__hl_request_id":2,"request":{{"name":"net_sendto","args":{{"fd":{fd},"data":"{b64}","addr":"127.0.0.1","port":9999}}}}}}"#
         );
         let resp = std::str::from_utf8(&reg.dispatch_drive(req.as_bytes()))
             .unwrap()

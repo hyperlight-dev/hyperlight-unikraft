@@ -14,8 +14,8 @@
  * and recv() must yield the vCPU back to the host (via the Unikraft
  * poll/epoll layer) instead of issuing a blocking host call — otherwise the
  * whole VM would freeze for the duration of the wait. The host-side test
- * (host/tests/poll_recv.rs) drives this guest with Sandbox::poll_step +
- * Sandbox::poll_wait while a client thread connects and sends a payload;
+ * (host/tests/poll_recv.rs) drives this guest with Sandbox::poll +
+ * Sandbox::drive_host_functions while a client thread connects and sends a payload;
  * the guest should reach the recv, print the bytes, and exit (Done).
  */
 

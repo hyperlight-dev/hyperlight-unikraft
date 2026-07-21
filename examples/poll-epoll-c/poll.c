@@ -26,7 +26,7 @@
  *     on them; each delivers a short ASCII integer which we parse and sum.
  *
  * The host-side test (host/tests/poll_epoll.rs) drives this guest with
- * Sandbox::poll_step + Sandbox::poll_wait_async while two clients connect and
+ * Sandbox::poll + Sandbox::drive_host_functions while two clients connect and
  * send "40" and "2" on the two ports at staggered times. Because the sends are
  * staggered, the guest's epoll_wait returns for the first socket, parks again,
  * and later returns for the second — proving epoll delivers readiness for two

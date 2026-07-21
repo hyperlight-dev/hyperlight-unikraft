@@ -5,14 +5,14 @@
 /*
  * Cooperative-poll async-await smoke app.
  *
- * Exercises the hcall yield/await-token mechanism (see
+ * Exercises the hcall yield/await request-ID mechanism (see
  * plat/hyperlight/hcall.c and plat/hyperlight/poll.c). The guest issues a
  * single host function call to a custom `async_add` tool that does NOT answer
  * immediately: the host returns the yield sentinel
- * {"result":{"__hl_yield__":"<token>"}}. The kernel's hyperlight_hcall() then
+ * {"result":{"__hl_yield__":<u64>}}. The kernel's hyperlight_hcall() then
  * transparently parks this thread; on each subsequent host `poll` the host
  * passes a batch of completed tasks as the poll argument, and the kernel
- * delivers the matching token's result to this parked call (see
+ * delivers the matching request ID's result to this parked call (see
  * hyperlight_hcall_deliver_batch). From this app's point of view the
  * write()/read() on /dev/hcall is an ordinary blocking call that eventually
  * yields the sum.

@@ -1,14 +1,14 @@
-# poll-await-c on Hyperlight (cooperative poll model, hcall yield/await tokens)
+# poll-await-c on Hyperlight (cooperative poll model, async request IDs)
 #
 # just rootfs   - Build rootfs via Docker (cross-platform)
 # just build    - Build the poll-enabled kernel via kraft
 # just clean    - Remove build artifacts
 #
 # The kernel is built with CONFIG_HYPERLIGHT_POLL=y and CONFIG_HYPERLIGHT_HCALL=y
-# (see kraft.yaml). The host-side live test `host/tests/poll_await.rs` drives
-# this guest via `Sandbox::poll_step` under KVM. The guest issues one host
+# (see kraft.yaml). The host-side live test `host/tests/poll_await_async.rs`
+# drives this guest via `Sandbox::poll` under KVM. The guest issues one host
 # function call to a custom `async_add` tool that answers asynchronously (the
-# yield/await-token protocol in plat/hyperlight/hcall.c), so the guest parks and
+# request-ID protocol in plat/hyperlight/hcall.c), so the guest parks and
 # resumes across several host polls before receiving the result.
 
 set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]

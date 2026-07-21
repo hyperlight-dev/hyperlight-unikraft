@@ -48,11 +48,39 @@ There is **one** guest-to-host RPC channel for tools: the Hyperlight host functi
 
 ## `__dispatch` wire format
 
-**Request** (UTF-8 JSON bytes, max **64 MiB**):
+Two request formats are accepted:
+
+### Cooperative (async) request
+
+Used when calling an **async tool** (e.g. `net_connect`, `net_recv`, `__hl_sleep`). The guest provides a nonzero `u64` request ID that becomes the completion token:
+
+```json
+{"__hl_request_id": <u64>, "request": {"name": "<tool_name>", "args": <json_value>}}
+```
+
+The host immediately returns a yield sentinel:
+
+```json
+{"result": {"__hl_yield__": <u64>}}
+```
+
+The guest parks on the token. Once the async work completes, the result is delivered in the next `poll` batch (a JSON object keyed by decimal ID string):
+
+```json
+{"<id>": {"result": <value>} | {"error": "<message>"}, …}
+```
+
+A duplicate or zero `__hl_request_id` is rejected atomically with `{"error": "…"}` without overwriting an existing task or queuing new work. Each sandbox accepts at most 1024 concurrent async tasks.
+
+### Legacy (sync) request
+
+Used for synchronous tools (e.g. `fs_read`, `net_socket`, `__hl_exit`):
 
 ```json
 {"name": "<tool_name>", "args": <json_value>}
 ```
+
+Calling an **async** tool in legacy format returns `{"error": "…"}` (protocol error).
 
 **Success response:**
 
@@ -66,7 +94,7 @@ There is **one** guest-to-host RPC channel for tools: the Hyperlight host functi
 {"error": "<message>"}
 ```
 
-Unknown tools, malformed JSON, and handler errors become `{"error": "..."}`. The host does not panic on bad guest input.
+Unknown tools, malformed JSON, invalid or missing `__hl_request_id` values, duplicate IDs, and pending-limit violations all become `{"error": "..."}`. The host does not panic on bad guest input.
 
 **Debug:** set `HL_DISPATCH_DEBUG=1` in the environment to log each request/response on stderr.
 
@@ -132,6 +160,8 @@ Sleep on the host thread (used by guest drivers).
 
 **Result:** `{}`  
 Can be cancelled via `SleepCancel` when tearing down the sandbox.
+
+**Async:** `__hl_sleep` is an async tool — the guest must use the cooperative request format with `__hl_request_id`.
 
 ---
 
