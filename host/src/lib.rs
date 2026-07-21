@@ -1503,9 +1503,10 @@ fn register_internal_tools(
         Ok(serde_json::json!({}))
     });
     // Cooperative poll model: the guest reports the nanoseconds until its
-    // next scheduler wakeup (0 = no pending timer) right before it yields
-    // the vCPU back to the host. `poll` reads this to decide how long
-    // to wait before the next `poll`. See plat/hyperlight/poll.c.
+    // next scheduler wakeup right before it yields the vCPU back to the host.
+    // 0 means no pending timer; 1 is the guest's minimum nonzero value for a
+    // timer already due, causing an immediate re-poll. `poll` reads this to
+    // decide how long to wait before the next `poll`. See plat/hyperlight/poll.c.
     let pd = poll_deadline.clone();
     tools.register("__hl_poll_yield", move |args| {
         let ns = args["ns"].as_u64().unwrap_or(0) & POLL_DEADLINE_MASK;
@@ -5612,6 +5613,24 @@ mod tests {
         assert_eq!(raw & POLL_EXITED_BIT, 0, "exit bit must be clear");
         assert_ne!(raw & POLL_YIELDED_BIT, 0, "yielded bit must be set");
         assert_eq!(raw & POLL_DEADLINE_MASK, 1234);
+    }
+
+    #[test]
+    fn test_poll_yield_preserves_immediate_repoll_deadline() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
+
+        tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":1}}"#);
+        let raw = poll_deadline.load(Ordering::Relaxed);
+        assert_ne!(raw & POLL_YIELDED_BIT, 0);
+        assert_eq!(
+            raw & POLL_DEADLINE_MASK,
+            1,
+            "an already-due guest timer must remain distinct from no timer"
+        );
     }
 
     #[test]
