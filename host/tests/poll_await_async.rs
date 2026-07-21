@@ -1,5 +1,5 @@
 //! Live cooperative-poll run exercising the **async host-function tools** API
-//! (`SandboxBuilder::tool_async` + `Sandbox::poll` + `drive_host_functions`)
+//! (`SandboxBuilder::tool_async` + `Sandbox::poll_outcome` + `drive_host_functions`)
 //! under a real hypervisor (`/dev/kvm` on Linux).
 //!
 //! This proves the framework transparently drives a plain Rust `async` handler
@@ -21,15 +21,19 @@
 //! The target driving loop under test:
 //! ```ignore
 //! loop {
-//!     match sandbox.poll()? {
-//!         Poll::Ready(()) => break,
-//!         Poll::Pending => sandbox.drive_host_functions().await,
+//!     match sandbox.poll_outcome()? {
+//!         PollOutcome::Exited => break,
+//!         PollOutcome::Idle | PollOutcome::Timer(_)
+//!         | PollOutcome::HostCallsPending { .. } => {
+//!             sandbox.drive_host_functions().await
+//!         }
 //!     }
 //! }
 //! ```
 //!
 //! Assertions (all must hold to prove the async-tools layer end-to-end):
-//!   - the run reaches [`Poll::Ready(())`](core::task::Poll::Ready),
+//!   - the run reaches [`PollOutcome::Exited`],
+//!   - at least one step reports [`PollOutcome::HostCallsPending`],
 //!   - it takes multiple poll steps (the guest parks/resumes across the await),
 //!   - `async_add` runs **exactly once** (the non-idempotent future is queued
 //!     once; the completion is delivered via a single poll batch), and
@@ -40,8 +44,7 @@
 //! diagnostic) when either is missing so `cargo test` still passes on runners
 //! without KVM or a built poll-await kernel.
 
-use core::task::Poll;
-use hyperlight_unikraft::Sandbox;
+use hyperlight_unikraft::{PollOutcome, Sandbox};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -184,17 +187,19 @@ async fn poll_await_async_tool_roundtrip_under_kvm() {
     let start = Instant::now();
     let mut steps = 0usize;
     let mut pending_steps = 0usize;
+    let mut saw_host_calls_pending = false;
     let mut done = false;
 
     while steps < MAX_STEPS && start.elapsed() < MAX_WALL {
         steps += 1;
-        match sbox.poll().expect("poll") {
-            Poll::Ready(()) => {
+        match sbox.poll_outcome().expect("poll") {
+            PollOutcome::Exited => {
                 done = true;
                 break;
             }
-            Poll::Pending => {
+            outcome => {
                 pending_steps += 1;
+                saw_host_calls_pending |= matches!(outcome, PollOutcome::HostCallsPending { .. });
                 // Let the registered async tool futures make progress off the
                 // vCPU thread; blocks until at least one completes or the
                 // guest's next timer deadline elapses.
@@ -226,6 +231,10 @@ async fn poll_await_async_tool_roundtrip_under_kvm() {
         pending_steps > 0,
         "expected at least one Pending step that drove host functions (the \
          guest awaits its request ID)"
+    );
+    assert!(
+        saw_host_calls_pending,
+        "typed poll outcome never reported the in-flight async host call"
     );
     // The non-idempotent async handler must run exactly once; the completion is
     // delivered to the guest in a single poll batch.

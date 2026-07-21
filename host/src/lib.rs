@@ -72,7 +72,7 @@ use hyperlight_host::{GuestBinary, HostFunctions, MultiUseSandbox, Uninitialized
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -114,33 +114,49 @@ const MAX_PENDING_ASYNC_TASKS: usize = 1024;
 /// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
 const MAX_SLEEP_NS: u64 = 60_000_000_000;
 
-/// Reserved high bit of the cooperative-poll deadline atomic used to signal
-/// that the guest process has explicitly exited (via `__hl_exit`, e.g. the
-/// Python driver's `report_exit_code`). Kept separate from the deadline so a
-/// late deadline report within the same `poll` call coexists with the exit
-/// signal.
-const POLL_EXITED_BIT: u64 = 1 << 63;
+/// Why one cooperative guest step returned control to the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollOutcome {
+    /// The guest explicitly exited or halted without a scheduler yield.
+    Exited,
+    /// The scheduler is idle and has no timer or host call to wake it.
+    Idle,
+    /// The scheduler is idle until the reported relative deadline.
+    Timer(Duration),
+    /// One or more guest host calls are being driven off the vCPU thread.
+    HostCallsPending {
+        /// A concurrent guest timer, if one was reported by the scheduler.
+        next_wakeup: Option<Duration>,
+    },
+}
 
-/// Reserved bit of the cooperative-poll deadline atomic set by the guest's
-/// idle pump every time it yields the vCPU back to the host (via
-/// `__hl_poll_yield`). Its purpose is to distinguish a *genuine* scheduler
-/// idle-yield from a VM *halt* that returned control without yielding.
-///
-/// A normal C guest (pid ≤ 2) that returns from `main` exits via
-/// `exit_group` → `uk_pm_shutdown(SYSHALT)` → a direct port-108 HALT. That
-/// path never runs the idle pump, so it never calls `__hl_poll_yield` and
-/// never sets `__hl_exit`. Without this bit, such a run would be
-/// indistinguishable from a zero-deadline idle-yield and [`Sandbox::poll`]
-/// would loop forever reporting [`Poll::Pending`](core::task::Poll::Pending).
-/// By clearing the atomic before each `poll` call and checking this bit
-/// afterwards, [`Sandbox::poll`] treats "the VM halted without yielding" as
-/// terminal ([`Poll::Ready`](core::task::Poll::Ready)).
-const POLL_YIELDED_BIT: u64 = 1 << 62;
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum GuestPollSignal {
+    #[default]
+    None,
+    Yielded {
+        deadline_ns: Option<u64>,
+    },
+    Exited,
+}
 
-/// Mask selecting the nanoseconds-until-next-wakeup deadline carried in the
-/// low bits of the cooperative-poll atomic (everything except the reserved
-/// [`POLL_EXITED_BIT`] and [`POLL_YIELDED_BIT`] flags).
-const POLL_DEADLINE_MASK: u64 = POLL_YIELDED_BIT - 1;
+type SharedPollSignal = Arc<Mutex<GuestPollSignal>>;
+
+fn classify_poll_signal(signal: GuestPollSignal, host_calls_pending: bool) -> PollOutcome {
+    let GuestPollSignal::Yielded { deadline_ns } = signal else {
+        return PollOutcome::Exited;
+    };
+    let deadline = deadline_ns.map(Duration::from_nanos);
+    if host_calls_pending {
+        PollOutcome::HostCallsPending {
+            next_wakeup: deadline,
+        }
+    } else if let Some(after) = deadline {
+        PollOutcome::Timer(after)
+    } else {
+        PollOutcome::Idle
+    }
+}
 
 /// Shared cancellation primitive for `__hl_sleep`. Calling
 /// [`SleepCancel::cancel`] wakes up any in-progress sleep immediately so
@@ -1485,21 +1501,17 @@ fn build_tools(
 fn register_internal_tools(
     tools: &mut ToolRegistry,
     exit_code: &Arc<AtomicI32>,
-    poll_deadline: &Arc<AtomicU64>,
+    poll_signal: &SharedPollSignal,
     sleep_cancel: &SleepCancel,
     network: Option<&NetworkPolicy>,
     listen_ports: Option<&ListenPorts>,
 ) -> Option<Arc<Mutex<SocketTable>>> {
     let ec = exit_code.clone();
-    let pd_exit = poll_deadline.clone();
+    let exit_signal = poll_signal.clone();
     tools.register("__hl_exit", move |args| {
         let code = args["code"].as_i64().unwrap_or(1) as i32;
         ec.store(code, Ordering::Relaxed);
-        // Signal completion to the cooperative poll loop without losing a
-        // deadline that a later __hl_poll_yield (from the idle pump) may
-        // report within the same `poll` call: the exit bit is preserved
-        // separately from the nanosecond deadline. See POLL_EXITED_BIT.
-        pd_exit.fetch_or(POLL_EXITED_BIT, Ordering::Relaxed);
+        *exit_signal.lock().unwrap() = GuestPollSignal::Exited;
         Ok(serde_json::json!({}))
     });
     // Cooperative poll model: the guest reports the nanoseconds until its
@@ -1507,14 +1519,28 @@ fn register_internal_tools(
     // 0 means no pending timer; 1 is the guest's minimum nonzero value for a
     // timer already due, causing an immediate re-poll. `poll` reads this to
     // decide how long to wait before the next `poll`. See plat/hyperlight/poll.c.
-    let pd = poll_deadline.clone();
+    let yield_signal = poll_signal.clone();
     tools.register("__hl_poll_yield", move |args| {
-        let ns = args["ns"].as_u64().unwrap_or(0) & POLL_DEADLINE_MASK;
-        // Preserve the exit bit if __hl_exit already fired this call, and set
-        // the yielded bit so `poll` can tell a real idle-yield apart from a
-        // bare HALT (see POLL_YIELDED_BIT).
-        let cur = pd.load(Ordering::Relaxed) & POLL_EXITED_BIT;
-        pd.store(cur | POLL_YIELDED_BIT | ns, Ordering::Relaxed);
+        let ns = args
+            .get("ns")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("__hl_poll_yield: ns must be a non-negative integer"))?;
+        let mut signal = yield_signal.lock().unwrap();
+        match *signal {
+            GuestPollSignal::None => {
+                *signal = GuestPollSignal::Yielded {
+                    deadline_ns: (ns != 0).then_some(ns),
+                };
+            }
+            // An explicit exit is authoritative. The idle pump may still yield
+            // later in the same dispatch while unwinding the scheduler.
+            GuestPollSignal::Exited => {}
+            GuestPollSignal::Yielded { .. } => {
+                return Err(anyhow!(
+                    "__hl_poll_yield: guest yielded more than once in one poll step"
+                ));
+            }
+        }
         Ok(serde_json::json!({}))
     });
     // Create socket table early so __hl_sleep can poll sockets while sleeping.
@@ -3061,10 +3087,10 @@ pub struct Sandbox {
     /// overwrites the region with the snapshot's original memory.
     initrd_path: Option<std::path::PathBuf>,
     exit_code: Arc<AtomicI32>,
-    /// Last next-wakeup deadline (ns) reported by the guest `poll`
-    /// function via `__hl_poll_yield`. 0 means "no pending timer".
-    poll_deadline: Arc<AtomicU64>,
-    /// Absolute deadline derived from `poll_deadline` at the end of each
+    /// Typed signal reported by `__hl_exit` or `__hl_poll_yield` during the
+    /// current cooperative guest step.
+    poll_signal: SharedPollSignal,
+    /// Absolute deadline derived from `poll_signal` at the end of each
     /// [`Sandbox::poll`]: `Some(instant)` when the guest reported a pending
     /// timer, `None` for an indefinite park (no timer) or exit. Consumed by
     /// [`Sandbox::drive_host_functions`] as the inter-step wait bound and
@@ -3358,13 +3384,13 @@ impl Sandbox {
         let mut usbox = UninitializedSandbox::new(env, Some(config.sandbox_config()))?;
 
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_signal = Arc::new(Mutex::new(GuestPollSignal::None));
         let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
         let socket_table = register_internal_tools(
             &mut tools,
             &exit_code,
-            &poll_deadline,
+            &poll_signal,
             &sleep_cancel,
             network,
             listen_ports,
@@ -3380,7 +3406,7 @@ impl Sandbox {
             usbox,
             None,
             exit_code,
-            poll_deadline,
+            poll_signal,
             sleep_cancel,
             socket_table,
             async_state,
@@ -3433,13 +3459,13 @@ impl Sandbox {
         };
 
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_signal = Arc::new(Mutex::new(GuestPollSignal::None));
         let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
         let socket_table = register_internal_tools(
             &mut tools,
             &exit_code,
-            &poll_deadline,
+            &poll_signal,
             &sleep_cancel,
             network,
             listen_ports,
@@ -3455,7 +3481,7 @@ impl Sandbox {
             usbox,
             initrd_owned,
             exit_code,
-            poll_deadline,
+            poll_signal,
             sleep_cancel,
             socket_table,
             async_state,
@@ -3466,7 +3492,7 @@ impl Sandbox {
         usbox: UninitializedSandbox,
         initrd_path: Option<std::path::PathBuf>,
         exit_code: Arc<AtomicI32>,
-        poll_deadline: Arc<AtomicU64>,
+        poll_signal: SharedPollSignal,
         sleep_cancel: SleepCancel,
         socket_table: Option<Arc<Mutex<SocketTable>>>,
         async_state: Option<AsyncToolState>,
@@ -3478,7 +3504,7 @@ impl Sandbox {
             snapshot,
             initrd_path,
             exit_code,
-            poll_deadline,
+            poll_signal,
             next_wakeup_at: None,
             socket_table,
             sleep_cancel,
@@ -3501,6 +3527,7 @@ impl Sandbox {
         if let Some(ref table) = self.socket_table {
             table.lock().unwrap().clear();
         }
+        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
         self.next_wakeup_at = None;
         Ok(())
     }
@@ -3517,25 +3544,6 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Run one cooperative poll step, reported as a [`core::task::Poll`].
-    ///
-    /// Invokes the guest `poll` function, which pumps the unikernel scheduler
-    /// until it would go idle, then yields the vCPU back to the host (a HALT),
-    /// reporting the nanoseconds until its next scheduled wakeup. Guest memory
-    /// persists across the HALT/re-entry boundary, so repeatedly calling `poll`
-    /// drives the guest forward cooperatively.
-    ///
-    /// - [`Poll::Ready(())`](core::task::Poll::Ready) — the guest exited; stop
-    ///   polling.
-    /// - [`Poll::Pending`](core::task::Poll::Pending) — the guest yielded and
-    ///   should be driven again after [`Sandbox::drive_host_functions`]. Query
-    ///   [`Sandbox::next_wakeup`] for the time until its pending timer (if any).
-    ///
-    /// This is the ergonomic entry point for the async-tools driving loop; see
-    /// [`SandboxBuilder::tool_async`] for the full loop shape.
-    ///
-    /// Requires a prior `restore()` to reset guest state before the first
-    /// step of a fresh run.
     /// Drain every resolved async-tool result into the JSON batch object the
     /// guest `poll` function receives as its argument:
     /// `{"<id>": {"result": …} | {"error": …}, …}` where each key is the
@@ -3572,12 +3580,22 @@ impl Sandbox {
         serde_json::Value::Object(map).to_string()
     }
 
-    pub fn poll(&mut self) -> Result<core::task::Poll<()>> {
-        use core::task::Poll;
-        // Clear the deadline atomic so a stale value from a previous step
-        // can't be misread; the guest sets it during this call via
-        // __hl_poll_yield / __hl_exit.
-        self.poll_deadline.store(0, Ordering::Relaxed);
+    /// Run one cooperative guest step and return its typed reason for yielding.
+    ///
+    /// This method owns vCPU progress: it delivers completed host-call results,
+    /// runs the guest scheduler until it exits or yields, and records any timer
+    /// deadline for [`Sandbox::drive_host_functions`]. When it returns
+    /// [`PollOutcome::HostCallsPending`], the caller should invoke
+    /// `drive_host_functions` before polling the guest again.
+    ///
+    /// A direct VM halt without `__hl_poll_yield` is classified as
+    /// [`PollOutcome::Exited`]. This covers normal C process completion via
+    /// `uk_pm_shutdown(SYSHALT)` as well as explicit `__hl_exit`.
+    ///
+    /// Requires a prior [`Sandbox::restore`] before the first step of a fresh
+    /// run.
+    pub fn poll_outcome(&mut self) -> Result<PollOutcome> {
+        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
         // Pass the batch of completed/errored async host tasks as the guest
         // `poll` function's argument. The guest kernel routes each token's
         // result to the matching parked host call (see
@@ -3587,25 +3605,48 @@ impl Sandbox {
         // nothing has completed since the last step.
         let batch = self.drain_completion_batch();
         let _: () = self.inner.call("poll", batch)?;
-        let raw = self.poll_deadline.load(Ordering::Relaxed);
-        // Default: no pending host-side timer (exit or indefinite park).
-        // Overwritten below once we know the guest reported a real deadline.
+        let signal = *self.poll_signal.lock().unwrap();
         self.next_wakeup_at = None;
-        // Explicit exit (e.g. the Python driver's __hl_exit) is terminal.
-        // The idle pump also sets POLL_YIELDED_BIT every time it hands the vCPU
-        // back cooperatively; if the poll returned without it, the guest halted
-        // (a normal C app exiting via SYSHALT, or an abort) — terminal too.
-        if raw & POLL_EXITED_BIT != 0 || raw & POLL_YIELDED_BIT == 0 {
-            return Ok(Poll::Ready(()));
+
+        let outcome = classify_poll_signal(signal, self.has_pending_host_calls());
+        let deadline = match outcome {
+            PollOutcome::Timer(after) => Some(after),
+            PollOutcome::HostCallsPending { next_wakeup } => next_wakeup,
+            PollOutcome::Exited | PollOutcome::Idle => None,
+        };
+        if let Some(after) = deadline {
+            // Keep an absolute deadline for drive_host_functions(), so time
+            // spent by the caller between the two operations is subtracted.
+            self.next_wakeup_at = Some(Instant::now() + after);
         }
-        let ns = raw & POLL_DEADLINE_MASK;
-        if ns != 0 {
-            // Capture the deadline as an absolute instant *now* (right after
-            // the poll call), so drive_host_functions() waits only the time
-            // actually remaining even if the caller did work in between.
-            self.next_wakeup_at = Some(Instant::now() + Duration::from_nanos(ns));
-        }
-        Ok(Poll::Pending)
+        Ok(outcome)
+    }
+
+    fn has_pending_host_calls(&self) -> bool {
+        self.async_state.as_ref().is_some_and(|state| {
+            !state.queue.lock().unwrap().is_empty()
+                || !state.join_set.is_empty()
+                || state
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|task| matches!(task.state, PendingState::Running))
+        })
+    }
+
+    /// Compatibility wrapper over [`Sandbox::poll_outcome`].
+    ///
+    /// Maps [`PollOutcome::Exited`] to [`core::task::Poll::Ready`] and every
+    /// yielded outcome to [`core::task::Poll::Pending`]. Use `poll_outcome`
+    /// when the caller needs to distinguish idle, timer, and host-call waits.
+    pub fn poll(&mut self) -> Result<core::task::Poll<()>> {
+        Ok(match self.poll_outcome()? {
+            PollOutcome::Exited => core::task::Poll::Ready(()),
+            PollOutcome::Idle | PollOutcome::Timer(_) | PollOutcome::HostCallsPending { .. } => {
+                core::task::Poll::Pending
+            }
+        })
     }
 
     /// Time remaining until the guest's next scheduled wakeup, as captured by
@@ -3859,10 +3900,15 @@ impl Sandbox {
         tokio::time::sleep(timeout).await;
     }
 
-    /// Reset the cooperative-poll deadline/exit state to its initial value.
+    /// Reset the cooperative-poll signal to its initial value.
     /// Call before starting a fresh poll-driven run.
+    pub fn reset_poll_state(&self) {
+        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
+    }
+
+    /// Backward-compatible alias for [`Sandbox::reset_poll_state`].
     pub fn reset_poll_deadline(&self) {
-        self.poll_deadline.store(0, Ordering::Relaxed);
+        self.reset_poll_state();
     }
 
     /// Call a named guest function with typed parameters.
@@ -4089,13 +4135,13 @@ impl Sandbox {
         let arc = Arc::new(loaded);
 
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_signal = Arc::new(Mutex::new(GuestPollSignal::None));
         let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(None, preopens)?.unwrap_or_default();
         let socket_table = register_internal_tools(
             &mut tools,
             &exit_code,
-            &poll_deadline,
+            &poll_signal,
             &sleep_cancel,
             network,
             listen_ports,
@@ -4121,7 +4167,7 @@ impl Sandbox {
             snapshot: Some(arc),
             initrd_path: initrd,
             exit_code,
-            poll_deadline,
+            poll_signal,
             next_wakeup_at: None,
             socket_table,
             sleep_cancel,
@@ -5412,7 +5458,7 @@ mod tests {
     fn net_tools_registered_with_blocklist() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
         register_internal_tools(
@@ -5433,7 +5479,7 @@ mod tests {
     fn net_tools_not_registered_without_policy() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
         let req = br#"{"name":"net_socket","args":{"family":2,"type":1}}"#;
@@ -5446,7 +5492,7 @@ mod tests {
     fn net_tools_registered_with_allow_all() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         register_internal_tools(
             &mut tools,
@@ -5481,7 +5527,7 @@ mod tests {
     fn net_bind_denied_without_listen_ports() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         register_internal_tools(
             &mut tools,
@@ -5512,7 +5558,7 @@ mod tests {
     fn net_bind_allowed_with_matching_port() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         let lp = ListenPorts::from_ports([8080]);
         register_internal_tools(
@@ -5540,7 +5586,7 @@ mod tests {
     fn net_bind_denied_with_wrong_port() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         let lp = ListenPorts::from_ports([8080]);
         register_internal_tools(
@@ -5587,7 +5633,7 @@ mod tests {
 
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
@@ -5601,60 +5647,96 @@ mod tests {
     fn test_poll_yield_reports_deadline() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
-        // A yield with a pending timer reports the nanosecond deadline in
-        // the low bits, sets the yielded bit, and leaves the exit bit clear.
         let resp = tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":1234}}"#);
         assert!(!std::str::from_utf8(&resp).unwrap().contains("\"error\""));
-        let raw = poll_deadline.load(Ordering::Relaxed);
-        assert_eq!(raw & POLL_EXITED_BIT, 0, "exit bit must be clear");
-        assert_ne!(raw & POLL_YIELDED_BIT, 0, "yielded bit must be set");
-        assert_eq!(raw & POLL_DEADLINE_MASK, 1234);
+        assert_eq!(
+            *poll_deadline.lock().unwrap(),
+            GuestPollSignal::Yielded {
+                deadline_ns: Some(1234)
+            }
+        );
+    }
+
+    #[test]
+    fn test_poll_signal_classifies_all_outcomes() {
+        assert_eq!(
+            classify_poll_signal(GuestPollSignal::None, false),
+            PollOutcome::Exited,
+            "a bare VM halt is terminal"
+        );
+        assert_eq!(
+            classify_poll_signal(GuestPollSignal::Exited, true),
+            PollOutcome::Exited,
+            "explicit exit takes precedence over pending host work"
+        );
+        assert_eq!(
+            classify_poll_signal(GuestPollSignal::Yielded { deadline_ns: None }, false),
+            PollOutcome::Idle
+        );
+        assert_eq!(
+            classify_poll_signal(
+                GuestPollSignal::Yielded {
+                    deadline_ns: Some(42)
+                },
+                false
+            ),
+            PollOutcome::Timer(Duration::from_nanos(42))
+        );
+        assert_eq!(
+            classify_poll_signal(
+                GuestPollSignal::Yielded {
+                    deadline_ns: Some(42)
+                },
+                true
+            ),
+            PollOutcome::HostCallsPending {
+                next_wakeup: Some(Duration::from_nanos(42))
+            }
+        );
     }
 
     #[test]
     fn test_poll_yield_preserves_immediate_repoll_deadline() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
         tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":1}}"#);
-        let raw = poll_deadline.load(Ordering::Relaxed);
-        assert_ne!(raw & POLL_YIELDED_BIT, 0);
         assert_eq!(
-            raw & POLL_DEADLINE_MASK,
-            1,
+            *poll_deadline.lock().unwrap(),
+            GuestPollSignal::Yielded {
+                deadline_ns: Some(1)
+            },
             "an already-due guest timer must remain distinct from no timer"
         );
     }
 
     #[test]
-    fn test_poll_yield_zero_sets_yielded_bit() {
+    fn test_poll_yield_zero_reports_idle() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
-        // A zero-deadline idle-yield must still set the yielded bit so it is
-        // distinguishable from a bare HALT (which sets nothing). `poll` maps
-        // the former to Pending (idle) and the latter to Ready (done).
         tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0}}"#);
-        let raw = poll_deadline.load(Ordering::Relaxed);
-        assert_ne!(raw & POLL_YIELDED_BIT, 0, "yielded bit must be set on ns=0");
-        assert_eq!(raw & POLL_DEADLINE_MASK, 0);
+        assert_eq!(
+            *poll_deadline.lock().unwrap(),
+            GuestPollSignal::Yielded { deadline_ns: None }
+        );
     }
 
     #[test]
-    fn test_exit_bit_survives_late_poll_yield() {
+    fn test_exit_survives_late_poll_yield() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
@@ -5663,11 +5745,36 @@ mod tests {
         tools.dispatch(br#"{"name":"__hl_exit","args":{"code":0}}"#);
         tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0}}"#);
 
-        let raw = poll_deadline.load(Ordering::Relaxed);
-        assert_ne!(
-            raw & POLL_EXITED_BIT,
-            0,
-            "exit bit must survive a later yield"
+        assert_eq!(*poll_deadline.lock().unwrap(), GuestPollSignal::Exited);
+    }
+
+    #[test]
+    fn test_poll_yield_rejects_missing_deadline() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_signal = Arc::new(Mutex::new(GuestPollSignal::None));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &poll_signal, &sc, None, None);
+
+        let resp = tools.dispatch(br#"{"name":"__hl_poll_yield","args":{}}"#);
+        assert!(std::str::from_utf8(&resp).unwrap().contains("\"error\""));
+        assert_eq!(*poll_signal.lock().unwrap(), GuestPollSignal::None);
+    }
+
+    #[test]
+    fn test_poll_yield_rejects_duplicate_signal() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_signal = Arc::new(Mutex::new(GuestPollSignal::None));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &poll_signal, &sc, None, None);
+
+        tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0}}"#);
+        let resp = tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":1}}"#);
+        assert!(std::str::from_utf8(&resp).unwrap().contains("\"error\""));
+        assert_eq!(
+            *poll_signal.lock().unwrap(),
+            GuestPollSignal::Yielded { deadline_ns: None }
         );
     }
 
@@ -5675,7 +5782,7 @@ mod tests {
     fn test_sleep_cancel_wakes_immediately() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
@@ -5888,7 +5995,7 @@ mod tests {
     fn net_socket_has_default_timeout() {
         let mut tools = ToolRegistry::new();
         let exit_code = Arc::new(AtomicI32::new(0));
-        let poll_deadline = Arc::new(AtomicU64::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
         let sc = SleepCancel::new();
         let table = register_internal_tools(
             &mut tools,
