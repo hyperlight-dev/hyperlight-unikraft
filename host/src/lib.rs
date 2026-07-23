@@ -110,6 +110,32 @@ const MAX_TRUNCATE_LEN: u64 = 1024 * 1024 * 1024;
 /// Cap for incoming dispatch payload size (64 MiB).
 const MAX_DISPATCH_PAYLOAD: usize = 64 * 1024 * 1024;
 const MAX_PENDING_ASYNC_TASKS: usize = 1024;
+const REQUEST_ID_HEX_LEN: usize = 16;
+
+fn format_request_id(request_id: u64) -> String {
+    format!("{request_id:016x}")
+}
+
+fn parse_request_id(value: &serde_json::Value, field: &str) -> Result<u64> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| anyhow!("'{field}' must be a 16-character lowercase hex string"))?;
+    if text.len() != REQUEST_ID_HEX_LEN
+        || !text
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return Err(anyhow!(
+            "'{field}' must be a 16-character lowercase hex string"
+        ));
+    }
+    let request_id = u64::from_str_radix(text, 16)
+        .map_err(|_| anyhow!("'{field}' contains an invalid hexadecimal request ID"))?;
+    if request_id == 0 {
+        return Err(anyhow!("'{field}' must encode a nonzero request ID"));
+    }
+    Ok(request_id)
+}
 
 /// Cap for `__hl_sleep` duration to prevent unbounded host-thread blocking (60 s).
 const MAX_SLEEP_NS: u64 = 60_000_000_000;
@@ -840,7 +866,7 @@ impl ToolRegistry {
     /// poll loop.
     ///
     /// The `payload` must use the cooperative format when the tool is async:
-    /// `{"__hl_request_id": <u64>, "request": {"name": "...", "args": ...}}`.
+    /// `{"__hl_request_id": "<16-digit-hex>", "request": {"name": "...", "args": ...}}`.
     #[cfg(test)]
     fn dispatch_drive(&self, payload: &[u8]) -> Vec<u8> {
         let resp = self.dispatch(payload);
@@ -851,7 +877,7 @@ impl ToolRegistry {
         let token_id: Option<u64> = parsed
             .get("result")
             .and_then(|r| r.get("__hl_yield__"))
-            .and_then(|t| t.as_u64());
+            .and_then(|t| parse_request_id(t, "__hl_yield__").ok());
         let Some(token_id) = token_id else {
             return resp;
         };
@@ -890,19 +916,19 @@ impl ToolRegistry {
     ///
     /// Two request formats are accepted:
     ///
-    /// - **Cooperative (async):** `{"__hl_request_id": <u64>, "request": {"name": "...", "args": <value>}}`
-    ///   Required when calling an async tool. The u64 ID is guest-assigned, must be
-    ///   nonzero, and becomes the completion token; the yield sentinel
-    ///   `{"__hl_yield__": <u64>}` is returned immediately while the future runs off
-    ///   the vCPU thread.
+    /// - **Cooperative (async):** `{"__hl_request_id": "<16-digit-hex>", "request": {"name": "...", "args": <value>}}`
+    ///   Required when calling an async tool. The fixed-width lowercase hex ID is
+    ///   guest-assigned, must encode a nonzero u64, and becomes the completion
+    ///   token; the yield sentinel echoes the same string while the future runs
+    ///   off the vCPU thread.
     ///
     /// - **Legacy (sync):** `{"name": "...", "args": <value>}`
     ///   Accepted for synchronous tools. Calling an async tool without `__hl_request_id`
     ///   returns a protocol error.
     ///
     /// Responses are `{"result": <value>}` or `{"error": "<msg>"}`.
-    /// Unknown tool names, JSON errors, missing ID on async tools, a zero ID, and
-    /// duplicate in-flight IDs all become error responses; this function never panics.
+    /// Unknown tool names, JSON errors, missing/malformed/zero IDs, and duplicate
+    /// in-flight IDs all become error responses; this function never panics.
     ///
     /// Set `HL_DISPATCH_DEBUG=1` in the environment to dump each call's
     /// payload and result to stderr — useful when diagnosing
@@ -932,17 +958,12 @@ impl ToolRegistry {
         }
         let result = (|| -> Result<serde_json::Value> {
             let req: serde_json::Value = serde_json::from_slice(payload)?;
-            // Cooperative async requests carry a guest-supplied u64 ID:
-            //   {"__hl_request_id": <u64>, "request": {"name": "…", "args": …}}
+            // Cooperative async requests carry a guest-supplied fixed-width
+            // lowercase hexadecimal u64 ID.
             // Legacy / sync-only requests omit the ID:
             //   {"name": "…", "args": …}
             let (name, args, request_id) = if let Some(id_val) = req.get("__hl_request_id") {
-                let request_id = id_val
-                    .as_u64()
-                    .ok_or_else(|| anyhow!("'__hl_request_id' must be a u64 integer"))?;
-                if request_id == 0 {
-                    return Err(anyhow!("'__hl_request_id' must be a nonzero u64 integer"));
-                }
+                let request_id = parse_request_id(id_val, "__hl_request_id")?;
                 let inner = req
                     .get("request")
                     .ok_or_else(|| anyhow!("cooperative request missing 'request' field"))?;
@@ -1097,7 +1118,7 @@ struct AsyncDispatch {
 
 impl AsyncDispatch {
     /// Mints the yield sentinel for `request_id`, queues the future to be driven
-    /// off-thread, and returns `{"__hl_yield__": request_id}`. Returns
+    /// off-thread, and returns the fixed-width hexadecimal yield sentinel. Returns
     /// `Err` if `request_id` is already in-flight (duplicate rejection).
     ///
     /// The pending entry is established **before** the future is pushed to the
@@ -1137,7 +1158,7 @@ impl AsyncDispatch {
         drop(pending);
         let fut = factory(args.clone());
         self.queue.lock().unwrap().push_back((request_id, fut));
-        Ok(serde_json::json!({ "__hl_yield__": request_id }))
+        Ok(serde_json::json!({ "__hl_yield__": format_request_id(request_id) }))
     }
 }
 
@@ -1165,20 +1186,20 @@ impl AsyncToolState {
             .iter()
             .map(|(token, task)| match &task.state {
                 PendingState::Running => json!({
-                    "token": token,
+                    "token": format_request_id(*token),
                     "name": task.name,
                     "args": task.args,
                     "status": "pending",
                 }),
                 PendingState::Ready(Ok(v)) => json!({
-                    "token": token,
+                    "token": format_request_id(*token),
                     "name": task.name,
                     "args": task.args,
                     "status": "completed",
                     "result": v,
                 }),
                 PendingState::Ready(Err(e)) => json!({
-                    "token": token,
+                    "token": format_request_id(*token),
                     "name": task.name,
                     "args": task.args,
                     "status": "completed",
@@ -1196,7 +1217,7 @@ impl AsyncToolState {
     /// The restore is **transactional**: the entire snapshot is validated
     /// before any shared state is mutated. A snapshot is rejected (and nothing
     /// is restored — no partial state is left behind) if any entry has a
-    /// non-`u64` or zero `token`, if two entries share a token, or if a token
+    /// malformed or zero hexadecimal `token`, if two entries share a token, or if a token
     /// collides with a task already in-flight in the current registry. Only
     /// after full validation are the pending map and drive queue mutated, under
     /// a single held lock so the commit is atomic against concurrent dispatch.
@@ -1229,12 +1250,7 @@ impl AsyncToolState {
         let mut seen: std::collections::HashSet<u64> =
             std::collections::HashSet::with_capacity(tasks.len());
         for entry in tasks {
-            let token = entry["token"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("task entry 'token' must be a u64 integer"))?;
-            if token == 0 {
-                return Err(anyhow!("task entry 'token' must be a nonzero u64 integer"));
-            }
+            let token = parse_request_id(&entry["token"], "token")?;
             if !seen.insert(token) {
                 return Err(anyhow!(
                     "duplicate token {} within task snapshot: refusing partial restore",
@@ -1255,8 +1271,8 @@ impl AsyncToolState {
         // one batch under the queue lock at the end.
         let mut new_futures: Vec<(u64, ToolFuture)> = Vec::new();
         for entry in tasks {
-            // `token` was validated as a nonzero u64 in phase 1.
-            let token = entry["token"].as_u64().unwrap();
+            // `token` was validated as a nonzero hexadecimal u64 in phase 1.
+            let token = parse_request_id(&entry["token"], "token").unwrap();
             let name = entry["name"].as_str().unwrap_or("").to_string();
             let args = entry
                 .get("args")
@@ -3547,7 +3563,7 @@ impl Sandbox {
     /// Drain every resolved async-tool result into the JSON batch object the
     /// guest `poll` function receives as its argument:
     /// `{"<id>": {"result": …} | {"error": …}, …}` where each key is the
-    /// decimal string form of the guest-supplied u64 request ID. Each entry is
+    /// fixed-width lowercase hex form of the guest-supplied u64 request ID. Each entry is
     /// removed from the shared pending map as it is drained (delivered exactly
     /// once). Returns `"{}"` when nothing has completed or no async tools exist.
     /// The per-entry value shape matches what the guest kernel copies verbatim
@@ -3571,9 +3587,7 @@ impl Sandbox {
                         Ok(v) => serde_json::json!({ "result": v }),
                         Err(e) => serde_json::json!({ "error": e }),
                     };
-                    // Decimal string key for JSON-object compatibility with
-                    // the guest parser (hyperlight_hcall_deliver_batch).
-                    map.insert(id.to_string(), value);
+                    map.insert(format_request_id(id), value);
                 }
             }
         }
@@ -4473,11 +4487,11 @@ mod tests {
     /// A pending task whose tool is still registered is re-queued (re-driven)
     /// on restore; a completed task's result/error is restored verbatim for
     /// re-delivery; and a pending task whose tool is gone becomes an error so
-    /// the guest can't hang on it. Snapshot tokens are numeric u64 values.
+    /// the guest can't hang on it. Snapshot tokens use fixed-width hex strings.
     #[test]
     fn async_task_export_restore_roundtrip() {
         // Source state: one running task (net_recv), one completed-ok task,
-        // one completed-error task. Keys are numeric u64 IDs (guest-supplied).
+        // one completed-error task. Internal keys remain u64 IDs.
         let src = async_state_with(HashMap::new());
         {
             let mut p = src.pending.lock().unwrap();
@@ -4511,8 +4525,12 @@ mod tests {
         let tasks = snapshot["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 3);
         assert!(
-            tasks.iter().all(|t| t["token"].is_number()),
-            "all snapshot token values must be numeric, got: {snapshot}"
+            tasks.iter().all(|t| {
+                t["token"]
+                    .as_str()
+                    .is_some_and(|s| s.len() == REQUEST_ID_HEX_LEN)
+            }),
+            "all snapshot token values must be fixed-width hex strings, got: {snapshot}"
         );
 
         // Restore into a fresh state that only re-registers `net_recv`
@@ -4550,12 +4568,12 @@ mod tests {
     /// A task that was *pending* on a tool no longer registered after restore
     /// becomes a delivered error, so the resumed guest unparks instead of
     /// hanging forever on a token that can never be fulfilled.
-    /// Snapshot token must be a numeric u64.
+    /// Snapshot token must be a fixed-width hexadecimal string.
     #[test]
     fn pending_task_without_factory_becomes_error_on_restore() {
         let snapshot = serde_json::json!({
             "tasks": [
-                { "token": 9u64, "name": "gone_tool", "args": {}, "status": "pending" }
+                { "token": "0000000000000009", "name": "gone_tool", "args": {}, "status": "pending" }
             ]
         });
         let mut dst = async_state_with(HashMap::new());
@@ -4570,25 +4588,49 @@ mod tests {
         assert!(dst.queue.lock().unwrap().is_empty());
     }
 
-    /// A cooperative request with a u64 ID dispatching an async tool yields
-    /// a numeric completion token (not a string).
+    /// A cooperative request with a hexadecimal ID dispatching an async tool
+    /// yields the same fixed-width hexadecimal completion token.
     #[test]
-    fn dispatch_async_numeric_id_yields_numeric_token() {
+    fn dispatch_async_hex_id_yields_hex_token() {
         let mut tools = ToolRegistry::new();
         tools.register_async_factory(
             "echo_async",
             Arc::new(|args| Box::pin(async move { Ok(args) })),
         );
 
-        let req = br#"{"__hl_request_id":42,"request":{"name":"echo_async","args":"hi"}}"#;
+        let req = br#"{"__hl_request_id":"000000000000002a","request":{"name":"echo_async","args":"hi"}}"#;
         let resp = tools.dispatch(req);
         let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
         let token = &v["result"]["__hl_yield__"];
         assert!(
-            token.is_number(),
-            "__hl_yield__ must be a numeric token, got: {v}"
+            token.is_string(),
+            "__hl_yield__ must be a string token, got: {v}"
         );
-        assert_eq!(token.as_u64(), Some(42), "token must equal the request ID");
+        assert_eq!(
+            token.as_str(),
+            Some("000000000000002a"),
+            "token must equal the request ID"
+        );
+    }
+
+    #[test]
+    fn request_id_parser_requires_canonical_nonzero_hex() {
+        assert_eq!(
+            parse_request_id(&serde_json::json!("ffffffffffffffff"), "__hl_request_id").unwrap(),
+            u64::MAX
+        );
+
+        for invalid in [
+            serde_json::json!(42),
+            serde_json::json!("2a"),
+            serde_json::json!("000000000000002A"),
+            serde_json::json!("0000000000000000"),
+        ] {
+            assert!(
+                parse_request_id(&invalid, "__hl_request_id").is_err(),
+                "non-canonical request ID should be rejected: {invalid}"
+            );
+        }
     }
 
     /// Calling an async tool without __hl_request_id returns a protocol error.
@@ -4624,7 +4666,7 @@ mod tests {
             Arc::new(|args| Box::pin(async move { Ok(args) })),
         );
 
-        let req = br#"{"__hl_request_id":0,"request":{"name":"echo_async","args":"hi"}}"#;
+        let req = br#"{"__hl_request_id":"0000000000000000","request":{"name":"echo_async","args":"hi"}}"#;
         let resp = tools.dispatch(req);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(
@@ -4661,16 +4703,16 @@ mod tests {
             }),
         );
 
-        let req1 = br#"{"__hl_request_id":99,"request":{"name":"slow_async","args":{"seq":1}}}"#;
+        let req1 = br#"{"__hl_request_id":"0000000000000063","request":{"name":"slow_async","args":{"seq":1}}}"#;
         let resp1 = tools.dispatch(req1);
         let v1: serde_json::Value = serde_json::from_slice(&resp1).unwrap();
         assert_eq!(
-            v1["result"]["__hl_yield__"].as_u64(),
-            Some(99),
+            v1["result"]["__hl_yield__"].as_str(),
+            Some("0000000000000063"),
             "first dispatch should yield token 99: {v1}"
         );
 
-        let req2 = br#"{"__hl_request_id":99,"request":{"name":"slow_async","args":{"seq":2}}}"#;
+        let req2 = br#"{"__hl_request_id":"0000000000000063","request":{"name":"slow_async","args":{"seq":2}}}"#;
         let resp2 = tools.dispatch(req2);
         let s2 = std::str::from_utf8(&resp2).unwrap();
         assert!(
@@ -4721,7 +4763,8 @@ mod tests {
 
         let request_id = MAX_PENDING_ASYNC_TASKS as u64 + 1;
         let req = format!(
-            r#"{{"__hl_request_id":{request_id},"request":{{"name":"async_tool","args":null}}}}"#
+            r#"{{"__hl_request_id":"{}","request":{{"name":"async_tool","args":null}}}}"#,
+            format_request_id(request_id)
         );
         let resp = tools.dispatch(req.as_bytes());
         let value: serde_json::Value = serde_json::from_slice(&resp).unwrap();
@@ -4742,8 +4785,8 @@ mod tests {
     fn snapshot_restore_rejects_duplicate_token() {
         let snapshot = serde_json::json!({
             "tasks": [
-                { "token": 5u64, "name": "tool_a", "args": {}, "status": "completed", "result": "first" },
-                { "token": 5u64, "name": "tool_b", "args": {}, "status": "completed", "result": "second" }
+                { "token": "0000000000000005", "name": "tool_a", "args": {}, "status": "completed", "result": "first" },
+                { "token": "0000000000000005", "name": "tool_b", "args": {}, "status": "completed", "result": "second" }
             ]
         });
         let mut dst = async_state_with(HashMap::new());
@@ -4785,8 +4828,8 @@ mod tests {
         // Snapshot: one fresh token (8) and one colliding token (7).
         let snapshot = serde_json::json!({
             "tasks": [
-                { "token": 8u64, "name": "tool_new", "args": {}, "status": "completed", "result": "x" },
-                { "token": 7u64, "name": "tool_dup", "args": {}, "status": "completed", "result": "y" }
+                { "token": "0000000000000008", "name": "tool_new", "args": {}, "status": "completed", "result": "x" },
+                { "token": "0000000000000007", "name": "tool_dup", "args": {}, "status": "completed", "result": "y" }
             ]
         });
         let err = dst.restore_tasks(&snapshot).unwrap_err();
@@ -4813,7 +4856,7 @@ mod tests {
     fn snapshot_restore_rejects_zero_token() {
         let snapshot = serde_json::json!({
             "tasks": [
-                { "token": 0u64, "name": "tool_a", "args": {}, "status": "pending" }
+                { "token": "0000000000000000", "name": "tool_a", "args": {}, "status": "pending" }
             ]
         });
         let mut dst = async_state_with(HashMap::new());
@@ -4825,10 +4868,9 @@ mod tests {
         assert!(dst.pending.lock().unwrap().is_empty());
     }
 
-    /// `restore_tasks` with a string token fails with a clear parse error
-    /// (string tokens are no longer valid).
+    /// `restore_tasks` rejects strings that are not canonical request IDs.
     #[test]
-    fn snapshot_restore_rejects_string_token() {
+    fn snapshot_restore_rejects_malformed_hex_token() {
         let snapshot = serde_json::json!({
             "tasks": [
                 { "token": "__hlasync-1", "name": "tool_a", "args": {}, "status": "pending" }
@@ -4837,8 +4879,8 @@ mod tests {
         let mut dst = async_state_with(HashMap::new());
         let err = dst.restore_tasks(&snapshot).unwrap_err();
         assert!(
-            err.to_string().contains("u64"),
-            "restore should reject a string token: {err}"
+            err.to_string().contains("16-character lowercase hex"),
+            "restore should reject a malformed token: {err}"
         );
     }
 
@@ -5637,7 +5679,7 @@ mod tests {
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
-        let req = br#"{"__hl_request_id":1,"request":{"name":"__hl_sleep","args":{"ns":0}}}"#;
+        let req = br#"{"__hl_request_id":"0000000000000001","request":{"name":"__hl_sleep","args":{"ns":0}}}"#;
         let resp = tools.dispatch_drive(req);
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(!s.contains("\"error\""), "sleep(0) should succeed: {s}");
@@ -5794,7 +5836,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let req =
-            br#"{"__hl_request_id":1,"request":{"name":"__hl_sleep","args":{"ns":60000000000}}}"#;
+            br#"{"__hl_request_id":"0000000000000001","request":{"name":"__hl_sleep","args":{"ns":60000000000}}}"#;
         // Drive the now-async sleep future to completion (as the poll loop's
         // drive_host_functions would); the cancel from the other thread should
         // make the blocking sleep return promptly.
@@ -5953,7 +5995,7 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&big_payload);
         // net_send is async: use the cooperative request format with __hl_request_id.
         let req = format!(
-            r#"{{"__hl_request_id":1,"request":{{"name":"net_send","args":{{"fd":{fd},"data":"{b64}"}}}}}}"#
+            r#"{{"__hl_request_id":"0000000000000001","request":{{"name":"net_send","args":{{"fd":{fd},"data":"{b64}"}}}}}}"#
         );
         let resp = std::str::from_utf8(&reg.dispatch_drive(req.as_bytes()))
             .unwrap()
@@ -5965,7 +6007,7 @@ mod tests {
 
         // Also test net_sendto (also async — use cooperative format).
         let req = format!(
-            r#"{{"__hl_request_id":2,"request":{{"name":"net_sendto","args":{{"fd":{fd},"data":"{b64}","addr":"127.0.0.1","port":9999}}}}}}"#
+            r#"{{"__hl_request_id":"0000000000000002","request":{{"name":"net_sendto","args":{{"fd":{fd},"data":"{b64}","addr":"127.0.0.1","port":9999}}}}}}"#
         );
         let resp = std::str::from_utf8(&reg.dispatch_drive(req.as_bytes()))
             .unwrap()
