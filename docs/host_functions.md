@@ -31,7 +31,7 @@ Guest (Unikraft)
         │
         ▼
 Hyperlight host (hyperlight-unikraft)
-  ToolRegistry::dispatch(payload)  →  JSON in / JSON out
+  ToolRegistry::dispatch(payload)  →  JSON tool payloads in binary async frames
 ```
 
 There is **one** guest-to-host RPC channel for tools: the Hyperlight host function **`__dispatch`**, registered when the sandbox is created. All tool names are looked up in a host-side `ToolRegistry`.
@@ -52,25 +52,33 @@ Two request formats are accepted:
 
 ### Cooperative (async) request
 
-Used when calling an **async tool** (e.g. `net_connect`, `net_recv`, `__hl_sleep`). The guest provides a nonzero `u64` request ID that becomes the completion token:
+Used when calling an **async tool** (e.g. `net_connect`, `net_recv`,
+`__hl_sleep`). `hyperlight_hcall()` places the ordinary JSON tool request in a
+versioned binary frame:
 
-```json
-{"__hl_request_id": <u64>, "request": {"name": "<tool_name>", "args": <json_value>}}
-```
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | Magic `HLAF` |
+| 4 | 1 | Version (`1`) |
+| 5 | 1 | Kind: request `1`, result `2`, pending `3`, batch `4` |
+| 6 | 2 | Reserved (`0`) |
+| 8 | 8 | Little-endian request ID, or entry count for a batch |
+| 16 | 4 | Little-endian payload length |
+| 20 | variable | JSON payload or binary batch entries |
 
-The host immediately returns a yield sentinel:
+The request ID is a guest-assigned nonzero `u64`. An immediate result frame
+contains the normal `{"result":...}` or `{"error":...}` JSON payload. A pending
+frame has no payload; the guest parks on its ID.
 
-```json
-{"result": {"__hl_yield__": <u64>}}
-```
+The next `poll` byte-vector argument carries a batch frame. Its payload is a
+sequence of `{request_id: u64, payload_length: u32, JSON payload}` entries.
+Framing makes IDs and result boundaries unambiguous without parsing JSON
+control fields. `/dev/hcall` still accepts and returns JSON; the kernel hides
+these internal frames.
 
-The guest parks on the token. Once the async work completes, the result is delivered in the next `poll` batch (a JSON object keyed by decimal ID string):
-
-```json
-{"<id>": {"result": <value>} | {"error": "<message>"}, …}
-```
-
-A duplicate or zero `__hl_request_id` is rejected atomically with `{"error": "…"}` without overwriting an existing task or queuing new work. Each sandbox accepts at most 1024 concurrent async tasks.
+A duplicate or zero request ID is rejected atomically without overwriting an
+existing task or queuing new work. Each sandbox accepts at most 1024 concurrent
+async tasks.
 
 ### Legacy (sync) request
 
@@ -94,7 +102,9 @@ Calling an **async** tool in legacy format returns `{"error": "…"}` (protocol 
 {"error": "<message>"}
 ```
 
-Unknown tools, malformed JSON, invalid or missing `__hl_request_id` values, duplicate IDs, and pending-limit violations all become `{"error": "..."}`. The host does not panic on bad guest input.
+Unknown tools, malformed JSON or frames, invalid IDs, duplicate IDs, and
+pending-limit violations become framed `{"error":"..."}` results. The host
+does not panic on bad guest input.
 
 **Debug:** set `HL_DISPATCH_DEBUG=1` in the environment to log each request/response on stderr.
 
@@ -161,7 +171,8 @@ Sleep on the host thread (used by guest drivers).
 **Result:** `{}`  
 Can be cancelled via `SleepCancel` when tearing down the sandbox.
 
-**Async:** `__hl_sleep` is an async tool — the guest must use the cooperative request format with `__hl_request_id`.
+**Async:** `__hl_sleep` is an async tool; `hyperlight_hcall()` supplies its
+binary request frame.
 
 ---
 

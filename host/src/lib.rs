@@ -111,6 +111,60 @@ const MAX_TRUNCATE_LEN: u64 = 1024 * 1024 * 1024;
 const MAX_DISPATCH_PAYLOAD: usize = 64 * 1024 * 1024;
 const MAX_PENDING_ASYNC_TASKS: usize = 1024;
 const REQUEST_ID_HEX_LEN: usize = 16;
+const ASYNC_FRAME_MAGIC: &[u8; 4] = b"HLAF";
+const ASYNC_FRAME_VERSION: u8 = 1;
+const ASYNC_FRAME_HEADER_LEN: usize = 20;
+const ASYNC_FRAME_MAX_LEN: usize = 65536;
+const ASYNC_FRAME_REQUEST: u8 = 1;
+const ASYNC_FRAME_RESULT: u8 = 2;
+const ASYNC_FRAME_PENDING: u8 = 3;
+const ASYNC_FRAME_BATCH: u8 = 4;
+
+struct AsyncFrame<'a> {
+    kind: u8,
+    id: u64,
+    payload: &'a [u8],
+}
+
+fn decode_async_frame(input: &[u8]) -> Result<Option<AsyncFrame<'_>>> {
+    if !input.starts_with(ASYNC_FRAME_MAGIC) {
+        return Ok(None);
+    }
+    if input.len() < ASYNC_FRAME_HEADER_LEN {
+        return Err(anyhow!("truncated async control frame"));
+    }
+    if input[4] != ASYNC_FRAME_VERSION {
+        return Err(anyhow!(
+            "unsupported async control frame version {}",
+            input[4]
+        ));
+    }
+    if input[6] != 0 || input[7] != 0 {
+        return Err(anyhow!("async control frame reserved bits are nonzero"));
+    }
+    let id = u64::from_le_bytes(input[8..16].try_into().unwrap());
+    let payload_len = u32::from_le_bytes(input[16..20].try_into().unwrap()) as usize;
+    if input.len() != ASYNC_FRAME_HEADER_LEN + payload_len {
+        return Err(anyhow!("async control frame length mismatch"));
+    }
+    Ok(Some(AsyncFrame {
+        kind: input[5],
+        id,
+        payload: &input[ASYNC_FRAME_HEADER_LEN..],
+    }))
+}
+
+fn encode_async_frame(kind: u8, id: u64, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(ASYNC_FRAME_HEADER_LEN + payload.len());
+    frame.extend_from_slice(ASYNC_FRAME_MAGIC);
+    frame.push(ASYNC_FRAME_VERSION);
+    frame.push(kind);
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(&id.to_le_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
 
 fn format_request_id(request_id: u64) -> String {
     format!("{request_id:016x}")
@@ -801,6 +855,11 @@ pub struct ToolRegistry {
     async_side: Option<AsyncDispatch>,
 }
 
+enum ToolDispatchOutcome {
+    Complete(serde_json::Value),
+    Pending(u64),
+}
+
 impl ToolRegistry {
     /// Create an empty registry. Add handlers with
     /// [`register`](Self::register) before wiring it into a sandbox.
@@ -865,22 +924,17 @@ impl ToolRegistry {
     /// tests exercise the now-async tools (e.g. `__hl_sleep`) without a full
     /// poll loop.
     ///
-    /// The `payload` must use the cooperative format when the tool is async:
-    /// `{"__hl_request_id": "<16-digit-hex>", "request": {"name": "...", "args": ...}}`.
+    /// Async tools require a binary request frame around the JSON tool payload.
     #[cfg(test)]
     fn dispatch_drive(&self, payload: &[u8]) -> Vec<u8> {
         let resp = self.dispatch(payload);
-        let parsed: serde_json::Value = match serde_json::from_slice(&resp) {
-            Ok(v) => v,
-            Err(_) => return resp,
-        };
-        let token_id: Option<u64> = parsed
-            .get("result")
-            .and_then(|r| r.get("__hl_yield__"))
-            .and_then(|t| parse_request_id(t, "__hl_yield__").ok());
-        let Some(token_id) = token_id else {
+        let Ok(Some(frame)) = decode_async_frame(&resp) else {
             return resp;
         };
+        if frame.kind != ASYNC_FRAME_PENDING {
+            return resp;
+        }
+        let token_id = frame.id;
         let Some(asy) = &self.async_side else {
             return resp;
         };
@@ -908,23 +962,16 @@ impl ToolRegistry {
             Some(PendingState::Ready(Err(e))) => serde_json::json!({ "error": e }),
             _ => return resp,
         };
-        serde_json::to_vec(&value).unwrap()
+        let payload = serde_json::to_vec(&value).unwrap();
+        encode_async_frame(ASYNC_FRAME_RESULT, token_id, &payload)
     }
 
     /// Decode a guest-side `__dispatch` request, look up the handler by
     /// name, invoke it, and encode the response as JSON bytes.
     ///
-    /// Two request formats are accepted:
-    ///
-    /// - **Cooperative (async):** `{"__hl_request_id": "<16-digit-hex>", "request": {"name": "...", "args": <value>}}`
-    ///   Required when calling an async tool. The fixed-width lowercase hex ID is
-    ///   guest-assigned, must encode a nonzero u64, and becomes the completion
-    ///   token; the yield sentinel echoes the same string while the future runs
-    ///   off the vCPU thread.
-    ///
-    /// - **Legacy (sync):** `{"name": "...", "args": <value>}`
-    ///   Accepted for synchronous tools. Calling an async tool without `__hl_request_id`
-    ///   returns a protocol error.
+    /// Cooperative requests use a binary async-control frame carrying a
+    /// guest-assigned nonzero request ID and a JSON tool payload. Legacy
+    /// synchronous callers may still pass the JSON tool payload directly.
     ///
     /// Responses are `{"result": <value>}` or `{"error": "<msg>"}`.
     /// Unknown tool names, JSON errors, missing/malformed/zero IDs, and duplicate
@@ -956,60 +1003,76 @@ impl ToolRegistry {
                 std::str::from_utf8(preview).unwrap_or("<non-utf8>")
             );
         }
-        let result = (|| -> Result<serde_json::Value> {
-            let req: serde_json::Value = serde_json::from_slice(payload)?;
-            // Cooperative async requests carry a guest-supplied fixed-width
-            // lowercase hexadecimal u64 ID.
-            // Legacy / sync-only requests omit the ID:
-            //   {"name": "…", "args": …}
-            let (name, args, request_id) = if let Some(id_val) = req.get("__hl_request_id") {
-                let request_id = parse_request_id(id_val, "__hl_request_id")?;
-                let inner = req
-                    .get("request")
-                    .ok_or_else(|| anyhow!("cooperative request missing 'request' field"))?;
-                let name = inner["name"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("missing 'name' in 'request'"))?;
-                let args = inner
-                    .get("args")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                (name, args, Some(request_id))
-            } else {
-                let name = req["name"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("missing 'name'"))?;
-                let args = req.get("args").cloned().unwrap_or(serde_json::Value::Null);
-                (name, args, None)
-            };
+        let decoded_frame = match decode_async_frame(payload) {
+            Ok(frame) => frame,
+            Err(e) => {
+                let json = serde_json::to_vec(&serde_json::json!({
+                    "error": e.to_string()
+                }))
+                .unwrap_or_default();
+                return encode_async_frame(ASYNC_FRAME_RESULT, 0, &json);
+            }
+        };
+        let (json_payload, request_id) = match decoded_frame.as_ref() {
+            Some(frame) if frame.kind == ASYNC_FRAME_REQUEST && frame.id != 0 => {
+                (frame.payload, Some(frame.id))
+            }
+            Some(frame) => {
+                let reason = if frame.id == 0 {
+                    "request ID must be nonzero".to_string()
+                } else {
+                    format!("unexpected frame kind {}", frame.kind)
+                };
+                let json = serde_json::to_vec(&serde_json::json!({
+                    "error": format!("invalid async request frame: {reason}")
+                }))
+                .unwrap_or_default();
+                return encode_async_frame(ASYNC_FRAME_RESULT, frame.id, &json);
+            }
+            None => (payload, None),
+        };
+        let result = (|| -> Result<ToolDispatchOutcome> {
+            let req: serde_json::Value = serde_json::from_slice(json_payload)?;
+            let name = req["name"]
+                .as_str()
+                .ok_or_else(|| anyhow!("missing 'name'"))?;
+            let args = req.get("args").cloned().unwrap_or(serde_json::Value::Null);
             // Async tools: require a cooperative request ID, then dispatch.
             // Sync tools: fall through to the sync handler table below.
             if let Some(asy) = &self.async_side {
                 if asy.factories.contains_key(name) {
                     let id = request_id.ok_or_else(|| {
                         anyhow!(
-                            "async tool '{}' requires '__hl_request_id' in the \
-                             cooperative request format",
+                            "async tool '{}' requires a binary async request frame",
                             name
                         )
                     })?;
-                    return asy.dispatch_async(id, name, &args);
+                    asy.dispatch_async(id, name, &args)?;
+                    return Ok(ToolDispatchOutcome::Pending(id));
                 }
             }
             let handler = self
                 .tools
                 .get(name)
                 .ok_or_else(|| anyhow!("unknown tool: {}", name))?;
-            handler(args)
+            Ok(ToolDispatchOutcome::Complete(handler(args)?))
         })();
         if debug {
             match &result {
-                Ok(v) => eprintln!("[__dispatch] OK: {}", v),
+                Ok(ToolDispatchOutcome::Complete(v)) => {
+                    eprintln!("[__dispatch] OK: {}", v)
+                }
+                Ok(ToolDispatchOutcome::Pending(id)) => {
+                    eprintln!("[__dispatch] PENDING: {id}")
+                }
                 Err(e) => eprintln!("[__dispatch] ERR: {}", e),
             }
         }
         let json = match result {
-            Ok(v) => serde_json::json!({ "result": v }),
+            Ok(ToolDispatchOutcome::Complete(v)) => serde_json::json!({ "result": v }),
+            Ok(ToolDispatchOutcome::Pending(id)) => {
+                return encode_async_frame(ASYNC_FRAME_PENDING, id, &[]);
+            }
             Err(e) => {
                 // Normalize common error strings so the cross-platform
                 // Unikraft guest doesn't depend on host-OS-specific
@@ -1028,8 +1091,12 @@ impl ToolRegistry {
                 serde_json::json!({ "error": normalize_fs_error(&e.to_string()) })
             }
         };
-        serde_json::to_vec(&json)
-            .unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec())
+        let json = serde_json::to_vec(&json)
+            .unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
+        match request_id {
+            Some(id) => encode_async_frame(ASYNC_FRAME_RESULT, id, &json),
+            None => json,
+        }
     }
 }
 
@@ -1117,19 +1184,12 @@ struct AsyncDispatch {
 }
 
 impl AsyncDispatch {
-    /// Mints the yield sentinel for `request_id`, queues the future to be driven
-    /// off-thread, and returns the fixed-width hexadecimal yield sentinel. Returns
-    /// `Err` if `request_id` is already in-flight (duplicate rejection).
+    /// Registers `request_id` and queues its future to be driven off-thread.
     ///
     /// The pending entry is established **before** the future is pushed to the
     /// queue so that the driver can always find an entry for any token it
     /// dequeues, even if it races with the dispatch thread.
-    fn dispatch_async(
-        &self,
-        request_id: u64,
-        name: &str,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    fn dispatch_async(&self, request_id: u64, name: &str, args: &serde_json::Value) -> Result<()> {
         // self.factories.get(name) is guaranteed Some by the caller check.
         let factory = self.factories.get(name).unwrap();
         let mut pending = self.pending.lock().unwrap();
@@ -1158,7 +1218,7 @@ impl AsyncDispatch {
         drop(pending);
         let fut = factory(args.clone());
         self.queue.lock().unwrap().push_back((request_id, fut));
-        Ok(serde_json::json!({ "__hl_yield__": format_request_id(request_id) }))
+        Ok(())
     }
 }
 
@@ -3560,16 +3620,15 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Drain every resolved async-tool result into the JSON batch object the
-    /// guest `poll` function receives as its argument:
-    /// `{"<id>": {"result": …} | {"error": …}, …}` where each key is the
-    /// fixed-width lowercase hex form of the guest-supplied u64 request ID. Each entry is
-    /// removed from the shared pending map as it is drained (delivered exactly
-    /// once). Returns `"{}"` when nothing has completed or no async tools exist.
-    /// The per-entry value shape matches what the guest kernel copies verbatim
-    /// into the parked op's response buffer (see `hyperlight_hcall_deliver_batch`).
-    fn drain_completion_batch(&mut self) -> String {
-        let mut map = serde_json::Map::new();
+    /// Drain resolved async-tool results into one bounded binary batch.
+    ///
+    /// Each entry is `{request_id: u64, payload_len: u32, JSON payload}`. An
+    /// entry is removed from the pending map only after it fits in this batch,
+    /// so results beyond the 64 KiB guest transport limit remain queued for the
+    /// next poll instead of being truncated.
+    fn drain_completion_batch(&mut self) -> Vec<u8> {
+        let mut entries = Vec::new();
+        let mut count = 0u64;
         if let Some(st) = self.async_state.as_ref() {
             let mut pending = st.pending.lock().unwrap();
             let ready: Vec<u64> = pending
@@ -3578,20 +3637,35 @@ impl Sandbox {
                 .map(|(id, _)| *id)
                 .collect();
             for id in ready {
-                if let Some(PendingTask {
+                let Some(PendingTask {
                     state: PendingState::Ready(res),
                     ..
-                }) = pending.remove(&id)
-                {
-                    let value = match res {
-                        Ok(v) => serde_json::json!({ "result": v }),
-                        Err(e) => serde_json::json!({ "error": e }),
-                    };
-                    map.insert(format_request_id(id), value);
+                }) = pending.get(&id)
+                else {
+                    continue;
+                };
+                let value = match res {
+                    Ok(v) => serde_json::json!({ "result": v }),
+                    Err(e) => serde_json::json!({ "error": e }),
+                };
+                let mut payload = serde_json::to_vec(&value).unwrap_or_else(|_| {
+                    b"{\"error\":\"completion serialization failed\"}".to_vec()
+                });
+                if ASYNC_FRAME_HEADER_LEN + 12 + payload.len() > ASYNC_FRAME_MAX_LEN {
+                    payload = b"{\"error\":\"async completion exceeds transport limit\"}".to_vec();
                 }
+                if ASYNC_FRAME_HEADER_LEN + entries.len() + 12 + payload.len() > ASYNC_FRAME_MAX_LEN
+                {
+                    continue;
+                }
+                entries.extend_from_slice(&id.to_le_bytes());
+                entries.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                entries.extend_from_slice(&payload);
+                pending.remove(&id);
+                count += 1;
             }
         }
-        serde_json::Value::Object(map).to_string()
+        encode_async_frame(ASYNC_FRAME_BATCH, count, &entries)
     }
 
     /// Run one cooperative guest step and return its typed reason for yielding.
@@ -3610,13 +3684,12 @@ impl Sandbox {
     /// run.
     pub fn poll_outcome(&mut self) -> Result<PollOutcome> {
         *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
-        // Pass the batch of completed/errored async host tasks as the guest
-        // `poll` function's argument. The guest kernel routes each token's
+        // Pass the binary batch of completed/errored async host tasks as the
+        // guest `poll` function's byte-vector argument. The guest routes each ID's
         // result to the matching parked host call (see
         // plat/hyperlight/poll.c `hyperlight_poll_deliver_arg` and
         // hcall.c `hyperlight_hcall_deliver_batch`), so a parked call resumes
-        // without ever issuing a follow-up host function. Empty (`{}`) when
-        // nothing has completed since the last step.
+        // without ever issuing a follow-up host function.
         let batch = self.drain_completion_batch();
         let _: () = self.inner.call("poll", batch)?;
         let signal = *self.poll_signal.lock().unwrap();
@@ -3640,12 +3713,7 @@ impl Sandbox {
         self.async_state.as_ref().is_some_and(|state| {
             !state.queue.lock().unwrap().is_empty()
                 || !state.join_set.is_empty()
-                || state
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .any(|task| matches!(task.state, PendingState::Running))
+                || !state.pending.lock().unwrap().is_empty()
         })
     }
 
@@ -4427,6 +4495,41 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn framed_request(id: u64, json: &[u8]) -> Vec<u8> {
+        encode_async_frame(ASYNC_FRAME_REQUEST, id, json)
+    }
+
+    fn framed_json(response: &[u8], kind: u8, id: u64) -> serde_json::Value {
+        let frame = decode_async_frame(response)
+            .unwrap()
+            .expect("response must be framed");
+        assert_eq!(frame.kind, kind);
+        assert_eq!(frame.id, id);
+        serde_json::from_slice(frame.payload).expect("frame payload must be JSON")
+    }
+
+    #[test]
+    fn async_frame_roundtrip_preserves_binary_payload() {
+        let payload = b"\0{\"result\":\"not control JSON\"}\xff";
+        let encoded = encode_async_frame(ASYNC_FRAME_RESULT, 42, payload);
+        let frame = decode_async_frame(&encoded).unwrap().unwrap();
+
+        assert_eq!(frame.kind, ASYNC_FRAME_RESULT);
+        assert_eq!(frame.id, 42);
+        assert_eq!(frame.payload, payload);
+    }
+
+    #[test]
+    fn async_frame_rejects_malformed_header_and_length() {
+        let mut encoded = encode_async_frame(ASYNC_FRAME_REQUEST, 1, b"{}");
+        encoded[4] = ASYNC_FRAME_VERSION + 1;
+        assert!(decode_async_frame(&encoded).is_err());
+
+        let mut encoded = encode_async_frame(ASYNC_FRAME_REQUEST, 1, b"{}");
+        encoded[16..20].copy_from_slice(&3u32.to_le_bytes());
+        assert!(decode_async_frame(&encoded).is_err());
+    }
+
     /// Async `wait_readable_or_timeout` behaviour, proving two things:
     /// 1. It returns via the timer when no fd is readable (idle wait).
     /// 2. It returns promptly once an fd becomes readable — using a *blocking*
@@ -4588,29 +4691,22 @@ mod tests {
         assert!(dst.queue.lock().unwrap().is_empty());
     }
 
-    /// A cooperative request with a hexadecimal ID dispatching an async tool
-    /// yields the same fixed-width hexadecimal completion token.
+    /// A framed request dispatching an async tool returns a pending frame with
+    /// the same numeric request ID.
     #[test]
-    fn dispatch_async_hex_id_yields_hex_token() {
+    fn dispatch_async_frame_yields_matching_id() {
         let mut tools = ToolRegistry::new();
         tools.register_async_factory(
             "echo_async",
             Arc::new(|args| Box::pin(async move { Ok(args) })),
         );
 
-        let req = br#"{"__hl_request_id":"000000000000002a","request":{"name":"echo_async","args":"hi"}}"#;
-        let resp = tools.dispatch(req);
-        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
-        let token = &v["result"]["__hl_yield__"];
-        assert!(
-            token.is_string(),
-            "__hl_yield__ must be a string token, got: {v}"
-        );
-        assert_eq!(
-            token.as_str(),
-            Some("000000000000002a"),
-            "token must equal the request ID"
-        );
+        let req = framed_request(42, br#"{"name":"echo_async","args":"hi"}"#);
+        let resp = tools.dispatch(&req);
+        let frame = decode_async_frame(&resp).unwrap().unwrap();
+        assert_eq!(frame.kind, ASYNC_FRAME_PENDING);
+        assert_eq!(frame.id, 42);
+        assert!(frame.payload.is_empty());
     }
 
     #[test]
@@ -4633,7 +4729,7 @@ mod tests {
         }
     }
 
-    /// Calling an async tool without __hl_request_id returns a protocol error.
+    /// Calling an async tool without a binary request frame returns an error.
     #[test]
     fn dispatch_async_missing_id_returns_error() {
         let mut tools = ToolRegistry::new();
@@ -4650,14 +4746,12 @@ mod tests {
             "missing ID should produce an error: {s}"
         );
         assert!(
-            s.contains("__hl_request_id"),
-            "error should mention __hl_request_id: {s}"
+            s.contains("binary async request frame"),
+            "error should mention the required binary frame: {s}"
         );
     }
 
-    /// A cooperative request with `__hl_request_id` of 0 is rejected as a
-    /// protocol error (0 is never a valid guest request ID) and no task is
-    /// queued.
+    /// A binary request frame with ID 0 is rejected and no task is queued.
     #[test]
     fn dispatch_async_zero_id_returns_error() {
         let mut tools = ToolRegistry::new();
@@ -4666,9 +4760,10 @@ mod tests {
             Arc::new(|args| Box::pin(async move { Ok(args) })),
         );
 
-        let req = br#"{"__hl_request_id":"0000000000000000","request":{"name":"echo_async","args":"hi"}}"#;
-        let resp = tools.dispatch(req);
-        let s = std::str::from_utf8(&resp).unwrap();
+        let req = framed_request(0, br#"{"name":"echo_async","args":"hi"}"#);
+        let resp = tools.dispatch(&req);
+        let value = framed_json(&resp, ASYNC_FRAME_RESULT, 0);
+        let s = value.to_string();
         assert!(
             s.contains("\"error\""),
             "zero ID should produce an error: {s}"
@@ -4703,18 +4798,15 @@ mod tests {
             }),
         );
 
-        let req1 = br#"{"__hl_request_id":"0000000000000063","request":{"name":"slow_async","args":{"seq":1}}}"#;
-        let resp1 = tools.dispatch(req1);
-        let v1: serde_json::Value = serde_json::from_slice(&resp1).unwrap();
-        assert_eq!(
-            v1["result"]["__hl_yield__"].as_str(),
-            Some("0000000000000063"),
-            "first dispatch should yield token 99: {v1}"
-        );
+        let req1 = framed_request(99, br#"{"name":"slow_async","args":{"seq":1}}"#);
+        let resp1 = tools.dispatch(&req1);
+        let frame1 = decode_async_frame(&resp1).unwrap().unwrap();
+        assert_eq!(frame1.kind, ASYNC_FRAME_PENDING);
+        assert_eq!(frame1.id, 99);
 
-        let req2 = br#"{"__hl_request_id":"0000000000000063","request":{"name":"slow_async","args":{"seq":2}}}"#;
-        let resp2 = tools.dispatch(req2);
-        let s2 = std::str::from_utf8(&resp2).unwrap();
+        let req2 = framed_request(99, br#"{"name":"slow_async","args":{"seq":2}}"#);
+        let resp2 = tools.dispatch(&req2);
+        let s2 = framed_json(&resp2, ASYNC_FRAME_RESULT, 99).to_string();
         assert!(
             s2.contains("\"error\""),
             "duplicate ID should return an error: {s2}"
@@ -4762,12 +4854,9 @@ mod tests {
         }
 
         let request_id = MAX_PENDING_ASYNC_TASKS as u64 + 1;
-        let req = format!(
-            r#"{{"__hl_request_id":"{}","request":{{"name":"async_tool","args":null}}}}"#,
-            format_request_id(request_id)
-        );
-        let resp = tools.dispatch(req.as_bytes());
-        let value: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let req = framed_request(request_id, br#"{"name":"async_tool","args":null}"#);
+        let resp = tools.dispatch(&req);
+        let value = framed_json(&resp, ASYNC_FRAME_RESULT, request_id);
         assert!(
             value["error"]
                 .as_str()
@@ -5679,9 +5768,9 @@ mod tests {
         let sc = SleepCancel::new();
         register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
 
-        let req = br#"{"__hl_request_id":"0000000000000001","request":{"name":"__hl_sleep","args":{"ns":0}}}"#;
-        let resp = tools.dispatch_drive(req);
-        let s = std::str::from_utf8(&resp).unwrap();
+        let req = framed_request(1, br#"{"name":"__hl_sleep","args":{"ns":0}}"#);
+        let resp = tools.dispatch_drive(&req);
+        let s = framed_json(&resp, ASYNC_FRAME_RESULT, 1).to_string();
         assert!(!s.contains("\"error\""), "sleep(0) should succeed: {s}");
     }
 
@@ -5835,17 +5924,16 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let req =
-            br#"{"__hl_request_id":"0000000000000001","request":{"name":"__hl_sleep","args":{"ns":60000000000}}}"#;
+        let req = framed_request(1, br#"{"name":"__hl_sleep","args":{"ns":60000000000}}"#);
         // Drive the now-async sleep future to completion (as the poll loop's
         // drive_host_functions would); the cancel from the other thread should
         // make the blocking sleep return promptly.
-        let resp = tools.dispatch_drive(req);
+        let resp = tools.dispatch_drive(&req);
         let elapsed = start.elapsed();
         handle.join().unwrap();
         sc.reset();
 
-        let s = std::str::from_utf8(&resp).unwrap();
+        let s = framed_json(&resp, ASYNC_FRAME_RESULT, 1).to_string();
         assert!(!s.contains("\"error\""), "sleep should succeed: {s}");
         assert!(
             elapsed.as_secs() < 5,
@@ -5993,25 +6081,21 @@ mod tests {
         // Create payload larger than MAX_NET_SEND (1 MiB)
         let big_payload = vec![0u8; MAX_NET_SEND + 1];
         let b64 = base64::engine::general_purpose::STANDARD.encode(&big_payload);
-        // net_send is async: use the cooperative request format with __hl_request_id.
-        let req = format!(
-            r#"{{"__hl_request_id":"0000000000000001","request":{{"name":"net_send","args":{{"fd":{fd},"data":"{b64}"}}}}}}"#
-        );
-        let resp = std::str::from_utf8(&reg.dispatch_drive(req.as_bytes()))
-            .unwrap()
-            .to_string();
+        let json = format!(r#"{{"name":"net_send","args":{{"fd":{fd},"data":"{b64}"}}}}"#);
+        let req = framed_request(1, json.as_bytes());
+        let raw = reg.dispatch_drive(&req);
+        let resp = framed_json(&raw, ASYNC_FRAME_RESULT, 1).to_string();
         assert!(
             resp.contains("too large"),
             "expected 'too large' error for net_send, got: {resp}"
         );
 
-        // Also test net_sendto (also async — use cooperative format).
-        let req = format!(
-            r#"{{"__hl_request_id":"0000000000000002","request":{{"name":"net_sendto","args":{{"fd":{fd},"data":"{b64}","addr":"127.0.0.1","port":9999}}}}}}"#
+        let json = format!(
+            r#"{{"name":"net_sendto","args":{{"fd":{fd},"data":"{b64}","addr":"127.0.0.1","port":9999}}}}"#
         );
-        let resp = std::str::from_utf8(&reg.dispatch_drive(req.as_bytes()))
-            .unwrap()
-            .to_string();
+        let req = framed_request(2, json.as_bytes());
+        let raw = reg.dispatch_drive(&req);
+        let resp = framed_json(&raw, ASYNC_FRAME_RESULT, 2).to_string();
         assert!(
             resp.contains("too large"),
             "expected 'too large' error for net_sendto, got: {resp}"

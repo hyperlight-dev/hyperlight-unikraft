@@ -6,13 +6,12 @@
 //! across the guest's cooperative park/resume:
 //!
 //!   - the tool is registered with `.tool_async("async_add", |args| async { … })`,
-//!   - the guest supplies a numeric request ID; the host echoes it in the yield
-//!     sentinel and queues the future while the guest parks,
+//!   - the guest supplies a numeric request ID in a binary control frame; the
+//!     host returns a pending frame and queues the future while the guest parks,
 //!   - the future is driven **off the vCPU thread** by
 //!     `sandbox.drive_host_functions().await`,
 //!   - once the future resolves, its result is delivered to the guest in the
-//!     next `poll` batch (the JSON argument passed to the guest `poll`
-//!     function), resuming the parked guest call transparently.
+//!     next binary `poll` batch, resuming the parked guest call transparently.
 //!
 //! The guest binary is `examples/poll-await-c/`: it issues ONE `/dev/hcall`
 //! call to `async_add` with `{a:40, b:2}`, then reports the received sum back as
