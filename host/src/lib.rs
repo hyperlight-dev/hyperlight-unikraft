@@ -3982,17 +3982,6 @@ impl Sandbox {
         tokio::time::sleep(timeout).await;
     }
 
-    /// Reset the cooperative-poll signal to its initial value.
-    /// Call before starting a fresh poll-driven run.
-    pub fn reset_poll_state(&self) {
-        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
-    }
-
-    /// Backward-compatible alias for [`Sandbox::reset_poll_state`].
-    pub fn reset_poll_deadline(&self) {
-        self.reset_poll_state();
-    }
-
     /// Call a named guest function with typed parameters.
     ///
     /// Thin passthrough to [`MultiUseSandbox::call`] so callers can take

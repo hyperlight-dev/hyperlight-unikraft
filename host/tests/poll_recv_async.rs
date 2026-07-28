@@ -182,7 +182,6 @@ async fn poll_recv_reaches_done_under_kvm_async() {
     // Reset guest state once before the first step; the poll loop then runs
     // without further restores so scheduler/thread/socket state persists
     // across the HALT/re-entry boundary.
-    sbox.reset_poll_deadline();
     sbox.restore().expect("restore before first poll");
 
     const MAX_STEPS: usize = 2000;
@@ -280,7 +279,6 @@ async fn poll_run_async_drives_poll_recv_under_kvm() {
         .build()
         .expect("build sandbox");
 
-    sbox.reset_poll_deadline();
     sbox.restore().expect("restore before first poll");
 
     const MAX_WALL: Duration = Duration::from_secs(30);

@@ -176,7 +176,6 @@ async fn poll_await_async_tool_roundtrip_under_kvm() {
     // Reset guest state once before the first step; the poll loop then runs
     // without further restores so scheduler/thread state persists across the
     // HALT/re-entry boundary.
-    sbox.reset_poll_deadline();
     sbox.restore().expect("restore before first poll");
 
     // Bound the loop so a hang can't wedge the suite.

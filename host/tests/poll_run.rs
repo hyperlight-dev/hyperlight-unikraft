@@ -130,7 +130,6 @@ fn poll_run_reaches_done_under_kvm() {
     // Reset guest state once before the first step; the poll loop then runs
     // without further restores so scheduler/thread state persists across the
     // HALT/re-entry boundary.
-    sbox.reset_poll_deadline();
     sbox.restore().expect("restore before first poll");
 
     // Bound the loop so a hang can't wedge the suite. The guest sleeps 3×10ms
