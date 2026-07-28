@@ -3631,22 +3631,16 @@ impl Sandbox {
     /// so results beyond the 64 KiB guest transport limit remain queued for the
     /// next poll instead of being truncated.
     fn drain_completion_batch(&mut self) -> Vec<u8> {
+        /// Per-entry `{request_id: u64, payload_len: u32}` prefix.
+        const ENTRY_HEADER_LEN: usize = 12;
+        let budget = ASYNC_FRAME_MAX_LEN - ASYNC_FRAME_HEADER_LEN;
+
         let mut entries = Vec::new();
         let mut count = 0u64;
         if let Some(st) = self.async_state.as_ref() {
-            let mut pending = st.pending.lock().unwrap();
-            let ready: Vec<u64> = pending
-                .iter()
-                .filter(|(_, t)| matches!(t.state, PendingState::Ready(_)))
-                .map(|(id, _)| *id)
-                .collect();
-            for id in ready {
-                let Some(PendingTask {
-                    state: PendingState::Ready(res),
-                    ..
-                }) = pending.get(&id)
-                else {
-                    continue;
+            st.pending.lock().unwrap().retain(|id, task| {
+                let PendingState::Ready(res) = &task.state else {
+                    return true;
                 };
                 let value = match res {
                     Ok(v) => serde_json::json!({ "result": v }),
@@ -3655,19 +3649,21 @@ impl Sandbox {
                 let mut payload = serde_json::to_vec(&value).unwrap_or_else(|_| {
                     b"{\"error\":\"completion serialization failed\"}".to_vec()
                 });
-                if ASYNC_FRAME_HEADER_LEN + 12 + payload.len() > ASYNC_FRAME_MAX_LEN {
+                // A result that can never fit becomes an error rather than
+                // blocking the entry forever.
+                if ENTRY_HEADER_LEN + payload.len() > budget {
                     payload = b"{\"error\":\"async completion exceeds transport limit\"}".to_vec();
                 }
-                if ASYNC_FRAME_HEADER_LEN + entries.len() + 12 + payload.len() > ASYNC_FRAME_MAX_LEN
-                {
-                    continue;
+                // Out of room in this batch — keep it for the next poll.
+                if entries.len() + ENTRY_HEADER_LEN + payload.len() > budget {
+                    return true;
                 }
                 entries.extend_from_slice(&id.to_le_bytes());
                 entries.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 entries.extend_from_slice(&payload);
-                pending.remove(&id);
                 count += 1;
-            }
+                false
+            });
         }
         encode_async_frame(ASYNC_FRAME_BATCH, count, &entries)
     }
@@ -3714,11 +3710,11 @@ impl Sandbox {
     }
 
     fn has_pending_host_calls(&self) -> bool {
-        self.async_state.as_ref().is_some_and(|state| {
-            !state.queue.lock().unwrap().is_empty()
-                || !state.running.is_empty()
-                || !state.pending.lock().unwrap().is_empty()
-        })
+        // Every queued and in-flight future has a `pending` entry recorded
+        // before it is queued, so this one map covers all three stages.
+        self.async_state
+            .as_ref()
+            .is_some_and(|state| !state.pending.lock().unwrap().is_empty())
     }
 
     /// Compatibility wrapper over [`Sandbox::poll_outcome`].
