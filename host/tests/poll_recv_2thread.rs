@@ -10,7 +10,7 @@
 //!
 //! Why this matters for the async host: two concurrently-parked guest recvs mean
 //! the host has TWO in-flight async net futures on the Tokio reactor at once,
-//! exercising the `JoinSet` multi-future path in
+//! exercising the `FuturesUnordered` multi-future path in
 //! [`Sandbox::drive_host_functions`] under real concurrency — not just the
 //! single-future fast path that `poll_recv` covers. It also exercises the
 //! cooperative scheduler waking two independent guest threads as their sockets

@@ -64,6 +64,8 @@ pub mod stderr_capture;
 pub use hyperlight_host::hypervisor::InterruptHandle;
 
 use anyhow::{anyhow, Result};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use hyperlight_host::func::Registerable;
 use hyperlight_host::sandbox::snapshot::{OciTag, Snapshot};
 use hyperlight_host::sandbox::uninitialized::GuestEnvironment;
@@ -911,7 +913,7 @@ impl ToolRegistry {
         self.async_side.as_ref().map(|a| AsyncToolState {
             pending: a.pending.clone(),
             queue: a.queue.clone(),
-            join_set: tokio::task::JoinSet::new(),
+            running: FuturesUnordered::new(),
             factories: a.factories.clone(),
         })
     }
@@ -1109,6 +1111,8 @@ impl Default for ToolRegistry {
 /// A boxed, `Send` future produced by an async tool handler.
 type ToolFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>>;
+type RunningToolFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (u64, Result<serde_json::Value>)> + Send>>;
 
 /// A boxed async-tool factory: called with the guest's `args`, returns the
 /// future that computes the result. `Arc`-wrapped so the same factory can be
@@ -1228,7 +1232,7 @@ impl AsyncDispatch {
 struct AsyncToolState {
     pending: Arc<Mutex<HashMap<u64, PendingTask>>>,
     queue: Arc<Mutex<std::collections::VecDeque<(u64, ToolFuture)>>>,
-    join_set: tokio::task::JoinSet<(u64, Result<serde_json::Value>)>,
+    running: FuturesUnordered<RunningToolFuture>,
     /// Clone of the registry's async-tool factories, so a task that was still
     /// `Running` at snapshot time can be re-invoked (with its saved args) to
     /// resume on restore (see [`Sandbox::restore_async_tasks`]).
@@ -3712,7 +3716,7 @@ impl Sandbox {
     fn has_pending_host_calls(&self) -> bool {
         self.async_state.as_ref().is_some_and(|state| {
             !state.queue.lock().unwrap().is_empty()
-                || !state.join_set.is_empty()
+                || !state.running.is_empty()
                 || !state.pending.lock().unwrap().is_empty()
         })
     }
@@ -3768,8 +3772,8 @@ impl Sandbox {
     ///
     /// Behaviour:
     ///   1. If any async-tool futures are in flight, absorb newly-submitted
-    ///      ones onto the `JoinSet` and `await` one completion (bounded by the
-    ///      guest's timer deadline), recording the result so the next
+    ///      ones into a `FuturesUnordered` and `await` one completion (bounded
+    ///      by the guest's timer deadline), recording the result so the next
     ///      [`Sandbox::poll`] batch delivers it and the parked guest call
     ///      resumes.
     ///   2. Otherwise, `await` until any host socket becomes readable or the
@@ -3798,23 +3802,23 @@ impl Sandbox {
                 let next = st.queue.lock().unwrap().pop_front();
                 match next {
                     Some((token, fut)) => {
-                        st.join_set.spawn(async move { (token, fut.await) });
+                        st.running.push(Box::pin(async move { (token, fut.await) }));
                     }
                     None => break,
                 }
             }
 
-            if !st.join_set.is_empty() {
+            if !st.running.is_empty() {
                 // Await one completion, bounded by the guest's timer deadline
                 // (if any) so a pending guest timer still fires on time.
                 let completed = match remaining {
-                    None => st.join_set.join_next().await,
+                    None => st.running.next().await,
                     Some(dur) => tokio::select! {
-                        out = st.join_set.join_next() => out,
+                        out = st.running.next() => out,
                         _ = tokio::time::sleep(dur) => None,
                     },
                 };
-                if let Some(Ok((token, res))) = completed {
+                if let Some((token, res)) = completed {
                     let mut pending = st.pending.lock().unwrap();
                     let state = PendingState::Ready(res.map_err(|e| e.to_string()));
                     match pending.get_mut(&token) {
@@ -4582,7 +4586,7 @@ mod tests {
         AsyncToolState {
             pending: Arc::new(Mutex::new(HashMap::new())),
             queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            join_set: tokio::task::JoinSet::new(),
+            running: FuturesUnordered::new(),
             factories,
         }
     }
