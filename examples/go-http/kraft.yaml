@@ -82,6 +82,13 @@ unikraft:
     CONFIG_LIBPOSIX_SOCKET: 'y'
     CONFIG_LIBHOSTSOCK: 'y'
 
+    # hostfs - transparent POSIX -> host RPC forwarding. Mounts one hostfs
+    # instance per preopen the host passes in the cmdline TLV, which is how
+    # actor volumes (e.g. a durable dir) reach the guest. Without it the
+    # rootfs is the initramfs alone and every write is lost at teardown.
+    CONFIG_LIBHOSTFS: 'y'
+    CONFIG_LIBHOSTFS_AUTOMOUNT: 'y'
+
     # FD infrastructure (required by posix-socket)
     CONFIG_LIBPOSIX_FDIO: 'y'
     CONFIG_LIBPOSIX_FDTAB: 'y'
