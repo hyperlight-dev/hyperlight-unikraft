@@ -183,7 +183,7 @@ just run
 | `python` | CPython 3.12 | Rootfs from Docker, script passed via cmdline |
 | `python-tools` | CPython 3.12 + host function call | Calls an echo Wasm host function registered with `--tool echo=...` |
 | `go` | Static PIE Go binary | Compiled with musl via Docker for CGO support |
-| `nodejs` | Node.js 21 | Rootfs from Alpine, script passed via cmdline |
+| `nodejs` | Node.js 22 | Rootfs from Alpine, script passed via cmdline |
 | `hostfs-posix-c` | C + unmodified POSIX | `open`/`read`/`write`/`mkdir` against `/host`, forwarded by `lib/hostfs` |
 | `hostfs-posix-py` | Python + stdlib | Same as `hostfs-posix-c` using `open()`/`os.mkdir`/`os.stat` |
 
@@ -333,7 +333,7 @@ hyperlight-unikraft/
 │   ├── python/             # CPython 3.12
 │   ├── python-agent-driver/# Python with pre-loaded packages (pyhl)
 │   ├── go/                 # Go (musl via Docker)
-│   ├── nodejs/             # Node.js 21
+│   ├── nodejs/             # Node.js 22
 │   ├── hostfs-posix-c/     # Host filesystem sandbox (C)
 │   ├── hostfs-posix-py/    # Host filesystem sandbox (Python)
 │   ├── dotnet/             # .NET
