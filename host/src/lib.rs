@@ -282,6 +282,12 @@ const MAX_DIR_ENTRIES: usize = 100_000;
 /// Default socket timeout for read/write/connect operations (30 s).
 const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Re-entry interval used when the inter-step readiness wait has filtered out a
+/// terminally-EOF socket. Short enough that a guest which *does* still want to
+/// observe the close sees it promptly, long enough to turn a full-rate poll spin
+/// into a park.
+const EOF_RECHECK: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// A preopened host directory exposed to the guest.
 ///
 /// Semantics mirror Wasmtime's `preopened_dir`: `host_dir` is canonicalised
@@ -3841,9 +3847,17 @@ impl Sandbox {
 
         // Step 2: no async futures in flight — wait for host-socket readiness
         // and/or the guest's timer deadline (the async inter-step wait).
-        let fds = self.socket_raw_fds();
-        if !fds.is_empty() || remaining.is_some() {
-            let dur = remaining.unwrap_or(SOCKET_TIMEOUT);
+        let (fds, filtered_eof) = self.socket_wait_fds();
+        if !fds.is_empty() || remaining.is_some() || filtered_eof {
+            // If a terminally-EOF socket was filtered out we may be wrong about
+            // the guest having lost interest in it (its interest set is guest-side
+            // state the host can't see), so cap the wait and re-enter the guest
+            // promptly. Bounds the cost of a wrong guess at EOF_RECHECK instead
+            // of a 30 s stall, while still replacing a full-rate spin with a park.
+            let mut dur = remaining.unwrap_or(SOCKET_TIMEOUT);
+            if filtered_eof {
+                dur = dur.min(EOF_RECHECK);
+            }
             Self::wait_readable_or_timeout(fds, dur).await;
         } else {
             // Step 3: indefinite idle with no wake source — bounded fallback so
@@ -3896,25 +3910,63 @@ impl Sandbox {
         }
     }
 
-    /// Snapshot the raw fds of all currently-open host sockets.
+    /// True if `fd` is a stream socket in a terminal EOF state: the peer has
+    /// closed and no unread data is queued.
+    ///
+    /// Such a socket is permanently readable at the epoll level. Leaving it in
+    /// the inter-step readiness set makes [`Sandbox::wait_readable_or_timeout`]
+    /// return instantly forever, so the poll loop busy-spins at full
+    /// vmexit rate instead of parking. Nothing can ever change on it again —
+    /// there is no edge left to wait for.
+    ///
+    /// `MSG_PEEK` keeps the probe non-destructive: `0` means EOF, `1` means
+    /// unread data is queued (and stays queued), and `EAGAIN` means the
+    /// connection is open but idle. Restricted to stream sockets because a
+    /// zero-length UDP datagram would otherwise be misread as EOF; listeners
+    /// return an error rather than `0`, so they are never filtered.
     #[cfg(unix)]
-    fn socket_raw_fds(&self) -> Vec<i32> {
-        use std::os::unix::io::AsRawFd;
-        match &self.socket_table {
-            Some(t) => t
-                .lock()
-                .unwrap()
-                .sockets
-                .values()
-                .map(|hs| hs.socket.as_raw_fd())
-                .collect(),
-            None => Vec::new(),
+    fn is_drained_eof(fd: i32, sock_type: i32) -> bool {
+        // SOCK_STREAM = 1 (matches the guest-side value stored in the table).
+        if sock_type != 1 {
+            return false;
         }
+        let mut byte = 0u8;
+        let n = unsafe {
+            libc::recv(
+                fd,
+                &mut byte as *mut u8 as *mut libc::c_void,
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        n == 0
+    }
+
+    /// Fds to watch for the inter-step readiness wait, and whether any socket
+    /// was filtered out as terminally EOF (see [`Sandbox::is_drained_eof`]).
+    #[cfg(unix)]
+    fn socket_wait_fds(&self) -> (Vec<i32>, bool) {
+        use std::os::unix::io::AsRawFd;
+        let Some(table) = &self.socket_table else {
+            return (Vec::new(), false);
+        };
+        let tbl = table.lock().unwrap();
+        let mut fds = Vec::with_capacity(tbl.sockets.len());
+        let mut filtered = false;
+        for hs in tbl.sockets.values() {
+            let fd = hs.socket.as_raw_fd();
+            if Self::is_drained_eof(fd, hs.sock_type) {
+                filtered = true;
+            } else {
+                fds.push(fd);
+            }
+        }
+        (fds, filtered)
     }
 
     #[cfg(not(unix))]
-    fn socket_raw_fds(&self) -> Vec<i32> {
-        Vec::new()
+    fn socket_wait_fds(&self) -> (Vec<i32>, bool) {
+        (Vec::new(), false)
     }
 
     /// Wait until any of `fds` becomes readable, or `timeout` elapses.
