@@ -162,6 +162,18 @@ struct Args {
     #[arg(long, short = 'e', conflicts_with = "app_args", value_name = "CODE")]
     exec: Option<String>,
 
+    /// Drive the guest with the cooperative poll pump instead of a single
+    /// run-to-completion call.
+    ///
+    /// Required by workloads whose event loop parks waiting for a timer or
+    /// socket — e.g. any Node.js script using `setTimeout`/`setInterval`, or
+    /// a long-lived server. Without it the guest runs one guest function to
+    /// completion, so a loop that blocks waiting to be woken never is.
+    ///
+    /// Requires a kernel built with `CONFIG_HYPERLIGHT_POLL=y`.
+    #[arg(long)]
+    poll: bool,
+
     /// Application arguments (passed after --)
     #[arg(last = true)]
     app_args: Vec<String>,
@@ -332,13 +344,31 @@ fn main() -> Result<()> {
 
     // Phase 2: restore + call — runs the application
     let total_runs = 1 + args.repeat;
+    let poll_rt = if args.poll {
+        Some(tokio::runtime::Runtime::new()?)
+    } else {
+        None
+    };
     for i in 0..total_runs {
         let t_restore = std::time::Instant::now();
         sandbox.restore()?;
         let restore_time = t_restore.elapsed();
 
         let t_call = std::time::Instant::now();
-        sandbox.call_run()?;
+        match poll_rt {
+            Some(ref rt) => {
+                let code = rt.block_on(sandbox.poll_run_async())?;
+                if code != 0 {
+                    eprintln!(
+                        "[run {}/{}] guest exited with code {}",
+                        i + 1,
+                        total_runs,
+                        code
+                    );
+                }
+            }
+            None => sandbox.call_run()?,
+        }
         let call_time = t_call.elapsed();
 
         if !args.quiet || args.repeat > 0 {

@@ -56,6 +56,11 @@ unikraft:
     CONFIG_LIBPOSIX_FUTEX: 'y'
     CONFIG_LIBUKSCHED: 'y'
     CONFIG_LIBUKSCHEDCOOP: 'y'
+    # Cooperative poll model: run the scheduler until it would go idle, then
+    # yield the vCPU back to the host with a next-wakeup deadline. Without it
+    # the guest runs a single guest function to completion, so libuv can never
+    # block-and-wake and any setTimeout that has to sleep hangs the VM.
+    CONFIG_HYPERLIGHT_POLL: 'y'
     CONFIG_LIBUKMPI: 'y'
     CONFIG_LIBUKLOCK: 'y'
     CONFIG_LIBUKLOCK_SEMAPHORE: 'y'

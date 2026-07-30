@@ -183,7 +183,7 @@ just run
 | `python` | CPython 3.12 | Rootfs from Docker, script passed via cmdline |
 | `python-tools` | CPython 3.12 + host function call | Calls an echo Wasm host function registered with `--tool echo=...` |
 | `go` | Static PIE Go binary | Compiled with musl via Docker for CGO support |
-| `nodejs` | Node.js 22 | Rootfs from Alpine, script passed via cmdline |
+| `nodejs` | Node.js 22 | Rootfs from Alpine, script passed via cmdline. Built with `CONFIG_HYPERLIGHT_POLL`; use `--poll` for timers/`await` |
 | `hostfs-posix-c` | C + unmodified POSIX | `open`/`read`/`write`/`mkdir` against `/host`, forwarded by `lib/hostfs` |
 | `hostfs-posix-py` | Python + stdlib | Same as `hostfs-posix-c` using `open()`/`os.mkdir`/`os.stat` |
 
@@ -267,6 +267,25 @@ hyperlight-unikraft kernel --initrd python.cpio --memory 256Mi -- /script.py arg
 hyperlight-unikraft kernel --initrd node.cpio --memory 512Mi -- /app/server.js --port 8080
 ```
 
+### Blocking event loops (`--poll`)
+
+By default the host makes a single run-to-completion call into the guest. A
+runtime whose event loop *parks* — waiting for a timer or a socket — is never
+woken again, so `setTimeout`, `setInterval` and `await`ed I/O hang forever.
+
+`--poll` instead drives the guest with the cooperative poll pump: the guest runs
+until its scheduler would go idle, exits the VM reporting its next-wakeup
+deadline, and the host re-enters it when that deadline expires or host I/O is
+ready.
+
+```bash
+# Without --poll this hangs; with it the timer fires on schedule
+hyperlight-unikraft kernel --initrd node.cpio --memory 512Mi --poll -- /app/timer.js
+```
+
+The kernel must be built with `CONFIG_HYPERLIGHT_POLL: 'y'` in its `kraft.yaml`
+(the `nodejs`, `go-http` and `poll-*` examples set it).
+
 ## CLI Options
 
 ```
@@ -302,6 +321,10 @@ Options:
                                repeatable; conflicts with --net-allow)
       --port <PORT>            Allow guest to bind (listen) on this port (implies --net; repeatable)
       --repeat <N>             Run the application N additional times via snapshot/restore [default: 0]
+      --poll                   Drive the guest with the cooperative poll pump instead of a single
+                               run-to-completion call. Required for event loops that park waiting
+                               on a timer or socket (e.g. Node.js `setTimeout`, long-lived servers).
+                               Needs a kernel built with `CONFIG_HYPERLIGHT_POLL=y`.
   -e, --exec <CODE>            Inline code snippet — interpreter invoked with -c <CODE>
                                (conflicts with positional -- <APP_ARGS>)
   -h, --help                   Print help

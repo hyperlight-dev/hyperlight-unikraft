@@ -2,6 +2,7 @@
 #
 # just run      - Run once
 # just run-5    - Run 5x (snapshot/restore)
+# just run-poll - Run under the cooperative poll pump (needed for timers/await)
 # just rootfs   - Build rootfs via Docker (cross-platform)
 # just build    - Build/pull kernel
 # just clean    - Remove build artifacts
@@ -22,6 +23,11 @@ run:
 # Run 10 times via snapshot/restore
 run-10:
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --repeat 9 --memory {{memory}} -- /app/hello.js
+
+# Run under the cooperative poll pump — required for scripts whose event loop
+# parks (setTimeout/setInterval/await). Needs CONFIG_HYPERLIGHT_POLL in the kernel.
+run-poll script="/app/hello.js":
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} --poll -- {{script}}
 
 # Build rootfs via Docker (cross-platform)
 rootfs:
