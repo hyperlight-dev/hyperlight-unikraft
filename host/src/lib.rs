@@ -580,11 +580,30 @@ fn dns_resolvers() -> &'static HashSet<IpAddr> {
 
 impl NetworkPolicy {
     fn check(&self, addr: &std::net::SocketAddr) -> Result<()> {
+        // Normalise IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to the IPv4 address it
+        // actually reaches. Linux routes those to the IPv4 stack, so without
+        // this every rule below could be evaded by rewriting the destination in
+        // mapped form: `::ffff:127.0.0.1` reached host loopback services, and
+        // `::ffff:169.254.169.254` reached instance metadata. Doing it here
+        // covers the allow/block lists too, not just the unconditional denials.
+        //
+        // Only the mapped form needs unwrapping. The deprecated IPv4-compatible
+        // form (`::a.b.c.d`) is not routed as IPv4, and unwrapping it here would
+        // be actively wrong -- `Ipv6Addr::to_ipv4` maps `::1` to `0.0.0.1`,
+        // which would turn loopback into an ordinary address.
+        let ip = match addr.ip() {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(v6)),
+            v4 => v4,
+        };
+
         // Block link-local addresses (169.254.0.0/16, fe80::/10) for all
         // policy variants.  In cloud environments the IPv4 link-local range
         // hosts the instance metadata service (169.254.169.254) which hands
         // out credentials without authentication.
-        let is_link_local = match addr.ip() {
+        let is_link_local = match ip {
             std::net::IpAddr::V4(v4) => v4.is_link_local(),
             std::net::IpAddr::V6(v6) => {
                 let seg = v6.segments();
@@ -601,7 +620,7 @@ impl NetworkPolicy {
         // Block loopback addresses (127.0.0.0/8, ::1) for all policy
         // variants. Host-local services typically trust loopback traffic
         // and perform no authentication.
-        if addr.ip().is_loopback() {
+        if ip.is_loopback() {
             return Err(anyhow!(
                 "network policy denies connection to loopback address {}",
                 addr
@@ -611,16 +630,14 @@ impl NetworkPolicy {
         match self {
             NetworkPolicy::AllowAll => Ok(()),
             NetworkPolicy::AllowList(al) => {
-                if al.is_allowed(&addr.ip())
-                    || (addr.port() == 53 && dns_resolvers().contains(&addr.ip()))
-                {
+                if al.is_allowed(&ip) || (addr.port() == 53 && dns_resolvers().contains(&ip)) {
                     Ok(())
                 } else {
                     Err(anyhow!("network policy denies connection to {}", addr))
                 }
             }
             NetworkPolicy::BlockList(bl) => {
-                if bl.is_blocked(&addr.ip()) {
+                if bl.is_blocked(&ip) {
                     Err(anyhow!("network policy denies connection to {}", addr))
                 } else {
                     Ok(())
@@ -6141,6 +6158,62 @@ mod tests {
             resp.contains("too large"),
             "expected 'too large' error for net_sendto, got: {resp}"
         );
+    }
+
+    /// `::ffff:a.b.c.d` reaches the IPv4 stack, so every policy rule has to see
+    /// through it. Before this was normalised a guest could reach host loopback
+    /// services and cloud instance metadata by simply rewriting the destination
+    /// in mapped form (verified end-to-end: the payload arrived at a real
+    /// 127.0.0.1 listener).
+    #[test]
+    fn ipv4_mapped_ipv6_cannot_evade_policy() {
+        let denied = |p: &NetworkPolicy, s: &str| {
+            let addr: std::net::SocketAddr = s.parse().unwrap();
+            p.check(&addr).is_err()
+        };
+
+        for policy in [
+            NetworkPolicy::AllowAll,
+            NetworkPolicy::BlockList(BlockList::from_hosts(&["198.51.100.7"]).unwrap()),
+        ] {
+            assert!(
+                denied(&policy, "[::ffff:127.0.0.1]:80"),
+                "mapped loopback must be denied"
+            );
+            assert!(
+                denied(&policy, "[::ffff:127.0.0.53]:53"),
+                "all of 127.0.0.0/8 must be denied in mapped form"
+            );
+            assert!(
+                denied(&policy, "[::ffff:169.254.169.254]:80"),
+                "mapped link-local (instance metadata) must be denied"
+            );
+            // The plain forms were already denied; keep them that way.
+            assert!(denied(&policy, "127.0.0.1:80"));
+            assert!(denied(&policy, "[::1]:80"));
+            assert!(denied(&policy, "169.254.169.254:80"));
+        }
+
+        // A blocklisted host must stay blocked when written in mapped form.
+        let bl = NetworkPolicy::BlockList(BlockList::from_hosts(&["198.51.100.7"]).unwrap());
+        assert!(denied(&bl, "198.51.100.7:443"));
+        assert!(
+            denied(&bl, "[::ffff:198.51.100.7]:443"),
+            "blocklist must see through IPv4-mapped IPv6"
+        );
+
+        // ...and an allowlisted host must still be reachable in mapped form,
+        // so normalising does not break legitimate traffic.
+        let al = NetworkPolicy::AllowList(AllowList::from_hosts(&["198.51.100.9"]).unwrap());
+        assert!(!denied(&al, "198.51.100.9:443"));
+        assert!(!denied(&al, "[::ffff:198.51.100.9]:443"));
+        assert!(denied(&al, "[::ffff:198.51.100.10]:443"));
+
+        // The deprecated IPv4-compatible form is NOT routed as IPv4 by the
+        // kernel, and unwrapping it would misclassify `::1`, so it must keep
+        // being treated as a plain IPv6 address.
+        let allow = NetworkPolicy::AllowAll;
+        assert!(denied(&allow, "[::1]:80"), "::1 must remain loopback");
     }
 
     #[test]
