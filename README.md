@@ -252,15 +252,17 @@ Caveats worth knowing before you debug the symptoms:
 - **DNS needs `--port 0`.** Resolvers `bind()` an ephemeral UDP source port, and
   `net_bind` rejects any port that isn't allowlisted. Without it `getaddrinfo`
   fails `EACCES` even though `--net` is set and the resolver is reachable.
-- **`getaddrinfo` fails `EIO` when the caller passes `AI_ADDRCONFIG`.** Every
-  other hint combination resolves, and IPv6 itself works (`lib/hostsock`
-  registers both `AF_INET` and `AF_INET6`; a raw IPv6 connect succeeds). But
-  Node's HTTP client sets `AI_ADDRCONFIG` by default, so `http.get` by hostname
-  fails until you pass an explicit `family` — `http.get({family: 4})` is
-  verified working. `dns.lookup` is unaffected.
 - **Loopback and link-local are always denied**, under every policy, including
   `--net`. `169.254.0.0/16` hosts cloud instance-metadata services, and
-  host-local services tend to trust loopback without authenticating.
+  host-local services tend to trust loopback without authenticating. This holds
+  for IPv4-mapped IPv6 too — `::ffff:127.0.0.1` is normalised before the policy
+  runs, so it cannot be used to slip past the denial (or past an allow/block
+  list). The one exception is deliberately inert: a UDP `connect()` to
+  loopback **port 65535** is answered rather than refused, because that exact
+  shape is how musl's `AI_ADDRCONFIG` asks "is this address family
+  configured?" — it transmits nothing. The host answers from its own stack and
+  never wires the guest's socket to loopback, so `connect`, `send` and `sendto`
+  to a loopback address all still fail.
 - **`/etc/resolv.conf` may be empty** in Docker-derived rootfs images; musl then
   falls back to `127.0.0.1:53`, which is denied as loopback. Bake a real
   `nameserver` line into the initrd.

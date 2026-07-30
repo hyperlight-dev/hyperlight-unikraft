@@ -2113,6 +2113,61 @@ fn handle_net_socket(
     Ok(json!({ "fd": fd }))
 }
 
+/// Answer musl's `AI_ADDRCONFIG` probe without exposing loopback to the guest.
+///
+/// `getaddrinfo(AI_ADDRCONFIG)` decides whether to request A and/or AAAA
+/// records by asking "is this family configured?", and musl phrases that
+/// question as: open a UDP socket and `connect()` it to that family's loopback
+/// address, port 65535. See musl `src/network/getaddrinfo.c`.
+///
+/// We deny loopback to guests on purpose, so that probe used to come back as a
+/// policy error. musl only accepts `EADDRNOTAVAIL`/`EAFNOSUPPORT`/
+/// `EHOSTUNREACH`/`ENETDOWN`/`ENETUNREACH` as "family unconfigured" and turns
+/// anything else into `EAI_SYSTEM`, so the whole lookup failed. Node's HTTP
+/// client sets `AI_ADDRCONFIG` whenever no explicit `family` is given, which is
+/// why `http.get` by hostname failed while `dns.lookup` worked.
+///
+/// Answering with an accepted errno instead would not help: both families would
+/// then report "unconfigured" and musl returns `EAI_NODATA`. The probe has to
+/// be able to *succeed*.
+///
+/// So run the probe on the host, on a throwaway socket. The host does all of
+/// the guest's routing, so its answer is the correct one — this makes guest
+/// `getaddrinfo` behave exactly as it would natively on the host. The guest's
+/// own socket is never connected to loopback, so no data path is opened, and
+/// `net_send`/`net_sendto` cannot reach loopback afterwards.
+fn addrconfig_probe(addr: &std::net::SocketAddr) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let domain = match addr {
+        std::net::SocketAddr::V4(_) => Domain::IPV4,
+        std::net::SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let probed = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .and_then(|s| s.connect(&(*addr).into()));
+
+    match probed {
+        Ok(()) => Ok(json!({})),
+        // "AddrNotAvail" is mapped to EADDRNOTAVAIL by the guest driver, which
+        // is on musl's accepted list, so the family is reported unconfigured
+        // rather than failing the lookup outright.
+        Err(e) => Err(anyhow!(
+            "AddrNotAvail: address family not configured on the host ({})",
+            e
+        )),
+    }
+}
+
+/// Does this connect match musl's `AI_ADDRCONFIG` probe exactly?
+///
+/// Kept as narrow as the probe itself (UDP, loopback, port 65535) so that any
+/// other connect to loopback still gets an honest denial. See
+/// [`addrconfig_probe`].
+fn is_addrconfig_probe(sock_type: i32, addr: &std::net::SocketAddr) -> bool {
+    // SOCK_DGRAM = 2
+    sock_type == 2 && addr.port() == 65535 && addr.ip().is_loopback()
+}
+
 async fn handle_net_connect(
     table: Arc<Mutex<SocketTable>>,
     policy: Arc<NetworkPolicy>,
@@ -2122,11 +2177,17 @@ async fn handle_net_connect(
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
     let addr = parse_sockaddr(&args)?;
-    policy.check(&addr)?;
     // Dup the socket out and drop the table lock before the async connect, so
     // the lock is never held across an await. The dup shares the kernel socket,
     // so the connection it establishes is visible on the table's fd.
     let (sock, sock_type) = dup_socket(&table, fd)?;
+    // A UDP connect to loopback:65535 transmits nothing; it is musl's
+    // AI_ADDRCONFIG routability probe. Answer it on the host instead of
+    // rejecting it, and leave the guest's socket untouched.
+    if is_addrconfig_probe(sock_type, &addr) {
+        return addrconfig_probe(&addr);
+    }
+    policy.check(&addr)?;
     if sock_type == 2 {
         // UDP connect just records the default peer; it returns immediately
         // and needs no reactor round-trip.
@@ -6214,6 +6275,72 @@ mod tests {
         // being treated as a plain IPv6 address.
         let allow = NetworkPolicy::AllowAll;
         assert!(denied(&allow, "[::1]:80"), "::1 must remain loopback");
+    }
+
+    /// The `AI_ADDRCONFIG` probe (a UDP connect to loopback) must be answered,
+    /// or musl turns it into `EAI_SYSTEM` and every default-hints
+    /// `getaddrinfo` fails. Answering it must NOT open a path to loopback:
+    /// TCP connect and datagram delivery there stay denied.
+    #[test]
+    fn addrconfig_probe_answered_but_loopback_stays_denied() {
+        use base64::Engine;
+
+        let mut reg = ToolRegistry::new();
+        let table = Arc::new(Mutex::new(SocketTable::new()));
+        register_net_tools(&mut reg, &NetworkPolicy::AllowAll, None, table);
+
+        let new_sock = |reg: &mut ToolRegistry, stype: u8| -> u64 {
+            let json = format!(r#"{{"name":"net_socket","args":{{"family":2,"type":{stype}}}}}"#);
+            let resp = String::from_utf8(reg.dispatch(json.as_bytes()).to_vec()).unwrap();
+            serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"]["fd"]
+                .as_u64()
+                .unwrap()
+        };
+        let connect = |reg: &mut ToolRegistry, fd: u64, id: u64, ip: &str, port: u16| -> String {
+            let json = format!(
+                r#"{{"name":"net_connect","args":{{"fd":{fd},"addr":"{ip}","port":{port}}}}}"#
+            );
+            let raw = reg.dispatch_drive(&framed_request(id, json.as_bytes()));
+            framed_json(&raw, ASYNC_FRAME_RESULT, id).to_string()
+        };
+
+        // The probe itself: UDP connect to loopback:65535 is answered, so musl
+        // sees the family as configured rather than erroring out.
+        let udp = new_sock(&mut reg, 2);
+        let resp = connect(&mut reg, udp, 1, "127.0.0.1", 65535);
+        assert!(
+            !resp.contains("error"),
+            "AI_ADDRCONFIG probe must be answered, got: {resp}"
+        );
+
+        // ...but the probed socket still cannot deliver a datagram there.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"payload");
+        let json = format!(
+            r#"{{"name":"net_sendto","args":{{"fd":{udp},"data":"{b64}","addr":"127.0.0.1","port":65535}}}}"#
+        );
+        let raw = reg.dispatch_drive(&framed_request(2, json.as_bytes()));
+        let resp = framed_json(&raw, ASYNC_FRAME_RESULT, 2).to_string();
+        assert!(
+            resp.contains("loopback"),
+            "sendto to loopback must stay denied, got: {resp}"
+        );
+
+        // ...and a real (TCP) connection to loopback is still refused.
+        let tcp = new_sock(&mut reg, 1);
+        let resp = connect(&mut reg, tcp, 3, "127.0.0.1", 65535);
+        assert!(
+            resp.contains("loopback"),
+            "TCP connect to loopback must stay denied, got: {resp}"
+        );
+
+        // The exception is only the probe's exact shape: a UDP connect to any
+        // other loopback port is still an honest denial.
+        let udp2 = new_sock(&mut reg, 2);
+        let resp = connect(&mut reg, udp2, 4, "127.0.0.1", 53);
+        assert!(
+            resp.contains("loopback"),
+            "UDP connect to loopback:53 must stay denied, got: {resp}"
+        );
     }
 
     #[test]
