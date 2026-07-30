@@ -1,6 +1,7 @@
 ARG BASE=ghcr.io/hyperlight-dev/hyperlight-unikraft/nodejs-base:latest
 FROM ${BASE} AS rootfs
 COPY hello.js /app/hello.js
+COPY server.js /app/server.js
 
 FROM alpine:3.20 AS cpio
 RUN apk add --no-cache cpio findutils

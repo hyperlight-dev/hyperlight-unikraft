@@ -183,7 +183,7 @@ just run
 | `python` | CPython 3.12 | Rootfs from Docker, script passed via cmdline |
 | `python-tools` | CPython 3.12 + host function call | Calls an echo Wasm host function registered with `--tool echo=...` |
 | `go` | Static PIE Go binary | Compiled with musl via Docker for CGO support |
-| `nodejs` | Node.js 22 | Rootfs from Alpine, script passed via cmdline. Built with `CONFIG_HYPERLIGHT_POLL`; use `--poll` for timers/`await` |
+| `nodejs` | Node.js 22 | Rootfs from Alpine, script passed via cmdline. Built with `CONFIG_HYPERLIGHT_POLL` + host-proxied sockets; use `--poll` for timers/`await`, `--net`/`--port` for HTTP |
 | `hostfs-posix-c` | C + unmodified POSIX | `open`/`read`/`write`/`mkdir` against `/host`, forwarded by `lib/hostfs` |
 | `hostfs-posix-py` | Python + stdlib | Same as `hostfs-posix-c` using `open()`/`os.mkdir`/`os.stat` |
 
@@ -212,6 +212,55 @@ escape (via `..` or symlinks) is rejected host-side.
 
 Known limitation: `opendir`/`readdir` don't work yet (see
 [lib/hostfs/README.md](https://github.com/unikraft/unikraft/blob/plat-hyperlight/lib/hostfs/README.md)). Stat and enumerate known paths instead.
+
+### Guest networking
+
+Networking is host-proxied: there is no TCP/IP stack in the guest. `lib/hostsock`
+registers an `AF_INET` socket driver that forwards `connect`/`bind`/`listen`/
+`accept`/`send`/`recv` to the host over `__dispatch`, and the host performs the
+real networking.
+
+Two things are required, and enabling only the first is a common mistake:
+
+```yaml
+    CONFIG_LIBPOSIX_SOCKET: 'y'   # syscall surface only
+    CONFIG_LIBHOSTSOCK: 'y'       # the AF_INET driver that actually does the work
+    CONFIG_LIBDEVFS: 'y'          # /dev/hcall, the transport hostsock proxies over
+    CONFIG_LIBDEVFS_AUTOMOUNT: 'y'
+```
+
+`CONFIG_LIBPOSIX_SOCKET` on its own compiles and boots, but registers no driver
+for `AF_INET`, so `bind`/`listen`/`connect` all fail `EAFNOSUPPORT`.
+
+Everything is still off by default at runtime — the kernel only gains the
+capability, and the host gates each direction separately:
+
+```bash
+# Outbound only
+hyperlight-unikraft kernel --initrd app.cpio --poll --net -- /app/client.js
+
+# Inbound: each listen port must be allowlisted
+hyperlight-unikraft kernel --initrd app.cpio --poll --net --port 8080 -- /app/server.js
+```
+
+Use `--poll` for any long-lived server; without it the guest gets a single
+run-to-completion call and the accept loop never runs (see
+[Blocking event loops](#blocking-event-loops---poll)).
+
+Caveats worth knowing before you debug the symptoms:
+
+- **DNS needs `--port 0`.** Resolvers `bind()` an ephemeral UDP source port, and
+  `net_bind` rejects any port that isn't allowlisted. Without it `getaddrinfo`
+  fails `EACCES` even though `--net` is set and the resolver is reachable.
+- **IPv4 only.** `lib/hostsock` registers `AF_INET`; `AF_INET6` is not handled.
+  A name that resolves to AAAA-only will fail — force IPv4 (in Node,
+  `dns.lookup(h, {family: 4})` / `http.get({family: 4})`).
+- **Loopback and link-local are always denied**, under every policy, including
+  `--net`. `169.254.0.0/16` hosts cloud instance-metadata services, and
+  host-local services tend to trust loopback without authenticating.
+- **`/etc/resolv.conf` may be empty** in Docker-derived rootfs images; musl then
+  falls back to `127.0.0.1:53`, which is denied as loopback. Bake a real
+  `nameserver` line into the initrd.
 
 ### Running ad-hoc code (no initrd rebuild)
 
@@ -319,7 +368,8 @@ Options:
                                conflicts with --net-block)
       --net-block <HOST_OR_IP> Block listed hosts/IPs, allow everything else (implies --net;
                                repeatable; conflicts with --net-allow)
-      --port <PORT>            Allow guest to bind (listen) on this port (implies --net; repeatable)
+      --port <PORT>            Allow guest to bind (listen) on this port (implies --net; repeatable).
+                               Use `--port 0` to permit ephemeral binds, which DNS resolvers need.
       --repeat <N>             Run the application N additional times via snapshot/restore [default: 0]
       --poll                   Drive the guest with the cooperative poll pump instead of a single
                                run-to-completion call. Required for event loops that park waiting

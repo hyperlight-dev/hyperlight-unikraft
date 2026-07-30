@@ -3,6 +3,7 @@
 # just run      - Run once
 # just run-5    - Run 5x (snapshot/restore)
 # just run-poll - Run under the cooperative poll pump (needed for timers/await)
+# just serve    - Run the HTTP server on :8080 (host-proxied sockets)
 # just rootfs   - Build rootfs via Docker (cross-platform)
 # just build    - Build/pull kernel
 # just clean    - Remove build artifacts
@@ -28,6 +29,12 @@ run-10:
 # parks (setTimeout/setInterval/await). Needs CONFIG_HYPERLIGHT_POLL in the kernel.
 run-poll script="/app/hello.js":
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} --poll -- {{script}}
+
+# Serve HTTP on :8080 over host-proxied sockets, then `curl localhost:8080`.
+# --poll keeps the accept loop running; --port allowlists the bind.
+serve port="8080":
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
+        --poll --net --port {{port}} -- /app/server.js {{port}}
 
 # Build rootfs via Docker (cross-platform)
 rootfs:

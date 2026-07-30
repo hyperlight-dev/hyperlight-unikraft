@@ -76,6 +76,19 @@ unikraft:
     CONFIG_LIBPOSIX_FDTAB: 'y'
     CONFIG_LIBUKFILE: 'y'
 
+    # devfs + /dev/hcall, the transport hostsock proxies socket calls over
+    CONFIG_LIBDEVFS: 'y'
+    CONFIG_LIBDEVFS_AUTOMOUNT: 'y'
+
+    # Networking: host-proxied sockets. LIBPOSIX_SOCKET alone only provides the
+    # syscall surface — it registers no driver for AF_INET, so bind/listen/
+    # connect all fail EAFNOSUPPORT (verified with a control kernel built with
+    # LIBPOSIX_SOCKET and nothing else). LIBHOSTSOCK is that driver, forwarding
+    # connect/bind/listen/accept/send/recv to the host over __dispatch.
+    # Runtime access stays opt-in and host-gated via --net / --port.
+    CONFIG_LIBPOSIX_SOCKET: 'y'
+    CONFIG_LIBHOSTSOCK: 'y'
+
 
 libraries:
   app-elfloader:

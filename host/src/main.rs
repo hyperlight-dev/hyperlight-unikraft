@@ -144,6 +144,10 @@ struct Args {
     /// Allow the guest to bind (listen) on the given port. Implies --net.
     /// Without this flag, `net_bind` is rejected (outbound-only).
     /// Repeatable: `--port 8080 --port 3000`.
+    ///
+    /// Pass `--port 0` to permit ephemeral binds. DNS resolvers bind an
+    /// ephemeral UDP source port, so without it `getaddrinfo` fails EACCES
+    /// even when the resolver itself is reachable.
     #[arg(long, value_name = "PORT")]
     port: Vec<u16>,
 
