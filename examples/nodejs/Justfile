@@ -3,6 +3,7 @@
 # just run      - Run once
 # just run-5    - Run 5x (snapshot/restore)
 # just run-poll - Run under the cooperative poll pump (needed for timers/await)
+# just exec     - Run an inline JS snippet (no initrd rebuild)
 # just serve    - Run the HTTP server on :8080 (host-proxied sockets)
 # just rootfs   - Build rootfs via Docker (cross-platform)
 # just build    - Build/pull kernel
@@ -29,6 +30,13 @@ run-10:
 # parks (setTimeout/setInterval/await). Needs CONFIG_HYPERLIGHT_POLL in the kernel.
 run-poll script="/app/hello.js":
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} --poll -- {{script}}
+
+# Run arbitrary JavaScript without rebuilding the initrd. Node spells the
+# "run this string" flag `-e`, not `-c` (`node -c` is --check, which wants a
+# file path), so --exec-flag overrides the default.
+exec CODE:
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
+        --exec-flag -e --exec {{quote(CODE)}}
 
 # Serve HTTP on :8080 over host-proxied sockets, then `curl localhost:8080`.
 # --poll keeps the accept loop running; --port allowlists the bind.

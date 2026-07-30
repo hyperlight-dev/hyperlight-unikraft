@@ -270,17 +270,24 @@ Caveats worth knowing before you debug the symptoms:
 ### Running ad-hoc code (no initrd rebuild)
 
 `--exec CODE` / `-e CODE` feeds a snippet to the guest interpreter as
-`-c CODE`. The host handles all the argparse-escape quoting internally,
-so you can pass arbitrary whitespace, quotes, and newlines without
-wrapping:
+`<exec-flag> CODE`, where `--exec-flag` defaults to `-c`. The host handles
+all the argparse-escape quoting internally, so you can pass arbitrary
+whitespace, quotes, and newlines without wrapping:
 
 ```bash
 hyperlight-unikraft python-kernel --initrd python.cpio --memory 96Mi \
     --exec 'for i in range(3): print(i * i)'
 ```
 
-Works for any interpreter that treats `-c` as "run the next arg as
-code" — CPython, `sh`, etc. `node -e` works identically with `-e`.
+The `-c` default suits any interpreter that treats it as "run the next arg
+as code" — CPython, `sh`, etc. Node.js spells it `-e`, so it needs
+`--exec-flag`; `node -c` means `--check`, which syntax-checks a *file* and
+fails with `MODULE_NOT_FOUND` on a code string:
+
+```bash
+hyperlight-unikraft nodejs-kernel --initrd node-initrd.cpio --memory 512Mi \
+    --exec-flag -e --exec 'console.log("hi", 2 + 2)'
+```
 
 `examples/hostfs-posix-py` wraps it in two Justfile recipes:
 
@@ -380,8 +387,10 @@ Options:
                                run-to-completion call. Required for event loops that park waiting
                                on a timer or socket (e.g. Node.js `setTimeout`, long-lived servers).
                                Needs a kernel built with `CONFIG_HYPERLIGHT_POLL=y`.
-  -e, --exec <CODE>            Inline code snippet — interpreter invoked with -c <CODE>
-                               (conflicts with positional -- <APP_ARGS>)
+  -e, --exec <CODE>            Inline code snippet — interpreter invoked with
+                               <exec-flag> <CODE> (conflicts with positional -- <APP_ARGS>)
+      --exec-flag <FLAG>       The interpreter flag meaning "run the next arg as code"
+                               [default: -c; Node.js needs -e]
   -h, --help                   Print help
   -V, --version                Print version
 ```

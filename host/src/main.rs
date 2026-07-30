@@ -157,14 +157,30 @@ struct Args {
     repeat: u32,
 
     /// Inline code snippet. The guest interpreter is invoked with
-    /// `["-c", <code>]` — works for Python, `sh`, `node -e` style
-    /// interpreters that treat `-c` as "run the next arg as code".
+    /// `[<exec-flag>, <code>]`, where `--exec-flag` defaults to `-c` —
+    /// the convention used by CPython, `sh`, and friends. Interpreters
+    /// that spell it differently need `--exec-flag`: Node.js wants `-e`,
+    /// because `node -c` means `--check` (syntax-check a *file*).
     /// The host handles all argparse-escape quoting internally, so your
     /// code can contain arbitrary spaces, quotes, newlines, etc.
     ///
     /// Conflicts with positional `-- <args>`.
     #[arg(long, short = 'e', conflicts_with = "app_args", value_name = "CODE")]
     exec: Option<String>,
+
+    /// The interpreter flag meaning "run the next argument as code".
+    ///
+    /// Defaults to `-c` (CPython, `sh`, ...). Node.js needs
+    /// `--exec-flag -e`, since `node -c` is `--check` and expects a file
+    /// path rather than code. Only meaningful together with `--exec`.
+    #[arg(
+        long,
+        requires = "exec",
+        conflicts_with = "app_args",
+        allow_hyphen_values = true,
+        value_name = "FLAG"
+    )]
+    exec_flag: Option<String>,
 
     /// Drive the guest with the cooperative poll pump instead of a single
     /// run-to-completion call.
@@ -251,10 +267,13 @@ fn main() -> Result<()> {
     // Zero-copy initrd via map_file_cow. If --mount is set, the directory is
     // preopened: the FsSandbox handlers get wired in and lib/hostfs in the
     // guest mounts it at the configured guest path.
-    // --exec CODE is sugar for `-- -c <CODE>`, but with the argparse
+    // --exec CODE is sugar for `-- <exec-flag> <CODE>`, but with the argparse
     // escaping applied so the user doesn't have to think about it.
     let app_args: Vec<String> = match args.exec {
-        Some(ref code) => vec!["-c".into(), argparse_escape(code)],
+        Some(ref code) => vec![
+            args.exec_flag.clone().unwrap_or_else(|| "-c".into()),
+            argparse_escape(code),
+        ],
         None => args.app_args.clone(),
     };
 
