@@ -145,7 +145,9 @@ fn snapshot_save_then_load_roundtrip() {
     };
 
     let tmp = tempdir_local("hl-snap");
-    let snap_path = tmp.join("roundtrip.hls");
+    // save_snapshot writes an OCI image layout *directory*, not a single
+    // file (changed in 1caba5c when we moved to hyperlight-host 0.16).
+    let snap_path = tmp.join("roundtrip-snapshot");
 
     {
         let mut sbox = Sandbox::builder(&kernel)
@@ -161,8 +163,8 @@ fn snapshot_save_then_load_roundtrip() {
         sbox.save_snapshot(&snap_path).expect("save_snapshot");
     }
     assert!(
-        snap_path.is_file(),
-        "save_snapshot should have created {}",
+        snap_path.is_dir(),
+        "save_snapshot should have created the OCI layout dir {}",
         snap_path.display()
     );
 
