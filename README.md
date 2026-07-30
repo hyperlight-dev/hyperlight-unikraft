@@ -258,9 +258,6 @@ Caveats worth knowing before you debug the symptoms:
   Node's HTTP client sets `AI_ADDRCONFIG` by default, so `http.get` by hostname
   fails until you pass an explicit `family` — `http.get({family: 4})` is
   verified working. `dns.lookup` is unaffected.
-- **Don't mix address families in one guest.** An IPv4 connection followed by an
-  IPv6 connection reliably crashes the kernel. Either family works on its own
-  (v4→v4 and v6→v6 are both fine); only the transition faults.
 - **Loopback and link-local are always denied**, under every policy, including
   `--net`. `169.254.0.0/16` hosts cloud instance-metadata services, and
   host-local services tend to trust loopback without authenticating.
