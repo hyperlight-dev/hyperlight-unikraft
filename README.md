@@ -252,9 +252,15 @@ Caveats worth knowing before you debug the symptoms:
 - **DNS needs `--port 0`.** Resolvers `bind()` an ephemeral UDP source port, and
   `net_bind` rejects any port that isn't allowlisted. Without it `getaddrinfo`
   fails `EACCES` even though `--net` is set and the resolver is reachable.
-- **IPv4 only.** `lib/hostsock` registers `AF_INET`; `AF_INET6` is not handled.
-  A name that resolves to AAAA-only will fail — force IPv4 (in Node,
-  `dns.lookup(h, {family: 4})` / `http.get({family: 4})`).
+- **`getaddrinfo` fails `EIO` when the caller passes `AI_ADDRCONFIG`.** Every
+  other hint combination resolves, and IPv6 itself works (`lib/hostsock`
+  registers both `AF_INET` and `AF_INET6`; a raw IPv6 connect succeeds). But
+  Node's HTTP client sets `AI_ADDRCONFIG` by default, so `http.get` by hostname
+  fails until you pass an explicit `family` — `http.get({family: 4})` is
+  verified working. `dns.lookup` is unaffected.
+- **Don't mix address families in one guest.** An IPv4 connection followed by an
+  IPv6 connection reliably crashes the kernel. Either family works on its own
+  (v4→v4 and v6→v6 are both fine); only the transition faults.
 - **Loopback and link-local are always denied**, under every policy, including
   `--net`. `169.254.0.0/16` hosts cloud instance-metadata services, and
   host-local services tend to trust loopback without authenticating.
