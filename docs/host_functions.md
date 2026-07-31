@@ -53,7 +53,8 @@ Two request formats are accepted:
 ### Cooperative (async) request
 
 Used when calling an **async tool** (e.g. `net_connect`, `net_recv`,
-`__hl_sleep`). `hyperlight_hcall()` places the ordinary JSON tool request in a
+`__hl_sleep`) from a guest built with `CONFIG_HYPERLIGHT_POLL`.
+`hyperlight_hcall()` places the ordinary JSON tool request in a
 versioned binary frame:
 
 | Offset | Size | Field |
@@ -88,7 +89,10 @@ Used for synchronous tools (e.g. `fs_read`, `net_socket`, `__hl_exit`):
 {"name": "<tool_name>", "args": <json_value>}
 ```
 
-Calling an **async** tool in legacy format returns `{"error": "…"}` (protocol error).
+Calling an **async** tool in legacy format is supported: guests built without
+`CONFIG_HYPERLIGHT_POLL` have no drive loop to collect a deferred completion,
+so the host resolves the tool inline and returns the result in the same
+blocking call.
 
 **Success response:**
 
@@ -171,8 +175,9 @@ Sleep on the host thread (used by guest drivers).
 **Result:** `{}`  
 Can be cancelled via `SleepCancel` when tearing down the sandbox.
 
-**Async:** `__hl_sleep` is an async tool; `hyperlight_hcall()` supplies its
-binary request frame.
+**Async:** `__hl_sleep` is an async tool. In poll builds `hyperlight_hcall()`
+supplies its binary request frame; in non-poll builds it is called in legacy
+format and the host resolves it inline (blocking the vCPU thread).
 
 ---
 
