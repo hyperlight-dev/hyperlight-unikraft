@@ -1,11 +1,11 @@
 //! Live cooperative-poll run exercising **named guest calls** — the poll-model
-//! counterpart of `Sandbox::call_named` — under a real hypervisor (`/dev/kvm`).
+//! `Sandbox::call_named_async` — under a real hypervisor (`/dev/kvm`).
 //!
-//! The blocking entry points (`call_run`, `call_named`) enter the guest exactly
-//! once, so a guest built with `CONFIG_HYPERLIGHT_POLL` that parks mid-call is
-//! abandoned part-way. `Sandbox::call_named_step` / `call_named_async` carry the
-//! function name and arguments on the *first* cooperative step and then drive
-//! the pump like any other poll loop, so the call can park and resume freely.
+//! A single guest entry runs one pump iteration, so a call that parks mid-way
+//! would be abandoned. `Sandbox::call_named_step` / `call_named_async` carry
+//! the function name and arguments on the *first* cooperative step and then
+//! drive the pump like any other poll loop, so the call can park and resume
+//! freely.
 //!
 //! The guest binary is `examples/poll-multifn-c/`. Its `main()` installs an
 //! FC-aware dispatch callback and halts; every later named call reaches that

@@ -1,6 +1,6 @@
 //! Live cooperative-poll run under a real hypervisor (`/dev/kvm` on Linux).
 //!
-//! Unlike [`call_run`], which runs a guest to completion in a single vCPU
+//! Unlike a single guest entry, which runs one pump iteration on one vCPU
 //! entry, the cooperative *poll* model runs the unikernel scheduler only up
 //! to the point it would go idle, then yields the vCPU back to the host
 //! (a HALT) reporting the nanoseconds until its next scheduled wakeup. The
@@ -193,44 +193,4 @@ fn poll_run_reaches_done_under_kvm() {
     // default). Termination is proven by reaching `Done` above, not by the
     // exit-code atomic — so we don't assert on it.
     let _ = sbox.last_exit_code();
-}
-
-/// A poll-built guest driven by the *blocking* entry point must report a
-/// clear error rather than silently succeeding.
-///
-/// `call_run` enters the guest exactly once. A `CONFIG_HYPERLIGHT_POLL` guest
-/// returns to the host as soon as it would block, so that single entry leaves
-/// the work half-done. Before this was detected the call returned `Ok(())`
-/// with no diagnostic anywhere — a script would simply stop at its first
-/// blocking operation and the run would look successful.
-#[test]
-fn call_run_on_poll_guest_errors_instead_of_silently_truncating() {
-    let Some((kernel, initrd)) = setup() else {
-        return;
-    };
-
-    let mut sbox = Sandbox::builder(&kernel)
-        .initrd_file(&initrd)
-        .heap_size(32 * 1024 * 1024)
-        .build()
-        .expect("build sandbox");
-    sbox.restore().expect("restore");
-
-    // poll-c sleeps before exiting, so its first yield happens inside the
-    // single blocking entry.
-    let err = match sbox.call_run() {
-        Err(e) => e.to_string(),
-        Ok(()) => panic!(
-            "call_run on a CONFIG_HYPERLIGHT_POLL guest returned Ok — the \
-             guest yielded mid-run, so this silently truncated the work"
-        ),
-    };
-    assert!(
-        err.contains("yielded instead of running to completion"),
-        "error should explain the guest parked: {err}"
-    );
-    assert!(
-        err.contains("poll"),
-        "error should point at the poll pump as the fix: {err}"
-    );
 }

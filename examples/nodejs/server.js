@@ -1,10 +1,9 @@
 // Minimal HTTP server, to exercise host-proxied sockets.
 //
 //   hyperlight-unikraft <kernel> --initrd node-initrd.cpio --memory 512Mi \
-//       --poll --net --port 8080 -- /app/server.js
+//       --net --port 8080 -- /app/server.js
 //
-// --poll is required: without it the guest gets a single run-to-completion
-// call and the accept loop never runs. --port allowlists the bind.
+// --port allowlists the bind.
 
 const http = require('http');
 

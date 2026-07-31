@@ -29,7 +29,7 @@ run-10:
 # Run under the cooperative poll pump — required for scripts whose event loop
 # parks (setTimeout/setInterval/await). Needs CONFIG_HYPERLIGHT_POLL in the kernel.
 run-poll script="/app/hello.js":
-    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} --poll -- {{script}}
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} -- {{script}}
 
 # Run arbitrary JavaScript without rebuilding the initrd. Node spells the
 # "run this string" flag `-e`, not `-c` (`node -c` is --check, which wants a
@@ -39,10 +39,10 @@ exec CODE:
         --exec-flag -e --exec {{quote(CODE)}}
 
 # Serve HTTP on :8080 over host-proxied sockets, then `curl localhost:8080`.
-# --poll keeps the accept loop running; --port allowlists the bind.
+# --port allowlists the bind.
 serve port="8080":
     hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} \
-        --poll --net --port {{port}} -- /app/server.js {{port}}
+        --net --port {{port}} -- /app/server.js {{port}}
 
 # Build rootfs via Docker (cross-platform)
 rootfs:

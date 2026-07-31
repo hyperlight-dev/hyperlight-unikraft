@@ -1,6 +1,7 @@
 use hyperlight_unikraft::Sandbox;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let kernel = std::env::args()
         .nth(1)
         .expect("usage: test_cpiovfs <kernel> <initrd>");
@@ -16,7 +17,7 @@ fn main() -> anyhow::Result<()> {
             .build()?;
         eprintln!("  build OK");
         sbox.restore()?;
-        let _: () = sbox.call_named("init", ())?;
+        sbox.call_named_async("init", ()).await?;
         eprintln!("  init OK");
         sbox.snapshot_now()?;
         eprintln!("  snapshot OK");
@@ -35,7 +36,8 @@ fn main() -> anyhow::Result<()> {
 
         sbox.restore()?;
         eprintln!("  restore OK");
-        let _: () = sbox.call_named("run", "print('test ok')".to_string())?;
+        sbox.call_named_async("run", "print('test ok')".to_string())
+            .await?;
         eprintln!("  call OK");
     }
 

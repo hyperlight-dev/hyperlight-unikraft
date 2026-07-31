@@ -29,6 +29,7 @@
 //!     mounts: &[],
 //!     network: None,
 //!     listen_ports: None,
+//!     max_surrogates: None,
 //!     force: false,
 //! })?;
 //!

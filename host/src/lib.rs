@@ -8,13 +8,14 @@
 //!
 //! ```no_run
 //! use hyperlight_unikraft::Sandbox;
-//! # fn main() -> anyhow::Result<()> {
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
 //! let mut sbox = Sandbox::builder("./kernel")
 //!     .initrd_file("./initrd.cpio")
 //!     .heap_size(256 * 1024 * 1024)
 //!     .build()?;
 //! sbox.restore()?;
-//! sbox.call_run()?;
+//! sbox.poll_run_async().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -3354,7 +3355,7 @@ impl FsRouter {
 /// Construct one with [`Sandbox::builder`]. Lifecycle:
 ///   1. `.build()` — creates the VM and runs guest init, takes a snapshot
 ///   2. [`Sandbox::restore`] — rewinds the VM to the post-init snapshot
-///   3. [`Sandbox::call_run`] — runs the guest application
+///   3. [`Sandbox::poll_run_async`] — runs the guest application
 pub struct Sandbox {
     inner: MultiUseSandbox,
     /// Post-init snapshot for fast restore between calls.
@@ -3808,40 +3809,6 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Call the dispatch function to re-run the application.
-    ///
-    /// Requires a prior `restore()` to reset guest state.
-    /// The dispatch function pops the FunctionCall from input,
-    /// runs the application, pushes a void result, and halts.
-    pub fn call_run(&mut self) -> Result<()> {
-        // call() with Void return type — the function name doesn't matter
-        // to the guest (it ignores it and just runs the app).
-        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
-        let _: () = self.inner.call("run", ())?;
-        self.check_guest_ran_to_completion("call_run")
-    }
-
-    /// Error if the guest parked instead of finishing.
-    ///
-    /// A guest built with `CONFIG_HYPERLIGHT_POLL` returns to the host
-    /// whenever it would block, expecting the caller to re-enter via
-    /// [`Sandbox::poll`]. The blocking entry points invoke the guest exactly
-    /// once, so such a yield means the work was abandoned part-way: the guest
-    /// is still parked and no error is reported anywhere. Without this check
-    /// the call silently succeeds having done only part of the work — e.g. a
-    /// script stops at its first socket read with no diagnostic at all.
-    fn check_guest_ran_to_completion(&self, entry: &str) -> Result<()> {
-        if let GuestPollSignal::Yielded { .. } = *self.poll_signal.lock().unwrap() {
-            return Err(anyhow!(
-                "{entry}: the guest yielded instead of running to completion — \
-                 it is built with CONFIG_HYPERLIGHT_POLL and must be driven by \
-                 the cooperative poll pump (Sandbox::poll_run_async, or the \
-                 --poll flag), not by a single blocking call"
-            ));
-        }
-        Ok(())
-    }
-
     /// Drain resolved async-tool results into one bounded binary batch.
     ///
     /// Each entry is `{request_id: u64, payload_len: u32, JSON payload}`. An
@@ -4106,12 +4073,7 @@ impl Sandbox {
     }
 
     /// Drive the guest to completion cooperatively from a Tokio runtime,
-    /// returning its exit code — the async, poll-driven analog of
-    /// [`Sandbox::call_run`].
-    ///
-    /// (Named `poll_run_async` rather than `call_run_async` because the latter
-    /// already exists for a different purpose — a pausable/snapshotable run
-    /// handle. This method instead runs the cooperative *poll* loop.)
+    /// returning its exit code.
     ///
     /// This is the full poll loop as a single `async fn`, built on the unified
     /// [`Sandbox::poll`] / [`Sandbox::drive_host_functions`] pair (the same
@@ -4152,12 +4114,10 @@ impl Sandbox {
     /// Invoke a named guest function and drive the cooperative poll pump until
     /// it returns.
     ///
-    /// This is the poll-model counterpart of [`Sandbox::call_named`]. The
-    /// blocking form enters the guest exactly once, so a call that parks —
-    /// on a socket, a timer or an async host function — is abandoned part-way.
-    /// Here the first step carries the function name and its arguments and
-    /// every later step is an ordinary pump step, so the call can park and
-    /// resume as often as it needs to.
+    /// The first step carries the function name and its arguments and every
+    /// later step is an ordinary pump step, so a call that parks — on a
+    /// socket, a timer or an async host function — resumes as often as it
+    /// needs to instead of being abandoned part-way.
     ///
     /// Returns when the guest reports the call finished
     /// ([`PollOutcome::CallComplete`]) or when the guest process exits during
@@ -4304,27 +4264,6 @@ impl Sandbox {
     #[cfg(not(unix))]
     async fn wait_readable_or_timeout(_fds: Vec<i32>, timeout: Duration) {
         tokio::time::sleep(timeout).await;
-    }
-
-    /// Call a named guest function with typed parameters.
-    ///
-    /// Thin passthrough to [`MultiUseSandbox::call`] so callers can take
-    /// advantage of Hyperlight's multi-function dispatch when the loaded
-    /// ELF uses it (e.g. registering an `init` for one-time warm-up and
-    /// a `run` for per-call work — see the FC-aware dispatch callback in
-    /// plat/hyperlight/dispatch.c).
-    ///
-    /// Requires a prior `restore()` to reset guest state to the snapshot
-    /// the caller wants to run against.
-    pub fn call_named<Output, Args>(&mut self, func_name: &str, args: Args) -> Result<Output>
-    where
-        Output: hyperlight_host::func::SupportedReturnType,
-        Args: hyperlight_host::func::ParameterTuple,
-    {
-        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
-        let out = self.inner.call(func_name, args)?;
-        self.check_guest_ran_to_completion("call_named")?;
-        Ok(out)
     }
 
     /// Read the exit code reported by the guest via `__hl_exit`.
@@ -4590,7 +4529,10 @@ pub struct VmOutput {
 /// Unikraft console output goes through Hyperlight's port I/O to host stderr.
 /// This function redirects stderr to a temp file during the call phase to
 /// capture it.  The Unikraft dispatch lifecycle is:
-///   evolve (boot+init+snapshot) → restore → call_run (app output here)
+///   evolve (boot+init+snapshot) → restore → poll (app output here)
+///
+/// Blocks on a private current-thread runtime that drives the cooperative
+/// poll pump, so it must not be called from inside another Tokio runtime.
 pub fn run_vm_capture_output(
     kernel_path: &Path,
     initrd: Option<&[u8]>,
@@ -4616,7 +4558,11 @@ pub fn run_vm_capture_output(
     // Phase 2: restore + call — application runs and produces output
     let evolve_start = std::time::Instant::now();
     sandbox.restore()?;
-    let call_result = sandbox.call_run();
+    let call_result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|rt| rt.block_on(sandbox.poll_run_async()));
     let evolve_time = evolve_start.elapsed();
 
     // Restore stderr
