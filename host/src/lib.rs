@@ -201,6 +201,9 @@ const MAX_SLEEP_NS: u64 = 60_000_000_000;
 pub enum PollOutcome {
     /// The guest explicitly exited or halted without a scheduler yield.
     Exited,
+    /// The named guest function the host asked for has returned. The guest
+    /// itself is still alive and can serve further calls.
+    CallComplete,
     /// The scheduler is idle and has no timer or host call to wake it.
     Idle,
     /// The scheduler is idle until the reported relative deadline.
@@ -218,6 +221,7 @@ enum GuestPollSignal {
     None,
     Yielded {
         deadline_ns: Option<u64>,
+        call_done: bool,
     },
     Exited,
 }
@@ -225,9 +229,16 @@ enum GuestPollSignal {
 type SharedPollSignal = Arc<Mutex<GuestPollSignal>>;
 
 fn classify_poll_signal(signal: GuestPollSignal, host_calls_pending: bool) -> PollOutcome {
-    let GuestPollSignal::Yielded { deadline_ns } = signal else {
+    let GuestPollSignal::Yielded {
+        deadline_ns,
+        call_done,
+    } = signal
+    else {
         return PollOutcome::Exited;
     };
+    if call_done {
+        return PollOutcome::CallComplete;
+    }
     let deadline = deadline_ns.map(Duration::from_nanos);
     if host_calls_pending {
         PollOutcome::HostCallsPending {
@@ -1672,11 +1683,16 @@ fn register_internal_tools(
             .get("ns")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| anyhow!("__hl_poll_yield: ns must be a non-negative integer"))?;
+        let call_done = args.get("call_done").map_or(Ok(false), |v| {
+            v.as_bool()
+                .ok_or_else(|| anyhow!("__hl_poll_yield: call_done must be a boolean"))
+        })?;
         let mut signal = yield_signal.lock().unwrap();
         match *signal {
             GuestPollSignal::None => {
                 *signal = GuestPollSignal::Yielded {
                     deadline_ns: (ns != 0).then_some(ns),
+                    call_done,
                 };
             }
             // An explicit exit is authoritative. The idle pump may still yield
@@ -3833,7 +3849,6 @@ impl Sandbox {
     /// Requires a prior [`Sandbox::restore`] before the first step of a fresh
     /// run.
     pub fn poll_outcome(&mut self) -> Result<PollOutcome> {
-        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
         // Pass the binary batch of completed/errored async host tasks as the
         // guest `poll` function's byte-vector argument. The guest routes each ID's
         // result to the matching parked host call (see
@@ -3841,7 +3856,35 @@ impl Sandbox {
         // hcall.c `hyperlight_hcall_deliver_batch`), so a parked call resumes
         // without ever issuing a follow-up host function.
         let batch = self.drain_completion_batch();
+        self.begin_step();
         let _: () = self.inner.call("poll", batch)?;
+        Ok(self.finish_step())
+    }
+
+    /// Start a named guest call and run its first cooperative step, returning
+    /// the same typed outcome as [`Sandbox::poll_outcome`].
+    ///
+    /// The guest pump recognises its own entry point by name and treats every
+    /// other name as an application call, which it runs on a schedulable
+    /// thread (see plat/hyperlight/poll.c `hl_poll_route_call`). Only the
+    /// first step of a call carries the name and arguments; drive the rest
+    /// with [`Sandbox::poll_outcome`] until the outcome is
+    /// [`PollOutcome::CallComplete`] or [`PollOutcome::Exited`], or let
+    /// [`Sandbox::call_named_async`] do it.
+    pub fn call_named_step<Args>(&mut self, func_name: &str, args: Args) -> Result<PollOutcome>
+    where
+        Args: hyperlight_host::func::ParameterTuple,
+    {
+        self.begin_step();
+        let _: () = self.inner.call(func_name, args)?;
+        Ok(self.finish_step())
+    }
+
+    fn begin_step(&mut self) {
+        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
+    }
+
+    fn finish_step(&mut self) -> PollOutcome {
         let signal = *self.poll_signal.lock().unwrap();
         self.next_wakeup_at = None;
 
@@ -3849,14 +3892,14 @@ impl Sandbox {
         let deadline = match outcome {
             PollOutcome::Timer(after) => Some(after),
             PollOutcome::HostCallsPending { next_wakeup } => next_wakeup,
-            PollOutcome::Exited | PollOutcome::Idle => None,
+            PollOutcome::Exited | PollOutcome::CallComplete | PollOutcome::Idle => None,
         };
         if let Some(after) = deadline {
             // Keep an absolute deadline for drive_host_functions(), so time
             // spent by the caller between the two operations is subtracted.
             self.next_wakeup_at = Some(Instant::now() + after);
         }
-        Ok(outcome)
+        outcome
     }
 
     fn has_pending_host_calls(&self) -> bool {
@@ -3874,7 +3917,7 @@ impl Sandbox {
     /// when the caller needs to distinguish idle, timer, and host-call waits.
     pub fn poll(&mut self) -> Result<core::task::Poll<()>> {
         Ok(match self.poll_outcome()? {
-            PollOutcome::Exited => core::task::Poll::Ready(()),
+            PollOutcome::Exited | PollOutcome::CallComplete => core::task::Poll::Ready(()),
             PollOutcome::Idle | PollOutcome::Timer(_) | PollOutcome::HostCallsPending { .. } => {
                 core::task::Poll::Pending
             }
@@ -4051,6 +4094,39 @@ impl Sandbox {
                 core::task::Poll::Ready(()) => return Ok(self.last_exit_code()),
                 core::task::Poll::Pending => self.drive_host_functions().await,
             }
+        }
+    }
+
+    /// Invoke a named guest function and drive the cooperative poll pump until
+    /// it returns.
+    ///
+    /// This is the poll-model counterpart of [`Sandbox::call_named`]. The
+    /// blocking form enters the guest exactly once, so a call that parks —
+    /// on a socket, a timer or an async host function — is abandoned part-way.
+    /// Here the first step carries the function name and its arguments and
+    /// every later step is an ordinary pump step, so the call can park and
+    /// resume as often as it needs to.
+    ///
+    /// Returns when the guest reports the call finished
+    /// ([`PollOutcome::CallComplete`]) or when the guest process exits during
+    /// it ([`PollOutcome::Exited`] — what a one-shot guest such as a plain
+    /// `main()` does). The value is the guest's exit code, 0 if it never set
+    /// one.
+    ///
+    /// Requires a prior [`Sandbox::restore`], and a guest built with
+    /// `CONFIG_HYPERLIGHT_POLL`. Cancellation composes the same way as
+    /// [`Sandbox::poll_run_async`].
+    pub async fn call_named_async<Args>(&mut self, func_name: &str, args: Args) -> Result<i32>
+    where
+        Args: hyperlight_host::func::ParameterTuple,
+    {
+        let mut outcome = self.call_named_step(func_name, args)?;
+        loop {
+            match outcome {
+                PollOutcome::CallComplete | PollOutcome::Exited => return Ok(self.last_exit_code()),
+                _ => self.drive_host_functions().await,
+            }
+            outcome = self.poll_outcome()?;
         }
     }
 
@@ -6019,9 +6095,50 @@ mod tests {
         assert_eq!(
             *poll_deadline.lock().unwrap(),
             GuestPollSignal::Yielded {
-                deadline_ns: Some(1234)
+                deadline_ns: Some(1234),
+                call_done: false
             }
         );
+    }
+
+    #[test]
+    fn test_poll_yield_call_done_reports_call_complete() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
+
+        let resp =
+            tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0,"call_done":true}}"#);
+        assert!(!std::str::from_utf8(&resp).unwrap().contains("\"error\""));
+        let signal = *poll_deadline.lock().unwrap();
+        assert_eq!(
+            signal,
+            GuestPollSignal::Yielded {
+                deadline_ns: None,
+                call_done: true
+            }
+        );
+        // A finished named call ends the drive loop even while host work is
+        // still outstanding: the guest is no longer waiting on it.
+        assert_eq!(
+            classify_poll_signal(signal, true),
+            PollOutcome::CallComplete
+        );
+    }
+
+    #[test]
+    fn test_poll_yield_rejects_non_boolean_call_done() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
+
+        let resp = tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0,"call_done":1}}"#);
+        assert!(std::str::from_utf8(&resp).unwrap().contains("\"error\""));
+        assert_eq!(*poll_deadline.lock().unwrap(), GuestPollSignal::None);
     }
 
     #[test]
@@ -6037,13 +6154,20 @@ mod tests {
             "explicit exit takes precedence over pending host work"
         );
         assert_eq!(
-            classify_poll_signal(GuestPollSignal::Yielded { deadline_ns: None }, false),
+            classify_poll_signal(
+                GuestPollSignal::Yielded {
+                    deadline_ns: None,
+                    call_done: false
+                },
+                false
+            ),
             PollOutcome::Idle
         );
         assert_eq!(
             classify_poll_signal(
                 GuestPollSignal::Yielded {
-                    deadline_ns: Some(42)
+                    deadline_ns: Some(42),
+                    call_done: false
                 },
                 false
             ),
@@ -6052,7 +6176,8 @@ mod tests {
         assert_eq!(
             classify_poll_signal(
                 GuestPollSignal::Yielded {
-                    deadline_ns: Some(42)
+                    deadline_ns: Some(42),
+                    call_done: false
                 },
                 true
             ),
@@ -6074,7 +6199,8 @@ mod tests {
         assert_eq!(
             *poll_deadline.lock().unwrap(),
             GuestPollSignal::Yielded {
-                deadline_ns: Some(1)
+                deadline_ns: Some(1),
+                call_done: false
             },
             "an already-due guest timer must remain distinct from no timer"
         );
@@ -6091,7 +6217,10 @@ mod tests {
         tools.dispatch(br#"{"name":"__hl_poll_yield","args":{"ns":0}}"#);
         assert_eq!(
             *poll_deadline.lock().unwrap(),
-            GuestPollSignal::Yielded { deadline_ns: None }
+            GuestPollSignal::Yielded {
+                deadline_ns: None,
+                call_done: false
+            }
         );
     }
 
@@ -6137,7 +6266,10 @@ mod tests {
         assert!(std::str::from_utf8(&resp).unwrap().contains("\"error\""));
         assert_eq!(
             *poll_signal.lock().unwrap(),
-            GuestPollSignal::Yielded { deadline_ns: None }
+            GuestPollSignal::Yielded {
+                deadline_ns: None,
+                call_done: false
+            }
         );
     }
 
