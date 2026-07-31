@@ -1066,14 +1066,25 @@ impl ToolRegistry {
             // Sync tools: fall through to the sync handler table below.
             if let Some(asy) = &self.async_side {
                 if asy.factories.contains_key(name) {
-                    let id = request_id.ok_or_else(|| {
-                        anyhow!(
-                            "async tool '{}' requires a binary async request frame",
-                            name
-                        )
-                    })?;
-                    asy.dispatch_async(id, name, &args)?;
-                    return Ok(ToolDispatchOutcome::Pending(id));
+                    match request_id {
+                        // Cooperative guest: register the task and let it
+                        // park; the result arrives in a later poll batch.
+                        Some(id) => {
+                            asy.dispatch_async(id, name, &args)?;
+                            return Ok(ToolDispatchOutcome::Pending(id));
+                        }
+                        // Legacy synchronous guest (built without
+                        // CONFIG_HYPERLIGHT_POLL): it blocks the vCPU thread
+                        // on this call and has no drive loop to resolve a
+                        // request ID, so run the tool to completion here and
+                        // answer inline. This is the same blocking behaviour
+                        // these guests had before the tools became async.
+                        None => {
+                            let factory = asy.factories.get(name).unwrap();
+                            return block_on_tool_future(factory(args))
+                                .map(ToolDispatchOutcome::Complete);
+                        }
+                    }
                 }
             }
             let handler = self
@@ -1136,6 +1147,39 @@ type ToolFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>>;
 type RunningToolFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = (u64, Result<serde_json::Value>)> + Send>>;
+
+/// Runtime used to resolve async tool futures for legacy synchronous guests.
+///
+/// Created on first use and kept for the process lifetime: these calls arrive
+/// on the vCPU thread one at a time, so a single worker is sufficient.
+fn legacy_dispatch_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RT: std::sync::OnceLock<Option<tokio::runtime::Runtime>> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .ok()
+    })
+    .as_ref()
+    .ok_or_else(|| anyhow!("could not start a runtime to resolve a synchronous host call"))
+}
+
+/// Run `fut` to completion, blocking the calling thread.
+///
+/// The future is spawned onto a dedicated runtime and the result collected
+/// over a channel, rather than calling `Runtime::block_on` directly, so this
+/// cannot panic with "cannot start a runtime from within a runtime" when the
+/// caller already happens to be inside one.
+fn block_on_tool_future(fut: ToolFuture) -> Result<serde_json::Value> {
+    let rt = legacy_dispatch_runtime()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    rt.spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv()
+        .unwrap_or_else(|_| Err(anyhow!("async tool future was dropped before completion")))
+}
 
 /// A boxed async-tool factory: called with the guest's `args`, returns the
 /// future that computes the result. `Arc`-wrapped so the same factory can be
@@ -1651,10 +1695,10 @@ fn register_internal_tools(
 
     let sc = sleep_cancel.clone();
     let st_for_sleep = socket_table.clone();
-    // Async: the sleep runs off the vCPU thread (blocking pool via
-    // `spawn_blocking`) and is driven to completion by
-    // `Sandbox::drive_host_functions`. Requires the cooperative poll / yield
-    // driver loop — there is no synchronous fallback.
+    // Async: under the cooperative poll model the sleep runs off the vCPU
+    // thread (blocking pool via `spawn_blocking`) and is driven to completion
+    // by `Sandbox::drive_host_functions`. Legacy guests without a poll loop
+    // call it unframed, and `ToolRegistry::dispatch` resolves it inline.
     tools.register_async_factory(
         "__hl_sleep",
         blocking_tool_factory(move |args| {
@@ -4848,9 +4892,11 @@ mod tests {
         }
     }
 
-    /// Calling an async tool without a binary request frame returns an error.
+    /// Calling an async tool without a binary request frame — as a legacy
+    /// non-poll guest does — resolves the tool inline and returns its result
+    /// as plain JSON, since such a guest has no drive loop.
     #[test]
-    fn dispatch_async_missing_id_returns_error() {
+    fn dispatch_async_without_frame_resolves_inline() {
         let mut tools = ToolRegistry::new();
         tools.register_async_factory(
             "echo_async",
@@ -4859,14 +4905,14 @@ mod tests {
 
         let req = br#"{"name":"echo_async","args":"hi"}"#;
         let resp = tools.dispatch(req);
-        let s = std::str::from_utf8(&resp).unwrap();
         assert!(
-            s.contains("\"error\""),
-            "missing ID should produce an error: {s}"
+            decode_async_frame(&resp).unwrap().is_none(),
+            "legacy caller must receive plain JSON, not a frame"
         );
-        assert!(
-            s.contains("binary async request frame"),
-            "error should mention the required binary frame: {s}"
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(
+            v["result"], "hi",
+            "async tool result should be returned inline: {v}"
         );
     }
 
@@ -5875,6 +5921,48 @@ mod tests {
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(!s.contains("\"error\""), "should succeed: {s}");
         assert!(s.contains("\"bytes_read\":5"), "{s}");
+    }
+
+    /// A guest built without `CONFIG_HYPERLIGHT_POLL` (e.g. the pyhl python
+    /// driver) issues an *unframed* JSON host call and blocks the vCPU thread
+    /// until it returns — it has no drive loop and cannot decode a `PENDING`
+    /// frame. Async tools must therefore resolve inline for these callers.
+    ///
+    /// Regression: async tools once rejected unframed calls outright, which
+    /// made `time.sleep()` a silent no-op and broke all guest networking.
+    #[test]
+    fn legacy_unframed_call_resolves_async_tool_inline() {
+        let mut tools = ToolRegistry::new();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let poll_deadline = Arc::new(Mutex::new(GuestPollSignal::None));
+        let sc = SleepCancel::new();
+        register_internal_tools(&mut tools, &exit_code, &poll_deadline, &sc, None, None);
+
+        // No async frame, exactly as a legacy guest sends it.
+        let raw = br#"{"name":"__hl_sleep","args":{"ns":1000000}}"#;
+        let start = std::time::Instant::now();
+        let resp = tools.dispatch(raw);
+        let elapsed = start.elapsed();
+
+        // The reply must be plain JSON the legacy guest can parse, not a
+        // binary async-control frame.
+        assert!(
+            decode_async_frame(&resp).unwrap().is_none(),
+            "legacy caller must not receive a binary frame: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp).expect("legacy reply must be JSON");
+        assert!(
+            v.get("error").is_none(),
+            "unframed async tool call must succeed, got {v}"
+        );
+        assert!(v.get("result").is_some(), "expected a result, got {v}");
+        // It must actually have waited rather than returning immediately.
+        assert!(
+            elapsed >= Duration::from_micros(900),
+            "sleep returned too fast to have run: {elapsed:?}"
+        );
     }
 
     #[test]
