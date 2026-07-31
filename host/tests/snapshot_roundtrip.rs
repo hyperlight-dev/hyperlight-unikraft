@@ -12,7 +12,7 @@
 //!
 //! The multifn-c guest is ideal because it:
 //!   - has two dispatchable entrypoints (`init`, `run`) that exercise
-//!     `call_named` plumbing,
+//!     `call_named_async` plumbing,
 //!   - preserves state via `.data` across snapshot/restore so we can
 //!     verify hermeticity.
 //!
@@ -107,8 +107,8 @@ fn setup() -> Option<(PathBuf, PathBuf)> {
 /// Baseline: can we build a sandbox, call into the guest twice (with a
 /// restore between), and get clean results? Without this, every snapshot
 /// test is moot.
-#[test]
-fn multifn_init_then_restore_and_run() {
+#[tokio::test]
+async fn multifn_init_then_restore_and_run() {
     let Some((kernel, initrd)) = setup() else {
         return;
     };
@@ -120,26 +120,26 @@ fn multifn_init_then_restore_and_run() {
         .expect("build sandbox");
 
     sbox.restore().expect("restore 1");
-    let _: () = sbox.call_named("init", ()).expect("init");
+    sbox.call_named_async("init", ()).await.expect("init");
 
     sbox.snapshot_now().expect("snapshot post-init");
 
     sbox.restore().expect("restore 2");
-    let _: () = sbox
-        .call_named("run", "alpha".to_string())
+    sbox.call_named_async("run", "alpha".to_string())
+        .await
         .expect("run alpha");
 
     sbox.restore().expect("restore 3");
-    let _: () = sbox
-        .call_named("run", "beta".to_string())
+    sbox.call_named_async("run", "beta".to_string())
+        .await
         .expect("run beta");
 }
 
 /// The real roundtrip: warm up the sandbox, persist a snapshot to disk,
 /// load it back from file into a *fresh* Sandbox, and verify we can
 /// still call into the guest with the recovered state.
-#[test]
-fn snapshot_save_then_load_roundtrip() {
+#[tokio::test]
+async fn snapshot_save_then_load_roundtrip() {
     let Some((kernel, initrd)) = setup() else {
         return;
     };
@@ -157,7 +157,7 @@ fn snapshot_save_then_load_roundtrip() {
             .expect("build sandbox");
 
         sbox.restore().expect("restore");
-        let _: () = sbox.call_named("init", ()).expect("init");
+        sbox.call_named_async("init", ()).await.expect("init");
 
         sbox.snapshot_now().expect("snapshot_now");
         sbox.save_snapshot(&snap_path).expect("save_snapshot");
@@ -172,14 +172,14 @@ fn snapshot_save_then_load_roundtrip() {
     let mut sbox = Sandbox::from_snapshot_file(&snap_path).expect("from_snapshot_file");
 
     // Should be immediately callable without re-doing evolve+init.
-    let _: () = sbox
-        .call_named("run", "post-load".to_string())
+    sbox.call_named_async("run", "post-load".to_string())
+        .await
         .expect("run after load");
 
     // Restore + call again to exercise the hermetic rewind path.
     sbox.restore().expect("restore after load");
-    let _: () = sbox
-        .call_named("run", "post-restore".to_string())
+    sbox.call_named_async("run", "post-restore".to_string())
+        .await
         .expect("run after restore");
 
     cleanup_tempdir(&tmp);
@@ -190,8 +190,8 @@ fn snapshot_save_then_load_roundtrip() {
 /// test side (multifn-c's state is internal), but every cycle should
 /// succeed — if restore had state leakage it would eventually diverge
 /// and fail.
-#[test]
-fn repeated_restore_run_is_stable() {
+#[tokio::test]
+async fn repeated_restore_run_is_stable() {
     let Some((kernel, initrd)) = setup() else {
         return;
     };
@@ -202,13 +202,13 @@ fn repeated_restore_run_is_stable() {
         .build()
         .expect("build sandbox");
     sbox.restore().expect("restore");
-    let _: () = sbox.call_named("init", ()).expect("init");
+    sbox.call_named_async("init", ()).await.expect("init");
     sbox.snapshot_now().expect("snapshot_now");
 
     for i in 0..10 {
         sbox.restore().expect("restore in loop");
-        let _: () = sbox
-            .call_named("run", format!("iter-{i}"))
+        sbox.call_named_async("run", format!("iter-{i}"))
+            .await
             .expect("run in loop");
     }
 }

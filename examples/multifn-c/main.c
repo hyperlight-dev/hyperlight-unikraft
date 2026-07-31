@@ -6,15 +6,17 @@
  *     call("init", ())            -> we print "INIT" and mark initialized
  *     call("run",  <string arg>)  -> we print "RUN: <arg>" (1 string arg)
  *
- * Every dispatch re-enters main(); the kernel's .data persists between
- * calls via snapshot/restore, so a `static` flag is enough to remember
- * that init already ran. The kernel pops the input stack before main
- * runs but leaves the bytes in shared memory — our current-FC pointer
- * slots live in kernel .data and are updated per call.
+ * main() runs once, installs a dispatch callback and serves the call that
+ * started it; every later call reaches that callback directly. The kernel's
+ * .data persists between calls via snapshot/restore, so a `static` flag is
+ * enough to remember that init already ran. The kernel pops the input stack
+ * before the callback runs but leaves the bytes in shared memory — our
+ * current-FC pointer slots live in kernel .data and are updated per call.
  *
  * Inputs main() reads at startup:
- *   envp HL_FC_BYTES_PTR=0x...  address of a (const uint8_t *) slot
- *   envp HL_FC_LEN_PTR=0x...    address of a (size_t) slot
+ *   envp HL_FC_BYTES_PTR=0x...      address of a (const uint8_t *) slot
+ *   envp HL_FC_LEN_PTR=0x...        address of a (size_t) slot
+ *   envp HL_V2_CALLBACK_PTR=0x...   address of the dispatch callback slot
  * Both addresses are stable across the whole VM lifetime; the values
  * at those addresses change per call.
  */
@@ -110,45 +112,16 @@ static const char *parse_fc_arg0_string(const uint8_t *b, size_t len,
 	return (const char *)(b + s + 4);
 }
 
-/* Print via outl port 0x3F8 (the plat's console routes stdout that way). */
 static int already_initialized = 0;
 
-int main(int argc, char **argv, char **envp)
+static void handle_call(const uint8_t *fc, size_t fc_len)
 {
-	/* Resolve the slot addresses once. On subsequent calls we just
-	 * dereference; the kernel writes new values on every dispatch.
-	 */
-	static const uint8_t **fc_bytes_slot;
-	static size_t *fc_len_slot;
-
-	if (!fc_bytes_slot) {
-		for (char **p = envp; p && *p; p++) {
-			if (!strncmp(*p, "HL_FC_BYTES_PTR=", 16)) {
-				unsigned long v = strtoul(*p + 16, NULL, 16);
-				fc_bytes_slot = (const uint8_t **)(uintptr_t)v;
-			} else if (!strncmp(*p, "HL_FC_LEN_PTR=", 14)) {
-				unsigned long v = strtoul(*p + 14, NULL, 16);
-				fc_len_slot = (size_t *)(uintptr_t)v;
-			}
-		}
-		if (!fc_bytes_slot || !fc_len_slot) {
-			fprintf(stderr, "multifn-c: env vars missing\n");
-			return 1;
-		}
-	}
-
-	const uint8_t *fc = *fc_bytes_slot;
-	size_t fc_len = *fc_len_slot;
-	if (!fc || fc_len == 0) {
-		fprintf(stderr, "multifn-c: no current FC bytes\n");
-		return 1;
-	}
-
 	const char *name = NULL;
 	size_t name_len = 0;
+
 	if (parse_fc_name(fc, fc_len, &name, &name_len) < 0) {
 		fprintf(stderr, "multifn-c: FC parse failed\n");
-		return 1;
+		return;
 	}
 
 	if (name_len == 4 && !memcmp(name, "init", 4)) {
@@ -168,5 +141,49 @@ int main(int argc, char **argv, char **envp)
 	}
 
 	fflush(stdout);
+}
+
+typedef void (*hl_dispatch_fn_t)(const uint8_t *fc, size_t fc_len);
+
+int main(int argc, char **argv, char **envp)
+{
+	const uint8_t **fc_bytes_slot = NULL;
+	size_t *fc_len_slot = NULL;
+	hl_dispatch_fn_t *v2_callback_slot = NULL;
+
+	(void)argc;
+	(void)argv;
+
+	for (char **p = envp; p && *p; p++) {
+		if (!strncmp(*p, "HL_FC_BYTES_PTR=", 16)) {
+			unsigned long v = strtoul(*p + 16, NULL, 16);
+			fc_bytes_slot = (const uint8_t **)(uintptr_t)v;
+		} else if (!strncmp(*p, "HL_FC_LEN_PTR=", 14)) {
+			unsigned long v = strtoul(*p + 14, NULL, 16);
+			fc_len_slot = (size_t *)(uintptr_t)v;
+		} else if (!strncmp(*p, "HL_V2_CALLBACK_PTR=", 19)) {
+			unsigned long v = strtoul(*p + 19, NULL, 16);
+			v2_callback_slot = (hl_dispatch_fn_t *)(uintptr_t)v;
+		}
+	}
+	if (!fc_bytes_slot || !fc_len_slot || !v2_callback_slot) {
+		fprintf(stderr, "multifn-c: env vars missing\n");
+		return 1;
+	}
+
+	/* Serve every later call from here instead of re-running main(). */
+	*v2_callback_slot = handle_call;
+
+	const uint8_t *fc = *fc_bytes_slot;
+	size_t fc_len = *fc_len_slot;
+	if (!fc || fc_len == 0) {
+		fprintf(stderr, "multifn-c: no current FC bytes\n");
+		return 1;
+	}
+	handle_call(fc, fc_len);
+
+	/* Halt, leaving the callback and already_initialized in guest memory
+	 * for whatever snapshot the host takes next.
+	 */
 	return 0;
 }

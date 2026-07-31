@@ -2,13 +2,13 @@
 //! dispatch plumbing.
 //!
 //! Drives the multifn-c guest (examples/multifn-c) through the new
-//! Sandbox::call_named + snapshot_now APIs, and eyeballs the console
+//! Sandbox::call_named_async + snapshot_now APIs, and eyeballs the console
 //! output. Expected sequence on stderr:
 //!
-//!   INIT                   <- from call_named("init", ())
+//!   INIT                   <- from call_named_async("init", ())
 //!   (snapshot_now here)
-//!   RUN: hello             <- from call_named("run", "hello"), post-restore
-//!   RUN: world             <- from call_named("run", "world"), post-restore
+//!   RUN: hello             <- from call_named_async("run", "hello"), post-restore
+//!   RUN: world             <- from call_named_async("run", "world"), post-restore
 //!
 //! Because `run` is called AFTER snapshot_now, the guest always sees
 //! `already_initialized=true` (state preserved via snapshot), so the
@@ -18,7 +18,8 @@ use anyhow::Result;
 use hyperlight_unikraft::Sandbox;
 use std::path::PathBuf;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("usage: {} <kernel> <initrd.cpio>", args[0]);
@@ -39,17 +40,17 @@ fn main() -> Result<()> {
     // snapshot the builder took is pre-"init". Explicitly call init
     // below to drive the dispatch path we actually want to exercise.
 
-    eprintln!("=== restore + call_named(\"init\", ()) ===");
+    eprintln!("=== restore + call_named_async(\"init\", ()) ===");
     sandbox.restore()?;
-    let _: () = sandbox.call_named("init", ())?;
+    sandbox.call_named_async("init", ()).await?;
 
     eprintln!("=== snapshot_now (capture post-init state) ===");
     sandbox.snapshot_now()?;
 
     for arg in ["hello", "world"] {
-        eprintln!("=== restore + call_named(\"run\", {:?}) ===", arg);
+        eprintln!("=== restore + call_named_async(\"run\", {:?}) ===", arg);
         sandbox.restore()?;
-        let _: () = sandbox.call_named("run", arg.to_string())?;
+        sandbox.call_named_async("run", arg.to_string()).await?;
     }
 
     eprintln!("=== done ===");
