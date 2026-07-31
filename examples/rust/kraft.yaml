@@ -50,6 +50,12 @@ unikraft:
     CONFIG_LIBUKBOOT_MAINTHREAD: 'y'
     CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL: 'y'
     CONFIG_LIBPOSIX_PROCESS_MULTITHREADING: 'y'
+    CONFIG_LIBUKSCHED: 'y'
+    CONFIG_LIBUKSCHEDCOOP: 'y'
+    # Cooperative poll model: run the scheduler until it would go idle, then
+    # yield the vCPU back to the host with a next-wakeup deadline, instead of
+    # running a single guest function to completion.
+    CONFIG_HYPERLIGHT_POLL: 'y'
 
     # MPI provides per-CPU structures used by the scheduler, posix-process, and
     # various other subsystems; required for correct brk/malloc behaviour
