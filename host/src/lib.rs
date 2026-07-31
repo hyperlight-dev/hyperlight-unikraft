@@ -3748,7 +3748,29 @@ impl Sandbox {
     pub fn call_run(&mut self) -> Result<()> {
         // call() with Void return type — the function name doesn't matter
         // to the guest (it ignores it and just runs the app).
+        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
         let _: () = self.inner.call("run", ())?;
+        self.check_guest_ran_to_completion("call_run")
+    }
+
+    /// Error if the guest parked instead of finishing.
+    ///
+    /// A guest built with `CONFIG_HYPERLIGHT_POLL` returns to the host
+    /// whenever it would block, expecting the caller to re-enter via
+    /// [`Sandbox::poll`]. The blocking entry points invoke the guest exactly
+    /// once, so such a yield means the work was abandoned part-way: the guest
+    /// is still parked and no error is reported anywhere. Without this check
+    /// the call silently succeeds having done only part of the work — e.g. a
+    /// script stops at its first socket read with no diagnostic at all.
+    fn check_guest_ran_to_completion(&self, entry: &str) -> Result<()> {
+        if let GuestPollSignal::Yielded { .. } = *self.poll_signal.lock().unwrap() {
+            return Err(anyhow!(
+                "{entry}: the guest yielded instead of running to completion — \
+                 it is built with CONFIG_HYPERLIGHT_POLL and must be driven by \
+                 the cooperative poll pump (Sandbox::poll_run_async, or the \
+                 --poll flag), not by a single blocking call"
+            ));
+        }
         Ok(())
     }
 
@@ -4171,7 +4193,10 @@ impl Sandbox {
         Output: hyperlight_host::func::SupportedReturnType,
         Args: hyperlight_host::func::ParameterTuple,
     {
-        Ok(self.inner.call(func_name, args)?)
+        *self.poll_signal.lock().unwrap() = GuestPollSignal::None;
+        let out = self.inner.call(func_name, args)?;
+        self.check_guest_ran_to_completion("call_named")?;
+        Ok(out)
     }
 
     /// Read the exit code reported by the guest via `__hl_exit`.
