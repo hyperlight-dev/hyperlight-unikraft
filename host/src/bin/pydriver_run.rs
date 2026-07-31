@@ -11,15 +11,20 @@
 //!
 //! With --repeat, after the first (warmup + code) call we
 //! `snapshot_now()` to capture the post-warmup state, then restore +
-//! call_named for each remaining iteration so we can actually
+//! call for each remaining iteration so we can actually
 //! *measure* the warm-path cost on runs 2..N.
+//!
+//! The driver kernel is built with cooperative poll, so a call can hand
+//! the vCPU back to the host part-way through; `call_named_async` drives
+//! it to completion rather than entering the guest once.
 
 use anyhow::{anyhow, Result};
 use hyperlight_unikraft::Sandbox;
 use std::path::PathBuf;
 use std::time::Instant;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let kernel = args
         .next()
@@ -55,7 +60,7 @@ fn main() -> Result<()> {
     sandbox.restore()?;
     let restore0_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let t1 = Instant::now();
-    let _: () = sandbox.call_named("run", script.clone())?;
+    sandbox.call_named_async("run", script.clone()).await?;
     let call0_ms = t1.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "[run 1/{}] restore={:.1}ms call={:.1}ms (includes Py_Initialize + warmup)",
@@ -70,7 +75,7 @@ fn main() -> Result<()> {
      * measurement we care about. */
     for i in 2..=repeat + 1 {
         let tc = Instant::now();
-        let _: () = sandbox.call_named("run", script.clone())?;
+        sandbox.call_named_async("run", script.clone()).await?;
         let call_ms = tc.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[run {}/{}] call={:.1}ms (warm)", i, repeat + 1, call_ms,);
     }

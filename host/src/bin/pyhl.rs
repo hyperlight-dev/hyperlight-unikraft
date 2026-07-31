@@ -419,7 +419,7 @@ fn image_installed(home: &Path) -> bool {
 
 // -- `setup` ------------------------------------------------------------------
 
-fn cmd_setup(args: SetupArgs) -> Result<()> {
+async fn cmd_setup(args: SetupArgs) -> Result<()> {
     hyperlight_unikraft::pyhl::configure_surrogates(args.max_surrogates);
 
     let home = resolve_home(args.dest.as_deref(), ResolveMode::ForSetup)?;
@@ -521,7 +521,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         }
         let mut sbox = builder.build()?;
         sbox.restore()?;
-        let _: () = sbox.call_named("run", "pass".to_string())?;
+        sbox.call_named_async("run", "pass".to_string()).await?;
         sbox.snapshot_now()?;
         sbox.save_snapshot(&dst_snapshot)?;
     }
@@ -573,7 +573,7 @@ fn now_iso8601() -> String {
 
 // -- `run` --------------------------------------------------------------------
 
-fn cmd_run(args: RunArgs) -> Result<()> {
+async fn cmd_run(args: RunArgs) -> Result<()> {
     hyperlight_unikraft::pyhl::configure_surrogates(args.max_surrogates);
 
     let code = match (args.script.as_deref(), args.code.as_deref()) {
@@ -669,7 +669,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
         sandbox.reset_exit_code();
         let t_call = Instant::now();
-        let _: () = sandbox.call_named("run", payload)?;
+        sandbox.call_named_async("run", payload).await?;
         let call_ms = t_call.elapsed().as_secs_f64() * 1000.0;
         let exit_code = sandbox.last_exit_code();
         if args.verbose {
@@ -739,11 +739,12 @@ fn fresh_seed() -> u128 {
 
 // -- main ---------------------------------------------------------------------
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Command::Setup(args) => cmd_setup(args),
-        Command::Run(args) => cmd_run(args),
+        Command::Setup(args) => cmd_setup(args).await,
+        Command::Run(args) => cmd_run(args).await,
     }
 }
 

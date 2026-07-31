@@ -49,6 +49,25 @@ use std::time::Instant;
 
 use crate::{Preopen, Sandbox};
 
+/// Build the private executor that turns the sandbox's cooperative poll
+/// loop back into a blocking call.
+///
+/// The guest runs under `CONFIG_HYPERLIGHT_POLL`, so a `run` call is a
+/// sequence of vCPU steps interleaved with host work rather than a single
+/// entry, and driving it is inherently async. `Runtime`'s callers (the
+/// `pyhl` binary, scripts, tests) are synchronous, so each `Runtime` owns
+/// a current-thread executor and blocks on the drive loop.
+///
+/// Consequently `run_code*` must not be called from inside another Tokio
+/// runtime; `block_on` panics there. Async callers should drive
+/// [`Sandbox::call_named_async`] directly instead.
+fn build_executor() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create the pyhl call executor")
+}
+
 /// Configure surrogate process count (Windows only).
 ///
 /// On Windows, Hyperlight pre-spawns surrogate processes (one per
@@ -236,7 +255,7 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<InstallReport> {
         }
         let mut sbox = builder.build()?;
         sbox.restore()?;
-        let _: () = sbox.call_named("run", "pass".to_string())?;
+        build_executor()?.block_on(sbox.call_named_async("run", "pass".to_string()))?;
         sbox.snapshot_now()?;
         sbox.save_snapshot(&dst_snapshot)?;
     }
@@ -275,6 +294,8 @@ pub struct RunTiming {
 /// load cost over many invocations.
 pub struct Runtime {
     sandbox: Sandbox,
+    /// Drives the guest's cooperative poll loop; see [`build_executor`].
+    executor: tokio::runtime::Runtime,
     /// True until the first run, when restore is still a no-op (the
     /// sandbox is already at the loaded-snapshot state).
     first_run: bool,
@@ -314,6 +335,7 @@ impl Runtime {
         )?;
         Ok(Self {
             sandbox,
+            executor: build_executor()?,
             first_run: true,
         })
     }
@@ -332,7 +354,8 @@ impl Runtime {
         self.sandbox.reset_exit_code();
 
         let tc = Instant::now();
-        let _: () = self.sandbox.call_named("run", code.to_string())?;
+        self.executor
+            .block_on(self.sandbox.call_named_async("run", code.to_string()))?;
         t.call_ms = tc.elapsed().as_secs_f64() * 1000.0;
         t.exit_code = self.sandbox.last_exit_code();
         Ok(t)
@@ -342,6 +365,25 @@ impl Runtime {
     /// exceeds `timeout`. Returns an error when the guest is
     /// interrupted. The runtime is left in a usable state — the next
     /// `run_code*` call will restore from the snapshot automatically.
+    ///
+    /// Enforcing the deadline takes two mechanisms because a poll-model
+    /// call alternates between two states that each ignore the other's
+    /// cancellation:
+    ///
+    /// - **inside the guest** (a `while True: pass` never yields the
+    ///   vCPU). The drive loop is blocked in the hypervisor, so no timer
+    ///   can fire; only [`InterruptHandle::kill`] gets us out, hence the
+    ///   watchdog thread.
+    /// - **waiting on the guest** (`time.sleep(120)` parks the Python
+    ///   thread and the guest reports a 120 s wakeup deadline). Here
+    ///   `kill` is a documented no-op — it only interrupts a call that
+    ///   is currently executing — so the deadline has to be enforced on
+    ///   the host side, by bounding the drive loop itself.
+    ///
+    /// Both are armed at `timeout`; whichever applies wins, and the
+    /// other is harmless (a stray `kill` between steps does nothing).
+    ///
+    /// [`InterruptHandle::kill`]: hyperlight_host::sandbox::interruptable::InterruptHandle::kill
     pub fn run_code_with_timeout(
         &mut self,
         code: &str,
@@ -378,7 +420,10 @@ impl Runtime {
         });
 
         let tc = Instant::now();
-        let call_result: Result<()> = self.sandbox.call_named("run", code.to_string());
+        let call = self.sandbox.call_named_async("run", code.to_string());
+        let call_result = self
+            .executor
+            .block_on(async { tokio::time::timeout(timeout, call).await });
         t.call_ms = tc.elapsed().as_secs_f64() * 1000.0;
 
         done.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -389,19 +434,27 @@ impl Runtime {
         // timed_out=true but call_result=Ok).
         self.sandbox.sleep_cancel.reset();
 
+        let timed_out_err = || anyhow!("execution timed out after {:.1}s", timeout.as_secs_f64());
         match call_result {
-            Ok(()) => {
+            Ok(Ok(_)) => {
                 t.exit_code = self.sandbox.last_exit_code();
                 Ok(t)
             }
-            Err(_) if timed_out => {
+            // The host-side bound elapsed while waiting on a parked guest.
+            Err(_) => {
                 self.sandbox.restore()?;
-                Err(anyhow!(
-                    "execution timed out after {:.1}s",
-                    timeout.as_secs_f64()
-                ))
+                Err(timed_out_err())
             }
-            Err(e) => Err(e),
+            // The guest call failed. Attribute it to the deadline only if
+            // the watchdog actually killed it.
+            Ok(Err(e)) => {
+                if timed_out {
+                    self.sandbox.restore()?;
+                    Err(timed_out_err())
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 

@@ -62,6 +62,11 @@ unikraft:
     CONFIG_LIBPOSIX_PROCESS_MULTITHREADING: 'y'
     CONFIG_LIBUKSCHED: 'y'
     CONFIG_LIBUKSCHEDCOOP: 'y'
+    # Cooperative execution: the guest yields the vCPU whenever it has no
+    # runnable work instead of running one guest call to completion, so a
+    # `run` call that blocks (sleep, socket, host FS) hands control back to
+    # the host driver rather than pinning the vCPU.
+    CONFIG_HYPERLIGHT_POLL: 'y'
     CONFIG_LIBUKMPI: 'y'
     CONFIG_LIBUKLOCK: 'y'
     CONFIG_LIBUKLOCK_SEMAPHORE: 'y'
