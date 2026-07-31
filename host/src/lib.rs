@@ -1751,6 +1751,50 @@ enum TokioSock {
     Udp(UdpSocket),
 }
 
+/// Dissolve a socket's association, the way `connect(fd, AF_UNSPEC)` does.
+///
+/// Linux only resets a datagram socket's peer *and* its bound source address
+/// when the address family is `AF_UNSPEC`; a `connect` to `0.0.0.0:0` is an
+/// ordinary connect that leaves both in place. That distinction is load-bearing
+/// for glibc's `getaddrinfo`, which reuses one probe socket across candidate
+/// addresses and disconnects between them. Without a real reset, a socket that
+/// first probed an IPv6 destination keeps its IPv6 source address, so probing
+/// an IPv4-mapped destination afterwards reports a source that is not
+/// IPv4-mapped — which `getaddrinfo` asserts on, aborting the guest.
+///
+/// `socket2` models addresses as `SocketAddr`, which cannot express `AF_UNSPEC`,
+/// so this goes straight to the socket API.
+fn disconnect_socket(sock: &Socket) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `sock` owns the fd for the duration of the call, and the
+        // address is a correctly sized, zero-initialised `sockaddr`.
+        let rc = unsafe {
+            let addr: libc::sockaddr = std::mem::zeroed();
+            libc::connect(
+                sock.as_raw_fd(),
+                &addr as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+            )
+        };
+        // Linux reports EAFNOSUPPORT for a stream socket (which has nothing to
+        // dissolve) even though the reset itself succeeded; treat it as done.
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EAFNOSUPPORT) {
+                return Err(err.into());
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sock;
+        Err(anyhow!("disconnect is not supported on this platform"))
+    }
+}
+
 /// Duplicate the socket behind `fd` out of the table and return the dup plus
 /// its recorded `sock_type`, dropping the table lock before the caller awaits.
 ///
@@ -2236,11 +2280,19 @@ async fn handle_net_connect(
     use serde_json::json;
 
     let fd = args["fd"].as_u64().ok_or_else(|| anyhow!("missing 'fd'"))?;
-    let addr = parse_sockaddr(&args)?;
     // Dup the socket out and drop the table lock before the async connect, so
     // the lock is never held across an await. The dup shares the kernel socket,
     // so the connection it establishes is visible on the table's fd.
     let (sock, sock_type) = dup_socket(&table, fd)?;
+    if args["family"].as_i64() == Some(0) {
+        // AF_UNSPEC: dissolve the socket's association rather than connect it.
+        // This has to reach the kernel as AF_UNSPEC — connecting to 0.0.0.0:0
+        // instead leaves the peer *and* the bound source address in place, so
+        // a later connect to a different family would report a stale
+        // getsockname (see disconnect_socket).
+        return disconnect_socket(&sock).map(|()| json!({}));
+    }
+    let addr = parse_sockaddr(&args)?;
     // A UDP connect to loopback:65535 transmits nothing; it is musl's
     // AI_ADDRCONFIG routability probe. Answer it on the host instead of
     // rejecting it, and leave the guest's socket untouched.
@@ -6424,6 +6476,37 @@ mod tests {
         assert!(
             s.contains("too large"),
             "expected 'too large' error, got: {s}"
+        );
+    }
+
+    #[test]
+    fn disconnect_socket_resets_peer_and_source_address() {
+        // A datagram socket's association is only dissolved by AF_UNSPEC.
+        // Connecting to 0.0.0.0:0 instead would leave the source address
+        // bound, which makes a later connect from a different family report a
+        // stale getsockname and aborts glibc's getaddrinfo.
+        let sock = Socket::new(Domain::IPV6, Type::DGRAM, None).unwrap();
+        let peer: SocketAddr = "[::1]:9".parse().unwrap();
+        sock.connect(&peer.into()).unwrap();
+        assert_eq!(sock.peer_addr().unwrap().as_socket(), Some(peer));
+        assert_ne!(
+            sock.local_addr().unwrap().as_socket().unwrap().port(),
+            0,
+            "connect should have bound a source port"
+        );
+
+        disconnect_socket(&sock).unwrap();
+
+        assert!(
+            sock.peer_addr().is_err(),
+            "the peer must be gone after a disconnect"
+        );
+        let local = sock.local_addr().unwrap().as_socket().unwrap();
+        assert_eq!(
+            (local.ip(), local.port()),
+            (std::net::Ipv6Addr::UNSPECIFIED.into(), 0),
+            "the source address must be released too, or the next connect \
+             from another family reports this one"
         );
     }
 
