@@ -59,7 +59,6 @@ unikraft:
     # devfs + /dev/hcall (required for host-proxied networking)
     CONFIG_LIBDEVFS: 'y'
     CONFIG_LIBDEVFS_AUTOMOUNT: 'y'
-    CONFIG_HYPERLIGHT_HCALL: 'y'
 
     # Networking: host-proxied sockets
     CONFIG_LIBPOSIX_SOCKET: 'y'

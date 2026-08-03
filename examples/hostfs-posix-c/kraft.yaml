@@ -32,11 +32,9 @@ unikraft:
     CONFIG_LIBCPIOVFS: 'y'
     CONFIG_LIBUKCPIO: 'y'
 
-    # devfs + /dev/hcall (needed for HYPERLIGHT_HCALL symbol;
-    # hostfs calls hyperlight_hcall() directly, not through /dev/hcall)
+    # devfs, so user space can reach /dev/hcall
     CONFIG_LIBDEVFS: 'y'
     CONFIG_LIBDEVFS_AUTOMOUNT: 'y'
-    CONFIG_HYPERLIGHT_HCALL: 'y'
 
     # hostfs — transparent POSIX -> host RPC forwarding (default mount /host).
     CONFIG_LIBHOSTFS: 'y'
