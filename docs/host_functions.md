@@ -53,9 +53,9 @@ Two request formats are accepted:
 ### Cooperative (async) request
 
 Used when calling an **async tool** (e.g. `net_connect`, `net_recv`,
-`__hl_sleep`) from a guest built with `CONFIG_HYPERLIGHT_POLL`.
-`hyperlight_hcall()` places the ordinary JSON tool request in a
-versioned binary frame:
+`__hl_sleep`) from a Unikraft guest, which always runs under the
+cooperative poll pump. `hyperlight_hcall()` places the ordinary JSON tool
+request in a versioned binary frame:
 
 | Offset | Size | Field |
 |--------|------|-------|
@@ -89,8 +89,8 @@ Used for synchronous tools (e.g. `fs_read`, `net_socket`, `__hl_exit`):
 {"name": "<tool_name>", "args": <json_value>}
 ```
 
-Calling an **async** tool in legacy format is supported: guests built without
-`CONFIG_HYPERLIGHT_POLL` have no drive loop to collect a deferred completion,
+Calling an **async** tool in legacy format is supported: a caller that did not
+frame its request has no parked operation for a later `poll` batch to resume,
 so the host resolves the tool inline and returns the result in the same
 blocking call.
 

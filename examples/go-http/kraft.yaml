@@ -60,7 +60,6 @@ unikraft:
     # `poll` driver to reach a clean checkpoint boundary — without it the
     # idle path never returns to the host and checkpoint/restore stalls.
     # See plat/hyperlight/poll.c, lib/ukschedcoop, and the host `poll` API.
-    CONFIG_HYPERLIGHT_POLL: 'y'
 
     # Signal and futex support (needed for Go runtime)
     CONFIG_LIBPOSIX_PROCESS_SIGNAL: 'y'

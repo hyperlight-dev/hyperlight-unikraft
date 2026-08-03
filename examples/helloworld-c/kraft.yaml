@@ -38,12 +38,6 @@ unikraft:
     CONFIG_LIBUKRANDOM_GETRANDOM: 'y'
     # Threading support for clean exit
     CONFIG_LIBPOSIX_PROCESS_MULTITHREADING: 'y'
-    CONFIG_LIBUKSCHED: 'y'
-    CONFIG_LIBUKSCHEDCOOP: 'y'
-    # Cooperative poll model: run the scheduler until it would go idle, then
-    # yield the vCPU back to the host with a next-wakeup deadline, instead of
-    # running a single guest function to completion.
-    CONFIG_HYPERLIGHT_POLL: 'y'
     CONFIG_LIBUKMPI: 'y'
     CONFIG_LIBUKLOCK: 'y'
     CONFIG_LIBUKLOCK_SEMAPHORE: 'y'
