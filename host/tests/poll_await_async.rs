@@ -45,85 +45,12 @@
 
 use hyperlight_unikraft::{PollOutcome, Sandbox};
 use serde_json::json;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
-// Environment probe
-// ---------------------------------------------------------------------------
-
-fn hypervisor_available() -> bool {
-    #[cfg(unix)]
-    {
-        std::fs::metadata("/dev/kvm")
-            .map(|_| {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/kvm")
-                    .is_ok()
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(windows)]
-    {
-        true
-    }
-}
-
-fn poll_artifacts() -> Option<(PathBuf, PathBuf)> {
-    let example_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("examples/poll-await-c");
-    let build = example_dir.join(".unikraft/build");
-    if !build.is_dir() {
-        return None;
-    }
-    let kernel = std::fs::read_dir(&build)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with("_hyperlight-x86_64") && !n.ends_with(".dbg"))
-                .unwrap_or(false)
-        })?;
-    let initrd = std::fs::read_dir(&example_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with("-initrd.cpio"))
-                .unwrap_or(false)
-        })?;
-    Some((kernel, initrd))
-}
-
-/// Skips the test body with a diagnostic if prerequisites aren't met.
-/// Returns None → the test body should early-return.
-fn setup() -> Option<(PathBuf, PathBuf)> {
-    if !hypervisor_available() {
-        eprintln!("SKIP: no hypervisor available (no /dev/kvm)");
-        return None;
-    }
-    let Some((kernel, initrd)) = poll_artifacts() else {
-        eprintln!(
-            "SKIP: poll-await-c artifacts missing under \
-             examples/poll-await-c/.unikraft/build/ — run `just rootfs` then \
-             `kraft-hyperlight build --plat hyperlight --arch x86_64` in \
-             examples/poll-await-c/ (kraft.yaml enables CONFIG_HYPERLIGHT_POLL \
-             and CONFIG_HYPERLIGHT_HCALL) to populate them"
-        );
-        return None;
-    };
-    Some((kernel, initrd))
-}
+mod common;
+use common::setup;
 
 // ---------------------------------------------------------------------------
 // Test
@@ -135,7 +62,7 @@ fn setup() -> Option<(PathBuf, PathBuf)> {
 /// the guest intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn poll_await_async_tool_roundtrip_under_kvm() {
-    let Some((kernel, initrd)) = setup() else {
+    let Some((kernel, initrd)) = setup("poll-await-c") else {
         return;
     };
 

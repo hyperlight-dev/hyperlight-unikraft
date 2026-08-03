@@ -23,13 +23,13 @@
 //! which we assert as the exit code — proving both sockets' payloads reached the
 //! guest intact through the multiplexed epoll path.
 //!
-//! Kernel reuse: the guest binary is loaded from the initrd at `/bin/poll`, so
-//! the kernel is an app-agnostic ELF loader. `poll-epoll-c` needs exactly the
-//! same kernel config as `poll-recv-c` (posix-poll — which provides epoll — plus
-//! hostsock and the cooperative poll hooks). We therefore discover a dedicated
-//! `poll-epoll-c` kernel if one has been built, and otherwise fall back to the
-//! already-built `poll-recv-c` kernel. Only the initrd (the epoll app) is
-//! specific to this test.
+//! The guest binary is loaded from the initrd at `/bin/poll`, so the kernel is
+//! an app-agnostic ELF loader; only the initrd (the epoll app) is specific to
+//! this test. `poll-epoll-c`'s kernel config is in fact identical to
+//! `poll-recv-c`'s (posix-poll — which provides epoll — plus hostsock and the
+//! cooperative poll hooks), but we still require its own build rather than
+//! borrowing another example's, so a stale or differently-configured kernel
+//! can't be silently substituted here.
 //!
 //! Like the other live tests, this needs a hypervisor and built artifacts; it
 //! self-skips (with a diagnostic) when either is missing so `cargo test`
@@ -37,14 +37,10 @@
 
 use core::task::Poll;
 use hyperlight_unikraft::{ListenPorts, NetworkPolicy, Sandbox};
-use std::io::Write;
-use std::net::TcpStream;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
-// Environment probe
-// ---------------------------------------------------------------------------
+mod common;
+use common::{client_connect_and_send, setup};
 
 /// The two ports the guest (`examples/poll-epoll-c/poll.c`) binds and listens
 /// on. Baked into the guest, so the host necessarily proxies these two ports.
@@ -52,118 +48,6 @@ use std::time::{Duration, Instant};
 /// run concurrently without fighting over a host port.
 const PORT_A: u16 = 34568;
 const PORT_B: u16 = 34569;
-
-fn hypervisor_available() -> bool {
-    #[cfg(unix)]
-    {
-        std::fs::metadata("/dev/kvm")
-            .map(|_| {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/kvm")
-                    .is_ok()
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(windows)]
-    {
-        true
-    }
-}
-
-/// Find the app-agnostic ELF-loader kernel: prefer a dedicated `poll-epoll-c`
-/// build, else fall back to the identical `poll-recv-c` kernel (same config;
-/// the app lives in the initrd, not the kernel).
-fn find_kernel() -> Option<PathBuf> {
-    let examples = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("examples");
-    for dir in ["poll-epoll-c", "poll-recv-c"] {
-        let build = examples.join(dir).join(".unikraft/build");
-        if !build.is_dir() {
-            continue;
-        }
-        let kernel = std::fs::read_dir(&build).ok().and_then(|rd| {
-            rd.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.ends_with("_hyperlight-x86_64") && !n.ends_with(".dbg"))
-                    .unwrap_or(false)
-            })
-        });
-        if let Some(k) = kernel {
-            return Some(k);
-        }
-    }
-    None
-}
-
-fn find_initrd() -> Option<PathBuf> {
-    let example_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("examples/poll-epoll-c");
-    let initrd = example_dir.join("poll-epoll-initrd.cpio");
-    initrd.is_file().then_some(initrd)
-}
-
-/// Skips the test body with a diagnostic if prerequisites aren't met.
-/// Returns None → the test body should early-return.
-fn setup() -> Option<(PathBuf, PathBuf)> {
-    if !hypervisor_available() {
-        eprintln!("SKIP: no hypervisor available (no /dev/kvm)");
-        return None;
-    }
-    let Some(kernel) = find_kernel() else {
-        eprintln!(
-            "SKIP: no ELF-loader kernel found — build poll-epoll-c (or \
-             poll-recv-c) under examples/*/.unikraft/build/ via \
-             `kraft-hyperlight build --plat hyperlight --arch x86_64`"
-        );
-        return None;
-    };
-    let Some(initrd) = find_initrd() else {
-        eprintln!(
-            "SKIP: poll-epoll initrd missing — run `just rootfs` in \
-             examples/poll-epoll-c/ to build poll-epoll-initrd.cpio"
-        );
-        return None;
-    };
-    Some((kernel, initrd))
-}
-
-/// Connect to `127.0.0.1:port`, retrying until the guest's host-proxied listener
-/// is up, then (after `send_delay`) send `payload`. Runs on its own OS thread so
-/// it can race the poll loop. The `send_delay` staggering between the two
-/// clients is what forces the guest's epoll to return for one socket, park, and
-/// later return for the other.
-fn client_connect_and_send(
-    port: u16,
-    payload: &[u8],
-    send_delay: Duration,
-    deadline: Instant,
-) -> bool {
-    let addr = format!("127.0.0.1:{port}");
-    while Instant::now() < deadline {
-        match TcpStream::connect(&addr) {
-            Ok(mut stream) => {
-                std::thread::sleep(send_delay);
-                if stream.write_all(payload).is_ok() {
-                    let _ = stream.flush();
-                    // Keep the stream open briefly so the guest's recv sees the
-                    // data before a close/RST could race it.
-                    std::thread::sleep(Duration::from_millis(100));
-                    return true;
-                }
-                return false;
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
-    false
-}
 
 // ---------------------------------------------------------------------------
 // Test
@@ -178,7 +62,7 @@ fn client_connect_and_send(
 /// cooperative park/resume boundary.
 #[tokio::test]
 async fn poll_epoll_two_sockets_reaches_done_under_kvm() {
-    let Some((kernel, initrd)) = setup() else {
+    let Some((kernel, initrd)) = setup("poll-epoll-c") else {
         return;
     };
 

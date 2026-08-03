@@ -12,24 +12,12 @@ use hyperlight_unikraft::pyhl::Runtime;
 use hyperlight_unikraft::{AllowList, NetworkPolicy, Preopen};
 use std::path::{Path, PathBuf};
 
+mod common;
+use common::hypervisor_available;
+
 // ---------------------------------------------------------------------------
 // Environment probe
 // ---------------------------------------------------------------------------
-
-fn hypervisor_available() -> bool {
-    #[cfg(unix)]
-    {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/kvm")
-            .is_ok()
-    }
-    #[cfg(windows)]
-    {
-        true
-    }
-}
 
 fn pyhl_home() -> Option<PathBuf> {
     // Check .pyhl/ in the workspace root (two levels up from host/)

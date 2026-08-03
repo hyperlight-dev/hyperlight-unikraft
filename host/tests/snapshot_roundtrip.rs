@@ -24,31 +24,12 @@
 use hyperlight_unikraft::Sandbox;
 use std::path::{Path, PathBuf};
 
+mod common;
+use common::hypervisor_available;
+
 // ---------------------------------------------------------------------------
 // Environment probe
 // ---------------------------------------------------------------------------
-
-fn hypervisor_available() -> bool {
-    #[cfg(unix)]
-    {
-        std::fs::metadata("/dev/kvm")
-            .map(|_| {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/kvm")
-                    .is_ok()
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(windows)]
-    {
-        // Hyperlight probes WHP at runtime; the cheap way from a test is
-        // to try and skip gracefully if construction fails. We optimistically
-        // return true and let the build() error in that case.
-        true
-    }
-}
 
 fn multifn_artifacts() -> Option<(PathBuf, PathBuf)> {
     let example_dir = Path::new(env!("CARGO_MANIFEST_DIR"))

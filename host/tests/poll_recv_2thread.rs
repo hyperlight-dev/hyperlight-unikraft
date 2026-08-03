@@ -36,14 +36,10 @@
 
 use core::task::Poll;
 use hyperlight_unikraft::{ListenPorts, NetworkPolicy, Sandbox};
-use std::io::Write;
-use std::net::TcpStream;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
-// Environment probe
-// ---------------------------------------------------------------------------
+mod common;
+use common::{client_connect_and_send, setup};
 
 /// The two ports the guest (`examples/poll-recv-2thread-c/poll.c`) binds and
 /// listens on, one per worker thread. Baked into the guest, so the host
@@ -52,114 +48,6 @@ use std::time::{Duration, Instant};
 /// without fighting over host ports.
 const PORT_A: u16 = 34570;
 const PORT_B: u16 = 34571;
-
-fn hypervisor_available() -> bool {
-    #[cfg(unix)]
-    {
-        std::fs::metadata("/dev/kvm")
-            .map(|_| {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/kvm")
-                    .is_ok()
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(windows)]
-    {
-        true
-    }
-}
-
-/// Find the dedicated `poll-recv-2thread-c` ELF-loader kernel. Unlike
-/// `poll_epoll`, we do NOT fall back to the `poll-recv-c` kernel: the guest
-/// spawns pthreads, which requires a kernel built with multithreading + futex
-/// support that `poll-recv-c` does not enable.
-fn find_kernel() -> Option<PathBuf> {
-    let build = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("examples/poll-recv-2thread-c/.unikraft/build");
-    if !build.is_dir() {
-        return None;
-    }
-    std::fs::read_dir(&build).ok().and_then(|rd| {
-        rd.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with("_hyperlight-x86_64") && !n.ends_with(".dbg"))
-                .unwrap_or(false)
-        })
-    })
-}
-
-fn find_initrd() -> Option<PathBuf> {
-    let example_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("examples/poll-recv-2thread-c");
-    let initrd = example_dir.join("poll-recv-2thread-initrd.cpio");
-    initrd.is_file().then_some(initrd)
-}
-
-/// Skips the test body with a diagnostic if prerequisites aren't met.
-/// Returns None → the test body should early-return.
-fn setup() -> Option<(PathBuf, PathBuf)> {
-    if !hypervisor_available() {
-        eprintln!("SKIP: no hypervisor available (no /dev/kvm)");
-        return None;
-    }
-    let Some(kernel) = find_kernel() else {
-        eprintln!(
-            "SKIP: no poll-recv-2thread-c kernel found — build it under \
-             examples/poll-recv-2thread-c/.unikraft/build/ via \
-             `kraft-hyperlight build --plat hyperlight --arch x86_64` (needs \
-             multithreading + futex; the poll-recv-c kernel is NOT a valid \
-             fallback here)"
-        );
-        return None;
-    };
-    let Some(initrd) = find_initrd() else {
-        eprintln!(
-            "SKIP: poll-recv-2thread initrd missing — run `just rootfs` in \
-             examples/poll-recv-2thread-c/ to build poll-recv-2thread-initrd.cpio"
-        );
-        return None;
-    };
-    Some((kernel, initrd))
-}
-
-/// Connect to `127.0.0.1:port`, retrying until the guest's host-proxied listener
-/// is up, then (after `send_delay`) send `payload`. Runs on its own OS thread so
-/// it can race the poll loop. The `send_delay` staggering between the two
-/// clients is what forces worker A to complete and its thread to exit while
-/// worker B is still parked in `recv()`.
-fn client_connect_and_send(
-    port: u16,
-    payload: &[u8],
-    send_delay: Duration,
-    deadline: Instant,
-) -> bool {
-    let addr = format!("127.0.0.1:{port}");
-    while Instant::now() < deadline {
-        match TcpStream::connect(&addr) {
-            Ok(mut stream) => {
-                std::thread::sleep(send_delay);
-                if stream.write_all(payload).is_ok() {
-                    let _ = stream.flush();
-                    // Keep the stream open briefly so the guest's recv sees the
-                    // data before a close/RST could race it.
-                    std::thread::sleep(Duration::from_millis(100));
-                    return true;
-                }
-                return false;
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
-    false
-}
 
 // ---------------------------------------------------------------------------
 // Test
@@ -174,7 +62,7 @@ fn client_connect_and_send(
 /// payload to its own thread.
 #[tokio::test]
 async fn poll_recv_two_threads_reaches_done_under_kvm() {
-    let Some((kernel, initrd)) = setup() else {
+    let Some((kernel, initrd)) = setup("poll-recv-2thread-c") else {
         return;
     };
 

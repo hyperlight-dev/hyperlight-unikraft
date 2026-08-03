@@ -36,121 +36,18 @@
 
 use core::task::Poll;
 use hyperlight_unikraft::{ListenPorts, NetworkPolicy, Sandbox};
-use std::io::Write;
-use std::net::TcpStream;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
-// Environment probe
-// ---------------------------------------------------------------------------
+mod common;
+use common::{client_connect_and_send, setup};
 
 /// The port the guest (`examples/poll-recv-c/poll.c`) binds and listens on.
 const GUEST_PORT: u16 = 34567;
 
-fn hypervisor_available() -> bool {
-    #[cfg(unix)]
-    {
-        std::fs::metadata("/dev/kvm")
-            .map(|_| {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/kvm")
-                    .is_ok()
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(windows)]
-    {
-        true
-    }
-}
-
-fn poll_recv_artifacts() -> Option<(PathBuf, PathBuf)> {
-    let example_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("examples/poll-recv-c");
-    let build = example_dir.join(".unikraft/build");
-    if !build.is_dir() {
-        return None;
-    }
-    let kernel = std::fs::read_dir(&build)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with("_hyperlight-x86_64") && !n.ends_with(".dbg"))
-                .unwrap_or(false)
-        })?;
-    let initrd = std::fs::read_dir(&example_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with("-initrd.cpio"))
-                .unwrap_or(false)
-        })?;
-    Some((kernel, initrd))
-}
-
-/// Skips the test body with a diagnostic if prerequisites aren't met.
-/// Returns None → the test body should early-return.
-fn setup() -> Option<(PathBuf, PathBuf)> {
-    if !hypervisor_available() {
-        eprintln!("SKIP: no hypervisor available (no /dev/kvm)");
-        return None;
-    }
-    let Some((kernel, initrd)) = poll_recv_artifacts() else {
-        eprintln!(
-            "SKIP: poll-recv-c artifacts missing under \
-             examples/poll-recv-c/.unikraft/build/ — run `just rootfs` then \
-             `kraft-hyperlight build --plat hyperlight --arch x86_64` in \
-             examples/poll-recv-c/ (kraft.yaml enables CONFIG_HYPERLIGHT_POLL \
-             and CONFIG_LIBHOSTSOCK) to populate them"
-        );
-        return None;
-    };
-    Some((kernel, initrd))
-}
-
-/// Connect to the guest's host-proxied listener and send a payload, retrying
-/// until the guest has bound/listened (or a deadline elapses). Runs on its
-/// own thread so it can race the poll loop.
-///
-/// A deliberate pause is inserted between `connect()` and the first byte of
-/// data: this is the scenario that previously busy-looped. While connected
-/// but data-less, the guest is parked in `recv()` waiting for POLLIN, but the
-/// accepted socket is already writable (POLLOUT), so a host inter-step wait
-/// that watched POLLOUT would return instantly on every iteration and spin
-/// `poll`. With the wait restricted to readability the host blocks for
-/// the whole pause and the loop stays idle.
-fn client_connect_and_send(payload: &[u8], deadline: Instant) -> bool {
-    let addr = format!("127.0.0.1:{GUEST_PORT}");
-    while Instant::now() < deadline {
-        match TcpStream::connect(&addr) {
-            Ok(mut stream) => {
-                // Hold the connection open with no data to reproduce the
-                // POLLOUT busy-loop scenario before sending.
-                std::thread::sleep(Duration::from_millis(300));
-                if stream.write_all(payload).is_ok() {
-                    let _ = stream.flush();
-                    // Keep the stream open briefly so the guest's recv sees the
-                    // data before a close/RST could race it.
-                    std::thread::sleep(Duration::from_millis(50));
-                    return true;
-                }
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
-    false
-}
+/// How long the client holds the connection open before sending its first
+/// byte. Load-bearing: this data-less window is the scenario that previously
+/// busy-looped, so shrinking it would quietly stop exercising the regression.
+const CONNECT_TO_SEND_DELAY: Duration = Duration::from_millis(300);
 
 // ---------------------------------------------------------------------------
 // Test
@@ -163,7 +60,7 @@ fn client_connect_and_send(payload: &[u8], deadline: Instant) -> bool {
 /// letting `poll` return).
 #[tokio::test]
 async fn poll_recv_reaches_done_under_kvm() {
-    let Some((kernel, initrd)) = setup() else {
+    let Some((kernel, initrd)) = setup("poll-recv-c") else {
         return;
     };
 
@@ -192,8 +89,14 @@ async fn poll_recv_reaches_done_under_kvm() {
 
     // Client races the poll loop: it retries connect() until the guest's
     // host-proxied listener is up, then sends the payload.
-    let client =
-        std::thread::spawn(move || client_connect_and_send(b"hello-poll-recv", start + MAX_WALL));
+    let client = std::thread::spawn(move || {
+        client_connect_and_send(
+            GUEST_PORT,
+            b"hello-poll-recv",
+            CONNECT_TO_SEND_DELAY,
+            start + MAX_WALL,
+        )
+    });
 
     let mut steps = 0usize;
     let mut saw_wait_or_idle = false;
