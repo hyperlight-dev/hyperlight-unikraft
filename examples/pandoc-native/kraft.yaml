@@ -1,0 +1,99 @@
+specification: '0.6'
+name: pandoc-native-hyperlight
+
+unikraft:
+  source: https://github.com/unikraft/unikraft.git
+  version: plat-hyperlight
+  kconfig:
+    CONFIG_PLAT_HYPERLIGHT: 'y'
+    CONFIG_PAGING: 'n'
+    CONFIG_LIBUKVMEM: 'n'
+    CONFIG_LIBUKINTCTLR_HYPERLIGHT: 'y'
+    CONFIG_HYPERLIGHT_MAX_GUEST_LOG_LEVEL: 4
+
+    CONFIG_LIBUKPRINT_KLVL_CRIT: 'y'
+    CONFIG_LIBUKPRINT_PRINT_TIME: 'n'
+    CONFIG_LIBUKPRINT_PRINT_SRCNAME: 'n'
+    CONFIG_LIBUKBOOT_BANNER_NONE: 'y'
+    CONFIG_OPTIMIZE_SIZE: 'y'
+    CONFIG_OPTIMIZE_PIE: 'y'
+
+    # VFS: cpiovfs for zero-copy initrd mount
+    CONFIG_LIBVFSCORE: 'y'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI: 'y'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI_CUSTOM: 'y'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_MP: '/'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_DRIVER: 'cpiovfs'
+    CONFIG_LIBVFSCORE_AUTOMOUNT_CI0_UKOPTS_IFINITRD0: 'y'
+    CONFIG_LIBCPIOVFS: 'y'
+    CONFIG_LIBUKCPIO: 'y'
+
+    CONFIG_LIBDEVFS: 'y'
+    CONFIG_LIBDEVFS_AUTOMOUNT: 'y'
+    CONFIG_HYPERLIGHT_HCALL: 'y'
+
+    CONFIG_LIBHOSTFS: 'y'
+    CONFIG_LIBHOSTFS_AUTOMOUNT: 'y'
+
+    # Networking: host-proxied sockets
+    CONFIG_LIBPOSIX_SOCKET: 'y'
+    CONFIG_LIBHOSTSOCK: 'y'
+
+    # FD infrastructure
+    CONFIG_LIBPOSIX_FDIO: 'y'
+    CONFIG_LIBPOSIX_FDTAB: 'y'
+    CONFIG_LIBUKFILE: 'y'
+
+    # ELF loader — run /bin/sh which execs the pandoc wrapper script
+    CONFIG_APPELFLOADER: 'y'
+    CONFIG_APPELFLOADER_VFSEXEC: 'y'
+    CONFIG_APPELFLOADER_CUSTOMAPPNAME: 'n'
+    CONFIG_APPELFLOADER_VFSEXEC_ENVPATH: 'n'
+    CONFIG_APPELFLOADER_VFSEXEC_PATH: '/bin/sh'
+    CONFIG_LIBPOSIX_ENVIRON_ENVP0: 'PATH=/usr/bin:/bin'
+    CONFIG_LIBPOSIX_ENVIRON_ENVP1: 'LD_LIBRARY_PATH=/usr/lib:/usr/lib64:/usr/lib/ghc-9.6.6/lib/x86_64-linux-ghc-9.6.6'
+    CONFIG_LIBELF: 'y'
+
+    # mmap needed by dynamic linker for loading shared libraries
+    CONFIG_LIBUKMMAP: 'y'
+    CONFIG_LIBPOSIX_FUTEX: 'y'
+
+    CONFIG_LIBUKRANDOM_CMDLINE_SEED: 'y'
+    CONFIG_LIBUKRANDOM_GETRANDOM: 'y'
+
+    # Multiprocess support (sh needs to fork+exec pandoc)
+    CONFIG_LIBPOSIX_PROCESS_MULTITHREADING: 'y'
+    CONFIG_LIBUKSCHED: 'y'
+    CONFIG_LIBUKSCHEDCOOP: 'y'
+    CONFIG_LIBUKMPI: 'y'
+    CONFIG_LIBUKLOCK: 'y'
+    CONFIG_LIBUKLOCK_SEMAPHORE: 'y'
+    CONFIG_LIBUKLOCK_MUTEX: 'y'
+    CONFIG_LIBUKBOOT_MAINTHREAD: 'y'
+    CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL: 'y'
+
+    CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS: 'y'
+    CONFIG_LIBPOSIX_PROCESS_EXECVE: 'y'
+    CONFIG_LIBPOSIX_PROCESS_SIGNAL: 'y'
+    CONFIG_LIBUKBINFMT: 'y'
+    CONFIG_APPELFLOADER_MULTIPROCESS: 'y'
+    CONFIG_APPELFLOADER_ELF_BINFMT: 'y'
+
+    CONFIG_LIBCONTEXT: 'y'
+    CONFIG_LIBCONTEXT_CLEAR_TBSS: 'y'
+
+    CONFIG_LIBPOSIX_FDTAB_MULTITAB: 'y'
+
+    CONFIG_LIBPOSIX_PROCESS_BRK: 'y'
+
+libraries:
+  app-elfloader:
+    source: https://github.com/unikraft/app-elfloader.git
+    version: plat-hyperlight
+  libelf:
+    source: https://github.com/unikraft/lib-libelf.git
+    version: staging
+
+targets:
+  - architecture: x86_64
+    platform: hyperlight
