@@ -1,0 +1,8 @@
+{
+  "name": "node-bench",
+  "version": "1.0.0",
+  "description": "Minimal Node.js benchmark project for Hyperlight",
+  "scripts": {
+    "test": "node test.js"
+  }
+}
