@@ -31,6 +31,13 @@ unikraft:
     CONFIG_LIBCPIOVFS: 'y'
     CONFIG_LIBUKCPIO: 'y'
 
+    # hostfs - transparent POSIX -> host RPC forwarding. Mounts one hostfs
+    # instance per preopen the host passes in the cmdline TLV, which is how
+    # actor volumes (e.g. a durable dir, or the staged process environment)
+    # reach the guest. Without it those mount points are empty directories.
+    CONFIG_LIBHOSTFS: 'y'
+    CONFIG_LIBHOSTFS_AUTOMOUNT: 'y'
+
     # ELF loader - execute Python binary
     CONFIG_APPELFLOADER: 'y'
     CONFIG_APPELFLOADER_VFSEXEC: 'y'
