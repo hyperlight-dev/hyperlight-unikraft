@@ -295,7 +295,7 @@ jobs:
               -f runtimes/python.Dockerfile runtimes/
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Build python-agent-driver rootfs (CPIO)
         working-directory: examples/python-agent-driver

@@ -72,7 +72,7 @@ jobs:
           cache: false
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Cache kraft-hyperlight
         id: kraft-cache
@@ -270,7 +270,7 @@ jobs:
 
       - name: Install just
         if: steps.kvm_check.outputs.available == 'true'
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Build kraft-hyperlight
         if: steps.kvm_check.outputs.available == 'true'
@@ -476,7 +476,7 @@ jobs:
           cache: false
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Cache kraft-hyperlight
         id: kraft-cache
