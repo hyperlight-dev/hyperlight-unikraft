@@ -43,7 +43,7 @@ jobs:
           cache: false
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Cache kraft-hyperlight
         id: kraft-cache
