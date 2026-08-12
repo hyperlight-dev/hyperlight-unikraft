@@ -1,5 +1,5 @@
 FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS build
-RUN apk add --no-cache clang lld musl-dev
+RUN apk add --no-cache clang lld musl-dev llvm gcc
 WORKDIR /src
 COPY Program.cs HelloNativeAot.csproj ./
 RUN dotnet publish -c Release -r linux-musl-x64 /p:StaticExecutable=true /p:LinkerFlavor=lld
