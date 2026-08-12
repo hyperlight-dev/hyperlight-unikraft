@@ -4,7 +4,7 @@ RUN apk add --no-cache libstdc++ libgcc libcrypto3 libssl3
 FROM base AS download
 RUN apk add --no-cache curl jq
 RUN curl -fL --retry 3 --retry-delay 5 -o /tmp/powershell.tar.gz \
-    https://github.com/PowerShell/PowerShell/releases/download/v7.5.4/powershell-7.5.4-linux-musl-x64.tar.gz
+    https://github.com/PowerShell/PowerShell/releases/download/v7.6.4/powershell-7.6.4-linux-musl-x64.tar.gz
 RUN mkdir -p /opt/microsoft/powershell/7 && \
     tar -xzf /tmp/powershell.tar.gz -C /opt/microsoft/powershell/7 && \
     cd /opt/microsoft/powershell/7 && \
