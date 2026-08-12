@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783976120949,
+  "lastUpdate": 1786573912561,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "Linux Benchmarks": [
@@ -2287,6 +2287,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot (disk)",
             "value": 701,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "d0f8436cd9877889a091074757bf3435a5da08e0",
+          "message": "ci: bump setup-just v2 to v4 (v2 uses node20, force-run on node24 causes socket hang up)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-08-12T22:19:01Z",
+          "tree_id": "c0c9e83127d225532c41c988b0547201f6417fba",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/d0f8436cd9877889a091074757bf3435a5da08e0"
+        },
+        "date": 1786573910663,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "hello_world (median)",
+            "value": 20,
+            "unit": "ms"
+          },
+          {
+            "name": "pandas (median)",
+            "value": 90,
+            "unit": "ms"
+          },
+          {
+            "name": "density (per VM)",
+            "value": 10,
+            "unit": "MB"
+          },
+          {
+            "name": "snapshot (disk)",
+            "value": 719,
             "unit": "MiB"
           }
         ]
