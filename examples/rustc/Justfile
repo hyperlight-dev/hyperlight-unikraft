@@ -1,0 +1,61 @@
+# rustc on Hyperlight
+#
+# just run          - Compile a Rust program inside a micro-VM
+# just run-version  - Show rustc version inside a micro-VM
+# just rootfs       - Build rootfs via Docker (cross-platform)
+# just build        - Build/pull kernel
+# just clean        - Remove build artifacts
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+export DOCKER_BUILDKIT := "0"
+
+kernel      := ".unikraft/build/rustc-hyperlight_hyperlight-x86_64"
+initrd      := "initrd.cpio"
+memory      := "2Gi"
+image       := "rustc-hyperlight"
+ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/rustc-kernel:latest"
+
+# Compile hello.rs inside the micro-VM (warnings prove the compiler ran)
+run:
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} -- --edition 2021 /hello.rs -o /tmp/hello
+
+# Show rustc version
+run-version:
+    hyperlight-unikraft {{kernel}} --initrd {{initrd}} --memory {{memory}} -- --version
+
+# Build rootfs via Docker (cross-platform)
+rootfs:
+    docker build --platform linux/amd64 --target cpio -t {{image}}-cpio .
+    - docker rm -f {{image}}-tmp
+    docker create --name {{image}}-tmp {{image}}-cpio /bin/true
+    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
+    docker rm -f {{image}}-tmp
+
+# Build kernel via kraft (Linux)
+[unix]
+build:
+    -kraft-hyperlight build --plat hyperlight --arch x86_64
+
+# Pull pre-built kernel from GHCR (Windows)
+[windows]
+build:
+    docker pull {{ghcr_kernel}}
+    - docker rm -f {{image}}-kernel-tmp
+    docker create --name {{image}}-kernel-tmp {{ghcr_kernel}} /kernel
+    New-Item -ItemType Directory -Force -Path (Split-Path {{kernel}}) | Out-Null
+    docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
+    docker rm -f {{image}}-kernel-tmp
+
+# Clean + rebuild everything
+rebuild: clean build rootfs
+
+# Clean build artifacts
+[unix]
+clean:
+    rm -rf .unikraft .config.* {{initrd}}
+
+[windows]
+clean:
+    if (Test-Path .unikraft) { Remove-Item -Recurse -Force .unikraft }
+    if (Test-Path .config.*) { Remove-Item -Force .config.* }
+    if (Test-Path {{initrd}}) { Remove-Item -Force {{initrd}} }
