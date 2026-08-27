@@ -1878,6 +1878,30 @@ impl HostSocket {
     }
 }
 
+/// A connected TCP socket whose peer has already closed.
+///
+/// Reads return EOF and polls report `POLLHUP`, which is exactly what a guest
+/// holding a connection across a checkpoint should observe: the peer went away
+/// with the old host process. Built over loopback so the result is a genuine
+/// TCP socket, indistinguishable from any other to the poll/recv paths that
+/// later dup it into tokio.
+fn disconnected_stream() -> Result<Socket> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|e| anyhow!("binding loopback listener for disconnected socket: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| anyhow!("reading loopback listener address: {e}"))?;
+    let client = std::net::TcpStream::connect(addr)
+        .map_err(|e| anyhow!("connecting loopback socket: {e}"))?;
+    // Dropping the accepted end is what puts the client into "peer closed".
+    let (server, _) = listener
+        .accept()
+        .map_err(|e| anyhow!("accepting loopback socket: {e}"))?;
+    drop(server);
+    drop(listener);
+    Ok(Socket::from(client))
+}
+
 /// Maximum number of IPs learned from DNS responses for AllowList policy.
 const MAX_LEARNED_IPS: usize = 256;
 
@@ -1934,40 +1958,45 @@ impl SocketTable {
     /// Serialize the currently-listening sockets (and the id counter)
     /// to JSON so they can be re-created on the host after a restore.
     ///
-    /// Only listening sockets are exported: a checkpoint of an idle
-    /// server has just its listener(s) open, and established/accepted
-    /// connections cannot be revived across a restore anyway. The guest
-    /// keeps using the same fd (= table id) for its listener, so we must
-    /// re-create each listener under its original id.
+    /// Listening sockets are re-created for real. Every *other* socket
+    /// (accepted connections, outbound connections) cannot be revived: the
+    /// peer is gone with the old host process. They are still exported, by
+    /// id, as `closed` -- see [`SocketTable::restore_listeners`], which backs
+    /// them with an already-disconnected endpoint. Leaving them out entirely
+    /// would strand the guest, which keeps using the same fd (= table id)
+    /// across a restore: an id with no entry polls `POLLNVAL` forever, and a
+    /// server looping on that fd never makes progress.
     fn export_listeners(&self) -> serde_json::Value {
         use serde_json::json;
-        let listeners: Vec<serde_json::Value> = self
-            .sockets
-            .iter()
-            .filter_map(|(id, sock)| {
-                let backlog = sock.listen_backlog?;
-                let addr = sock.bound_addr?;
-                let family: i32 = match addr {
-                    SocketAddr::V4(_) => 2,
-                    SocketAddr::V6(_) => 10,
-                };
-                Some(json!({
-                    "id": id,
-                    "family": family,
-                    "sock_type": sock.sock_type,
-                    "addr": addr.ip().to_string(),
-                    "port": addr.port(),
-                    "backlog": backlog,
-                }))
-            })
-            .collect();
-        json!({ "next_id": self.next_id, "listeners": listeners })
+        let mut listeners: Vec<serde_json::Value> = Vec::new();
+        let mut closed: Vec<serde_json::Value> = Vec::new();
+        for (id, sock) in self.sockets.iter() {
+            match (sock.listen_backlog, sock.bound_addr) {
+                (Some(backlog), Some(addr)) => {
+                    let family: i32 = match addr {
+                        SocketAddr::V4(_) => 2,
+                        SocketAddr::V6(_) => 10,
+                    };
+                    listeners.push(json!({
+                        "id": id,
+                        "family": family,
+                        "sock_type": sock.sock_type,
+                        "addr": addr.ip().to_string(),
+                        "port": addr.port(),
+                        "backlog": backlog,
+                    }));
+                }
+                _ => closed.push(json!({ "id": id, "sock_type": sock.sock_type })),
+            }
+        }
+        json!({ "next_id": self.next_id, "listeners": listeners, "closed": closed })
     }
 
     /// Re-create listening sockets described by [`Self::export_listeners`]
     /// and re-insert them under their original ids, restoring `next_id`.
-    /// Called on restore, before the guest resumes, so the resumed guest
-    /// finds its listener fds backed by real, bound, listening sockets.
+    /// Sockets exported as `closed` are re-inserted as already-disconnected
+    /// endpoints. Called on restore, before the guest resumes, so the resumed
+    /// guest finds every fd it still holds backed by a real socket.
     fn restore_listeners(&mut self, data: &serde_json::Value) -> Result<()> {
         let listeners = data["listeners"]
             .as_array()
@@ -2019,6 +2048,34 @@ impl SocketTable {
                     sock_type,
                     bound_addr: Some(addr),
                     listen_backlog: Some(backlog),
+                },
+            );
+        }
+        // Connections could not be revived, but their fds must still resolve.
+        // A disconnected endpoint reports EOF rather than POLLNVAL, so the
+        // guest sees an ordinary "peer hung up" -- a path every server already
+        // handles -- and closes the fd instead of spinning on it.
+        for entry in data["closed"].as_array().unwrap_or(&Vec::new()) {
+            let id = entry["id"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("closed socket entry missing 'id'"))?;
+            let sock_type = entry["sock_type"].as_i64().unwrap_or(1) as i32;
+            let socket = if sock_type == 2 {
+                // Datagram sockets have no connection to lose; a fresh unbound
+                // socket keeps send() working and reads simply never arrive.
+                Socket::new(Domain::IPV4, Type::DGRAM, None)?
+            } else {
+                disconnected_stream()?
+            };
+            socket.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+            socket.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+            self.sockets.insert(
+                id,
+                HostSocket {
+                    socket,
+                    sock_type,
+                    bound_addr: None,
+                    listen_backlog: None,
                 },
             );
         }
@@ -4756,6 +4813,54 @@ fn sparsify_file(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn disconnected_stream_reports_eof() {
+        use std::io::Read;
+        let sock = disconnected_stream().expect("build disconnected socket");
+        let mut stream = std::net::TcpStream::from(sock);
+        let mut buf = [0u8; 16];
+        // A closed peer reads as EOF, not as an error.
+        assert_eq!(stream.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn accepted_sockets_are_restored_as_closed_not_dropped() {
+        // An accepted connection cannot be revived, but its fd must still
+        // resolve after a restore: an id with no entry polls POLLNVAL, which
+        // is what previously made a keep-alive server spin forever.
+        let mut table = SocketTable::new();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted_id = table
+            .insert(HostSocket::new(
+                Socket::from(std::net::TcpStream::connect(addr).unwrap()),
+                1,
+            ))
+            .unwrap();
+
+        let exported = table.export_listeners();
+        assert_eq!(
+            exported["closed"][0]["id"].as_u64(),
+            Some(accepted_id),
+            "non-listening sockets must be exported as closed"
+        );
+
+        let mut restored = SocketTable::new();
+        restored.restore_listeners(&exported).unwrap();
+        let sock = restored
+            .get_socket(accepted_id)
+            .expect("restored fd must resolve");
+
+        use std::io::Read;
+        let mut stream = std::net::TcpStream::from(sock.try_clone().unwrap());
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            stream.read(&mut buf).unwrap(),
+            0,
+            "restored connection must read as EOF"
+        );
+    }
 
     fn framed_request(id: u64, json: &[u8]) -> Vec<u8> {
         encode_async_frame(ASYNC_FRAME_REQUEST, id, json)
