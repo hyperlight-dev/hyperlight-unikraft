@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789241168495,
+  "lastUpdate": 1789243067491,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "agent benchmarks": [
@@ -128,6 +128,150 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot-size/stdlib",
             "value": 876,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 28,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 20,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 33,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "cb6b6e1eb13f0ad346a93e6ca28a0f1dd042df4c",
+          "message": "kernel: source the Unikraft platform from upstream unikraft/unikraft@plat-hyperlight-v2\n\nThe kernel/unikraft submodule now points at the canonical\nunikraft/unikraft plat-hyperlight-v2 branch instead of the danbugs fork.\nSame commit (9eca1f0b), so the embedded kernel binary is unchanged.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-09-12T19:42:24Z",
+          "tree_id": "c408dbd54aff44e0e30a89eeb097bf40aadf0f80",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/cb6b6e1eb13f0ad346a93e6ca28a0f1dd042df4c"
+        },
+        "date": 1789243062285,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 10496.686,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 10601.972,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 10543.128,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 91.886,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 49.256,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 122.439,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 19.48,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 8.813,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 33.477,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 29.994,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 28.567,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 29.572,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 1.598,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.172,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 7.046,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 26.533,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 14.57,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 47.242,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 875.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 875.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 875.8,
             "unit": "MiB"
           },
           {
