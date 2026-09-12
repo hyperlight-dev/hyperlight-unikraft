@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789245073800,
+  "lastUpdate": 1789247430750,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "agent benchmarks": [
@@ -416,6 +416,150 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot-size/stdlib",
             "value": 875.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 28,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 28,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 30,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "b36bb983867a5f5c9a8ca351f1e3ca339d9978ef",
+          "message": "ci: pin crates-io-auth-action to a SHA (v1.0.5); drop stale git-deps note\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-09-12T21:02:16Z",
+          "tree_id": "792a30b74831261ef4269f4aecbb46dcd993d811",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/b36bb983867a5f5c9a8ca351f1e3ca339d9978ef"
+        },
+        "date": 1789247429635,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 6389.251,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 6522.324,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 6413.899,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 22.573,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 8.843,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 38.081,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 7.939,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 3.733,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 16.879,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 0.963,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 0.955,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 1.001,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 1.609,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.1,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 7.455,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 12.484,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 5.265,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 24.776,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 875.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 875.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 875.7,
             "unit": "MiB"
           },
           {
