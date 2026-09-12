@@ -498,9 +498,7 @@ publish-kernel registry version="":
 publish-urunc registry version="":
     #!/usr/bin/env bash
     set -euo pipefail
-    cd "{{root_dir}}/demos/urunc"
-    just stage
-    docker build -f Containerfile -t hluk-hello-urunc .
+    ( cd "{{root_dir}}/demos/urunc" && just stage && docker build -f Containerfile -t hluk-hello-urunc . )
     just _push hluk-hello-urunc "{{registry}}/hello-urunc" "{{version}}"
 
 # Clean rebuild of a rootfs — pulls fresh base images, no Docker cache.
