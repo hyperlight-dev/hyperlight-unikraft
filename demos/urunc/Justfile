@@ -19,6 +19,9 @@ image    := "hluk/hello-urunc:demo"
 stage:
     #!/usr/bin/env bash
     set -euo pipefail
+    # rootfs.Dockerfile is FROM hluk-python-rootfs:latest — build that base first
+    # (it's a local build stage, not a registry image).
+    ( cd "{{root_dir}}" && just build-rootfs python )
     ( cd "{{root_dir}}" && just build-rootfs urunc-hello demos/urunc/rootfs.Dockerfile )
     cp "{{kernel}}" elfloader_hyperlight-x86_64
     cp "{{rootfs}}" initrd.cpio
