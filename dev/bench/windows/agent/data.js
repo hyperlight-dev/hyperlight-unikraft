@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789245734091,
+  "lastUpdate": 1789248652937,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "agent benchmarks": [
@@ -421,6 +421,150 @@ window.BENCHMARK_DATA = {
           {
             "name": "rss/compute",
             "value": 28,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 20,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 33,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "15a18a414bf59270698af375e24e5f942c365216",
+          "message": "cargo: add required crates.io metadata (description, license, repository, readme)\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-09-12T21:10:44Z",
+          "tree_id": "4092aa4c6bedbd45a68c5b62f3aedab79635ab16",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/15a18a414bf59270698af375e24e5f942c365216"
+        },
+        "date": 1789248649899,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 16064.46,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 16170.061,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 16588.859,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 139.909,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 78.165,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 193.284,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 26.961,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 13.412,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 47.588,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 55.447,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 56.165,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 57.103,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.93,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.322,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 10.659,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 42.108,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 19.814,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 101.288,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 875.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 875.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 875.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 27,
             "unit": "MB"
           },
           {
