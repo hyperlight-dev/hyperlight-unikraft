@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789244852014,
+  "lastUpdate": 1789247188239,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python benchmarks": [
@@ -570,6 +570,150 @@ window.BENCHMARK_DATA = {
           {
             "name": "rss/hello",
             "value": 12,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 26,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "b36bb983867a5f5c9a8ca351f1e3ca339d9978ef",
+          "message": "ci: pin crates-io-auth-action to a SHA (v1.0.5); drop stale git-deps note\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-09-12T21:02:16Z",
+          "tree_id": "792a30b74831261ef4269f4aecbb46dcd993d811",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/b36bb983867a5f5c9a8ca351f1e3ca339d9978ef"
+        },
+        "date": 1789247185168,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 1043.49,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 1040.474,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 1197.764,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 51.693,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 34.956,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 273.287,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 17.314,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 9.701,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 188.559,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 9.798,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 9.686,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 10.725,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.712,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.331,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 45.011,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 26.265,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 15.665,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 327.656,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 78.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 78.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 78.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 13,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 11,
             "unit": "MB"
           },
           {
