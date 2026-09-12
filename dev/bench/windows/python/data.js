@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789244390874,
+  "lastUpdate": 1789244852014,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python benchmarks": [
@@ -426,6 +426,150 @@ window.BENCHMARK_DATA = {
           {
             "name": "rss/hello",
             "value": 11,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 26,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "d41b90a58bb73653a019f8bfa3357ad0ef93ea15",
+          "message": "demos/urunc: call _push from the repo root\n\nThe publish-urunc recipe cd'd into demos/urunc and then called `just _push`,\nwhich resolved to demos/urunc/Justfile (no _push there). Run the staging +\ndocker build in a subshell so _push runs against the root justfile.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-09-12T20:23:33Z",
+          "tree_id": "4b667d4b38a0253453f3cf9cafc6f4477fce31ea",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/d41b90a58bb73653a019f8bfa3357ad0ef93ea15"
+        },
+        "date": 1789244848817,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 1080.214,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 1053.175,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 1197.159,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 54.16,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 38.919,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 278.972,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 17.218,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 9.864,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 196.163,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 9.774,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 9.687,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 11.617,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.732,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.351,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 45.14,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 38.041,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 15.044,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 442.791,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 78.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 78.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 78.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 13,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 12,
             "unit": "MB"
           },
           {
