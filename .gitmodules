@@ -1,7 +1,7 @@
 [submodule "kernel/unikraft"]
 	path = kernel/unikraft
-	url = https://github.com/danbugs/unikraft.git
-	branch = plat-hyperlight-cleanup
+	url = https://github.com/unikraft/unikraft.git
+	branch = plat-hyperlight-v2
 [submodule "kernel/app-elfloader"]
 	path = kernel/app-elfloader
 	url = https://github.com/unikraft/app-elfloader.git
