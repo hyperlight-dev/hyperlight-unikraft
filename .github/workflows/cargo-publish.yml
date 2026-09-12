@@ -1,0 +1,47 @@
+# Publish the `hyperlight-unikraft` crate (which ships the `hluk` binary) to
+# crates.io. Manual; a dry run unless `dry_run` is set to false.
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without actually publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # crates.io trusted publishing (OIDC)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check crate not already published
+        run: |
+          CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if curl -sf "https://crates.io/api/v1/crates/hyperlight-unikraft/$CARGO_VER" \
+               -H "User-Agent: hyperlight-unikraft-ci" | jq -e .version > /dev/null 2>&1; then
+            echo "::warning::hyperlight-unikraft@$CARGO_VER already published"
+            echo "ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Dry run (no auth needed)
+        if: ${{ inputs.dry_run && env.ALREADY_PUBLISHED != 'true' }}
+        run: cargo publish --locked --dry-run
+
+      - name: Authenticate with crates.io
+        if: ${{ !inputs.dry_run && env.ALREADY_PUBLISHED != 'true' }}
+        uses: rust-lang/crates-io-auth-action@v1 # pin to a SHA before real use
+        id: crates-io-auth
+
+      - name: Publish
+        if: ${{ !inputs.dry_run && env.ALREADY_PUBLISHED != 'true' }}
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}

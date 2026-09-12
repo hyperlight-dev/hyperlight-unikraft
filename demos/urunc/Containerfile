@@ -1,0 +1,18 @@
+#syntax=harbor.nbfc.io/nubificus/bunny:latest
+#
+# Package a hyperlight-unikraft guest (kernel + rootfs CPIO) as an OCI image
+# that urunc's hyperlight VMM can run. The bunny frontend turns these LABELs
+# into the com.urunc.unikernel.* OCI annotations and the in-image urunc.json.
+#
+# Mirrors the upstream packaging in hyperlight-dev/hyperlight-unikraft, adapted
+# for this repo's locally-built kernel + rootfs. Stage them first (`just stage`),
+# then:  docker build -f Containerfile -t hluk/hello-urunc:demo .
+FROM scratch
+
+COPY elfloader_hyperlight-x86_64 /unikernel/kernel
+COPY initrd.cpio                 /unikernel/initrd.cpio
+
+LABEL "com.urunc.unikernel.binary"="/unikernel/kernel"
+LABEL "com.urunc.unikernel.initrd"="/unikernel/initrd.cpio"
+LABEL "com.urunc.unikernel.unikernelType"="unikraft"
+LABEL "com.urunc.unikernel.hypervisor"="hyperlight-unikraft"

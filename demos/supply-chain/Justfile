@@ -1,0 +1,71 @@
+# Supply chain attack demo — Hyperlight micro-VM (hluk)
+#
+# Two runs of the SAME code, side by side:
+#   just bare-metal   - no sandbox: credentials stolen, C2 reached, persistence set
+#   just run          - hluk sandbox (mount + allowed network): attack contained
+#   just run-minimal  - hluk sandbox (mount only, no network): attack contained
+#   just c2           - standalone C2 listener (watch exfil arrive; split terminal)
+#
+# Linux only (KVM + Docker for the rootfs). Build the python rootfs once
+# from the repo root:  just build-rootfs python
+
+root_dir  := justfile_directory() / ".." / ".."
+hluk      := root_dir / "target" / "release" / "hluk"
+rootfs    := root_dir / "build-elfloader" / "python-rootfs.cpio"
+demo_dir  := justfile_directory()
+guest_dir := justfile_directory() / "guest"
+
+# Assemble the guest directory: victim app + malicious package + workspace input.
+[private]
+prepare:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{guest_dir}}/reqeusts" "{{guest_dir}}/workspace"
+    cp "{{demo_dir}}/victim_app.py" "{{guest_dir}}/victim_app.py"
+    cp "{{demo_dir}}"/reqeusts/*.py "{{guest_dir}}/reqeusts/"
+    echo "Hello from the host filesystem" > "{{guest_dir}}/workspace/input.txt"
+
+# Build hluk and the python rootfs if missing.
+[private]
+build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ( cd "{{root_dir}}" && just build )
+    if [ ! -f "{{rootfs}}" ]; then ( cd "{{root_dir}}" && just build-rootfs python ); fi
+
+# Bare metal (attack succeeds): plants fake secrets in a temp HOME, starts a
+# local C2, runs the victim, shows the stolen artifacts, cleans up.
+bare-metal:
+    ./bare-metal/run.sh
+
+# Scoped hluk sandbox: guest gets the mount + egress to example.com only.
+#   legitimate work succeeds; every attack phase is contained:
+#   creds (outside mount) - env (never forwarded) - C2 (loopback denied)
+#   - cloud metadata (link-local denied) - persistence (dotfiles not mounted)
+run: build prepare
+    #!/usr/bin/env bash
+    set -euo pipefail
+    "{{hluk}}" run \
+        --initrd "{{rootfs}}" --scratch-mb 256 \
+        --mount "{{guest_dir}}:/host" \
+        --net-allow example.com \
+        --exec "import sys; sys.path.insert(0, '/host'); exec(open('/host/victim_app.py').read())"
+    echo ""
+    echo "-- Workspace after run --"
+    cat "{{guest_dir}}/workspace/output.txt" 2>/dev/null || echo "(no output written)"
+
+# Minimal hluk sandbox: mount only, no network — malicious egress also fails.
+run-minimal: build prepare
+    #!/usr/bin/env bash
+    set -euo pipefail
+    "{{hluk}}" run \
+        --initrd "{{rootfs}}" --scratch-mb 256 \
+        --mount "{{guest_dir}}:/host" \
+        --exec "import sys; sys.path.insert(0, '/host'); exec(open('/host/victim_app.py').read())"
+
+# Standalone C2 listener (decodes exfil in real time; useful split-terminal).
+c2:
+    python3 c2_server.py
+
+clean:
+    rm -rf "{{guest_dir}}"

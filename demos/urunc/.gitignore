@@ -1,0 +1,3 @@
+# Staged build artifacts (created by `just stage`)
+elfloader_hyperlight-x86_64
+initrd.cpio

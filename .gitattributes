@@ -1,0 +1,6 @@
+# Keep LF in every checkout.  Guest scripts (examples/*.sh, *.py, …) are
+# read on the host and executed inside a Linux guest, and just recipes are
+# bash/pwsh scripts — both break on CRLF.  Binaries are detected by content.
+* text=auto eol=lf
+*.cpio binary
+kernel/elfloader_hyperlight-x86_64 binary

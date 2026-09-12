@@ -1,0 +1,55 @@
+[package]
+name = "hyperlight-unikraft"
+version = "0.13.0"
+edition = "2024"
+
+[[bin]]
+name = "hluk"
+path = "src/main.rs"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:tracing-subscriber"]
+# Also target the Microsoft Hypervisor (Azure Linux / Mariner) on Linux, in
+# addition to the default KVM.  Off by default because enabling mshv3 opts the
+# whole build out of the MADV_DONTNEED fast restore path (see the dependency
+# comment below), so `hluk` on KVM stays fast; turn this on to run on MSHV.
+mshv = ["hyperlight-host/mshv3"]
+
+[dependencies]
+hyperlight-common = "0.17"
+tracing = "0.1"
+
+# Host I/O.  Filesystem: cap-std's `Dir` is the capability that keeps
+# guest paths inside the mount on every host OS.  Networking: the guest
+# speaks POSIX sockets one syscall per host call, and rustix is the safe,
+# cross-platform (Linux, Windows) wrapper over exactly that API.
+cap-std = "4"
+rustix = { version = "1", features = ["net", "event"] }
+
+# Optional — CLI only.
+clap = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# hyperlight-host's hypervisor backend is chosen at compile time by feature.
+# We keep every backend hyperlight supports reachable, but tune the default:
+#   Linux   — KVM by default; add MSHV (Azure Linux / Mariner) with `--features
+#             mshv`.  We drop the default `mshv3` from the base build because,
+#             when mshv3 is compiled in, SharedMemory::zero_or_replace() cannot
+#             take the MADV_DONTNEED lazy-zero fast path on snapshot restore and
+#             falls back to a full fill(0) of scratch — ~30x slower restore and
+#             a much larger resident set.  KVM-only keeps that fast path; the
+#             `mshv` feature re-adds mshv3 for hosts that need it.
+#   Windows — WHP, compiled in unconditionally for the target (no feature).
+#   macOS   — Hypervisor.framework via the default `hvf` feature.
+[target.'cfg(target_os = "linux")'.dependencies]
+hyperlight-host = { version = "0.17", default-features = false, features = ["kvm", "build-metadata"] }
+
+# Non-Linux keeps hyperlight's defaults: HVF (macOS) is on, WHP (Windows) is
+# unconditional, and the Linux-only kvm/mshv3 features are inert here.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+hyperlight-host = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+# Private working set for the bench RSS line (already in the tree via clap).
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }

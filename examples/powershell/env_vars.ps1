@@ -1,0 +1,6 @@
+$myVar = [Environment]::GetEnvironmentVariable("MY_VAR")
+$debug = [Environment]::GetEnvironmentVariable("DEBUG")
+$greeting = [Environment]::GetEnvironmentVariable("GREETING")
+[Console]::WriteLine("MY_VAR=$myVar")
+[Console]::WriteLine("DEBUG=$debug")
+[Console]::WriteLine("GREETING=$greeting")

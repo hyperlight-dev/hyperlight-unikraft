@@ -1,0 +1,87 @@
+# Publish artifacts to GHCR.  Each runtime is one package with two tags — the
+# same rootfs in two forms, so the registry isn't cluttered:
+#   <runtime>:latest  — the rootfs filesystem image; build a custom guest
+#                       `FROM ghcr.io/<owner>/<repo>/<runtime>`.
+#   <runtime>:initrd  — the runnable CPIO; `just pull-rootfs <runtime>` fetches
+#                       it into build-elfloader/ to `hluk run` — no local build.
+# Plus busybox (:latest is its base), kernel, and the urunc "hello" image.
+#
+# On a git tag push the version is added too (:<version> and :initrd-<version>).
+# The tag/push logic lives in the justfile (`just publish*`), so it can be run
+# locally after `docker login` too.
+name: Publish images to GHCR
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_BASE: ghcr.io/${{ github.repository }}
+  # v<version> on a tag push, empty otherwise (only :latest then).
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+jobs:
+  # One package per runtime: :latest (filesystem base) + :initrd (cpio).
+  publish-runtimes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [python, node, agent, python-shell, bash, c, go, rust, dotnet-aot, dotnet-jit, powershell]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Install cpio
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends cpio
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build and publish rootfs
+        run: just publish ${{ matrix.runtime }} "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}"
+
+  # The shared BusyBox base (base-only — no driver, not a runnable guest).
+  publish-busybox:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build and publish busybox base
+        run: just publish-busybox "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}"
+
+  publish-kernel:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Publish kernel image
+        run: just publish-kernel "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}"
+
+  publish-urunc:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build and publish urunc image
+        run: just publish-urunc "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}"

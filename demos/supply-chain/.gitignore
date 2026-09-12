@@ -1,0 +1,4 @@
+# Generated at demo time by `just prepare`
+guest/
+__pycache__/
+*.pyc

@@ -1,0 +1,5 @@
+# The supply-chain demo (demos/supply-chain/) intentionally ships a typosquatted
+# package named `reqeusts` (a misspelling of `requests`) — that misspelling is
+# the whole point of the demo, so tell typos it is expected.
+[default.extend-words]
+reqeusts = "reqeusts"

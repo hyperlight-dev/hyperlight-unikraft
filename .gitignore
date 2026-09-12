@@ -1,0 +1,13 @@
+/target
+/build-elfloader
+/.snapshots
+/bench-results.json
+
+# Python bytecode (ci/run_demo.py compiles this on run)
+__pycache__/
+*.pyc
+
+# .NET build output (examples/dotnet-*/ produce these on `dotnet build`/`publish`)
+bin/
+obj/
+publish/

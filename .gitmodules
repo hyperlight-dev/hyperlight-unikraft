@@ -1,0 +1,12 @@
+[submodule "kernel/unikraft"]
+	path = kernel/unikraft
+	url = https://github.com/danbugs/unikraft.git
+	branch = plat-hyperlight-cleanup
+[submodule "kernel/app-elfloader"]
+	path = kernel/app-elfloader
+	url = https://github.com/unikraft/app-elfloader.git
+	branch = staging
+[submodule "kernel/libs/libelf"]
+	path = kernel/libs/libelf
+	url = https://github.com/unikraft/lib-libelf.git
+	branch = staging

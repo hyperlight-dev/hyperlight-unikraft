@@ -1,0 +1,38 @@
+# PPTX generator demo — LLM-written python-pptx code, run inside a Hyperlight VM.
+#
+# just rootfs   - Build the python-pptx rootfs (Docker; python-shell must exist)
+# just build    - Build the Rust CLI
+# just run      - Generate a presentation (needs OPENAI_API_KEY)
+# just dry-run  - Print the generated code without running it
+#
+# Linux only (KVM + Docker). Build the python-shell base once from the repo root:
+#   just build-rootfs python-shell
+
+root_dir := justfile_directory() / ".." / ".."
+rootfs   := root_dir / "build-elfloader" / "pptx-rootfs.cpio"
+
+# Build the python-pptx rootfs if it is missing.
+rootfs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f "{{rootfs}}" ]; then
+        ( cd "{{root_dir}}" && just build-rootfs pptx demos/pptx-gen/Dockerfile.rootfs )
+    else
+        echo "rootfs present: {{rootfs}}"
+    fi
+
+# Build the Rust CLI.
+build:
+    cargo build --release
+
+# Generate a presentation. Put OPENAI_API_KEY in .env (see .env.example).
+run prompt="Create a 3-slide presentation about micro-VMs": rootfs build
+    ./target/release/hyperlight-pptx-gen --prompt "{{prompt}}"
+
+# Print the generated code without executing it (still calls the API).
+dry-run prompt="Create a 3-slide presentation about micro-VMs": build
+    ./target/release/hyperlight-pptx-gen --prompt "{{prompt}}" --dry-run
+
+clean:
+    cargo clean
+    rm -f *.pptx

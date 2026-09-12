@@ -1,0 +1,2 @@
+# Kernel build artifacts (output of `just build-kernel`)
+.build/

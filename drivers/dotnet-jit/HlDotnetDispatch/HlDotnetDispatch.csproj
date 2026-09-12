@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- R2R pre-compiles Roslyn methods to native code, avoiding the
+         massive JIT overhead that makes first compilation take minutes
+         in the unikernel. -->
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <!-- No trimming — Roslyn's metadata reader uses reflection. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Compilation API only (not Scripting — its async internals
+         deadlock the cooperative scheduler). -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.12.0" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,5 @@
+# Pinned so every machine and CI runner builds, lints and formats with the
+# same compiler.  Bump deliberately (clippy gains lints between releases).
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

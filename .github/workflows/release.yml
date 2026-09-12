@@ -1,0 +1,107 @@
+# Cut a release: tag the version in Cargo.toml, create a GitHub Release with
+# auto-generated notes and the `hluk` binaries, and kick off the GHCR image
+# publish. Run it manually (Actions → Create release → Run workflow) after
+# bumping `version` in Cargo.toml on main.
+#
+# crates.io publishing is intentionally NOT triggered here — see cargo-publish.yml
+# and docs/RELEASE.md (the crate has git dependencies and can't be published yet).
+name: Create release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-linux:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag + release
+      actions: write # trigger publish-images.yml
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Validate version and tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version '$VERSION' in Cargo.toml — expected semver like 1.2.3"
+            exit 1
+          fi
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists — bump the version in Cargo.toml first"
+            exit 1
+          fi
+
+      - name: Build hluk (Linux x86_64)
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          tar -C target/release -czf "hluk-v$VERSION-x86_64-unknown-linux-gnu.tar.gz" hluk
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Release notes are the matching CHANGELOG.md section (curated), not
+          # an auto-generated PR list.
+          just changelog-notes "v$VERSION" > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "::error::No CHANGELOG.md section for v$VERSION — add one before releasing"
+            exit 1
+          fi
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --notes-file RELEASE_NOTES.md \
+            "hluk-v$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+
+      - name: Trigger GHCR image publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run publish-images.yml --ref "v${{ steps.version.outputs.version }}"
+
+  # Build the Windows binary on a Windows runner and attach it to the release
+  # created above. Separate job so each binary is built natively (no artifact
+  # hand-off needed — both upload straight to the release).
+  release-windows:
+    needs: release-linux
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ needs.release-linux.outputs.version }}
+
+      - name: Build hluk (Windows x86_64)
+        run: cargo build --release --locked
+
+      - name: Package and upload binary
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $v = "${{ needs.release-linux.outputs.version }}"
+          Compress-Archive -Path target\release\hluk.exe -DestinationPath "hluk-v$v-x86_64-pc-windows-msvc.zip"
+          gh release upload "v$v" "hluk-v$v-x86_64-pc-windows-msvc.zip"

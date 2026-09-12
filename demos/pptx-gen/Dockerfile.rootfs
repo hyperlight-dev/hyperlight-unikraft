@@ -1,0 +1,16 @@
+# python-pptx rootfs — extends python-shell with python-pptx (pulls in lxml + Pillow).
+#
+# No prebuilt rootfs ships python-pptx (or its lxml/Pillow C extensions), so a
+# custom rootfs is needed regardless; python-shell is the smallest base that has
+# pip. python-pptx installs as manylinux wheels, so no compiler is required.
+#
+# Build:  just build-rootfs pptx demos/pptx-gen/Dockerfile.rootfs
+FROM hluk-python-shell-rootfs:latest AS base
+
+FROM python:3.12-slim-bookworm AS installer
+COPY --from=base / /rootfs/
+RUN pip install --no-cache-dir --target /rootfs/usr/local/lib/python3.12/site-packages \
+        python-pptx
+
+FROM scratch
+COPY --from=installer /rootfs/ /

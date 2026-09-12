@@ -1,0 +1,36 @@
+# urunc packaging for a hyperlight-unikraft guest.
+#
+# urunc (github.com/urunc-dev/urunc) has a native VMM for hyperlight-unikraft
+# guests, run through containerd. That VMM support is being upstreamed from this
+# project; until it is on your host you can still PREPARE the OCI image here.
+#
+# just stage    - Build the workload rootfs + copy it and the kernel into this dir
+# just image    - Build the OCI image (bunny frontend; needs Docker/buildkit)
+# just inspect  - Show the com.urunc.unikernel.* annotations on the built image
+# just clean    - Remove the staged artifacts
+
+root_dir := justfile_directory() / ".." / ".."
+kernel   := root_dir / "kernel" / "elfloader_hyperlight-x86_64"
+rootfs   := root_dir / "build-elfloader" / "urunc-hello-rootfs.cpio"
+image    := "hluk/hello-urunc:demo"
+
+# Build the python rootfs with the demo workload baked in at /entrypoint.py,
+# then copy it (as initrd.cpio) and the kernel into the OCI build context.
+stage:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ( cd "{{root_dir}}" && just build-rootfs urunc-hello demos/urunc/rootfs.Dockerfile )
+    cp "{{kernel}}" elfloader_hyperlight-x86_64
+    cp "{{rootfs}}" initrd.cpio
+    echo "staged: elfloader_hyperlight-x86_64, initrd.cpio (python + /entrypoint.py)"
+
+# Build the OCI image (bunny runs as a buildkit frontend via the #syntax line).
+image: stage
+    docker build -f Containerfile -t {{image}} .
+
+# Show the urunc annotations baked into the image.
+inspect:
+    docker inspect -f '{{{{json .Config.Labels}}}}' {{image}}
+
+clean:
+    rm -f elfloader_hyperlight-x86_64 initrd.cpio

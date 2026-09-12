@@ -1,0 +1,5 @@
+target/
+build-elfloader/
+.snapshots/
+.git/
+bench-results.json
