@@ -4,7 +4,7 @@
 # bumping `version` in Cargo.toml on main.
 #
 # crates.io publishing is intentionally NOT triggered here — see cargo-publish.yml
-# and docs/RELEASE.md (the crate has git dependencies and can't be published yet).
+# and docs/RELEASE.md.
 name: Create release
 
 on:
