@@ -19,6 +19,12 @@ CONFIG_APPELFLOADER_STACK_NBPAGES=512
 CONFIG_LIBDEVFS=y
 CONFIG_LIBDEVFS_AUTOMOUNT=y
 CONFIG_LIBPOSIX_ENVIRON=y
+# ENVP0 defaults to PATH=/bin, where no interpreter lives, so a bare
+# subprocess.run(["python3", ...]) would fail.  The python drivers replace
+# PATH with /usr/local/bin:/usr/bin:/bin at startup (hl_pydriver.c,
+# hl_pywarmdriver.c); a host --env PATH still overrides it.  For a driverless
+# entry point (--entry /bin/sh) pass --env PATH=... instead, or set
+# CONFIG_LIBPOSIX_ENVIRON_ENVP0 here to cover every image at once.
 CONFIG_LIBPOSIX_EVENT=y
 CONFIG_LIBPOSIX_EVENTFD=y
 CONFIG_LIBPOSIX_FDIO=y
@@ -38,12 +44,14 @@ CONFIG_APPELFLOADER_MULTIPROCESS=y
 CONFIG_APPELFLOADER_ELF_BINFMT=y
 CONFIG_APPELFLOADER_BRK=y
 CONFIG_LIBPOSIX_SOCKET=y
+CONFIG_LIBPOSIX_UNIXSOCKET=y
 CONFIG_LIBPOSIX_SYSINFO=y
 CONFIG_LIBPOSIX_TIME=y
 CONFIG_LIBPOSIX_TIMERFD=y
 CONFIG_LIBPOSIX_USER=y
 CONFIG_LIBUKSIGNAL=y
 CONFIG_LIBUKRANDOM=y
+# CONFIG_LIBUKRANDOM_RESEED is not set
 CONFIG_LIBUKRANDOM_GETRANDOM=y
 CONFIG_LIBUKRANDOM_DEVFS=y
 CONFIG_LIBUKRANDOM_LCPU=y

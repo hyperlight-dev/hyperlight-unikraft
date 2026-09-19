@@ -1,6 +1,6 @@
 # Kernel
 
-The embedded kernel binary (`elfloader_hyperlight-x86_64`) is a Unikraft app-elfloader built against the `plat-hyperlight-cleanup` branch.
+The embedded kernel binary (`elfloader_hyperlight-x86_64`) is a Unikraft app-elfloader built against `unikraft/unikraft`'s `plat-hyperlight-v2` branch, whose `plat/hyperlight` carries the cooperative step model (`step.c`, `/dev/hlcall`) that lets the host drive long-running guests and snapshot them mid-run.
 
 Users don't need to build this — it's embedded in the `hluk` binary via `include_bytes!`. Only the rootfs (built with `just build-rootfs`) needs to be produced by users.
 
@@ -14,7 +14,7 @@ The kernel is built from three git submodules pinned under `kernel/`:
 
 | Submodule | Source | Branch |
 |-----------|--------|--------|
-| `unikraft` | [danbugs/unikraft](https://github.com/danbugs/unikraft) | `plat-hyperlight-cleanup` |
+| `unikraft` | [unikraft/unikraft](https://github.com/unikraft/unikraft) | `plat-hyperlight-v2` |
 | `app-elfloader` | [unikraft/app-elfloader](https://github.com/unikraft/app-elfloader) | `staging` |
 | `libs/libelf` | [unikraft/lib-libelf](https://github.com/unikraft/lib-libelf) | `staging` |
 
