@@ -15,6 +15,15 @@ hluk run --initrd ../../build-elfloader/c-rootfs.cpio --scratch-mb 64 \
          --mount ./:/mnt/bin --exec /mnt/bin/hello
 ```
 
+Or as the guest's entry point, with no runtime driver in between: the program is the guest's PID 1, runs to completion, and `hluk run` exits with its status (`status.c` returns 3):
+
+```bash
+hluk run --initrd ../../build-elfloader/c-rootfs.cpio --scratch-mb 64 \
+         --mount ./:/mnt/bin --entry /mnt/bin/hello
+hluk run --initrd ../../build-elfloader/c-rootfs.cpio --scratch-mb 64 \
+         --mount ./:/mnt/bin --entry /mnt/bin/status; echo $?   # 3
+```
+
 Or with a snapshot (save once, run many):
 
 ```bash

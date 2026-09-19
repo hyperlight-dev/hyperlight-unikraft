@@ -27,3 +27,11 @@ hluk snapshot save --initrd ../../build-elfloader/go-rootfs.cpio --scratch-mb 12
 # Run from snapshot — mount the directory with the binary
 hluk snapshot run ../../.snapshots/go --mount ./:/mnt/bin --exec /mnt/bin/hello
 ```
+
+`counter.go` is a small HTTP server that counts its requests.  It runs as the guest's entry point rather than through the driver, so it doubles as the test of a plain program under the step model (`go_counter_entry_survives_checkpoint_restore` in `tests/step.rs`):
+
+```bash
+hluk run --initrd ../../build-elfloader/go-rootfs.cpio --scratch-mb 256 \
+         --mount ./:/mnt/bin --net --port 8080 --entry "/mnt/bin/counter -port 8080"
+curl http://127.0.0.1:8080/    # count: 1
+```
