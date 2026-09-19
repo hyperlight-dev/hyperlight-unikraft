@@ -11,7 +11,9 @@
 
 use std::path::PathBuf;
 
-use hyperlight_unikraft::{ListenPorts, NetworkPolicy, SandboxBuilder, run};
+use tempfile::TempDir;
+
+use hyperlight_unikraft::{ListenPorts, NetworkPolicy, SandboxBuilder};
 
 #[allow(dead_code)]
 pub fn rootfs(runtime: &str) -> Option<PathBuf> {
@@ -33,11 +35,14 @@ pub fn require_rootfs(runtime: &str) -> PathBuf {
     }
 }
 
+/// A fresh directory under the system temp dir, named after the test.  It
+/// is removed when dropped, so a failed test leaves nothing behind either.
 #[allow(dead_code)]
-pub fn snapshot_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("hluk-test-{label}-{}", std::process::id(),));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+pub fn temp_dir(label: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("hluk-test-{label}-"))
+        .tempdir()
+        .unwrap()
 }
 
 /// Run hluk as a subprocess with piped stdin.
@@ -105,6 +110,19 @@ pub fn require_bins(runtime: &str) -> PathBuf {
     dir
 }
 
+/// [`require_bins`], and the one binary the test is after must be in it:
+/// a `bins/` built before that example was added is otherwise reported as
+/// a boot failure.
+#[allow(dead_code)]
+pub fn require_bin(runtime: &str, name: &str) -> PathBuf {
+    let dir = require_bins(runtime);
+    assert!(
+        dir.join(name).is_file(),
+        "build-elfloader/bins/{runtime}/{name} not found — rebuild with `just build-test-bins`",
+    );
+    dir
+}
+
 /// The host's non-loopback IP.
 #[allow(dead_code)]
 pub fn host_ip() -> String {
@@ -125,10 +143,7 @@ pub fn net_probe(
     host: &str,
     port: u16,
 ) -> String {
-    let rootfs = match rootfs("python") {
-        Some(p) => p,
-        None => return "SKIP".to_string(),
-    };
+    let rootfs = require_rootfs("python");
     let mut builder = SandboxBuilder::from_initrd(rootfs).scratch_mb(256);
     if let Some(policy) = policy {
         builder = builder.network(policy);
@@ -136,11 +151,11 @@ pub fn net_probe(
     if let Some(listen_ports) = listen_ports {
         builder = builder.listen_ports(listen_ports);
     }
-    let (mut sandbox, cfg) = builder.boot().unwrap();
+    let mut sandbox = builder.boot().unwrap();
     let code = format!(
         "HOST = {host:?}; PORT = {port}\n{}",
         include_str!("../../examples/python/net_policy_probe.py"),
     );
-    let _ = run(&mut sandbox, &*code);
-    cfg.drain_output()
+    let _ = sandbox.run(&*code);
+    sandbox.drain_output()
 }

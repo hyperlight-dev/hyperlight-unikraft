@@ -95,7 +95,7 @@ modules = [
 reason = """hostsock individual ops work; threaded select/poll works after halt_irq fix. \
 Remaining failures: threaded server tests that crash on thread lifecycle bugs, \
 getaddrinfo V4MAPPED assertion crash, AF_UNIX and SSL unsupported."""
-todo = "Fix thread lifecycle crashes; getaddrinfo V4MAPPED assertion in net_resolve"
+todo = "Fix thread lifecycle crashes; getaddrinfo V4MAPPED assertion"
 modules = [
     "test_docxmlrpc",           # HANG  — XML-RPC over HTTP; threaded server's select() never wakes
     "test_ftplib",              # CRASH — FTP client uses threaded server with select()

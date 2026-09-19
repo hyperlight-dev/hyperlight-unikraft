@@ -3,22 +3,19 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use common::{hluk_with_stdin, require_rootfs, snapshot_dir};
-use hyperlight_unikraft::{
-    Exec, Mount, NetworkPolicy, OciTag, SNAPSHOT_TAG, SandboxBuilder, Snapshot, run,
-};
+use common::{hluk_with_stdin, require_rootfs, temp_dir};
+use hyperlight_unikraft::{Exec, ListenPorts, Mount, NetworkPolicy, SandboxBuilder};
 
 #[test]
 fn python_inline_code() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(&mut sandbox, "print('hluk-test-ok')").unwrap();
-    let output = cfg.drain_output();
+    sandbox.run("print('hluk-test-ok')").unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("hluk-test-ok"),
         "expected guest to print 'hluk-test-ok', got: {output:?}",
@@ -29,12 +26,12 @@ fn python_inline_code() {
 fn python_exec_file() {
     let rootfs = require_rootfs("python");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/hello.py");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Hello"),
         "expected hello.py to produce output containing 'Hello', got: {output:?}",
@@ -44,47 +41,44 @@ fn python_exec_file() {
 #[test]
 fn python_snapshot_round_trip() {
     let rootfs = require_rootfs("python");
-    let snap_dir = snapshot_dir("py-snap");
+    let snap_dir = temp_dir("py-snap");
 
     // Save
-    let (mut sandbox, _cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    let snap = sandbox.snapshot().unwrap();
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    snap.save(&snap_dir, &tag).unwrap();
+    sandbox.snapshot_to(&snap_dir).unwrap();
 
     // Restore + run
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    let snap = Arc::new(Snapshot::load(&snap_dir, tag).unwrap());
-    let (mut sandbox, cfg2) = SandboxBuilder::from_snapshot(snap).boot().unwrap();
-    run(&mut sandbox, "print('restored-ok')").unwrap();
-    let output = cfg2.drain_output();
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap_dir)
+        .unwrap()
+        .boot()
+        .unwrap();
+    sandbox.run("print('restored-ok')").unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("restored-ok"),
         "expected restored guest to print 'restored-ok', got: {output:?}",
     );
-
-    let _ = std::fs::remove_dir_all(&snap_dir);
 }
 
 #[test]
 fn python_multiple_runs() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(&mut sandbox, "x = 1 + 1").unwrap();
-    run(&mut sandbox, "print(f'x={x}')").unwrap();
-    let output = cfg.drain_output();
+    sandbox.run("x = 1 + 1").unwrap();
+    sandbox.run("print(f'x={x}')").unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("x=2"),
         "expected 'x=2' after multiple runs, got: {output:?}",
     );
-    run(&mut sandbox, "import sys; print(sys.version)").unwrap();
-    let output = cfg.drain_output();
+    sandbox.run("import sys; print(sys.version)").unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("3.12"),
         "expected sys.version to contain '3.12', got: {output:?}",
@@ -94,22 +88,21 @@ fn python_multiple_runs() {
 #[test]
 fn python_env_vars() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    cfg.set_env_vars(&[
+    sandbox.set_env_vars(&[
         ("MY_VAR", "hello_world"),
         ("DEBUG", "1"),
         ("GREETING", "hi there"),
-    ])
-    .unwrap();
-    run(
-        &mut sandbox,
-        Exec::File(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/env_vars.py")),
-    )
-    .unwrap();
-    let output = cfg.drain_output();
+    ]);
+    sandbox
+        .run(Exec::File(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/env_vars.py"),
+        ))
+        .unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("MY_VAR=hello_world"),
         "expected MY_VAR=hello_world, got: {output:?}"
@@ -127,13 +120,15 @@ fn python_env_vars() {
 #[test]
 fn python_env_vars_inline() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    cfg.set_env_vars(&[("SECRET", "42")]).unwrap();
-    run(&mut sandbox, "import os; print(os.environ['SECRET'])").unwrap();
-    let output = cfg.drain_output();
+    sandbox.set_env_vars(&[("SECRET", "42")]);
+    sandbox
+        .run("import os; print(os.environ['SECRET'])")
+        .unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("42"),
         "expected '42' from SECRET env var, got: {output:?}",
@@ -143,95 +138,91 @@ fn python_env_vars_inline() {
 #[test]
 fn python_env_vars_snapshot_restore() {
     let rootfs = require_rootfs("python");
-    let snap_dir = snapshot_dir("py-env-snap");
+    let snap_dir = temp_dir("py-env-snap");
 
     // Save snapshot (no env vars set at save time)
-    let (mut sandbox, _cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    let snap = sandbox.snapshot().unwrap();
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    snap.save(&snap_dir, &tag).unwrap();
+    sandbox.snapshot_to(&snap_dir).unwrap();
 
     // Restore + set env vars AFTER restore
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    let snap = Arc::new(Snapshot::load(&snap_dir, tag).unwrap());
-    let (mut sandbox, cfg2) = SandboxBuilder::from_snapshot(snap).boot().unwrap();
-    cfg2.set_env_vars(&[("RESTORED_VAR", "from_snapshot")])
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap_dir)
+        .unwrap()
+        .boot()
         .unwrap();
-    run(
-        &mut sandbox,
-        r#"
+    sandbox.set_env_vars(&[("RESTORED_VAR", "from_snapshot")]);
+    sandbox
+        .run(
+            r#"
 import os
 v = os.environ.get('RESTORED_VAR', 'NOT_FOUND')
 print(f'RESTORED_VAR={v}')
 "#,
-    )
-    .unwrap();
-    let output = cfg2.drain_output();
+        )
+        .unwrap();
+    let output = sandbox.drain_output();
     eprintln!("snapshot env output: {output:?}");
     assert!(
         output.contains("RESTORED_VAR=from_snapshot"),
         "expected env var set after snapshot restore, got: {output:?}",
     );
-
-    let _ = std::fs::remove_dir_all(&snap_dir);
 }
 
 /// Env vars are stateful across dispatches without restore.
 #[test]
 fn python_env_vars_stateful_across_dispatches() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
 
     // 1. Run with no env vars set — STATEFUL_VAR should not exist.
-    run(
-        &mut sandbox,
-        r#"
+    sandbox
+        .run(
+            r#"
 import os
 v = os.environ.get('STATEFUL_VAR', 'NOT_FOUND')
 print(f'step1: STATEFUL_VAR={v}')
 "#,
-    )
-    .unwrap();
-    let out1 = cfg.drain_output();
+        )
+        .unwrap();
+    let out1 = sandbox.drain_output();
     assert!(
         out1.contains("step1: STATEFUL_VAR=NOT_FOUND"),
         "expected no STATEFUL_VAR before setting, got: {out1:?}",
     );
 
     // 2. Set env vars, then run — should see them.
-    cfg.set_env_vars(&[("STATEFUL_VAR", "persisted")]).unwrap();
-    run(
-        &mut sandbox,
-        r#"
+    sandbox.set_env_vars(&[("STATEFUL_VAR", "persisted")]);
+    sandbox
+        .run(
+            r#"
 import os
 v = os.environ.get('STATEFUL_VAR', 'NOT_FOUND')
 print(f'step2: STATEFUL_VAR={v}')
 "#,
-    )
-    .unwrap();
-    let out2 = cfg.drain_output();
+        )
+        .unwrap();
+    let out2 = sandbox.drain_output();
     assert!(
         out2.contains("step2: STATEFUL_VAR=persisted"),
         "expected STATEFUL_VAR=persisted after setting, got: {out2:?}",
     );
 
     // 3. Run AGAIN without setting env vars or restoring.
-    run(
-        &mut sandbox,
-        r#"
+    sandbox
+        .run(
+            r#"
 import os
 v = os.environ.get('STATEFUL_VAR', 'NOT_FOUND')
 print(f'step3: STATEFUL_VAR={v}')
 "#,
-    )
-    .unwrap();
-    let out3 = cfg.drain_output();
+        )
+        .unwrap();
+    let out3 = sandbox.drain_output();
     assert!(
         out3.contains("step3: STATEFUL_VAR=persisted"),
         "expected env vars to persist across dispatches without restore, got: {out3:?}",
@@ -328,25 +319,24 @@ fn python_stdin_empty_piped() {
 #[test]
 fn python_fs_ops() {
     let rootfs = require_rootfs("python");
-    let mount_dir = std::env::temp_dir().join(format!("hluk-fs-ops-{}", std::process::id()));
-    std::fs::create_dir_all(&mount_dir).unwrap();
+    let mount_dir = temp_dir("fs-ops");
 
-    let mounts = vec![Mount::rw(&mount_dir, "/mnt/host")];
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mounts = vec![Mount::rw(mount_dir.path(), "/mnt/host")];
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .mounts(mounts)
         .boot()
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/fs_ops.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Cleanup done"),
         "expected fs_ops.py to print 'Cleanup done', got: {output:?}",
     );
 
-    let sentinel = mount_dir.join("sentinel.txt");
+    let sentinel = mount_dir.path().join("sentinel.txt");
     let content = std::fs::read_to_string(&sentinel)
         .expect("sentinel.txt should exist on the host after guest write");
     assert_eq!(content, "guest-was-here\n", "sentinel content mismatch");
@@ -362,26 +352,23 @@ fn python_fs_ops() {
         "expected only sentinel.txt, found: {:?}",
         entries
     );
-
-    let _ = std::fs::remove_dir_all(&mount_dir);
 }
 
 #[test]
 fn python_fs_large_file() {
     let rootfs = require_rootfs("python");
-    let mount_dir = std::env::temp_dir().join(format!("hluk-fs-large-{}", std::process::id()));
-    std::fs::create_dir_all(&mount_dir).unwrap();
+    let mount_dir = temp_dir("fs-large");
 
-    let mounts = vec![Mount::rw(&mount_dir, "/mnt/host")];
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mounts = vec![Mount::rw(mount_dir.path(), "/mnt/host")];
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .mounts(mounts)
         .boot()
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/fs_large.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("large file round-trip OK"),
         "expected fs_large.py to print 'large file round-trip OK', got: {output:?}",
@@ -393,21 +380,19 @@ fn python_fs_large_file() {
         "fs_large.py should clean up, but {} entries remain",
         entries.len()
     );
-
-    let _ = std::fs::remove_dir_all(&mount_dir);
 }
 
 #[test]
 fn python_guest_fs_ops() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/guest_fs.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Guest filesystem tests passed"),
         "expected guest_fs.py to print 'Guest filesystem tests passed', got: {output:?}",
@@ -415,17 +400,36 @@ fn python_guest_fs_ops() {
 }
 
 #[test]
+fn python_asyncio() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .listen_ports(ListenPorts::from_ports([18095]))
+        .boot()
+        .unwrap();
+
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/asyncio_demo.py");
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("asyncio demo passed"),
+        "expected asyncio demo to pass, got: {output:?}",
+    );
+}
+
+#[test]
 fn python_threading() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/threading_demo.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Threading demo passed"),
         "expected threading_demo.py to print 'Threading demo passed', got: {output:?}",
@@ -435,15 +439,15 @@ fn python_threading() {
 #[test]
 fn python_subprocess() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/subprocess_demo.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Subprocess demo passed"),
         "expected subprocess_demo.py to print 'Subprocess demo passed', got: {output:?}",
@@ -453,15 +457,15 @@ fn python_subprocess() {
 #[test]
 fn python_tcp_echo() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .network(NetworkPolicy::AllowAll)
         .boot()
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/tcp_echo.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("TCP echo test passed"),
         "expected tcp_echo.py to print 'TCP echo test passed', got: {output:?}",
@@ -471,15 +475,15 @@ fn python_tcp_echo() {
 #[test]
 fn python_tcp_bidir() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .network(NetworkPolicy::AllowAll)
         .boot()
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/tcp_bidir.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Bidirectional TCP test passed"),
         "expected tcp_bidir.py to print 'Bidirectional TCP test passed', got: {output:?}",
@@ -489,7 +493,7 @@ fn python_tcp_bidir() {
 #[test]
 fn python_http_server_client() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .network(NetworkPolicy::AllowAll)
         .boot()
@@ -497,8 +501,8 @@ fn python_http_server_client() {
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/http_server_client.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("HTTP server+client test passed"),
         "expected http_server_client.py to print 'HTTP server+client test passed', got: {output:?}",
@@ -508,15 +512,15 @@ fn python_http_server_client() {
 #[test]
 fn python_http_get() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .network(NetworkPolicy::AllowAll)
         .boot()
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/http_get.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Status: 200"),
         "expected http_get.py to get Status: 200, got: {output:?}",
@@ -526,7 +530,7 @@ fn python_http_get() {
 #[test]
 fn python_threaded_select() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .network(NetworkPolicy::AllowAll)
         .boot()
@@ -534,10 +538,101 @@ fn python_threaded_select() {
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/threaded_select.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Threaded select() test passed"),
         "expected threaded_select.py to pass, got: {output:?}",
     );
+}
+
+/// `sys.exit()` ends the call the way it ends a script: its code is the
+/// call's status, and the interpreter is still there for the next call.
+#[test]
+fn python_sys_exit_ends_the_call() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox
+        .run("import sys\nprint('leaving')\nsys.exit(0)\nprint('not reached')")
+        .unwrap();
+    assert_eq!(sandbox.drain_output(), "leaving\r\n");
+    assert!(
+        sandbox.run("import sys\nsys.exit(3)").is_err(),
+        "a non-zero exit code did not fail the call"
+    );
+    assert!(
+        sandbox.run("import sys\nsys.exit('bye')").is_err(),
+        "a message exit did not fail the call"
+    );
+    assert!(
+        sandbox.drain_output().contains("bye"),
+        "the exit message was not printed"
+    );
+    sandbox.run("print('still here')").unwrap();
+    assert!(sandbox.drain_output().contains("still here"));
+}
+
+/// `sys.exit` ends the call, not the interpreter, so the guest can still be
+/// snapshotted afterwards and the restored clone takes calls.
+#[test]
+fn python_sys_exit_then_snapshot_restore() {
+    let rootfs = require_rootfs("python");
+    let snap_dir = temp_dir("py-exit-snap");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox.run("kept = 'yes'").unwrap();
+    assert!(
+        sandbox.run("import sys\nsys.exit(3)").is_err(),
+        "a non-zero exit code did not fail the call"
+    );
+    sandbox.snapshot_to(&snap_dir).unwrap();
+
+    let mut restored = SandboxBuilder::from_snapshot_dir(&snap_dir)
+        .unwrap()
+        .boot()
+        .unwrap();
+    restored.run("print('kept =', kept)").unwrap();
+    assert_eq!(restored.drain_output(), "kept = yes\r\n");
+}
+
+/// A mounted directory too large to list in one host call fails that one
+/// `listdir` with `EOVERFLOW`, and the sandbox goes on; before, the call
+/// failed inside the hypervisor and poisoned the sandbox.  A listing's
+/// other errors arrive as themselves, not as `EIO`.
+#[test]
+fn python_huge_directory_listing_fails_cleanly() {
+    let rootfs = require_rootfs("python");
+    let dir = temp_dir("huge-dir");
+    for i in 0..5000 {
+        std::fs::write(dir.path().join(format!("file_{i}.txt")), b"").unwrap();
+    }
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .mounts(vec![Mount::ro(dir.path(), "/mnt/huge")])
+        .boot()
+        .unwrap();
+    sandbox
+        .run(concat!(
+            "import errno, os\n",
+            "try:\n",
+            "    os.listdir('/mnt/huge')\n",
+            "    print('listed')\n",
+            "except OSError as e:\n",
+            "    print('listdir errno', e.errno == errno.EOVERFLOW)\n",
+            "try:\n",
+            "    os.listdir('/mnt/huge/nope')\n",
+            "except OSError as e:\n",
+            "    print('missing errno', e.errno == errno.ENOENT)\n",
+        ))
+        .unwrap();
+    let out = sandbox.drain_output();
+    assert!(out.contains("listdir errno True"), "{out:?}");
+    assert!(out.contains("missing errno True"), "{out:?}");
+    sandbox.run("print('still here')").unwrap();
+    assert!(sandbox.drain_output().contains("still here"));
 }

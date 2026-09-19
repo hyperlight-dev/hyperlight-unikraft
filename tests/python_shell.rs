@@ -3,21 +3,20 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use common::{require_rootfs, snapshot_dir};
-use hyperlight_unikraft::{Exec, OciTag, SNAPSHOT_TAG, SandboxBuilder, Snapshot, run};
+use common::{require_rootfs, temp_dir};
+use hyperlight_unikraft::{Exec, SandboxBuilder};
 
 #[test]
 fn python_shell_hello() {
     let rootfs = require_rootfs("python-shell");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/hello.py");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from the Hyperlight agent"),
         "expected agent hello.py to run on python-shell, got: {output:?}",
@@ -27,13 +26,13 @@ fn python_shell_hello() {
 #[test]
 fn python_shell_ssl_available() {
     let rootfs = require_rootfs("python-shell");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(
-        &mut sandbox,
-        r#"
+    sandbox
+        .run(
+            r#"
 import ssl
 print(f'ssl={ssl.OPENSSL_VERSION}')
 import sqlite3
@@ -41,9 +40,9 @@ print('sqlite3-ok')
 import ctypes
 print('ctypes-ok')
 "#,
-    )
-    .unwrap();
-    let output = cfg.drain_output();
+        )
+        .unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("ssl="),
         "SSL not available in python-shell: {output:?}"
@@ -62,12 +61,12 @@ print('ctypes-ok')
 fn python_shell_shell_subprocess() {
     let rootfs = require_rootfs("python-shell");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/shell_commands.py");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from hush shell!"),
         "expected shell_commands.py to work on python-shell, got: {output:?}",
@@ -77,23 +76,23 @@ fn python_shell_shell_subprocess() {
 #[test]
 fn python_shell_no_numpy() {
     let rootfs = require_rootfs("python-shell");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
     // python-shell should NOT have numpy — it's the slim rootfs
-    run(
-        &mut sandbox,
-        r#"
+    sandbox
+        .run(
+            r#"
 try:
     import numpy
     print('numpy-found')
 except ImportError:
     print('numpy-missing-ok')
 "#,
-    )
-    .unwrap();
-    let output = cfg.drain_output();
+        )
+        .unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("numpy-missing-ok"),
         "python-shell should NOT have numpy, got: {output:?}",
@@ -103,28 +102,25 @@ except ImportError:
 #[test]
 fn python_shell_snapshot_round_trip() {
     let rootfs = require_rootfs("python-shell");
-    let snap_dir = snapshot_dir("python-shell-snap");
+    let snap_dir = temp_dir("python-shell-snap");
 
     // Save
-    let (mut sandbox, _cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    let snap = sandbox.snapshot().unwrap();
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    snap.save(&snap_dir, &tag).unwrap();
+    sandbox.snapshot_to(&snap_dir).unwrap();
 
     // Restore + run hello.py from snapshot
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    let snap = Arc::new(Snapshot::load(&snap_dir, tag).unwrap());
-    let (mut sandbox, cfg2) = SandboxBuilder::from_snapshot(snap).boot().unwrap();
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap_dir)
+        .unwrap()
+        .boot()
+        .unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/hello.py");
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg2.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from the Hyperlight agent"),
         "expected hello.py to work after python-shell snapshot restore, got: {output:?}",
     );
-
-    let _ = std::fs::remove_dir_all(&snap_dir);
 }

@@ -46,14 +46,17 @@ fn native_kernel_boots_and_prints() {
 
     // A bare native kernel: no initrd, no mounts, no networking.
     // boot() runs the guest's main() to its halt; capture what it printed.
-    let (_sandbox, cfg) = SandboxBuilder::from_kernel(kernel)
+    let mut sandbox = SandboxBuilder::from_kernel(kernel)
         .scratch_mb(64)
         .boot()
         .unwrap();
-    let output = cfg.drain_output();
+    let output = sandbox.drain_output();
 
     assert!(
         output.contains("Hello, World from a NATIVE mini kernel"),
         "native kernel boot output missing greeting, got: {output:?}",
     );
+    // main() returned 0 during boot; the kernel reports it on the way down
+    // even without the step model, so join() has nothing left to drive.
+    assert_eq!(sandbox.join().unwrap(), 0);
 }

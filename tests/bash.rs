@@ -3,20 +3,19 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use common::{hluk_with_stdin, require_rootfs, snapshot_dir};
-use hyperlight_unikraft::{Exec, OciTag, SNAPSHOT_TAG, SandboxBuilder, Snapshot, run};
+use common::{hluk_with_stdin, require_rootfs, temp_dir};
+use hyperlight_unikraft::{Exec, SandboxBuilder};
 
 #[test]
 fn bash_inline_code() {
     let rootfs = require_rootfs("bash");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(&mut sandbox, "echo 'hluk-bash-ok'").unwrap();
-    let output = cfg.drain_output();
+    sandbox.run("echo 'hluk-bash-ok'").unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("hluk-bash-ok"),
         "expected guest to print 'hluk-bash-ok', got: {output:?}",
@@ -27,12 +26,12 @@ fn bash_inline_code() {
 fn bash_exec_file() {
     let rootfs = require_rootfs("bash");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/bash/hello.sh");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("Hello"),
         "expected hello.sh to produce output containing 'Hello', got: {output:?}",
@@ -42,39 +41,36 @@ fn bash_exec_file() {
 #[test]
 fn bash_snapshot_round_trip() {
     let rootfs = require_rootfs("bash");
-    let snap_dir = snapshot_dir("bash-snap");
+    let snap_dir = temp_dir("bash-snap");
 
-    let (mut sandbox, _cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    let snap = sandbox.snapshot().unwrap();
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    snap.save(&snap_dir, &tag).unwrap();
+    sandbox.snapshot_to(&snap_dir).unwrap();
 
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    let snap = Arc::new(Snapshot::load(&snap_dir, tag).unwrap());
-    let (mut sandbox, cfg2) = SandboxBuilder::from_snapshot(snap).boot().unwrap();
-    run(&mut sandbox, "echo 'restored-bash-ok'").unwrap();
-    let output = cfg2.drain_output();
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap_dir)
+        .unwrap()
+        .boot()
+        .unwrap();
+    sandbox.run("echo 'restored-bash-ok'").unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("restored-bash-ok"),
         "expected restored guest to print 'restored-bash-ok', got: {output:?}",
     );
-
-    let _ = std::fs::remove_dir_all(&snap_dir);
 }
 
 #[test]
 fn bash_multiple_runs() {
     let rootfs = require_rootfs("bash");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(&mut sandbox, "x=42").unwrap();
-    run(&mut sandbox, "echo \"x=$x\"").unwrap();
-    let output = cfg.drain_output();
+    sandbox.run("x=42").unwrap();
+    sandbox.run("echo \"x=$x\"").unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("x=42"),
         "expected 'x=42' after multiple runs, got: {output:?}",
@@ -85,12 +81,12 @@ fn bash_multiple_runs() {
 fn bash_coreutils() {
     let rootfs = require_rootfs("bash");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/bash/coreutils.sh");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    run(&mut sandbox, Exec::File(script)).unwrap();
-    let output = cfg.drain_output();
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
 
     assert!(
         output.contains("=== cat ==="),
@@ -172,22 +168,21 @@ fn bash_shell_interactive() {
 #[test]
 fn bash_env_vars() {
     let rootfs = require_rootfs("bash");
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    cfg.set_env_vars(&[
+    sandbox.set_env_vars(&[
         ("MY_VAR", "hello_world"),
         ("DEBUG", "1"),
         ("GREETING", "hi there"),
-    ])
-    .unwrap();
-    run(
-        &mut sandbox,
-        Exec::File(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/bash/env_vars.sh")),
-    )
-    .unwrap();
-    let output = cfg.drain_output();
+    ]);
+    sandbox
+        .run(Exec::File(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/bash/env_vars.sh"),
+        ))
+        .unwrap();
+    let output = sandbox.drain_output();
     assert!(
         output.contains("MY_VAR=hello_world"),
         "expected MY_VAR=hello_world, got: {output:?}"
@@ -200,4 +195,25 @@ fn bash_env_vars() {
         output.contains("GREETING=hi there"),
         "expected GREETING=hi there, got: {output:?}"
     );
+}
+
+/// `exit` ends the shell, which is the runtime: the call ends with that
+/// status, and the next call starts a fresh shell.
+#[test]
+fn bash_exit_ends_the_call() {
+    let rootfs = require_rootfs("bash");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox
+        .run("echo leaving; exit 0; echo not reached")
+        .unwrap();
+    assert_eq!(sandbox.drain_output(), "leaving\r\n");
+    assert!(
+        sandbox.run("exit 3").is_err(),
+        "exit 3 did not fail the call"
+    );
+    sandbox.run("echo still here").unwrap();
+    assert!(sandbox.drain_output().contains("still here"));
 }

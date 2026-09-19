@@ -11,10 +11,8 @@
 
 mod common;
 
-use std::sync::Arc;
-
-use common::{BIN_MOUNT, require_bins, require_rootfs, snapshot_dir};
-use hyperlight_unikraft::{Mount, OciTag, SNAPSHOT_TAG, SandboxBuilder, Snapshot, run};
+use common::{BIN_MOUNT, require_bins, require_rootfs, temp_dir};
+use hyperlight_unikraft::{Mount, SandboxBuilder};
 
 /// Environment handed to the `env_vars` examples.
 const ENV: &[(&str, &str)] = &[
@@ -28,50 +26,43 @@ const ENV: &[(&str, &str)] = &[
 fn run_bins(runtime: &str, scratch_mb: usize, env: &[(&str, &str)], paths: &[&str]) -> String {
     let rootfs = require_rootfs(runtime);
     let mounts = vec![Mount::rw(require_bins(runtime), BIN_MOUNT)];
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(scratch_mb)
         .mounts(mounts)
         .boot()
         .unwrap();
     if !env.is_empty() {
-        cfg.set_env_vars(env).unwrap();
+        sandbox.set_env_vars(env);
     }
     for path in paths {
-        run(&mut sandbox, *path).unwrap();
+        sandbox.run(*path).unwrap();
     }
-    cfg.drain_output()
+    sandbox.drain_output()
 }
 
 /// Snapshot `runtime` with an empty [`BIN_MOUNT`], restore it with the
 /// prebuilt binaries mounted, run `path`, and return the output.
 fn run_bin_from_snapshot(runtime: &str, scratch_mb: usize, path: &str) -> String {
     let rootfs = require_rootfs(runtime);
-    let snap_dir = snapshot_dir(&format!("{runtime}-snap"));
-    let empty_mount = snapshot_dir(&format!("{runtime}-snap-mount"));
+    let snap_dir = temp_dir(&format!("{runtime}-snap"));
+    let empty_mount = temp_dir(&format!("{runtime}-snap-mount"));
 
-    let mounts_save = vec![Mount::rw(&empty_mount, BIN_MOUNT)];
-    let (mut sandbox, _cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mounts_save = vec![Mount::rw(empty_mount.path(), BIN_MOUNT)];
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(scratch_mb)
         .mounts(mounts_save)
         .boot()
         .unwrap();
-    let snap = sandbox.snapshot().unwrap();
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    snap.save(&snap_dir, &tag).unwrap();
+    sandbox.snapshot_to(&snap_dir).unwrap();
 
     let mounts_run = vec![Mount::rw(require_bins(runtime), BIN_MOUNT)];
-    let tag: OciTag = SNAPSHOT_TAG.parse().unwrap();
-    let snap = Arc::new(Snapshot::load(&snap_dir, tag).unwrap());
-    let (mut sandbox, cfg2) = SandboxBuilder::from_snapshot(snap)
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap_dir)
+        .unwrap()
         .mounts(mounts_run)
         .boot()
         .unwrap();
-    run(&mut sandbox, path).unwrap();
-    let output = cfg2.drain_output();
-
-    let _ = std::fs::remove_dir_all(&empty_mount);
-    let _ = std::fs::remove_dir_all(&snap_dir);
-    output
+    sandbox.run(path).unwrap();
+    sandbox.drain_output()
 }
 
 fn assert_env(output: &str) {
@@ -98,6 +89,28 @@ fn c_hello() {
         output.contains("Hello from C on Hyperlight"),
         "expected C hello output, got: {output:?}"
     );
+}
+
+/// A program that exits non-zero fails the call, as it would fail a
+/// shell: the exec driver collects the child's status instead of taking
+/// the closed pipe for a success.
+#[test]
+fn c_exit_status_fails_the_call() {
+    let rootfs = require_rootfs("c");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(64)
+        .mounts(vec![Mount::rw(require_bins("c"), BIN_MOUNT)])
+        .boot()
+        .unwrap();
+    sandbox.run("/mnt/bin/hello").unwrap();
+    assert!(
+        sandbox.run("/mnt/bin/status").is_err(),
+        "exit status 3 was reported as success"
+    );
+    sandbox
+        .run("/mnt/bin/hello")
+        .expect("the guest serves calls after a failed one");
+    assert!(sandbox.drain_output().contains("Hello from C"));
 }
 
 #[test]
@@ -129,6 +142,53 @@ fn cpp_hello() {
         output.contains("Hello from C++ on Hyperlight"),
         "expected C++ hello output, got: {output:?}"
     );
+}
+
+/// A plain program as the guest's entry point: no driver, nothing to
+/// dispatch.  It runs to completion during boot, and `join` hands back its
+/// exit status -- what `hluk run --entry` mirrors.
+#[test]
+fn c_entry_point_exit_status() {
+    let rootfs = require_rootfs("c");
+    let bins = require_bins("c");
+    for (bin, status, marker) in [("hello", 0, "Hello from C"), ("status", 3, "")] {
+        let mut sandbox = SandboxBuilder::from_initrd(&rootfs)
+            .scratch_mb(64)
+            .mounts(vec![Mount::rw(&bins, BIN_MOUNT)])
+            .entry(format!("{BIN_MOUNT}/{bin}"))
+            .boot()
+            .unwrap();
+        assert!(
+            !sandbox.has_driver(),
+            "{bin}: a plain program is not a driver"
+        );
+        assert!(
+            sandbox.submit("x").is_err(),
+            "{bin}: nothing in the guest serves calls"
+        );
+        assert_eq!(sandbox.join().unwrap(), status, "{bin}");
+        let output = sandbox.drain_output();
+        assert!(output.contains(marker), "{bin}: got {output:?}");
+    }
+}
+
+/// Builder env vars reach a program that is the entry point: the kernel
+/// fetches the environment on its way to main(), before any call could
+/// refresh it, so they must be set before the boot.
+#[test]
+fn c_entry_point_sees_builder_env() {
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("c"))
+        .scratch_mb(64)
+        .mounts(vec![Mount::rw(require_bins("c"), BIN_MOUNT)])
+        .entry(format!("{BIN_MOUNT}/env_vars"))
+        .env("MY_VAR", "hello_world")
+        .env("DEBUG", "1")
+        .boot()
+        .unwrap();
+    assert_eq!(sandbox.join().unwrap(), 0);
+    let output = sandbox.drain_output();
+    assert!(output.contains("MY_VAR=hello_world"), "got: {output:?}");
+    assert!(output.contains("DEBUG=1"), "got: {output:?}");
 }
 
 #[test]
@@ -218,20 +278,19 @@ fn dotnet_aot_capabilities() {
     // from BIN_MOUNT; it writes to guest /tmp and to a second, writable host
     // mount at /mnt/out, which we verify on the host side.
     let rootfs = require_rootfs("dotnet-aot");
-    let out_dir = std::env::temp_dir().join(format!("hluk-dotnet-aot-caps-{}", std::process::id()));
-    std::fs::create_dir_all(&out_dir).unwrap();
+    let out_dir = temp_dir("dotnet-aot-caps");
 
     let mounts = vec![
         Mount::rw(require_bins("dotnet-aot"), BIN_MOUNT),
-        Mount::rw(&out_dir, "/mnt/out"),
+        Mount::rw(out_dir.path(), "/mnt/out"),
     ];
-    let (mut sandbox, cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .mounts(mounts)
         .boot()
         .unwrap();
-    run(&mut sandbox, "/mnt/bin/Caps").unwrap();
-    let output = cfg.drain_output();
+    sandbox.run("/mnt/bin/Caps").unwrap();
+    let output = sandbox.drain_output();
 
     assert!(
         output.contains("guest-fs-read-back: aot-guest-fs-data"),
@@ -247,9 +306,7 @@ fn dotnet_aot_capabilities() {
     );
     // The host-fs write went through hostfs and landed on the host side.
     assert!(
-        out_dir.join("aot_host_fs.txt").exists(),
+        out_dir.path().join("aot_host_fs.txt").exists(),
         "expected AOT Caps host-fs write to appear on the host mount"
     );
-
-    let _ = std::fs::remove_dir_all(&out_dir);
 }
