@@ -772,13 +772,15 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-unikraft"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cap-std",
  "clap",
  "hyperlight-common",
  "hyperlight-host",
  "rustix",
+ "tempfile",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
