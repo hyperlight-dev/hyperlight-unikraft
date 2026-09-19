@@ -5,15 +5,15 @@
 //! on Hyperlight.
 //!
 //! ```no_run
-//! use hyperlight_unikraft::{SandboxBuilder, run};
+//! use hyperlight_unikraft::SandboxBuilder;
 //!
-//! let (mut sandbox, cfg) = SandboxBuilder::from_initrd("rootfs/python.cpio")
+//! let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
 //!     .scratch_mb(256)
 //!     .boot()?;
-//! run(&mut sandbox, "print('hello')")?;
-//! let output = cfg.drain_output();
+//! sandbox.run("print('hello')")?;
+//! let output = sandbox.drain_output();
 //! assert!(output.contains("hello"));
-//! # Ok::<(), hyperlight_unikraft::hyperlight_host::HyperlightError>(())
+//! # Ok::<(), hyperlight_unikraft::Error>(())
 //! ```
 
 use std::fmt::Write as _;
@@ -21,19 +21,17 @@ use std::fs::File;
 use std::io::{Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub use hyperlight_host;
 
 use hyperlight_host::{
-    GuestBinary, MultiUseSandbox, UninitializedSandbox, func::Registerable,
-    sandbox::SandboxConfiguration,
+    GuestBinary, HyperlightError, MultiUseSandbox, UninitializedSandbox, func::Registerable,
+    sandbox::SandboxConfiguration, sandbox::snapshot::OciTag,
 };
 
 // Re-export snapshot types so dependents don't need hyperlight-host directly.
-pub use hyperlight_host::{
-    HostFunctions,
-    sandbox::snapshot::{OciTag, Snapshot},
-};
+pub use hyperlight_host::{HostFunctions, sandbox::snapshot::Snapshot};
 
 use tracing::{debug, info};
 
@@ -42,7 +40,99 @@ mod hostfs;
 mod hostnet;
 pub mod net_policy;
 
-pub use net_policy::{AllowList, BlockList, ListenPorts, NetworkPolicy};
+pub use net_policy::{AllowList, BlockList, ListenPorts, NetworkPolicy, ResolveError};
+
+// ── Errors ──────────────────────────────────────────────────────────────
+
+/// Why a sandbox operation failed.
+///
+/// The guest's conditions and this crate's contract have a variant each,
+/// so an embedder can match them; what the hypervisor layer reports comes
+/// through as [`Hyperlight`](Self::Hyperlight).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    /// The driver reported the call failed, with the status it gave (see
+    /// [`Yield::CallFailed`]).  The guest is alive; its output has the
+    /// details.
+    #[error("the call failed in the guest with status {status} (see its output)")]
+    CallFailed { status: i32 },
+    /// The guest process has exited with `status`: before the call
+    /// returned, or before one could be submitted.  Nothing will run
+    /// again.
+    #[error("the guest exited with status {status}")]
+    GuestExited { status: i32 },
+    /// Every guest thread is blocked with no timer pending and no host
+    /// socket that could wake it, while a call's return or the process's
+    /// exit is still owed.
+    #[error(
+        "the guest is deadlocked: every thread is blocked with no timer pending and no host \
+         socket that could wake it"
+    )]
+    Deadlocked,
+    /// The guest has no driver to serve calls: its entry point is a plain
+    /// program, driven with [`AppSandbox::join`].
+    #[error(
+        "the guest has no driver to serve calls: its entry point is a plain program (drive it \
+         with join)"
+    )]
+    NoDriver,
+    /// A call is already in flight; step until it is done first.
+    #[error("a call is already in flight; step until it is done first")]
+    CallInFlight,
+    /// Nothing in the guest can exit: its driver is waiting for a call
+    /// (use [`AppSandbox::run`] or [`AppSandbox::submit`], not `join`).
+    #[error(
+        "nothing in the guest can exit: its driver is waiting for a call (use run or submit \
+         instead of join)"
+    )]
+    NothingToJoin,
+    /// The kernel refused the call: nothing is reading `/dev/hlcall`.
+    #[error("the guest refused the call: nothing is reading /dev/hlcall")]
+    CallRejected,
+    /// The guest halted without reporting a boundary or an exit: its
+    /// kernel is not one of ours, or the entry failed.
+    #[error("the guest halted without a word: its kernel reported neither a boundary nor an exit")]
+    GuestSilent,
+    /// A guest mount path the kernel's fstab list would misparse: not
+    /// absolute, or containing whitespace, `:` or brackets.
+    #[error(
+        "guest mount path {guest_path:?} must be absolute and contain no whitespace, ':' or \
+         brackets (it is passed to the kernel in its vfs.fstab list)"
+    )]
+    MountPath { guest_path: String },
+    /// A host mount directory could not be opened.
+    #[error(
+        "cannot open the host directory {} for the guest mount {guest_path}: {source}",
+        host_path.display()
+    )]
+    Mount {
+        host_path: PathBuf,
+        guest_path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A `from_snapshot` builder was given a kernel, initrd, entry point
+    /// or scratch size; the snapshot carries its own.
+    #[error(
+        "a snapshot carries its own kernel, initrd, entry point and scratch size: \
+         kernel/initrd/entry/scratch_mb do not apply to from_snapshot"
+    )]
+    SnapshotSettings,
+    /// The script of an [`Exec::File`] could not be read.
+    #[error("failed to read script {}: {source}", path.display())]
+    Script {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The hypervisor layer failed.
+    #[error(transparent)]
+    Hyperlight(#[from] HyperlightError),
+}
+
+/// The result of a sandbox operation.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -64,33 +154,23 @@ pub const DEFAULT_SCRATCH_MB: usize = 256;
 
 /// Largest payload of one host call, in either direction.
 ///
-/// This matches the guest's compile-time ceiling, regardless of what
-/// `GetHostFsChunkSize` says: the guest's host-call encoder
-/// (`g_generic_fc_buf` in `plat/hyperlight/hcall.c`) and its socket
-/// driver's transfer buffers (`lib/hostsock/hostsock.c`) are static
-/// 64 KiB arrays, and hostfs clamps the queried chunk size to a
-/// compile-time `HOSTFS_MAX_CHUNK`.
-///
-/// TODO: let the host be the only place this is decided.  The guest
-/// already caches the host-chosen I/O stack sizes from the PEB in
-/// `hl_hcall_init` (`peb->input_stack.size`, `peb->output_stack.size`,
-/// i.e. [`IO_STACK_SIZE`]); it should size its buffers from those:
-/// keep a small static encoder buffer for the few host calls made
-/// before the allocator exists (`GetCmdLine`, `GetPagingBudget`), then
-/// switch to a PEB-sized heap buffer, and have hostsock/hostfs allocate
-/// their transfer buffers from the same value at init.  That removes
-/// the `65536` literals, `HCALL_SEND_MAX` and the `HOSTFS_MAX_CHUNK`
-/// clamp, and this constant plus `IO_STACK_SIZE` become the single
-/// source of truth, delivered through the PEB.
+/// The host decides this alone: it sizes the PEB I/O stacks
+/// ([`IO_STACK_SIZE`]) and the guest sizes every transfer buffer from
+/// the stack sizes it reads back out of the PEB
+/// (`hl_hcall_max_payload()` in `plat/hyperlight/hcall.c`: the smaller
+/// stack less a 4 KiB reserve for the FlatBuffer framing).  So a guest
+/// never asks for, or sends, more than this, and the host functions
+/// here only cap what they hand back (`net_recvfrom`) as a courtesy to
+/// a guest that asks for more.
 pub(crate) const HOST_CALL_MAX: usize = 64 * 1024;
 
 /// PEB I/O stack size for host-call data transfer.
 ///
 /// Both the input stack (host→guest results) and output stack
 /// (guest→host calls) must hold a FlatBuffer-encoded message carrying
-/// a [`HOST_CALL_MAX`] payload, plus the stack header (8 bytes) and
-/// alignment padding.  Default Hyperlight stacks are only 16 KiB — too
-/// small for large file or network transfers.
+/// a [`HOST_CALL_MAX`] payload plus its framing, the same 4 KiB reserve
+/// the guest subtracts.  Default Hyperlight stacks are only 16 KiB —
+/// too small for large file or network transfers.
 const IO_STACK_SIZE: usize = HOST_CALL_MAX + 4096;
 
 /// PEB heap size.
@@ -100,8 +180,38 @@ const IO_STACK_SIZE: usize = HOST_CALL_MAX + 4096;
 /// scratch instead.
 const HEAP_SIZE: u64 = 0x10_0000; // 1 MiB
 
-/// OCI tag used when saving/loading snapshots to disk.
-pub const SNAPSHOT_TAG: &str = "latest";
+/// The name a snapshot is saved under in its directory: this crate's
+/// version.  A snapshot is only good for the release that wrote it -- the
+/// host functions and their behaviour move with the release -- so a load
+/// by another version fails, and the error names the versions the
+/// directory holds.  (The version must stay a valid OCI tag: no `+build`
+/// metadata; the unit test below keeps that honest.)
+fn snapshot_tag() -> OciTag {
+    env!("CARGO_PKG_VERSION")
+        .parse()
+        .expect("the crate version is a valid OCI tag")
+}
+
+/// Write a snapshot from [`AppSandbox::snapshot`] to `dir` as an OCI image
+/// layout, named by this crate's version.  Another process, or a later run
+/// of this one, reads it back with [`load_snapshot`],
+/// [`SandboxBuilder::from_snapshot_dir`] or [`AppSandbox::restore_from`];
+/// only this version of the crate can, since the host side a snapshot
+/// depends on moves with the release.  [`AppSandbox::snapshot_to`] does
+/// both steps in one.
+pub fn save_snapshot(snapshot: &Snapshot, dir: impl AsRef<Path>) -> Result<()> {
+    let digest = snapshot.save(dir.as_ref(), &snapshot_tag())?;
+    debug!(dir = %dir.as_ref().display(), %digest, "snapshot saved");
+    Ok(())
+}
+
+/// Read a snapshot written by [`save_snapshot`] back into memory, to boot
+/// ([`SandboxBuilder::from_snapshot`]) or restore ([`AppSandbox::restore`])
+/// any number of guests from one load.  The snapshot must come from this
+/// version of the crate; see [`save_snapshot`].
+pub fn load_snapshot(dir: impl AsRef<Path>) -> Result<Arc<Snapshot>> {
+    Ok(Arc::new(Snapshot::load(dir.as_ref(), snapshot_tag())?))
+}
 
 /// MSRs the Unikraft guest reads/writes, which hyperlight 0.17.0's
 /// default-deny KVM MSR filter must permit.
@@ -122,10 +232,67 @@ const GUEST_MSRS: &[u32] = &[
     0xC000_0084, // IA32_FMASK — syscall RFLAGS mask
 ];
 
+/// The TSC frequency, in Hz, measured once against the monotonic clock.
+///
+/// Hyperlight passes the host TSC through unscaled (it only saves and
+/// restores the TSC register), so the rate the guest sees is this one.
+/// Twenty milliseconds against a nanosecond clock give it to a few parts
+/// per million, provided the two endpoints are clean: each clock reading
+/// is bracketed by two counter reads and kept only when nothing ran in
+/// between, so a preemption cannot skew the one sample the process keeps.
+/// The invariant TSC does not drift with the core frequency, so measuring
+/// once is enough.
+///
+/// TODO: the kernel asks only at boot.  A snapshot restored on a host with
+/// a different TSC rate keeps the old frequency, so its monotonic clock
+/// and sleeps run fast or slow by the ratio; the resume entry should ask
+/// again and re-base the clock (the wall clock is already re-anchored
+/// there).
+fn host_tsc_hz() -> u64 {
+    static HZ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *HZ.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::_rdtsc;
+            /// The clock and the counter at one instant: the tightest of
+            /// up to a hundred brackets, taken at once when the bracket is
+            /// under 10 000 ticks (a few microseconds at any plausible
+            /// rate, which no preemption fits in).
+            fn sample() -> (Instant, u64) {
+                let mut best: Option<(u64, Instant, u64)> = None;
+                for _ in 0..100 {
+                    let a = unsafe { _rdtsc() };
+                    let t = Instant::now();
+                    let b = unsafe { _rdtsc() };
+                    let width = b.wrapping_sub(a);
+                    if best.is_none_or(|(w, _, _)| width < w) {
+                        best = Some((width, t, a + width / 2));
+                    }
+                    if width < 10_000 {
+                        break;
+                    }
+                }
+                let (_, t, c) = best.expect("at least one sample");
+                (t, c)
+            }
+            let (t0, c0) = sample();
+            std::thread::sleep(Duration::from_millis(20));
+            let (t1, c1) = sample();
+            let ns = t1.duration_since(t0).as_nanos();
+            ((c1 - c0) as u128 * 1_000_000_000 / ns) as u64
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            0
+        }
+    })
+}
+
 /// Declare [`GUEST_MSRS`] on a sandbox configuration.
-fn apply_guest_msrs(cfg: &mut SandboxConfiguration) -> hyperlight_host::Result<()> {
-    cfg.guest_msrs(GUEST_MSRS)
-        .map_err(|e| hyperlight_host::new_error!("declaring guest MSRs: {}", e))?;
+fn apply_guest_msrs(cfg: &mut SandboxConfiguration) -> Result<()> {
+    cfg.guest_msrs(GUEST_MSRS).map_err(|e| {
+        Error::Hyperlight(hyperlight_host::new_error!("declaring guest MSRs: {}", e))
+    })?;
     Ok(())
 }
 
@@ -197,6 +364,72 @@ impl Mount {
     }
 }
 
+// ── Cooperative step ────────────────────────────────────────────────────
+
+/// Why [`AppSandbox::step`] handed control back.
+///
+/// The guest runs its scheduler only until every thread is blocked, then
+/// yields the vCPU with a report; the host waits for what the report says
+/// and re-enters.  Guest memory — every parked thread, the scheduler
+/// queues, the application heap — persists across the boundary, and a
+/// snapshot taken there resumes exactly where the guest left off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Yield {
+    /// The guest process ended and the kernel shut down with its exit
+    /// status.  Nothing will run again; every later step reports this.
+    Exited { status: i32 },
+    /// The call started with [`AppSandbox::submit`] has returned.  The
+    /// guest is alive and can take another.
+    CallDone,
+    /// The call returned but the driver reported it failed, with `status`
+    /// as the driver put it: a program's or an `exit()`'s own code, 1 for
+    /// an uncaught exception (what the runtime's script would exit with),
+    /// -1 when the driver could not run the call at all.  The guest is
+    /// alive and can take another call; its output has the details.
+    CallFailed { status: i32 },
+    /// Every guest thread is blocked.  `until` is the guest's next timer,
+    /// or `None` when only I/O on one of its host sockets can wake it.
+    ///
+    /// [`AppSandbox::step`] returns this in two cases it does not tell
+    /// apart: the guest ran and blocked again, or the timeout ran out and
+    /// the VM was never entered (then `until` is the last one heard).
+    /// TODO: a distinct variant if a caller ever needs to know whether
+    /// guest code ran.
+    Blocked { until: Option<Instant> },
+}
+
+/// One thing the guest said, through one of its six event host functions
+/// (see the kernel's `plat/hyperlight/step.c`).  Three of them are a
+/// [`Yield`] as is: `Yield(ns)` is [`Yield::Blocked`], `CallDone(status)`
+/// is [`Yield::CallDone`] or [`Yield::CallFailed`], `Exited(status)` is
+/// [`Yield::Exited`].  The other three are facts about the guest that no
+/// step returns by themselves.  An entry can say several (`CallDone`,
+/// then `Blocked`; or nothing at all), while the VM is still running; once
+/// it halts, [`GuestConfig::absorb`] reads them in order and reduces them
+/// to the one [`Yield`] the entry amounts to.
+#[derive(Debug, Clone, Copy)]
+enum Event {
+    /// A way the entry could end, as the guest put it.
+    Outcome(Yield),
+    /// `/dev/hlcall` was opened: named calls are served.
+    DriverReady,
+    /// The driver took a named call.
+    CallStarted,
+    /// A named call had no reader, or did not fit: it never ran.
+    CallRejected,
+}
+
+/// The host's standing picture of the guest, folded from its events.
+#[derive(Debug, Default)]
+struct Guest {
+    /// Named calls are served.
+    has_driver: bool,
+    /// Between `CallStarted` and `CallDone`.
+    call_in_flight: bool,
+    /// Absolute deadline of its next timer, from its last `Yield`.
+    next_wakeup_at: Option<Instant>,
+}
+
 // ── GuestConfig ─────────────────────────────────────────────────────────
 
 /// Runtime parameters for the guest's host functions.
@@ -207,24 +440,57 @@ impl Mount {
 /// The fields are internal — a caller receives a `GuestConfig` from
 /// [`SandboxBuilder::boot`] and interacts with it through the
 /// methods ([`set_env_vars`](Self::set_env_vars), [`drain_output`](Self::drain_output)).
-pub struct GuestConfig {
+pub(crate) struct GuestConfig {
     cmdline: String,
     scratch_size: usize,
     initrd_base: u64,
     initrd_size: u64,
     /// Host filesystem mounts.
     mounts: Vec<Mount>,
-    /// Network access policy (`None` = networking disabled).
-    network: Option<NetworkPolicy>,
-    /// Ports the guest is allowed to `bind()` for inbound connections.
-    listen_ports: Option<ListenPorts>,
     /// Captured guest stdout — accumulated by the HostPrint callback.
     output: Arc<Mutex<String>>,
     /// NUL-separated KEY=VALUE pairs for guest env vars.
     env_str: Arc<Mutex<String>>,
+    /// Host networking state (`None` = networking disabled).  Shared with
+    /// the `net_*` host functions; kept here for the inter-step wait of
+    /// the cooperative step model.
+    net: Option<Arc<hostnet::Net>>,
+    /// Events from the guest's last entry, in order; shared with the event
+    /// host functions, which push, and drained by [`absorb`](Self::absorb).
+    events: Arc<Mutex<Vec<Event>>>,
+    /// What those events add up to.
+    guest: Mutex<Guest>,
 }
 
 impl GuestConfig {
+    /// Assemble a config; `register` must be called on the sandbox next.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        cmdline: String,
+        scratch_size: usize,
+        initrd_base: u64,
+        initrd_size: u64,
+        mounts: Vec<Mount>,
+        network: Option<NetworkPolicy>,
+        listen_ports: Option<ListenPorts>,
+    ) -> Self {
+        // Networking is opt-in: no policy, no `net_*` host functions and
+        // nothing for the inter-step wait to watch.
+        let net = network.map(|policy| Arc::new(hostnet::Net::new(policy, listen_ports)));
+        Self {
+            cmdline,
+            scratch_size,
+            initrd_base,
+            initrd_size,
+            mounts,
+            output: Arc::new(Mutex::new(String::new())),
+            env_str: Arc::new(Mutex::new(String::new())),
+            net,
+            events: Arc::new(Mutex::new(Vec::new())),
+            guest: Mutex::new(Guest::default()),
+        }
+    }
+
     /// How much scratch memory to give the paging frame allocator (75%).
     fn paging_budget(&self) -> u64 {
         (self.scratch_size as u64) * 3 / 4
@@ -254,39 +520,31 @@ impl GuestConfig {
     ///
     /// ```no_run
     /// # use hyperlight_unikraft::SandboxBuilder;
-    /// let (mut sandbox, cfg) = SandboxBuilder::from_initrd("rootfs/python.cpio").boot().unwrap();
-    /// cfg.set_env_vars(&[("MY_VAR", "hello"), ("DEBUG", "1")]).unwrap();
-    /// // the next run(&mut sandbox, …) observes them
-    /// # let _ = &mut sandbox;
+    /// let sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio").boot().unwrap();
+    /// sandbox.set_env_vars(&[("MY_VAR", "hello"), ("DEBUG", "1")]);
+    /// // the next sandbox.run(…) observes them
     /// ```
-    pub fn set_env_vars(&self, vars: &[(&str, &str)]) -> hyperlight_host::Result<()> {
+    pub fn set_env_vars(&self, vars: &[(&str, &str)]) {
         let mut s = String::new();
         for (k, v) in vars {
-            if k.starts_with("HL_") {
-                return Err(hyperlight_host::HyperlightError::Error(format!(
-                    "environment variable key '{}' uses reserved HL_ prefix",
-                    k,
-                )));
-            }
             s.push_str(k);
             s.push('=');
             s.push_str(v);
             s.push('\0');
         }
         *self.env_str.lock().unwrap() = s;
-        Ok(())
+    }
+
+    /// Drain captured guest output, clearing the buffer.
+    pub fn drain_output(&self) -> String {
+        self.output.lock().unwrap().split_off(0)
     }
 
     /// Register host functions on any [`Registerable`] target.
     ///
     /// Works for both the init path (`UninitializedSandbox`) and the
     /// snapshot-restore path (`HostFunctions`).
-    /// Drain captured guest output, clearing the buffer.
-    pub fn drain_output(&self) -> String {
-        self.output.lock().unwrap().split_off(0)
-    }
-
-    pub fn register(&self, target: &mut impl Registerable) -> hyperlight_host::Result<()> {
+    pub fn register(&self, target: &mut impl Registerable) -> Result<()> {
         // Override Hyperlight's default HostPrint (which wraps output in
         // green ANSI on stdout) — send guest output to stdout uncolored,
         // and capture it for programmatic access.
@@ -340,6 +598,13 @@ impl GuestConfig {
                 .unwrap_or(0))
         })?;
 
+        // The guest's clock is the TSC, whose frequency KVM does not tell
+        // it (no CPUID.15H, no hypervisor leaf); without this it assumes
+        // 2.5 GHz and its clock runs fast or slow by the difference.
+        target.register_host_function("GetTscHz", || -> hyperlight_host::Result<u64> {
+            Ok(host_tsc_hz())
+        })?;
+
         target
             .register_host_function("GetHostFsChunkSize", || -> hyperlight_host::Result<u64> {
                 Ok(hostfs::CHUNK as u64)
@@ -347,26 +612,10 @@ impl GuestConfig {
 
         // ── Environment variables ─────────────────────────────────
         let env_str = self.env_str.clone();
-        target.register_host_function(
-            "GetEnvVars",
-            move || -> hyperlight_host::Result<String> {
-                let raw = env_str.lock().unwrap().clone();
-                // Filter out HL_* vars — those are internal kernel
-                // addresses that must not leak to guest user code.
-                let mut filtered = String::new();
-                for entry in raw.split('\0') {
-                    if entry.is_empty() {
-                        continue;
-                    }
-                    if entry.starts_with("HL_") {
-                        continue;
-                    }
-                    filtered.push_str(entry);
-                    filtered.push('\0');
-                }
-                Ok(filtered)
-            },
-        )?;
+        target
+            .register_host_function("GetEnvVars", move || -> hyperlight_host::Result<String> {
+                Ok(env_str.lock().unwrap().clone())
+            })?;
 
         // ── Stdin ─────────────────────────────────────────────────
         target.register_host_function(
@@ -380,20 +629,196 @@ impl GuestConfig {
             },
         )?;
 
-        // Register per-operation host functions for filesystem and networking.
+        // ── Cooperative step ──────────────────────────────────────
+        // The guest reports through named host functions, one fact each.
+        // They are only recorded here, in order; `absorb` reads them once
+        // the entry has halted.
+        let events = self.events.clone();
+        target.register_host_function("Yield", move |ns: u64| -> hyperlight_host::Result<i32> {
+            // Keep the absolute deadline so time the host spends elsewhere
+            // counts against it and the guest timer still fires on schedule.
+            let until = (ns != 0).then(|| Instant::now() + Duration::from_nanos(ns));
+            events
+                .lock()
+                .unwrap()
+                .push(Event::Outcome(Yield::Blocked { until }));
+            Ok(0)
+        })?;
+        let events = self.events.clone();
+        target.register_host_function("DriverReady", move || -> hyperlight_host::Result<i32> {
+            events.lock().unwrap().push(Event::DriverReady);
+            Ok(0)
+        })?;
+        let events = self.events.clone();
+        target.register_host_function("CallStarted", move || -> hyperlight_host::Result<i32> {
+            events.lock().unwrap().push(Event::CallStarted);
+            Ok(0)
+        })?;
+        let events = self.events.clone();
+        target.register_host_function(
+            "CallDone",
+            move |status: i32| -> hyperlight_host::Result<i32> {
+                let done = if status == 0 {
+                    Yield::CallDone
+                } else {
+                    Yield::CallFailed { status }
+                };
+                events.lock().unwrap().push(Event::Outcome(done));
+                Ok(0)
+            },
+        )?;
+        let events = self.events.clone();
+        target.register_host_function(
+            "CallRejected",
+            move || -> hyperlight_host::Result<i32> {
+                events.lock().unwrap().push(Event::CallRejected);
+                Ok(0)
+            },
+        )?;
+        let events = self.events.clone();
+        target.register_host_function(
+            "Exited",
+            move |status: i32| -> hyperlight_host::Result<i32> {
+                events
+                    .lock()
+                    .unwrap()
+                    .push(Event::Outcome(Yield::Exited { status }));
+                Ok(0)
+            },
+        )?;
+
+        // The filesystem and networking host functions exist only when
+        // there is something for them to serve: no mounts, no `fs_*`; no
+        // policy, no `net_*`.  (A guest restored without the mounts its
+        // snapshot was saved with gets EIO on them, as the kernel treats
+        // a missing host function.)
         if !self.mounts.is_empty() {
-            let hfs_mounts: Vec<(String, PathBuf, bool)> = self
-                .mounts
-                .iter()
-                .map(|m| (m.guest_path.clone(), m.host_path.clone(), m.readonly))
-                .collect();
-            hostfs::register(target, &hfs_mounts)?;
+            hostfs::register(target, &self.mounts)?;
         }
-        if self.network.is_some() {
-            hostnet::register(target, self.network.clone(), self.listen_ports.clone())?;
+        if let Some(net) = &self.net {
+            hostnet::register(target, net)?;
         }
 
         Ok(())
+    }
+
+    // ── Cooperative step (driven by AppSandbox) ─────────────────────
+
+    /// Whether a runtime driver is serving named calls, per what the
+    /// guest has said.
+    fn has_driver(&self) -> bool {
+        self.guest.lock().unwrap().has_driver
+    }
+
+    /// Whether the guest is serving a named call, per what it has said.
+    fn call_in_flight(&self) -> bool {
+        self.guest.lock().unwrap().call_in_flight
+    }
+
+    /// The guest's next timer, from its last `Yield`.
+    fn next_wakeup_at(&self) -> Option<Instant> {
+        self.guest.lock().unwrap().next_wakeup_at
+    }
+
+    /// One VM entry: call `name`, then read what the guest said during it.
+    /// The guest runs its scheduler until every thread is blocked and
+    /// halts; see [`absorb`](Self::absorb) for how the events reduce.
+    fn enter<Args>(&self, sandbox: &mut MultiUseSandbox, name: &str, args: Args) -> Result<Yield>
+    where
+        Args: hyperlight_host::func::ParameterTuple,
+    {
+        // An entry starts with an empty inbox: a previous one that failed
+        // in the hypervisor may have left events behind.
+        self.events.lock().unwrap().clear();
+        sandbox.call::<()>(name, args)?;
+        let yielded = self.absorb()?;
+        debug!(?yielded, name, "entry");
+        Ok(yielded)
+    }
+
+    /// Take the events of the entry that just halted, in order, fold them
+    /// into the standing picture of the guest, and reduce them to what the
+    /// entry amounts to: a terminal event (the call returned, the process
+    /// ended) wins; else a `Yield` means a boundary was reached.  A halt
+    /// with neither is an error: every kernel on this platform reports one
+    /// or the other, so silence is a kernel that is not one of ours or a
+    /// dispatch that failed.  A rejected call is an error too: nothing in
+    /// the guest could run it.
+    fn absorb(&self) -> Result<Yield> {
+        let events = std::mem::take(&mut *self.events.lock().unwrap());
+        let mut guest = self.guest.lock().unwrap();
+        let mut terminal = None;
+        let mut boundary = None;
+        let mut rejected = false;
+
+        guest.next_wakeup_at = None;
+        for event in events {
+            match event {
+                Event::Outcome(Yield::Blocked { until }) => {
+                    guest.next_wakeup_at = until;
+                    boundary = Some(Yield::Blocked { until });
+                }
+                Event::Outcome(Yield::Exited { status }) => {
+                    terminal = Some(Yield::Exited { status });
+                }
+                Event::Outcome(done @ (Yield::CallDone | Yield::CallFailed { .. })) => {
+                    guest.call_in_flight = false;
+                    terminal = Some(done);
+                }
+                Event::DriverReady => guest.has_driver = true,
+                Event::CallStarted => guest.call_in_flight = true,
+                Event::CallRejected => rejected = true,
+            }
+        }
+        if rejected {
+            return Err(Error::CallRejected);
+        }
+        terminal.or(boundary).ok_or(Error::GuestSilent)
+    }
+
+    /// Forget everything heard: the guest state the picture described was
+    /// just replaced by a restored snapshot.  The `resume` entry that
+    /// follows has the guest say again what still holds.
+    fn forget(&self) {
+        self.events.lock().unwrap().clear();
+        *self.guest.lock().unwrap() = Guest::default();
+    }
+
+    /// Whether anything can make the guest runnable again: a pending
+    /// timer, or a host socket that can still produce an event.  False
+    /// means the guest is blocked for good: nothing the host watches, or
+    /// could watch, will ever change its state.
+    fn can_wake(&self) -> bool {
+        self.next_wakeup_at().is_some() || self.net.as_ref().is_some_and(|n| n.has_waitable())
+    }
+
+    /// Park the host until the guest may be runnable again: its next timer
+    /// is due, or one of its host sockets is ready.  Waits at most `cap`,
+    /// or without limit for `None`.  Returns `false` if the cap ran out
+    /// first, or if there was nothing to wait for.
+    ///
+    /// The VM is halted throughout; the host thread sits in `poll(2)` on
+    /// the guest's sockets (a plain sleep when it has none).
+    fn wait_runnable(&self, cap: Option<Duration>) -> bool {
+        let deadline = self.next_wakeup_at();
+        let to_timer = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let dur = match (to_timer, cap) {
+            (Some(t), Some(c)) => Some(t.min(c)),
+            (Some(t), None) => Some(t),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+        let woke_on_io = match (dur, &self.net) {
+            (Some(d), _) if d.is_zero() => false,
+            (_, Some(net)) => net.wait_ready(dur),
+            (Some(d), None) => {
+                std::thread::sleep(d);
+                false
+            }
+            // No timer, no cap, no sockets: nothing could end the wait.
+            (None, None) => false,
+        };
+        woke_on_io || deadline.is_some_and(|d| Instant::now() >= d)
     }
 }
 
@@ -470,6 +895,41 @@ fn resolve_entry(entry: &Option<String>, initrd: &Option<PathBuf>) -> Option<Str
 
 // ── Public API ─────────────────────────────────────────────────────────
 
+/// The kernel's `vfs.fstab` parameter for `mounts` (empty for none): one
+/// hostfs entry per mount, whose source-device field is the mount's index
+/// (hostfs routes host calls by it) and whose options make the mount
+/// point.  The list is unquoted: entries are separated by spaces and
+/// fields by colons, so a guest path holding either would be misparsed
+/// by the kernel; such a path is refused here, where the error can say
+/// why.
+fn fstab_arg(mounts: &[Mount]) -> Result<String> {
+    let mut arg = String::new();
+    for m in mounts {
+        let unfit = |c: char| c.is_whitespace() || matches!(c, ':' | '[' | ']');
+        if !m.guest_path.starts_with('/') || m.guest_path.contains(unfit) {
+            return Err(Error::MountPath {
+                guest_path: m.guest_path.clone(),
+            });
+        }
+    }
+    if mounts.is_empty() {
+        return Ok(arg);
+    }
+    arg.push_str(" vfs.fstab=[");
+    for (i, m) in mounts.iter().enumerate() {
+        if i > 0 {
+            arg.push(' ');
+        }
+        // Format: sdev:path:drv:flags:opts:ukopts.  flags: MNT_RDONLY is
+        // 0x1.  ukopts: mkmp creates the mount point if missing.  No
+        // quotes: uk_libparam does not strip them.
+        let flags = if m.readonly { "0x1" } else { "0x0" };
+        write!(arg, "{i}:{}:hostfs:{flags}::mkmp", m.guest_path).unwrap();
+    }
+    arg.push(']');
+    Ok(arg)
+}
+
 /// Assemble the uninitialized sandbox and its [`GuestConfig`] from the
 /// pieces a [`SandboxBuilder`] gathered.  `kernel` is `None` for the
 /// embedded [`KERNEL`], `Some` for an external one; `initrd` is `None`
@@ -482,7 +942,7 @@ fn assemble_sandbox(
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
-) -> hyperlight_host::Result<(UninitializedSandbox, GuestConfig)> {
+) -> Result<(UninitializedSandbox, GuestConfig)> {
     let scratch_size = scratch_mb * 1024 * 1024;
     let mut cfg = SandboxConfiguration::default();
     cfg.set_scratch_size(scratch_size);
@@ -528,24 +988,7 @@ fn assemble_sandbox(
     // Layout: <progname> [kernel params...] -- [entry point]
     let mut cmdline = "unikraft-hyperlight".to_string();
 
-    // Inject vfs.fstab entries so the kernel mounts hostfs at each
-    // guest path.  The source-device field carries the mount index
-    // (used by hostfs to route hcalls to the correct host Dir).
-    if !mounts.is_empty() {
-        cmdline.push_str(" vfs.fstab=[");
-        for (i, m) in mounts.iter().enumerate() {
-            if i > 0 {
-                cmdline.push(' ');
-            }
-            // MNT_RDONLY = 0x1
-            let flags = if m.readonly { "0x1" } else { "0x0" };
-            // Format: sdev:path:drv:flags:opts:ukopts
-            // mkmp = make mount point (creates the directory if missing)
-            // No quotes — uk_libparam doesn't strip them.
-            write!(cmdline, "{i}:{}:hostfs:{flags}::mkmp", m.guest_path).unwrap();
-        }
-        cmdline.push(']');
-    }
+    cmdline.push_str(&fstab_arg(&mounts)?);
 
     // Entry point path.  The `--` separator is needed only when there
     // are kernel params (like vfs.fstab) before it — uklibparam strips
@@ -561,7 +1004,7 @@ fn assemble_sandbox(
         }
     }
 
-    let config = GuestConfig {
+    let config = GuestConfig::new(
         cmdline,
         scratch_size,
         initrd_base,
@@ -569,9 +1012,7 @@ fn assemble_sandbox(
         mounts,
         network,
         listen_ports,
-        output: Arc::new(Mutex::new(String::new())),
-        env_str: Arc::new(Mutex::new(String::new())),
-    };
+    );
 
     config.register(&mut usandbox)?;
 
@@ -590,21 +1031,19 @@ fn assemble_sandbox(
 /// `SandboxBuilder::from_initrd(path).boot()` is a complete call.
 ///
 /// [`boot`](Self::boot) brings the guest to a running state (evolving a fresh
-/// guest, or restoring a snapshot) and hands back the ready
-/// [`MultiUseSandbox`] plus its [`GuestConfig`].
+/// guest, or restoring a snapshot) and hands back a [`AppSandbox`].
 ///
 /// ```no_run
-/// use hyperlight_unikraft::{SandboxBuilder, Mount, NetworkPolicy, run};
+/// use hyperlight_unikraft::{SandboxBuilder, Mount, NetworkPolicy};
 ///
-/// let (mut sandbox, cfg) = SandboxBuilder::from_initrd("rootfs/python.cpio")
+/// let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
 ///     .scratch_mb(256)
 ///     .mount(Mount::ro("/data", "/mnt/data"))
 ///     .network(NetworkPolicy::AllowAll)
 ///     .env("GREETING", "hi")
 ///     .boot()?;
-/// run(&mut sandbox, "import os; print(os.environ['GREETING'])")?;
-/// # let _ = cfg;
-/// # Ok::<(), hyperlight_unikraft::hyperlight_host::HyperlightError>(())
+/// sandbox.run("import os; print(os.environ['GREETING'])")?;
+/// # Ok::<(), hyperlight_unikraft::Error>(())
 /// ```
 pub struct SandboxBuilder {
     kernel: Option<PathBuf>,
@@ -613,7 +1052,7 @@ pub struct SandboxBuilder {
     scratch_mb: Option<usize>,
     /// When set, [`boot`](Self::boot) restores this snapshot instead of
     /// booting a fresh guest; `kernel`/`initrd`/`entry`/`scratch_mb` are
-    /// then ignored (the snapshot carries them).
+    /// then an error (the snapshot carries them).
     snapshot: Option<Arc<Snapshot>>,
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
@@ -666,6 +1105,12 @@ impl SandboxBuilder {
     /// The snapshot carries the guest's cmdline/initrd/layout, so the
     /// kernel/initrd/entry/scratch settings do not apply here.
     ///
+    /// The guest re-establishes its own host sockets on its first step: a
+    /// listener is bound again (its port must be in this sandbox's
+    /// [`listen_ports`](Self::listen_ports)), and connections whose peers
+    /// died with the old host read as closed.  Nothing needs to be saved
+    /// beside the snapshot.
+    ///
     /// **Mounts must match.** The guest kernel's fstab entries are baked into
     /// the snapshot; re-supply the same [`mount`](Self::mount)s the snapshot
     /// was saved with so the host side serves them.  Missing or different
@@ -675,6 +1120,12 @@ impl SandboxBuilder {
             snapshot: Some(snapshot),
             ..Self::empty()
         }
+    }
+
+    /// [`from_snapshot`](Self::from_snapshot) with the snapshot read from
+    /// `dir`, where [`AppSandbox::snapshot_to`] wrote it.
+    pub fn from_snapshot_dir(dir: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::from_snapshot(load_snapshot(dir)?))
     }
 
     /// CPIO rootfs to map for the guest (see [`from_initrd`](Self::from_initrd)).
@@ -733,12 +1184,12 @@ impl SandboxBuilder {
     }
 
     /// Register the host functions, bring the guest to a running state, and
-    /// return the ready [`MultiUseSandbox`] plus its [`GuestConfig`].
+    /// return it as a [`AppSandbox`].
     ///
     /// A fresh guest ([`from_initrd`](Self::from_initrd) /
     /// [`from_kernel`](Self::from_kernel)) is evolved (booted); a
     /// [`from_snapshot`](Self::from_snapshot) source is restored.
-    pub fn boot(self) -> hyperlight_host::Result<(MultiUseSandbox, GuestConfig)> {
+    pub fn boot(self) -> Result<AppSandbox> {
         let Self {
             kernel,
             initrd,
@@ -751,8 +1202,22 @@ impl SandboxBuilder {
             env_vars,
         } = self;
 
+        let restored = snapshot.is_some();
+        if restored
+            && (kernel.is_some() || initrd.is_some() || entry.is_some() || scratch_mb.is_some())
+        {
+            return Err(Error::SnapshotSettings);
+        }
+        let env_refs: Vec<(&str, &str)> = env_vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         let (sandbox, cfg) = match snapshot {
-            Some(snapshot) => restore_snapshot(snapshot, mounts, network, listen_ports)?,
+            Some(snapshot) => {
+                let (sandbox, cfg) = restore_snapshot(snapshot, mounts, network, listen_ports)?;
+                cfg.set_env_vars(&env_refs);
+                (sandbox, cfg)
+            }
             None => {
                 let (usandbox, cfg) = assemble_sandbox(
                     &kernel,
@@ -763,18 +1228,51 @@ impl SandboxBuilder {
                     network,
                     listen_ports,
                 )?;
-                (usandbox.evolve()?, cfg)
+                // Before the boot: the kernel fetches the environment once
+                // on its way to main(), so an entry-point program starts
+                // with these; a driver refreshes them on every call anyway.
+                cfg.set_env_vars(&env_refs);
+                let sandbox = match usandbox.evolve() {
+                    Ok(sandbox) => sandbox,
+                    Err(e) => {
+                        // The guest's last words are the diagnosis.
+                        let output = cfg.drain_output();
+                        if !output.is_empty() {
+                            tracing::error!(%output, "guest console output before the boot failure");
+                        }
+                        return Err(e.into());
+                    }
+                };
+                (sandbox, cfg)
             }
         };
 
-        if !env_vars.is_empty() {
-            let refs: Vec<(&str, &str)> = env_vars
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            cfg.set_env_vars(&refs)?;
+        // A fresh guest has spoken during boot: a step-model kernel reports
+        // boot complete, and a process that ran to completion meanwhile (a
+        // program as the entry point, a native kernel whose main()
+        // returned) reports its exit status on the way down.  A restored
+        // guest says nothing until its resume entry below.
+        let exited = if restored {
+            None
+        } else {
+            match cfg.absorb()? {
+                exit @ Yield::Exited { .. } => Some(exit),
+                _ => None,
+            }
+        };
+        let mut app = AppSandbox {
+            sandbox,
+            config: cfg,
+            exited,
+            pending: None,
+        };
+        if restored {
+            // Put the image right for this host before anyone can observe
+            // it: the kernel reseeds its CSPRNG and re-establishes the
+            // guest's host sockets (see `resume`).
+            app.resume()?;
         }
-        Ok((sandbox, cfg))
+        Ok(app)
     }
 }
 
@@ -811,30 +1309,318 @@ impl From<String> for Exec {
     }
 }
 
-/// Execute code or a script file in the guest.
+// ── AppSandbox ──────────────────────────────────────────────────────────
+
+/// A booted guest: the Hyperlight sandbox and the host-side state its host
+/// functions share, as one handle.  Returned by [`SandboxBuilder::boot`].
 ///
-/// Dispatches to the guest's driver callback. Accepts inline code
-/// (`"print('hi')"`) or a file path (`Exec::File("hello.py".into())`).
+/// Between calls the guest is always parked at a *boundary*: every guest
+/// thread is blocked and the vCPU is halted.  Each method here enters the
+/// VM, lets the guest scheduler run until it blocks again, and returns at
+/// the next boundary.  A [`snapshot`](Self::snapshot) taken at any
+/// boundary resumes exactly there.
 ///
-/// Guest stdout is captured in the [`GuestConfig`] returned by
-/// [`SandboxBuilder::boot`].  Call [`GuestConfig::drain_output`] after
-/// `run()` to retrieve what the guest printed.
-pub fn run(sandbox: &mut MultiUseSandbox, exec: impl Into<Exec>) -> hyperlight_host::Result<()> {
-    match exec.into() {
-        Exec::Code(s) => sandbox.call::<()>("Exec", s),
-        Exec::File(path) => {
-            let code = std::fs::read_to_string(&path).map_err(|e| {
-                hyperlight_host::HyperlightError::Error(format!(
-                    "failed to read {}: {e}",
-                    path.display(),
-                ))
-            })?;
-            sandbox.call::<()>("Exec", code)
+/// Two kinds of workload:
+///
+/// * A *driver* image (the Python, Node, … rootfs) boots a runtime that
+///   waits for calls.  [`run`](Self::run) dispatches one and waits for it;
+///   [`submit`](Self::submit) dispatches one and hands the boundaries in
+///   between to the caller through [`step`](Self::step).
+/// * An *entry-point* image (`--entry /bin/server`) is the workload
+///   itself.  There is nothing to dispatch; [`join`](Self::join) keeps it
+///   going until it exits.
+///
+/// A guest restored from a snapshot is announced to the kernel with a
+/// `resume` entry before [`SandboxBuilder::boot`] (or
+/// [`restore`](Self::restore)) returns.  The kernel reseeds its CSPRNG
+/// there, so two guests restored from the same image do not draw the same
+/// random bytes, and re-establishes its host sockets, so a server keeps
+/// its listener and sees its old connections as closed.
+///
+/// [`snapshot`](Self::snapshot) captures the guest at the current
+/// boundary and [`snapshot_to`](Self::snapshot_to) writes it to disk;
+/// [`SandboxBuilder::from_snapshot`] / [`from_snapshot_dir`](SandboxBuilder::from_snapshot_dir)
+/// and [`restore`](Self::restore) / [`restore_from`](Self::restore_from)
+/// bring it back.  Dropping the sandbox tears
+/// the VM down and releases every host socket it held.
+pub struct AppSandbox {
+    sandbox: MultiUseSandbox,
+    config: GuestConfig,
+    /// The [`Yield::Exited`] the guest process ended with, once it has;
+    /// every later step reports it again.
+    exited: Option<Yield>,
+    /// A terminal result produced while delivering a call, handed out by
+    /// the next [`step`](Self::step).
+    pending: Option<Yield>,
+}
+
+impl AppSandbox {
+    /// Execute code or a script file in the guest and wait for it to finish.
+    ///
+    /// Accepts inline code (`"print('hi')"`), a file path
+    /// (`Exec::File("hello.py".into())`) or a guest command
+    /// ([`Exec::Guest`]).  The call is served by the guest's driver on its
+    /// own thread; meanwhile the host parks on the guest's timers and
+    /// sockets, costing no CPU, until the driver reports the call done.
+    ///
+    /// ```no_run
+    /// # use hyperlight_unikraft::SandboxBuilder;
+    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio").boot()?;
+    /// sandbox.run("import time; time.sleep(2); print('later')")?;  // ~2 s, VM halted meanwhile
+    /// assert!(sandbox.drain_output().contains("later"));
+    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// ```
+    ///
+    /// Errors if the guest has no driver ([`Error::NoDriver`]), if the
+    /// driver reports the call failed ([`Error::CallFailed`], an uncaught
+    /// exception say), if the guest exits before the call returns
+    /// ([`Error::GuestExited`]), or if the guest deadlocks
+    /// ([`Error::Deadlocked`]): every thread blocked, no timer pending and
+    /// no host socket that could wake it.
+    pub fn run(&mut self, exec: impl Into<Exec>) -> Result<()> {
+        self.submit(exec)?;
+        loop {
+            match self.step_with(None)? {
+                Yield::CallDone => return Ok(()),
+                Yield::CallFailed { status } => return Err(Error::CallFailed { status }),
+                Yield::Exited { status } => return Err(Error::GuestExited { status }),
+                Yield::Blocked { .. } => {}
+            }
         }
-        // Guest command: dispatched under a distinct function name so the
-        // driver runs the named guest file (empty command → its conventional
-        // entrypoint) rather than treating the payload as inline code.
-        Exec::Guest(cmd) => sandbox.call::<()>("GuestExec", cmd),
+    }
+
+    /// Keep the guest running until its process exits, and return its exit
+    /// status.
+    ///
+    /// For an entry-point workload, where the program is the guest's PID 1
+    /// and there is nothing to dispatch:
+    ///
+    /// ```no_run
+    /// # use hyperlight_unikraft::{ListenPorts, NetworkPolicy, SandboxBuilder};
+    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/counter.cpio")
+    ///     .entry("/bin/server --port 80")
+    ///     .network(NetworkPolicy::AllowAll)
+    ///     .listen_ports(ListenPorts::from_ports([80]))
+    ///     .boot()?;                 // returns at the server's first accept()
+    /// let status = sandbox.join()?; // returns when the server process exits
+    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// ```
+    ///
+    /// Errors at once on a driver image with no call in flight
+    /// ([`Error::NothingToJoin`]): a driver waiting for calls never exits
+    /// on its own, so the join could never return.  Use [`run`](Self::run)
+    /// or [`submit`](Self::submit) there.  Also errors if the guest
+    /// deadlocks ([`Error::Deadlocked`], see [`run`](Self::run)).
+    pub fn join(&mut self) -> Result<i32> {
+        if self.exited.is_none() && self.has_driver() && !self.config.call_in_flight() {
+            return Err(Error::NothingToJoin);
+        }
+        loop {
+            match self.step_with(None)? {
+                Yield::Exited { status } => return Ok(status),
+                Yield::CallDone | Yield::CallFailed { .. } | Yield::Blocked { .. } => {}
+            }
+        }
+    }
+
+    /// Hand the driver a call without waiting for it to finish.
+    ///
+    /// The call is delivered by one VM entry, so the guest runs until it
+    /// blocks before this returns.  From then on drive it with
+    /// [`step`](Self::step); [`Yield::CallDone`] marks the return.  This is
+    /// how to keep the boundaries for yourself: to talk to a server the
+    /// script started, or to checkpoint in the middle of the call.
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use hyperlight_unikraft::{SandboxBuilder, Yield};
+    /// # let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio").boot()?;
+    /// sandbox.submit("import select; print('a'); select.select([], [], [], 1); print('b')")?;
+    /// // 'a' is printed and the script is parked on its one-second wait.
+    /// let y = sandbox.step(Duration::from_secs(5))?;
+    /// // Waited ~1 s (VM halted), re-entered, 'b' printed, script returned.
+    /// assert_eq!(y, Yield::CallDone);
+    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// ```
+    ///
+    /// Errors if the guest has exited ([`Error::GuestExited`]), has no
+    /// driver ([`Error::NoDriver`]), or already has a call in flight
+    /// ([`Error::CallInFlight`]: the kernel serves one at a time).
+    pub fn submit(&mut self, exec: impl Into<Exec>) -> Result<()> {
+        if let Some(Yield::Exited { status }) = self.exited {
+            return Err(Error::GuestExited { status });
+        }
+        // The kernel would reject it too (nothing reads /dev/hlcall);
+        // refusing here is earlier and says why.
+        if !self.has_driver() {
+            return Err(Error::NoDriver);
+        }
+        if self.config.call_in_flight() {
+            return Err(Error::CallInFlight);
+        }
+        let (name, arg) = match exec.into() {
+            Exec::Code(code) => ("Exec", code),
+            Exec::File(path) => {
+                let code = std::fs::read_to_string(&path).map_err(|source| Error::Script {
+                    path: path.clone(),
+                    source,
+                })?;
+                ("Exec", code)
+            }
+            // Dispatched under its own name so the driver runs the named
+            // guest file (empty command → its conventional entrypoint)
+            // rather than treating the payload as inline code.
+            Exec::Guest(cmd) => ("GuestExec", cmd),
+        };
+        let yielded = self.config.enter(&mut self.sandbox, name, arg)?;
+        match self.note(yielded) {
+            Yield::Blocked { .. } => {}
+            terminal => self.pending = Some(terminal),
+        }
+        Ok(())
+    }
+
+    /// Announce a restore to the kernel with one `resume` entry, on which
+    /// it reseeds its CSPRNG and re-establishes the guest's host sockets.
+    /// Like a step, it runs the scheduler to the next boundary, so a
+    /// terminal outcome (a call in flight at snapshot time finishing, or
+    /// the process exiting) is kept for the next [`step`](Self::step).
+    fn resume(&mut self) -> Result<()> {
+        let yielded = self.config.enter(&mut self.sandbox, "resume", ())?;
+        match self.note(yielded) {
+            Yield::Blocked { .. } => {}
+            terminal => self.pending = Some(terminal),
+        }
+        Ok(())
+    }
+
+    /// Remember an exit; everything else needs no bookkeeping.
+    fn note(&mut self, yielded: Yield) -> Yield {
+        if let Yield::Exited { .. } = yielded {
+            self.exited = Some(yielded);
+        }
+        yielded
+    }
+
+    /// Advance the guest by one step.
+    ///
+    /// Waits until the guest may be runnable again (its next timer is due,
+    /// or one of its host sockets is readable), at most `timeout`; then
+    /// enters the VM, lets the scheduler run until every guest thread is
+    /// blocked, and returns why it stopped.  If `timeout` runs out first
+    /// nothing has changed, and the last [`Yield::Blocked`] is returned
+    /// without entering, so `Duration::ZERO` is a non-blocking probe.
+    ///
+    /// The VM is halted for the whole wait; the host thread sits in
+    /// `poll(2)`.  [`run`](Self::run) and [`join`](Self::join) are loops
+    /// over this with no bound: they wait until a timer or a socket wakes
+    /// the guest, and fail if nothing could.
+    ///
+    /// Errors if the guest is deadlocked ([`Error::Deadlocked`]): nothing
+    /// can wake it and something is owed that only it can produce (see
+    /// [`run`](Self::run)).
+    pub fn step(&mut self, timeout: Duration) -> Result<Yield> {
+        self.step_with(Some(timeout))
+    }
+
+    /// [`step`](Self::step) with an optional bound; `None` waits until the
+    /// guest can run, however long that takes, and returns at once when
+    /// nothing could ever wake it (see [`GuestConfig::can_wake`]).
+    fn step_with(&mut self, timeout: Option<Duration>) -> Result<Yield> {
+        if let Some(y) = self.pending.take() {
+            return Ok(y);
+        }
+        if let Some(exit) = self.exited {
+            return Ok(exit);
+        }
+        // A guest nothing can wake -- no timer, no live host socket -- while
+        // something is owed that only it can produce (a call's return, or
+        // an entry-point workload's exit) is stuck for good: waiting any
+        // longer, for any timeout, would be waiting forever.  A driver
+        // idle between calls is not that; the host wakes it by submitting.
+        if !self.config.can_wake() && (self.config.call_in_flight() || !self.config.has_driver()) {
+            return Err(Error::Deadlocked);
+        }
+        // Wait for the guest to become runnable.
+        if !self.config.wait_runnable(timeout) {
+            return Ok(Yield::Blocked {
+                until: self.config.next_wakeup_at(),
+            });
+        }
+        let yielded = self.config.enter(&mut self.sandbox, "step", ())?;
+        Ok(self.note(yielded))
+    }
+
+    /// Capture the guest at the current boundary: every parked thread, the
+    /// scheduler queues, the application heap.  A guest resumed from it
+    /// (in this process with [`restore`](Self::restore), or anywhere with
+    /// [`SandboxBuilder::from_snapshot`]) picks up exactly here, in the
+    /// middle of a call or not, and re-establishes its host sockets by
+    /// itself.
+    ///
+    /// Errors with [`Error::GuestExited`] once the guest process has
+    /// exited: there is nothing left to resume.
+    pub fn snapshot(&mut self) -> Result<Arc<Snapshot>> {
+        if let Some(Yield::Exited { status }) = self.exited {
+            return Err(Error::GuestExited { status });
+        }
+        Ok(self.sandbox.snapshot()?)
+    }
+
+    /// [`snapshot`](Self::snapshot), then [`save_snapshot`] it to `dir`.
+    /// The snapshot is also returned, for use in this process.
+    pub fn snapshot_to(&mut self, dir: impl AsRef<Path>) -> Result<Arc<Snapshot>> {
+        let snapshot = self.snapshot()?;
+        save_snapshot(&snapshot, dir)?;
+        Ok(snapshot)
+    }
+
+    /// Restore a snapshot into this sandbox in place and put the restored
+    /// guest right for this host with a `resume` entry, as
+    /// [`SandboxBuilder::boot`] does.
+    pub fn restore(&mut self, snapshot: Arc<Snapshot>) -> Result<()> {
+        self.sandbox.restore(snapshot)?;
+        // The host sockets belong to the guest state just discarded; the
+        // restored guest re-creates the ones it holds on its resume entry.
+        if let Some(net) = &self.config.net {
+            net.reset();
+        }
+        self.exited = None;
+        self.pending = None;
+        self.config.forget();
+        self.resume()
+    }
+
+    /// [`restore`](Self::restore) with the snapshot read from `dir`, where
+    /// [`snapshot_to`](Self::snapshot_to) wrote it.
+    pub fn restore_from(&mut self, dir: impl AsRef<Path>) -> Result<()> {
+        self.restore(load_snapshot(dir)?)
+    }
+
+    /// Whether a runtime driver in the guest serves calls, so whether
+    /// [`run`](Self::run) and [`submit`](Self::submit) can work.  False for
+    /// an entry-point image, which is driven with [`join`](Self::join).
+    /// Known once [`SandboxBuilder::boot`] returns, for a fresh and a
+    /// restored guest alike.
+    pub fn has_driver(&self) -> bool {
+        self.config.has_driver()
+    }
+
+    /// Take the guest output captured so far.
+    pub fn drain_output(&self) -> String {
+        self.config.drain_output()
+    }
+
+    /// Set guest environment variables for the next call.
+    pub fn set_env_vars(&self, vars: &[(&str, &str)]) {
+        self.config.set_env_vars(vars)
+    }
+
+    /// A handle that can break an entry in progress from another thread
+    /// (see [`hyperlight_host::hypervisor::InterruptHandle`]): the way out
+    /// of a step that will not come back, at the cost of the sandbox.
+    pub fn interrupt_handle(&self) -> Arc<dyn hyperlight_host::hypervisor::InterruptHandle> {
+        self.sandbox.interrupt_handle()
     }
 }
 
@@ -855,23 +1641,21 @@ fn restore_snapshot(
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
-) -> hyperlight_host::Result<(MultiUseSandbox, GuestConfig)> {
+) -> Result<(MultiUseSandbox, GuestConfig)> {
     if mounts.is_empty() {
         debug!(
             "restore: no mounts provided — if the snapshot was saved with mounts, hostfs operations will fail"
         );
     }
-    let config = GuestConfig {
-        cmdline: String::new(),
-        scratch_size: DEFAULT_SCRATCH_MB * 1024 * 1024,
-        initrd_base: 0,
-        initrd_size: 0,
+    let config = GuestConfig::new(
+        String::new(),
+        DEFAULT_SCRATCH_MB * 1024 * 1024,
+        0,
+        0,
         mounts,
         network,
         listen_ports,
-        output: Arc::new(Mutex::new(String::new())),
-        env_str: Arc::new(Mutex::new(String::new())),
-    };
+    );
     let mut hf = HostFunctions::default();
     config.register(&mut hf)?;
 
@@ -895,22 +1679,28 @@ fn restore_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
+
+    /// OCI tags forbid `+`, so a `+build` suffix on the crate version would
+    /// make every snapshot save panic.
+    #[test]
+    fn snapshot_tag_is_the_crate_version() {
+        assert_eq!(snapshot_tag().to_string(), env!("CARGO_PKG_VERSION"));
+    }
 
     #[test]
     fn paging_budget_is_75_percent() {
-        let cfg = GuestConfig {
-            cmdline: String::new(),
-            scratch_size: 256 * 1024 * 1024,
-            initrd_base: 0,
-            initrd_size: 0,
-            mounts: Vec::new(),
-            network: None,
-            listen_ports: None,
-            output: Arc::new(Mutex::new(String::new())),
-            env_str: Arc::new(Mutex::new(String::new())),
-        };
+        let cfg = GuestConfig::new(
+            String::new(),
+            256 * 1024 * 1024,
+            0,
+            0,
+            Vec::new(),
+            None,
+            None,
+        );
         assert_eq!(cfg.paging_budget(), 192 * 1024 * 1024);
     }
 
@@ -1058,28 +1848,24 @@ mod tests {
     }
 
     #[test]
-    fn fstab_cmdline_single_rw_mount() {
-        let mounts = [Mount::rw("/tmp/share", "/mnt/host")];
-        let mut cmdline = "unikraft-hyperlight /entry".to_string();
-        if !mounts.is_empty() {
-            cmdline.push_str(" vfs.fstab=[");
-            for (i, m) in mounts.iter().enumerate() {
-                if i > 0 {
-                    cmdline.push(' ');
-                }
-                let flags = if m.readonly { "0x1" } else { "0x0" };
-                std::fmt::Write::write_fmt(
-                    &mut cmdline,
-                    format_args!("{i}:{}:hostfs:{flags}::mkmp", m.guest_path),
-                )
-                .unwrap();
-            }
-            cmdline.push(']');
+    fn fstab_single_rw_mount() {
+        let arg = fstab_arg(&[Mount::rw("/tmp/share", "/mnt/host")]).unwrap();
+        assert_eq!(arg, " vfs.fstab=[0:/mnt/host:hostfs:0x0::mkmp]");
+    }
+
+    #[test]
+    fn fstab_no_mounts_is_empty() {
+        assert_eq!(fstab_arg(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn fstab_rejects_a_path_the_kernel_would_misparse() {
+        for bad in ["relative", "/mnt/a b", "/mnt/a:b", "/mnt/[a]"] {
+            assert!(
+                fstab_arg(&[Mount::rw("/tmp", bad)]).is_err(),
+                "{bad:?} was accepted"
+            );
         }
-        assert_eq!(
-            cmdline,
-            "unikraft-hyperlight /entry vfs.fstab=[0:/mnt/host:hostfs:0x0::mkmp]",
-        );
     }
 
     /// Reproduce the exact byte output of the C `fb_encode_generic` encoder
@@ -1443,27 +2229,11 @@ mod tests {
     }
 
     #[test]
-    fn fstab_cmdline_multiple_mixed_mounts() {
-        let mounts = [Mount::rw("/a", "/mnt/a"), Mount::ro("/b", "/mnt/b")];
-        let mut cmdline = "unikraft-hyperlight /entry".to_string();
-        if !mounts.is_empty() {
-            cmdline.push_str(" vfs.fstab=[");
-            for (i, m) in mounts.iter().enumerate() {
-                if i > 0 {
-                    cmdline.push(' ');
-                }
-                let flags = if m.readonly { "0x1" } else { "0x0" };
-                std::fmt::Write::write_fmt(
-                    &mut cmdline,
-                    format_args!("{i}:{}:hostfs:{flags}::mkmp", m.guest_path),
-                )
-                .unwrap();
-            }
-            cmdline.push(']');
-        }
+    fn fstab_multiple_mixed_mounts() {
+        let arg = fstab_arg(&[Mount::rw("/a", "/mnt/a"), Mount::ro("/b", "/mnt/b")]).unwrap();
         assert_eq!(
-            cmdline,
-            "unikraft-hyperlight /entry vfs.fstab=[0:/mnt/a:hostfs:0x0::mkmp 1:/mnt/b:hostfs:0x1::mkmp]",
+            arg,
+            " vfs.fstab=[0:/mnt/a:hostfs:0x0::mkmp 1:/mnt/b:hostfs:0x1::mkmp]"
         );
     }
 }
