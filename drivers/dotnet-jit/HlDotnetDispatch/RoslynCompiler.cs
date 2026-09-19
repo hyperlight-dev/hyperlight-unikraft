@@ -89,28 +89,15 @@ using System.Threading.Tasks;
             if (entryPoint == null)
                 return (false, "no entry point found");
 
-            // Capture stdout — user code writes to Console.Out
-            var sw = new StringWriter();
-            var origOut = Console.Out;
-            Console.SetOut(sw);
-
-            try
-            {
-                // Top-level statements compile to Main(string[] args) or Main()
-                var parameters = entryPoint.GetParameters();
-                if (parameters.Length > 0)
-                    entryPoint.Invoke(null, new object[] { Array.Empty<string>() });
-                else
-                    entryPoint.Invoke(null, null);
-            }
-            finally
-            {
-                Console.SetOut(origOut);
-            }
-
-            var output = sw.ToString();
-            if (output.Length > 0)
-                Console.Write(output);
+            // User code writes to Console.Out as it runs: a long call's
+            // output reaches the host while the call is in flight, and
+            // an Environment.Exit() loses nothing already written.
+            // Top-level statements compile to Main(string[] args) or Main()
+            var parameters = entryPoint.GetParameters();
+            if (parameters.Length > 0)
+                entryPoint.Invoke(null, new object[] { Array.Empty<string>() });
+            else
+                entryPoint.Invoke(null, null);
             Console.Out.Flush();
 
             return (true, null);

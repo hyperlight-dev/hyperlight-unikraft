@@ -1,159 +1,216 @@
 /*
- * hl_env.h — Shared environment variable refresh for Hyperlight drivers.
+ * hl_env.h — host environment refresh for Hyperlight drivers.
  *
- * After snapshot restore, the kernel re-injects host-provided env vars
- * into its own environ (via setenv in dispatch.c), but drivers that
- * were loaded as ELFs via app-elfloader have a SEPARATE glibc environ
- * that stays stale.  This header provides the common logic to query
- * the host and update glibc's environ on each dispatch.
+ * The kernel brings the host-provided environment variables into its own
+ * environ before every named call, but a driver loaded as an ELF has a
+ * separate libc environ that the kernel cannot reach, and it goes stale
+ * the moment the host changes a variable -- after a snapshot restore,
+ * typically.  So the driver asks the kernel for the host's current
+ * environment (the HLCALL_IOC_GETENV ioctl on /dev/hlcall, see
+ * hl_driver.h) at the top of each call it serves and setenv()s it.
  *
- * Usage:
- *   1. Call hl_env_init(envp) from main() to parse HL_GET_ENV_VARS_FN.
- *   2. Call hl_env_refresh(cb, ctx) at the top of each dispatch to
- *      setenv() all non-HL_ host vars.  The optional callback lets
- *      runtime-specific drivers do extra work per var (e.g. update
- *      Python's os.environ or inject `export` lines for bash).
- *
- * Depends on hl_parse_hex() from hl_fc.h — include hl_fc.h first.
+ * Usage: call hl_env_refresh(cb, ctx) at the top of each dispatch.  The
+ * optional callback carries each variable into the runtime: Python sets
+ * os.environ through the C API; bash, Node and .NET are fed source text
+ * and quote the value with the helpers at the end of this header.
  */
 
 #ifndef HL_ENV_H
 #define HL_ENV_H
 
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 
-/* ── Kernel function pointer for querying host env vars ────────── */
-
-typedef int (*hl_get_env_fn_t)(char *, size_t);
-
-/*
- * Set by hl_env_init(); NULL if the kernel didn't export
- * HL_GET_ENV_VARS_FN (older kernel or evolve without env support).
- */
-static hl_get_env_fn_t g_hl_get_env_fn;
+#include "hl_driver.h" /* g_hl_call_fd, g_hl_call_cap, HLCALL_IOC_GETENV */
 
 /*
- * Parse HL_GET_ENV_VARS_FN from envp.
- * Also parses HL_DISPATCH_CALLBACK_PTR and HL_DISPATCH_ENTRY into
- * the caller-provided pointers (common to every driver's main()).
- */
-static inline void hl_env_init(char **envp,
-			       hl_dispatch_fn_t **out_cb_slot,
-			       uint64_t *out_entry)
-{
-	for (char **p = envp; p && *p; p++) {
-		if (!strncmp(*p, "HL_DISPATCH_CALLBACK_PTR=", 25))
-			*out_cb_slot = (hl_dispatch_fn_t *)
-				hl_parse_hex(*p + 25);
-		else if (!strncmp(*p, "HL_DISPATCH_ENTRY=", 18))
-			*out_entry = hl_parse_hex(*p + 18);
-		else if (!strncmp(*p, "HL_GET_ENV_VARS_FN=", 19))
-			g_hl_get_env_fn = (hl_get_env_fn_t)
-				hl_parse_hex(*p + 19);
-	}
-}
-
-/* ── Remove reserved HL_ vars from glibc environ ─────────────── */
-
-/*
- * After hl_env_init() has parsed the HL_ addresses into globals,
- * remove all HL_ prefixed vars from glibc's environ so guest user
- * code (Python scripts, Node.js code, etc.) cannot read internal
- * addresses like HL_DISPATCH_CALLBACK_PTR via getenv().
- *
- * Must be called AFTER hl_env_init() — the globals are already set,
- * and the env vars are no longer needed.
- */
-static inline void hl_env_clean_reserved(void)
-{
-	extern char **environ;
-	/* Collect keys first — unsetenv modifies environ in place. */
-	char keys[8][64];
-	int n = 0;
-	for (char **p = environ; p && *p && n < 8; p++) {
-		if ((*p)[0] == 'H' && (*p)[1] == 'L' && (*p)[2] == '_') {
-			char *eq = strchr(*p, '=');
-			if (eq) {
-				size_t klen = (size_t)(eq - *p);
-				if (klen < 64) {
-					memcpy(keys[n], *p, klen);
-					keys[n][klen] = '\0';
-					n++;
-				}
-			}
-		}
-	}
-	for (int i = 0; i < n; i++)
-		unsetenv(keys[i]);
-}
-
-/* ── Per-dispatch env refresh ──────────────────────────────────── */
-
-/*
- * Optional callback invoked for each non-HL_ env var.
- * key and value are NUL-terminated (the '=' was temporarily zeroed).
- * The callback can use them for runtime-specific updates:
- *   - Python: PyObject_SetItem(os.environ, key, value)
- *   - Bash:   fprintf(f, "export %s='%s'\n", key, value)
- *   - Node:   append "process.env['key']='value';\n" to code
+ * Invoked for each variable.  key and value are NUL-terminated (the '='
+ * is temporarily zeroed).
  */
 typedef void (*hl_env_cb_t)(const char *key, const char *val, void *ctx);
 
+/* The entries arrive on the same PEB stack as a call, so a call-sized
+ * buffer always holds them; allocated on the first refresh, kept since
+ * this runs on every call. */
+static char *g_hl_env_buf;
+
 /*
- * Query the host for env vars and inject them into glibc's environ
- * via setenv().  For each non-HL_ variable, also invokes cb (if
- * non-NULL) for runtime-specific propagation.
+ * Fetch the host's environment and setenv() every variable, overriding
+ * what was there; cb, if non-NULL, sees each one too.
  *
- * On a normal boot this is redundant (glibc environ already matches
- * the kernel's) but cheap — one host call returning a small string.
- * After snapshot restore this is the only path that updates glibc's
- * environ with vars the host set after restore.
- *
- * Returns the number of vars set, or 0 if unavailable / no vars.
+ * Returns the number of variables set: 0 if there are none, if the
+ * device is not open, or on a kernel without the ioctl (then there is
+ * nothing to refresh from).
  */
 static inline int hl_env_refresh(hl_env_cb_t cb, void *ctx)
 {
-	if (!g_hl_get_env_fn)
-		return 0;
-
-	char buf[4096];
-	int len = g_hl_get_env_fn(buf, sizeof(buf));
-	if (len <= 0)
-		return 0;
-
+	struct hlcall_env env;
 	int count = 0;
-	char *p = buf;
-	char *end = buf + len;
-	while (p < end) {
-		char *eq;
 
-		if (*p == '\0') {
-			p++;
+	if (g_hl_call_fd < 0)
+		return 0;
+	if (!g_hl_env_buf) {
+		g_hl_env_buf = malloc(g_hl_call_cap);
+		if (!g_hl_env_buf)
+			return 0;
+	}
+
+	env.buf = g_hl_env_buf;
+	env.cap = g_hl_call_cap;
+	env.len = 0;
+	if (ioctl(g_hl_call_fd, HLCALL_IOC_GETENV, &env) < 0) {
+		if (errno != ENOTTY)
+			fprintf(stderr, "hl_env: cannot read the host environment: %s\n",
+				strerror(errno));
+		return 0;
+	}
+
+	for (char *p = env.buf, *end = env.buf + env.len; p < end;
+	     p += strlen(p) + 1) {
+		char *eq = strchr(p, '=');
+
+		if (!eq || eq == p)
 			continue;
-		}
-		/* Skip HL_ reserved keys */
-		if (p[0] == 'H' && p[1] == 'L' && p[2] == '_')
-			goto skip;
-
-		eq = p;
-		while (*eq && *eq != '=')
-			eq++;
-		if (*eq == '=') {
-			*eq = '\0';
-			setenv(p, eq + 1, 1);
-			if (cb)
-				cb(p, eq + 1, ctx);
-			*eq = '=';
-			count++;
-		}
-skip:
-		while (p < end && *p)
-			p++;
-		p++;
+		*eq = '\0';
+		setenv(p, eq + 1, 1);
+		if (cb)
+			cb(p, eq + 1, ctx);
+		*eq = '=';
+		count++;
 	}
 
 	return count;
+}
+
+/* ── Quoting the environment into runtime source ───────────────── */
+
+/*
+ * A driver whose runtime is a separate process (bash, Node, .NET) cannot
+ * setenv() into it; it prefixes each call's source with one assignment
+ * per variable instead.  The buffer grows with the environment -- the
+ * kernel hands over all of it -- and the values are quoted as literals
+ * of the target language, so no character in a value can alter the
+ * source.  An allocation failure sets `err` and turns later appends
+ * into no-ops; the driver then fails the call rather than send a
+ * truncated prefix.
+ */
+struct hl_strbuf {
+	char *buf;
+	size_t len;
+	size_t cap;
+	int err;
+};
+
+static inline void hl_strbuf_put(struct hl_strbuf *b, const char *s, size_t n)
+{
+	if (b->err)
+		return;
+	if (b->len + n + 1 > b->cap) {
+		size_t cap = b->cap ? b->cap : 4096;
+		char *nb;
+
+		while (cap < b->len + n + 1)
+			cap *= 2;
+		nb = realloc(b->buf, cap);
+		if (!nb) {
+			b->err = 1;
+			return;
+		}
+		b->buf = nb;
+		b->cap = cap;
+	}
+	memcpy(b->buf + b->len, s, n);
+	b->len += n;
+	b->buf[b->len] = '\0';
+}
+
+static inline void hl_strbuf_puts(struct hl_strbuf *b, const char *s)
+{
+	hl_strbuf_put(b, s, strlen(s));
+}
+
+static inline void hl_strbuf_free(struct hl_strbuf *b)
+{
+	free(b->buf);
+	b->buf = NULL;
+	b->len = b->cap = 0;
+}
+
+/* Append @s as a JSON string literal.  JavaScript and C# both read one as
+ * a string of the same value: `"` and `\` escaped, control characters as
+ * \n \t \r \b \f or \u00XX, every other byte as it is. */
+static inline void hl_strbuf_put_json(struct hl_strbuf *b, const char *s)
+{
+	hl_strbuf_put(b, "\"", 1);
+	for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+		char u[8];
+
+		switch (*p) {
+		case '"':
+			hl_strbuf_puts(b, "\\\"");
+			break;
+		case '\\':
+			hl_strbuf_puts(b, "\\\\");
+			break;
+		case '\n':
+			hl_strbuf_puts(b, "\\n");
+			break;
+		case '\r':
+			hl_strbuf_puts(b, "\\r");
+			break;
+		case '\t':
+			hl_strbuf_puts(b, "\\t");
+			break;
+		case '\b':
+			hl_strbuf_puts(b, "\\b");
+			break;
+		case '\f':
+			hl_strbuf_puts(b, "\\f");
+			break;
+		default:
+			if (*p < 0x20) {
+				snprintf(u, sizeof(u), "\\u%04x", *p);
+				hl_strbuf_puts(b, u);
+			} else {
+				hl_strbuf_put(b, (const char *)p, 1);
+			}
+		}
+	}
+	hl_strbuf_put(b, "\"", 1);
+}
+
+/* Append @s single-quoted for a POSIX shell.  Nothing is special inside
+ * single quotes but the quote itself, spelled '\'' -- close, one escaped
+ * quote, reopen. */
+static inline void hl_strbuf_put_shquoted(struct hl_strbuf *b, const char *s)
+{
+	hl_strbuf_put(b, "'", 1);
+	for (const char *p = s; *p; p++) {
+		if (*p == '\'')
+			hl_strbuf_puts(b, "'\\''");
+		else
+			hl_strbuf_put(b, p, 1);
+	}
+	hl_strbuf_put(b, "'", 1);
+}
+
+/* Whether @key is a name a shell accepts in `export KEY=`: ASCII
+ * letters, digits and underscore, not starting with a digit.  Spelled
+ * out rather than isalpha(), which follows the process locale.  Other
+ * keys are left to setenv() alone. */
+static inline int hl_env_key_is_identifier(const char *key)
+{
+	for (const char *p = key; *p; p++) {
+		int ok = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+			 *p == '_' || (p != key && *p >= '0' && *p <= '9');
+
+		if (!ok)
+			return 0;
+	}
+	return *key != '\0';
 }
 
 #endif /* HL_ENV_H */

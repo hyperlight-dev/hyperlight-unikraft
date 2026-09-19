@@ -6,18 +6,20 @@
  * pwsh invocation (no persistent subprocess).
  *
  * Exit detection uses a pipe (same as the exec driver): the child
- * inherits the write end, and EOF signals the parent when it exits.
+ * inherits the write end, and EOF signals the parent when it exits;
+ * waitpid() then collects pwsh's exit code, which becomes the call's.
  *
  * Flow:
  *   boot (evolve):
- *     main() → register dispatch callback → halt
+ *     main() → hl_driver_init(): open /dev/hlcall
+ *            → hl_driver_run(): block in read() on the call queue
  *
  *   host: call("Exec", "Write-Host 'hello'")
- *     dispatch → pwsh_dispatch(fc, fc_len)
+ *     read() returns the call → pwsh_dispatch(fc, fc_len)
  *              → write code to /tmp/hl_dispatch.ps1
  *              → pipe() + vfork + execl("pwsh", "-File", ...)
  *              → read(pipe) blocks until child exits
- *              → return → halt
+ *              → back into read(): the call is done
  */
 
 #include <stdio.h>
@@ -88,6 +90,9 @@ static int pwsh_dispatch(const uint8_t *fc, size_t fc_len)
 		return -1;
 	}
 
+	/* The child needs only the write end, whose close is the EOF. */
+	fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+
 	pid_t pid = vfork();
 	if (pid < 0) {
 		close(fds[0]);
@@ -112,23 +117,25 @@ static int pwsh_dispatch(const uint8_t *fc, size_t fc_len)
 		;
 	close(fds[0]);
 
-	return 0;
+	/* The EOF says pwsh is gone, not how it went: its exit status is the
+	 * call's, so a script's `exit 3` or a terminating error fails the
+	 * call as it would fail a shell. */
+	return hl_wait_status(pid);
 }
 
 /* ── Entry point ───────────────────────────────────────────────── */
 
-int main(int argc, char **argv, char **envp)
+int main(int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
 
-	/* Parse kernel addresses from env vars */
-	if (hl_driver_init(envp, "hl_pwshdriver"))
+	if (hl_driver_init("hl_pwshdriver"))
 		return 1;
 
 	/* .NET requires ICU for globalization; skip it in the unikernel */
 	putenv("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true");
 
-	/* Register dispatch callback */
+	/* Serve named calls from the kernel's queue; never returns */
 	hl_driver_run(pwsh_dispatch);
 }

@@ -1,11 +1,20 @@
 /*
  * hl_fc.h — Minimal FunctionCall FlatBuffer reader for Hyperlight drivers.
  *
- * Extracts the first string parameter from a Hyperlight FunctionCall
- * FlatBuffer.  Shared across all runtime drivers (Python, Node, .NET).
+ * Extracts the function name and the first string parameter from a
+ * Hyperlight FunctionCall FlatBuffer, as the kernel hands it to the
+ * driver through /dev/hlcall.  Shared across all runtime drivers.
  *
- * Also provides the env-var parsing for the dispatch addresses
- * injected by the kernel's dispatch.c via uk_late_initcall.
+ * The vtable offsets and the union discriminant below follow the field
+ * order of hyperlight's schema (src/schema/function_call.fbs and
+ * function_types.fbs in the hyperlight repository): FunctionCall is
+ * function_name, parameters; Parameter is the value union, whose
+ * seventh member is hlstring; hlstring is value.  The buffer is
+ * size-prefixed, hence the root offset read at byte 4.
+ *
+ * Every offset is checked against the buffer's length as it is
+ * followed: a malformed call makes the extractors return NULL, which
+ * fails the call, rather than read outside the buffer.
  */
 
 #ifndef HL_FC_H
@@ -17,35 +26,88 @@
 
 /* ── FlatBuffer primitives ─────────────────────────────────────── */
 
-static inline uint32_t fb_u32(const uint8_t *b, size_t o)
+/* An offset that would leave the buffer; every later step passes it
+ * through, so a check at the start of a chain covers the whole chain. */
+#define FB_BAD ((size_t)-1)
+
+/* Whether [o, o + n) lies within a buffer of `len` bytes. */
+static inline int fb_in(size_t len, size_t o, size_t n)
 {
-	return b[o] | ((uint32_t)b[o+1] << 8) |
-	       ((uint32_t)b[o+2] << 16) | ((uint32_t)b[o+3] << 24);
+	return o != FB_BAD && o <= len && n <= len - o;
 }
 
-static inline uint16_t fb_u16(const uint8_t *b, size_t o)
+static inline int fb_get_u32(const uint8_t *b, size_t len, size_t o, uint32_t *out)
 {
-	return b[o] | ((uint16_t)b[o+1] << 8);
-}
-
-static inline size_t fb_vtable(const uint8_t *b, size_t tbl)
-{
-	return tbl - (int32_t)fb_u32(b, tbl);
-}
-
-static inline uint16_t fb_field(const uint8_t *b, size_t tbl, uint16_t vt)
-{
-	size_t v = fb_vtable(b, tbl);
-	return vt >= fb_u16(b, v) ? 0 : fb_u16(b, v + vt);
-}
-
-static inline size_t fb_follow(const uint8_t *b, size_t tbl, uint16_t vt)
-{
-	uint16_t f = fb_field(b, tbl, vt);
-	if (!f)
+	if (!fb_in(len, o, 4))
 		return 0;
-	size_t p = tbl + f;
-	return p + fb_u32(b, p);
+	*out = b[o] | ((uint32_t)b[o+1] << 8) |
+	       ((uint32_t)b[o+2] << 16) | ((uint32_t)b[o+3] << 24);
+	return 1;
+}
+
+static inline int fb_get_u16(const uint8_t *b, size_t len, size_t o, uint16_t *out)
+{
+	if (!fb_in(len, o, 2))
+		return 0;
+	*out = b[o] | ((uint16_t)b[o+1] << 8);
+	return 1;
+}
+
+/* The root table of a size-prefixed buffer: the uoffset at byte 4. */
+static inline size_t fb_root(const uint8_t *b, size_t len)
+{
+	uint32_t off;
+
+	if (!fb_get_u32(b, len, 4, &off) || !fb_in(len, 4 + (size_t)off, 4))
+		return FB_BAD;
+	return 4 + (size_t)off;
+}
+
+/* A table's vtable: the table starts with a signed offset back to it. */
+static inline size_t fb_vtable(const uint8_t *b, size_t len, size_t tbl)
+{
+	uint32_t raw;
+	int64_t v;
+
+	if (!fb_get_u32(b, len, tbl, &raw))
+		return FB_BAD;
+	v = (int64_t)tbl - (int32_t)raw;
+	if (v < 0 || !fb_in(len, (size_t)v, 4))
+		return FB_BAD;
+	return (size_t)v;
+}
+
+/* The offset of field `vt` within its table: 0 if the field is absent
+ * (a vtable shorter than `vt`, or a zero entry), FB_BAD if malformed. */
+static inline size_t fb_field(const uint8_t *b, size_t len, size_t tbl, uint16_t vt)
+{
+	size_t v = fb_vtable(b, len, tbl);
+	uint16_t vsize, f;
+
+	if (v == FB_BAD || !fb_get_u16(b, len, v, &vsize))
+		return FB_BAD;
+	if (vt >= vsize)
+		return 0;
+	if (!fb_get_u16(b, len, v + vt, &f))
+		return FB_BAD;
+	return f;
+}
+
+/* Follow an offset field to the table, vector or string it points at:
+ * 0 if the field is absent, FB_BAD if malformed. */
+static inline size_t fb_follow(const uint8_t *b, size_t len, size_t tbl, uint16_t vt)
+{
+	size_t f = fb_field(b, len, tbl, vt);
+	size_t p, target;
+	uint32_t off;
+
+	if (f == 0 || f == FB_BAD)
+		return f;
+	p = tbl + f;
+	if (!fb_get_u32(b, len, p, &off))
+		return FB_BAD;
+	target = p + (size_t)off;
+	return fb_in(len, target, 4) ? target : FB_BAD;
 }
 
 /* ── FunctionCall string extraction ────────────────────────────── */
@@ -54,7 +116,8 @@ static inline size_t fb_follow(const uint8_t *b, size_t tbl, uint16_t vt)
  * Extract the first parameter as a string from a FunctionCall FlatBuffer.
  *
  * Returns a pointer into `fc` and sets *out_len to the string length,
- * or returns NULL if the first parameter isn't a string.
+ * or returns NULL if the first parameter isn't a string, or the buffer
+ * is malformed.
  *
  * The returned pointer is NOT NUL-terminated — the caller must copy
  * and terminate before passing to string APIs.
@@ -62,37 +125,39 @@ static inline size_t fb_follow(const uint8_t *b, size_t tbl, uint16_t vt)
 static inline const char *fc_arg0_string(const uint8_t *fc, size_t fc_len,
 					 size_t *out_len)
 {
-	if (fc_len < 8)
-		return NULL;
+	size_t root, params, p0_pos, p0, tf, hs, s;
+	uint32_t count, off, slen;
 
-	size_t root = 4 + fb_u32(fc, 4);
+	root = fb_root(fc, fc_len);
+	if (root == FB_BAD)
+		return NULL;
 
 	/* FunctionCall.parameters (vtable offset 6) → vector of Parameter */
-	size_t params = fb_follow(fc, root, 6);
-	if (!params || fb_u32(fc, params) == 0)
+	params = fb_follow(fc, fc_len, root, 6);
+	if (!params || params == FB_BAD ||
+	    !fb_get_u32(fc, fc_len, params, &count) || count == 0)
 		return NULL;
 
-	/* First parameter */
-	size_t p0_pos = params + 4;
-	size_t p0 = p0_pos + fb_u32(fc, p0_pos);
+	/* First parameter: the vector's first uoffset */
+	p0_pos = params + 4;
+	if (!fb_get_u32(fc, fc_len, p0_pos, &off))
+		return NULL;
+	p0 = p0_pos + (size_t)off;
 
 	/* Parameter.value_type (vtable offset 4) must be 7 = hlstring */
-	uint16_t tf = fb_field(fc, p0, 4);
-	if (!tf || fc[p0 + tf] != 7)
+	tf = fb_field(fc, fc_len, p0, 4);
+	if (!tf || tf == FB_BAD || !fb_in(fc_len, p0 + tf, 1) || fc[p0 + tf] != 7)
 		return NULL;
 
 	/* Parameter.value (vtable offset 6) → hlstring table */
-	size_t hs = fb_follow(fc, p0, 6);
-	if (!hs)
+	hs = fb_follow(fc, fc_len, p0, 6);
+	if (!hs || hs == FB_BAD)
 		return NULL;
 
-	/* hlstring.value (vtable offset 4) → string */
-	size_t s = fb_follow(fc, hs, 4);
-	if (!s || s + 4 > fc_len)
-		return NULL;
-
-	uint32_t slen = fb_u32(fc, s);
-	if (s + 4 + slen > fc_len)
+	/* hlstring.value (vtable offset 4) → string: a length, then the bytes */
+	s = fb_follow(fc, fc_len, hs, 4);
+	if (!s || s == FB_BAD || !fb_get_u32(fc, fc_len, s, &slen) ||
+	    !fb_in(fc_len, s + 4, slen))
 		return NULL;
 
 	*out_len = slen;
@@ -110,18 +175,17 @@ static inline const char *fc_arg0_string(const uint8_t *fc, size_t fc_len,
 static inline const char *fc_function_name(const uint8_t *fc, size_t fc_len,
 					   size_t *out_len)
 {
-	if (fc_len < 8)
-		return NULL;
+	size_t root, s;
+	uint32_t slen;
 
-	size_t root = 4 + fb_u32(fc, 4);
+	root = fb_root(fc, fc_len);
+	if (root == FB_BAD)
+		return NULL;
 
 	/* FunctionCall.function_name (vtable offset 4) → string */
-	size_t s = fb_follow(fc, root, 4);
-	if (!s || s + 4 > fc_len)
-		return NULL;
-
-	uint32_t slen = fb_u32(fc, s);
-	if (s + 4 + slen > fc_len)
+	s = fb_follow(fc, fc_len, root, 4);
+	if (!s || s == FB_BAD || !fb_get_u32(fc, fc_len, s, &slen) ||
+	    !fb_in(fc_len, s + 4, slen))
 		return NULL;
 
 	*out_len = slen;
@@ -160,29 +224,6 @@ static inline int hl_split_ws(char *buf, char **argv, int max)
 	}
 	argv[argc] = NULL;
 	return argc;
-}
-
-/* ── Hex address parsing ───────────────────────────────────────── */
-
-static inline uintptr_t hl_parse_hex(const char *s)
-{
-	uintptr_t v = 0;
-
-	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
-		s += 2;
-	for (; *s; s++) {
-		unsigned d;
-		if (*s >= '0' && *s <= '9')
-			d = *s - '0';
-		else if (*s >= 'a' && *s <= 'f')
-			d = *s - 'a' + 10;
-		else if (*s >= 'A' && *s <= 'F')
-			d = *s - 'A' + 10;
-		else
-			break;
-		v = (v << 4) | d;
-	}
-	return v;
 }
 
 /* ── Callback type ─────────────────────────────────────────────── */
