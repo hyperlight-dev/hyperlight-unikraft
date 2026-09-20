@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789247581565,
+  "lastUpdate": 1789945371624,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python benchmarks": [
@@ -833,6 +833,150 @@ window.BENCHMARK_DATA = {
           {
             "name": "parallel-exec/stdlib",
             "value": 215.231,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 78.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 78.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 78.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 18,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 18,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 22,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "36b94063b559dc15d8111264903d463d0039ca95",
+          "message": "Merge pull request #114 from hyperlight-dev/coop-pause-vm-v0.14.0\n\nv0.14.0: cooperative step model for long-running guests",
+          "timestamp": "2026-09-20T15:50:40-07:00",
+          "tree_id": "ef82580ea34504b16e6480392c408ffc6e3644bb",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/36b94063b559dc15d8111264903d463d0039ca95"
+        },
+        "date": 1789945368793,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 278.028,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 275.992,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 391.678,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 14.388,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 8.528,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 143.3,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 4.649,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 1.156,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 122.044,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 2.005,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 1.919,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 2.633,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.47,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.166,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 44.112,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 8.026,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 1.83,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 213.152,
             "unit": "ms"
           },
           {
