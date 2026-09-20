@@ -285,6 +285,13 @@ int main(int argc, char **argv)
 	setenv("COMPlus_EnableDiagnostics", "0", 1);
 	setenv("DOTNET_GCHeapHardLimitPercent", "0x32", 1);
 	setenv("DOTNET_gcServer", "0", 1);
+	/* Environment.Exit tears the runtime down by coordinating its threads;
+	 * on the single-vCPU cooperative scheduler that teardown can leave a
+	 * background thread parked with no wake, so the shutdown never finishes
+	 * and the call deadlocks.  The concurrent GC's background thread never
+	 * runs concurrently on a single vCPU anyway -- drop it, which removes a
+	 * thread from the shutdown handoff and lets it complete. */
+	setenv("DOTNET_gcConcurrent", "0", 1);
 	setenv("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1", 1);
 	setenv("DOTNET_DefaultStackSize", "0x40000", 1);
 	setenv("DOTNET_ThreadPool_ForceMinWorkerThreads", "1", 1);
