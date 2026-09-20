@@ -664,7 +664,7 @@ build-test-bins:
     rm -rf "$bins"
     mkdir -p "$bins/c" "$bins/rust" "$bins/go" "$bins/dotnet-aot"
     echo "==> C / C++"
-    for src in hello goodbye env_vars; do
+    for src in hello goodbye env_vars status; do
         gcc -O2 -Wall -static-pie -fPIE -o "$bins/c/$src" "{{examples_dir}}/c/$src.c"
     done
     g++ -O2 -Wall -static-pie -fPIE -o "$bins/c/hello_cpp" "{{examples_dir}}/c/hello_cpp.cpp"
@@ -674,13 +674,13 @@ build-test-bins:
             -o "$bins/rust/$src" "{{examples_dir}}/rust/$src.rs"
     done
     echo "==> Go"
-    for src in hello env_vars; do
+    for src in hello env_vars counter; do
         CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildmode=pie -ldflags='-s -w' \
             -o "$bins/go/$src" "{{examples_dir}}/go/$src.go"
     done
     echo "==> .NET AOT"
-    for proj in dotnet-aot dotnet-aot-envvars dotnet-aot-caps; do
-        dotnet publish "{{examples_dir}}/$proj" -c Release -r linux-musl-x64 -v q --nologo \
+    for proj in hello env_vars caps; do
+        dotnet publish "{{examples_dir}}/dotnet-aot/$proj" -c Release -r linux-musl-x64 -v q --nologo \
             -o "$bins/dotnet-aot"
     done
     rm -f "$bins/dotnet-aot"/*.dbg

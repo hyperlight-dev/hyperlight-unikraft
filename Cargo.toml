@@ -1,6 +1,6 @@
 [package]
 name = "hyperlight-unikraft"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 description = "Run ordinary Linux programs inside Hyperlight micro-VMs using a Unikraft unikernel as the guest kernel — the hluk CLI and library."
 license = "Apache-2.0"
@@ -22,6 +22,7 @@ mshv = ["hyperlight-host/mshv3"]
 
 [dependencies]
 hyperlight-common = "0.17"
+thiserror = "2"
 tracing = "0.1"
 
 # Host I/O.  Filesystem: cap-std's `Dir` is the capability that keeps
@@ -57,3 +58,6 @@ hyperlight-host = "0.17"
 [target.'cfg(windows)'.dependencies]
 # Private working set for the bench RSS line (already in the tree via clap).
 windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"

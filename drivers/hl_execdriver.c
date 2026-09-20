@@ -4,19 +4,22 @@
  * On dispatch, receives a binary path (e.g. "/mnt/bin/hello") and runs
  * it via vfork+execve.  Exit detection uses a pipe: the child inherits
  * the write end, and when it exits the write end closes, producing
- * EOF on the parent's read.  Used by C, Rust, Go, and .NET Native AOT
- * runtimes where the user mounts a host directory containing the
+ * EOF on the parent's read; waitpid() then collects the exit status,
+ * which becomes the call's.  Used by C, Rust, Go, and .NET Native AOT
+ * runtimes, where the embedder mounts a host directory containing the
  * compiled binary into the guest.
  *
  * Flow:
  *   boot (evolve):
- *     main() → register dispatch callback → halt
+ *     main() → hl_driver_init(): open /dev/hlcall
+ *            → hl_driver_run(): block in read() on the call queue
  *
  *   host: call("Exec", "/bin/hello")
- *     dispatch → exec_dispatch(fc, fc_len)
- *              → pipe() + vfork + execl(path)
+ *     read() returns the call → exec_dispatch(fc, fc_len)
+ *              → pipe() + vfork + execv(path)
  *              → read(pipe) blocks until child exits (EOF)
- *              → return → halt
+ *              → waitpid(): the exit status is the call's status
+ *              → back into read(): the call is done
  */
 
 #include <stdio.h>
@@ -73,15 +76,18 @@ static int exec_dispatch(const uint8_t *fc, size_t fc_len)
 	}
 
 	/* Create a pipe for exit detection.  The child inherits the
-	 * write end via exec (no CLOEXEC).  When the child exits,
-	 * the kernel closes its fds, dropping the last writer and
-	 * producing EOF on the parent's read end. */
+	 * write end via exec.  When the child exits, the kernel closes
+	 * its fds, dropping the last writer and producing EOF on the
+	 * parent's read end. */
 	int fds[2];
 	if (pipe(fds) < 0) {
 		fprintf(stderr, "hl_execdriver: pipe() failed\n");
 		fflush(stderr);
 		return -1;
 	}
+
+	/* The child needs only the write end, whose close is the EOF. */
+	fcntl(fds[0], F_SETFD, FD_CLOEXEC);
 
 	pid_t pid = vfork();
 	if (pid < 0) {
@@ -92,8 +98,8 @@ static int exec_dispatch(const uint8_t *fc, size_t fc_len)
 		return -1;
 	}
 	if (pid == 0) {
-		/* Child — only exec or _exit allowed after vfork.
-		 * Both pipe ends are inherited; exec keeps them. */
+		/* Child — only exec or _exit allowed after vfork.  It inherits
+		 * the pipe's write end, whose close at exit is the EOF. */
 		execv(argv[0], argv);
 		_exit(127);
 	}
@@ -107,20 +113,22 @@ static int exec_dispatch(const uint8_t *fc, size_t fc_len)
 		;
 	close(fds[0]);
 
-	return 0;
+	/* The EOF says the program is gone, not how it went: its exit status
+	 * is the call's, so a non-zero exit or a signal (an abort, a
+	 * std::terminate) fails the call as it would fail a shell. */
+	return hl_wait_status(pid);
 }
 
 /* ── Entry point ───────────────────────────────────────────────── */
 
-int main(int argc, char **argv, char **envp)
+int main(int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
 
-	/* Parse kernel addresses from env vars */
-	if (hl_driver_init(envp, "hl_execdriver"))
+	if (hl_driver_init("hl_execdriver"))
 		return 1;
 
-	/* Register dispatch callback */
+	/* Serve named calls from the kernel's queue; never returns */
 	hl_driver_run(exec_dispatch);
 }

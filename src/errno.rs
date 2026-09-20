@@ -7,7 +7,9 @@
 //! reports to it must be a *Linux* errno number, whatever the host OS.
 //! On Linux the host's own errno already is that number and passes
 //! through untouched.  On Windows the raw OS code is translated: Win32
-//! and Winsock codes first, then `io::ErrorKind` as the fallback.
+//! and Winsock codes first, then `io::ErrorKind` as the fallback.  On
+//! any other host (macOS) the raw code is another numbering and only the
+//! `io::ErrorKind` fallback applies.
 //!
 //! Callers get the errno number itself (`ECONNREFUSED` is 111) and
 //! negate it on the wire, the usual `-errno` convention.  Only the
@@ -40,6 +42,7 @@ pub const EMLINK: i32 = 31;
 pub const EPIPE: i32 = 32;
 pub const EDEADLK: i32 = 35;
 pub const ENOTEMPTY: i32 = 39;
+pub const EOVERFLOW: i32 = 75;
 pub const ENOPROTOOPT: i32 = 92;
 pub const EPROTONOSUPPORT: i32 = 93;
 pub const EOPNOTSUPP: i32 = 95;
@@ -50,14 +53,16 @@ pub const ENETDOWN: i32 = 100;
 pub const ENETUNREACH: i32 = 101;
 pub const ECONNABORTED: i32 = 103;
 pub const ECONNRESET: i32 = 104;
+pub const EISCONN: i32 = 106;
 pub const ENOTCONN: i32 = 107;
 pub const ETIMEDOUT: i32 = 110;
 pub const ECONNREFUSED: i32 = 111;
 pub const EHOSTUNREACH: i32 = 113;
+pub const EINPROGRESS: i32 = 115;
 pub const ESTALE: i32 = 116;
 pub const EDQUOT: i32 = 122;
 
-// Only the Windows translation table (and one unit test) needs these.
+// Only the Windows translation table needs these.
 #[cfg(windows)]
 pub const EPERM: i32 = 1;
 #[cfg(windows)]
@@ -82,14 +87,10 @@ pub const EPFNOSUPPORT: i32 = 96;
 pub const ENETRESET: i32 = 102;
 #[cfg(windows)]
 pub const ENOBUFS: i32 = 105;
-#[cfg(any(windows, test))]
-pub const EISCONN: i32 = 106;
 #[cfg(windows)]
 pub const EHOSTDOWN: i32 = 112;
 #[cfg(windows)]
 pub const EALREADY: i32 = 114;
-#[cfg(windows)]
-pub const EINPROGRESS: i32 = 115;
 
 /// Linux errno for a host I/O error.
 pub fn from_io(e: &io::Error) -> i32 {
@@ -251,8 +252,8 @@ mod tests {
         let e = io::Error::from_raw_os_error(ECONNREFUSED);
         assert_eq!(from_io(&e), ECONNREFUSED);
         // Even codes we don't name are passed through verbatim.
-        let e = io::Error::from_raw_os_error(75); // EOVERFLOW
-        assert_eq!(from_io(&e), 75);
+        let e = io::Error::from_raw_os_error(84); // EILSEQ
+        assert_eq!(from_io(&e), 84);
     }
 
     #[cfg(windows)]

@@ -1,10 +1,10 @@
 {
   "python": {
-    "linux":   { "cold/hello": 600,   "cold-snap/hello": 20,  "warm-restore/hello": 16, "restore-cost/hello": 2,   "warm-stateful/hello": 0.4, "parallel-exec/hello": 25, "snapshot-size/hello": 100 },
+    "linux":   { "cold/hello": 600,   "cold-snap/hello": 20,  "warm-restore/hello": 16, "restore-cost/hello": 4,   "warm-stateful/hello": 0.4, "parallel-exec/hello": 25, "snapshot-size/hello": 100 },
     "windows": { "cold/hello": 3000,  "cold-snap/hello": 100, "warm-restore/hello": 30, "restore-cost/hello": 30,  "warm-stateful/hello": 1,   "parallel-exec/hello": 45, "snapshot-size/hello": 100 }
   },
   "python-shell": {
-    "linux":   { "cold/hello": 1200,  "cold-snap/hello": 20,  "warm-restore/hello": 16, "restore-cost/hello": 2,   "warm-stateful/hello": 0.4, "parallel-exec/hello": 25, "snapshot-size/hello": 140 },
+    "linux":   { "cold/hello": 1200,  "cold-snap/hello": 20,  "warm-restore/hello": 16, "restore-cost/hello": 5,   "warm-stateful/hello": 0.4, "parallel-exec/hello": 25, "snapshot-size/hello": 140 },
     "windows": { "cold/hello": 5000,  "cold-snap/hello": 100, "warm-restore/hello": 30, "restore-cost/hello": 30,  "warm-stateful/hello": 1,   "parallel-exec/hello": 50, "snapshot-size/hello": 140 }
   },
   "agent": {

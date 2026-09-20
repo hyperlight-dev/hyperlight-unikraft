@@ -4,7 +4,9 @@ Demonstrates that subprocess.run() works in the Unikraft guest.
 Python 3.12 uses posix_spawn/vfork internally for subprocess,
 so this works without os.fork() support.
 
-sys.executable is set by sitecustomize.py in the rootfs.
+sys.executable is set by sitecustomize.py in the rootfs.  It pins the exact
+interpreter; the bare name "python3" also resolves now that the Python driver
+puts /usr/local/bin on PATH.
 """
 import subprocess
 import sys

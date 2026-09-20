@@ -29,8 +29,8 @@
 //! Errno values are Linux errnos (see [`crate::errno`]) — the guest is a
 //! Linux-ABI unikernel whatever the host OS is.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -45,7 +45,7 @@ use rustix::net::{
 
 use crate::HOST_CALL_MAX;
 use crate::errno::{self, from_rustix};
-use crate::net_policy::{self, ListenPorts, NetworkPolicy};
+use crate::net_policy::{ListenPorts, NetworkPolicy};
 
 const MAX_SOCKETS: usize = 1024;
 
@@ -124,6 +124,20 @@ fn socket_flags() -> SocketFlags {
     }
 }
 
+/// The DNS message in a send to port 53: the datagram itself on UDP; on
+/// TCP the message behind its two-byte length, provided the send holds
+/// exactly one whole message.  Anything else is no message, and the
+/// policy refuses it.
+fn dns_message(data: &[u8], udp: bool) -> &[u8] {
+    if udp {
+        return data;
+    }
+    match data {
+        [hi, lo, rest @ ..] if rest.len() == usize::from(u16::from_be_bytes([*hi, *lo])) => rest,
+        _ => &[],
+    }
+}
+
 /// Never let a dead peer raise SIGPIPE in the host process.
 fn send_flags() -> SendFlags {
     #[cfg(target_os = "linux")]
@@ -138,55 +152,107 @@ fn send_flags() -> SendFlags {
 
 // ── SocketTable ─────────────────────────────────────────────────────
 
+/// What the policy needs to know about a socket beyond its address: a
+/// UDP socket aimed at port 53 carries DNS questions, which are checked
+/// by name where they are sent.
+#[derive(Clone, Copy, Debug)]
+struct SockMeta {
+    udp: bool,
+    /// Where a `send` on it goes, once the guest connected it.
+    peer: Option<SocketAddr>,
+}
+
 /// Guest fd → host socket.  Dropping the fd closes the socket.
 struct SocketTable {
-    sockets: HashMap<i32, OwnedFd>,
+    sockets: HashMap<i32, Arc<OwnedFd>>,
+    meta: HashMap<i32, SockMeta>,
     next_fd: i32,
+    /// What the guest is parked on, as learnt from its `net_poll` answers:
+    /// a socket it asked about and was told "not readable" / "not
+    /// writable".  The inter-step wait watches exactly these, for exactly
+    /// that.  Cleared when the condition is delivered (by a poll answer or
+    /// by the wait itself); a socket nobody in the guest is waiting on is
+    /// not watched, or unread data on it would make every wait return at
+    /// once and spin the step loop.
+    want_readable: HashSet<i32>,
+    want_writable: HashSet<i32>,
 }
 
 impl SocketTable {
     fn new() -> Self {
         Self {
             sockets: HashMap::new(),
+            meta: HashMap::new(),
             next_fd: 3, // skip stdin/stdout/stderr
+            want_readable: HashSet::new(),
+            want_writable: HashSet::new(),
         }
     }
 
-    fn insert(&mut self, sock: OwnedFd) -> Res<i32> {
+    /// Record the outcome of a send on `fd` for the inter-step wait.
+    fn note_send(&mut self, fd: i32, result: &Res<usize>) {
+        match result {
+            Err(e) if *e == errno::EAGAIN => {
+                self.want_writable.insert(fd);
+            }
+            Ok(_) => {
+                self.want_writable.remove(&fd);
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn insert(&mut self, sock: OwnedFd, udp: bool) -> Res<i32> {
         if self.sockets.len() >= MAX_SOCKETS {
             return Err(errno::EMFILE);
         }
         let fd = self.next_fd;
         self.next_fd = self.next_fd.wrapping_add(1);
-        self.sockets.insert(fd, sock);
+        self.sockets.insert(fd, Arc::new(sock));
+        self.meta.insert(fd, SockMeta { udp, peer: None });
         Ok(fd)
     }
 
-    fn get(&self, fd: i32) -> Res<&OwnedFd> {
-        self.sockets.get(&fd).ok_or(errno::EBADF)
+    fn meta(&self, fd: i32) -> Res<SockMeta> {
+        self.meta.get(&fd).copied().ok_or(errno::EBADF)
     }
 
-    fn remove(&mut self, fd: i32) -> Res<OwnedFd> {
+    fn set_peer(&mut self, fd: i32, peer: SocketAddr) {
+        if let Some(m) = self.meta.get_mut(&fd) {
+            m.peer = Some(peer);
+        }
+    }
+
+    fn get(&self, fd: i32) -> Res<&OwnedFd> {
+        self.sockets
+            .get(&fd)
+            .map(|s| s.as_ref())
+            .ok_or(errno::EBADF)
+    }
+
+    fn remove(&mut self, fd: i32) -> Res<Arc<OwnedFd>> {
+        self.want_readable.remove(&fd);
+        self.want_writable.remove(&fd);
+        self.meta.remove(&fd);
         self.sockets.remove(&fd).ok_or(errno::EBADF)
     }
 }
 
 // ── Net ─────────────────────────────────────────────────────────────
 
-/// Per-sandbox networking state shared by all `net_*` host functions.
-struct Net {
+pub(crate) struct Net {
     /// The `net_*` closures share this state through an `Arc`, which
     /// needs it to be `Sync` (Hyperlight wants each closure `Send +
     /// 'static`).  Hence a mutex, even though a sandbox has one vCPU
     /// and never makes two host calls at once: the lock is uncontended
     /// and is held across the (non-blocking) syscalls without harm.
     table: Mutex<SocketTable>,
-    policy: Option<NetworkPolicy>,
+    policy: NetworkPolicy,
     listen_ports: Option<ListenPorts>,
 }
 
 impl Net {
-    fn new(policy: Option<NetworkPolicy>, listen_ports: Option<ListenPorts>) -> Self {
+    pub(crate) fn new(policy: NetworkPolicy, listen_ports: Option<ListenPorts>) -> Self {
         // WinSock must be initialised before any socket call; std does
         // this lazily for its own types but rustix calls it directly.
         #[cfg(windows)]
@@ -207,18 +273,19 @@ impl Net {
         self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Outbound policy (connect, sendto).
-    fn allow_outbound(&self, addr: &SocketAddr) -> Res<()> {
-        match &self.policy {
-            Some(p) if p.check(addr).is_err() => Err(errno::EACCES),
-            _ => Ok(()),
+    /// Outbound policy (connect, sendto), for a UDP socket or not.
+    fn allow_outbound(&self, addr: &SocketAddr, udp: bool) -> Res<()> {
+        if self.policy.allows(addr, udp) {
+            Ok(())
+        } else {
+            Err(errno::EACCES)
         }
     }
 
     /// Inbound policy (bind).  Ephemeral binds (port 0) are always allowed.
     fn allow_bind(&self, addr: &SocketAddr) -> Res<()> {
         match &self.listen_ports {
-            Some(lp) if addr.port() != 0 && lp.check(addr.port()).is_err() => Err(errno::EACCES),
+            Some(lp) if addr.port() != 0 && !lp.allows(addr.port()) => Err(errno::EACCES),
             _ => Ok(()),
         }
     }
@@ -251,7 +318,7 @@ impl Net {
         if af == AddressFamily::INET6 {
             let _ = sockopt::set_ipv6_v6only(&sock, false);
         }
-        self.table().insert(sock)
+        self.table().insert(sock, ty == SocketType::DGRAM)
     }
 
     fn bind(&self, fd: i32, addr: SocketAddr) -> Res<()> {
@@ -269,49 +336,68 @@ impl Net {
             net::acceptfrom_with(tbl.get(fd)?, socket_flags()).map_err(from_rustix)?;
         rustix::io::ioctl_fionbio(&conn, true).map_err(from_rustix)?;
         let peer = peer.and_then(|a| SocketAddr::try_from(a).ok());
-        Ok((tbl.insert(conn)?, peer))
+        // No peer is recorded: only a socket the guest itself aimed at port
+        // 53 carries its DNS questions, and a remote client may pick any
+        // source port, 53 included.
+        Ok((tbl.insert(conn, false)?, peer))
     }
 
-    /// Completes the handshake before returning, so the vCPU is frozen
-    /// for as long as the peer takes — up to the OS's SYN retry timeout
-    /// for an unreachable one (about 2 minutes on Linux, 20 seconds on
-    /// Windows).  The guest driver has no non-blocking connect protocol
-    /// that would let us do better.
+    /// Starts the handshake and returns at once: `EINPROGRESS` while it
+    /// is under way, as a non-blocking connect(2) does.  The guest's
+    /// socket layer then parks its thread on writability, which the
+    /// inter-step wait watches (see [`Self::poll`]), and reads the outcome
+    /// through `SO_ERROR`.  Waiting here instead held the vCPU and the
+    /// embedder's thread for as long as the peer took: up to the OS's SYN
+    /// retry timeout, about two minutes on Linux.
     fn connect(&self, fd: i32, addr: SocketAddr) -> Res<()> {
-        self.allow_outbound(&addr)?;
-        let tbl = self.table();
+        let udp = self.table().meta(fd)?.udp;
+        self.allow_outbound(&addr, udp)?;
+        let mut tbl = self.table();
+        // Later sends on this socket go to `addr`: for a UDP socket aimed
+        // at port 53 they are DNS questions, checked by name in `send`.
+        tbl.set_peer(fd, addr);
         let fd = tbl.get(fd)?;
+        // Linux answers a second connect on a connected stream socket
+        // with EISCONN; say so here, since nothing calls connect(2) again
+        // on the host socket to make the OS observe the established state.
+        if sockopt::socket_type(fd) == Ok(SocketType::STREAM)
+            && net::getpeername(fd).is_ok_and(|p| p.is_some())
+        {
+            return Err(errno::EISCONN);
+        }
         match net::connect(fd, &addr) {
             Ok(()) => Ok(()),
-            // Handshake in progress: wait for it like a blocking connect
-            // would (the OS still times out SYN retries), then report
-            // the outcome the socket recorded.
-            Err(Errno::INPROGRESS) | Err(Errno::WOULDBLOCK) => {
-                let mut pfd = [PollFd::new(fd, PollFlags::OUT)];
-                rustix::event::poll(&mut pfd, None).map_err(from_rustix)?;
-                sockopt::socket_error(fd)
-                    .map_err(from_rustix)?
-                    .map_err(from_rustix)?;
-                // Linux keeps a non-blocking socket "connecting" until a
-                // later connect() observes the established state.  Make
-                // that observation here so a guest that connects again
-                // gets EISCONN, exactly as after a blocking connect.
-                match net::connect(fd, &addr) {
-                    Ok(()) | Err(Errno::ISCONN) => Ok(()),
-                    Err(e) => Err(from_rustix(e)),
-                }
-            }
+            Err(Errno::INPROGRESS) | Err(Errno::WOULDBLOCK) => Err(errno::EINPROGRESS),
             Err(e) => Err(from_rustix(e)),
         }
     }
 
     fn send(&self, fd: i32, data: &[u8]) -> Res<usize> {
-        net::send(self.table().get(fd)?, data, send_flags()).map_err(from_rustix)
+        let mut tbl = self.table();
+        // A DNS question on a socket connected to port 53: the name is
+        // checked here, where it still is one (see `NetworkPolicy::allows_query`).
+        let meta = tbl.meta(fd)?;
+        if meta.peer.is_some_and(|p| p.port() == 53)
+            && !self.policy.allows_query(dns_message(data, meta.udp))
+        {
+            return Err(errno::EACCES);
+        }
+        let r = net::send(tbl.get(fd)?, data, send_flags()).map_err(from_rustix);
+        tbl.note_send(fd, &r);
+        r
     }
 
     fn sendto(&self, fd: i32, data: &[u8], addr: SocketAddr) -> Res<usize> {
-        self.allow_outbound(&addr)?;
-        net::sendto(self.table().get(fd)?, data, send_flags(), &addr).map_err(from_rustix)
+        let udp = self.table().meta(fd)?.udp;
+        self.allow_outbound(&addr, udp)?;
+        // A DNS question sent unconnected: the same name check as `send`.
+        if addr.port() == 53 && !self.policy.allows_query(dns_message(data, udp)) {
+            return Err(errno::EACCES);
+        }
+        let mut tbl = self.table();
+        let r = net::sendto(tbl.get(fd)?, data, send_flags(), &addr).map_err(from_rustix);
+        tbl.note_send(fd, &r);
+        r
     }
 
     /// Receive up to `len` bytes plus the source address when the
@@ -339,12 +425,10 @@ impl Net {
         };
         buf.truncate(n);
         let from = from.and_then(|a| SocketAddr::try_from(a).ok());
-        // Under an allow-list, learn the IPs in DNS answers so the guest
-        // can reach what it just resolved.
-        if let (Some(NetworkPolicy::AllowList(al)), Some(src)) = (&self.policy, from)
-            && src.port() == 53
-        {
-            net_policy::learn_ips_from_dns_response(&buf, al);
+        // A DNS answer: under an allow list, the addresses it gives for a
+        // listed name are recorded, so the connect that follows is known.
+        if let Some(src) = from {
+            self.policy.learn_from_dns_answer(src, &buf);
         }
         Ok((buf, from))
     }
@@ -482,8 +566,13 @@ impl Net {
 
     /// `poll(2)` over guest fds.  Returns the ready count (or `-errno`)
     /// and one Linux-encoded `revents` per entry.
+    /// Poll the guest's sockets on its behalf (`net_poll`): `entries` are
+    /// (guest fd, events) pairs, `timeout_ms` as for poll(2) except that a
+    /// negative one (forever) is refused with `EINVAL`.  Returns poll's
+    /// count and the revents per entry; an fd the guest does not own
+    /// reports `POLLNVAL`.
     fn poll(&self, entries: &[(i32, i16)], timeout_ms: i32) -> (i32, Vec<i16>) {
-        let tbl = self.table();
+        let mut tbl = self.table();
         let mut revents = vec![0i16; entries.len()];
         let mut fds = Vec::with_capacity(entries.len());
         let mut index = Vec::with_capacity(entries.len());
@@ -500,36 +589,147 @@ impl Net {
                 }
             }
         }
-        // Negative timeout = block indefinitely.  An invalid entry counts
-        // as ready, so with one present poll must return at once.
+        // An invalid entry counts as ready, so with one present poll must
+        // return at once, whatever the timeout.  Otherwise a wait inside a
+        // host call would freeze the vCPU and the embedder's thread with no
+        // way to interrupt either; waiting is the host's job between
+        // entries (see wait_ready), so an indefinite timeout is refused.
         let timeout_ms = if invalid > 0 {
-            Some(0)
+            0
         } else {
-            u64::try_from(timeout_ms).ok()
+            match u64::try_from(timeout_ms) {
+                Ok(ms) => ms,
+                Err(_) => return (-errno::EINVAL, revents),
+            }
         };
-        let timeout = timeout_ms.map(|ms| Timespec {
-            tv_sec: (ms / 1000) as _,
-            tv_nsec: ((ms % 1000) * 1_000_000) as _,
-        });
+        let timeout = Timespec {
+            tv_sec: (timeout_ms / 1000) as _,
+            tv_nsec: ((timeout_ms % 1000) * 1_000_000) as _,
+        };
         if fds.is_empty() {
             // Nothing to poll: sleep for the timeout, as Linux does.
-            match timeout_ms {
-                Some(ms) => std::thread::sleep(Duration::from_millis(ms)),
-                None => loop {
-                    std::thread::sleep(Duration::from_secs(3600));
-                },
-            }
+            std::thread::sleep(Duration::from_millis(timeout_ms));
             return (invalid, revents);
         }
-        match rustix::event::poll(&mut fds, timeout.as_ref()) {
+        let ready = match rustix::event::poll(&mut fds, Some(&timeout)) {
             Ok(ready) => {
                 for (pfd, &i) in fds.iter().zip(&index) {
                     revents[i] = linux_revents(pfd.revents());
                 }
-                (ready as i32 + invalid, revents)
+                ready as i32 + invalid
             }
-            Err(e) => (-from_rustix(e), revents),
+            Err(e) => -from_rustix(e),
+        };
+        drop(fds);
+        // This is where the guest learns what it must wait for: hostsock
+        // asks before every accept/recv/send and, told "not yet", parks
+        // the thread on that condition.  Watch the socket for exactly
+        // that in the inter-step wait; a condition reported ready (or an
+        // error) needs no watching.
+        for (i, &(fd, events)) in entries.iter().enumerate() {
+            let err = revents[i] & (POLLERR | POLLHUP | POLLNVAL) != 0;
+            if events & POLLIN != 0 {
+                if revents[i] & POLLIN == 0 && !err {
+                    tbl.want_readable.insert(fd);
+                } else {
+                    tbl.want_readable.remove(&fd);
+                }
+            }
+            if events & POLLOUT != 0 {
+                if revents[i] & POLLOUT == 0 && !err {
+                    tbl.want_writable.insert(fd);
+                } else {
+                    tbl.want_writable.remove(&fd);
+                }
+            }
         }
+        (ready, revents)
+    }
+
+    /// Drop every host socket.  Used when the guest state that owned them
+    /// is discarded by an in-place restore; the restored guest re-creates
+    /// the sockets it holds on its resume entry.
+    pub(crate) fn reset(&self) {
+        let mut tbl = self.table();
+        tbl.sockets.clear();
+        tbl.meta.clear();
+        tbl.want_readable.clear();
+        tbl.want_writable.clear();
+    }
+
+    /// Whether the guest is parked on any socket: something the
+    /// inter-step wait could wake it for.
+    pub(crate) fn has_waitable(&self) -> bool {
+        let tbl = self.table();
+        tbl.want_readable
+            .iter()
+            .chain(&tbl.want_writable)
+            .any(|fd| tbl.sockets.contains_key(fd))
+    }
+
+    /// Block until a socket the guest is parked on becomes ready or
+    /// `timeout` elapses (`None`: no limit).  Returns whether one fired.
+    ///
+    /// The inter-step wait of the cooperative step model: a guest parked
+    /// in `accept`/`recv`/`send` yielded the vCPU, and this is how the
+    /// host learns it is worth re-entering.  Each socket is watched for
+    /// the condition the guest was refused (see [`Net::poll`]) and for
+    /// nothing else.  With nothing to watch, a bounded wait is a plain
+    /// sleep and an unbounded one returns at once (nothing could end it).
+    pub(crate) fn wait_ready(&self, timeout: Option<Duration>) -> bool {
+        // Copy out what to watch and release the table: the closures never
+        // run while the VM is halted, but nothing else should have to wait
+        // behind a poll either.
+        let wanted: Vec<(i32, Arc<OwnedFd>, PollFlags)> = {
+            let tbl = self.table();
+            tbl.sockets
+                .iter()
+                .filter_map(|(&fd, sock)| {
+                    let mut flags = PollFlags::empty();
+                    if tbl.want_readable.contains(&fd) {
+                        flags |= PollFlags::IN;
+                    }
+                    if tbl.want_writable.contains(&fd) {
+                        flags |= PollFlags::OUT;
+                    }
+                    (!flags.is_empty()).then(|| (fd, sock.clone(), flags))
+                })
+                .collect()
+        };
+        if wanted.is_empty() {
+            if let Some(timeout) = timeout {
+                std::thread::sleep(timeout);
+            }
+            return false;
+        }
+        let mut fds: Vec<PollFd<'_>> = wanted
+            .iter()
+            .map(|(_, sock, flags)| PollFd::new(sock, *flags))
+            .collect();
+        let ts = timeout.map(|t| Timespec {
+            tv_sec: t.as_secs() as _,
+            tv_nsec: t.subsec_nanos() as _,
+        });
+        let fired = matches!(rustix::event::poll(&mut fds, ts.as_ref()), Ok(n) if n > 0);
+        // A condition was delivered: the guest's next poll decides whether
+        // it needs watching again.
+        let delivered: Vec<(i32, PollFlags)> = wanted
+            .iter()
+            .zip(&fds)
+            .map(|((fd, _, _), p)| (*fd, p.revents()))
+            .collect();
+        drop(fds);
+        let mut tbl = self.table();
+        for (fd, revents) in delivered {
+            let err = revents.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL);
+            if err || revents.contains(PollFlags::IN) {
+                tbl.want_readable.remove(&fd);
+            }
+            if err || revents.contains(PollFlags::OUT) {
+                tbl.want_writable.remove(&fd);
+            }
+        }
+        fired
     }
 }
 
@@ -609,16 +809,17 @@ fn ret_vec(r: Res<Vec<u8>>) -> Vec<u8> {
     r.unwrap_or_else(|e| (-e).to_le_bytes().to_vec())
 }
 
-/// Register all `net_*` host functions plus `net_resolve` and `host_nanosleep`.
+/// Register all `net_*` host functions.
 ///
-/// `policy` controls which outbound destinations are allowed.
-/// `listen_ports` controls which ports `net_bind` accepts.
+/// `net` carries the policy (which outbound destinations are allowed,
+/// which ports `net_bind` accepts) and the socket table the closures
+/// share; the caller keeps its own handle for the inter-step wait of the
+/// cooperative step model.
 pub(crate) fn register(
     target: &mut impl Registerable,
-    policy: Option<NetworkPolicy>,
-    listen_ports: Option<ListenPorts>,
+    net: &Arc<Net>,
 ) -> hyperlight_host::Result<()> {
-    let net = Arc::new(Net::new(policy, listen_ports));
+    let net = net.clone();
 
     // net_socket(family, type, protocol) -> fd or -errno
     let n = net.clone();
@@ -793,41 +994,20 @@ pub(crate) fn register(
                     )
                 })
                 .collect();
-            let (ready, revents) = n.poll(&entries, timeout_ms);
+            // The guest kernel only ever asks with a zero timeout (it parks
+            // its own thread and the host waits between entries); anything
+            // else would stall the vCPU inside this call.
+            let (ready, revents) = if timeout_ms == 0 {
+                n.poll(&entries, 0)
+            } else {
+                (-errno::EINVAL, vec![0i16; entries.len()])
+            };
             let mut buf = Vec::with_capacity(4 + revents.len() * 2);
             buf.extend(ready.to_le_bytes());
             for r in revents {
                 buf.extend(r.to_le_bytes());
             }
             Ok(buf)
-        },
-    )?;
-
-    // net_resolve(hostname) -> "ip1,ip2,..." or "error:reason"
-    target.register_host_function(
-        "net_resolve",
-        move |hostname: String| -> hyperlight_host::Result<String> {
-            // ToSocketAddrs requires a port — use 0.
-            match format!("{hostname}:0").to_socket_addrs() {
-                Ok(addrs) => {
-                    let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
-                    if ips.is_empty() {
-                        Ok("error:ENOENT".to_string())
-                    } else {
-                        Ok(ips.join(","))
-                    }
-                }
-                Err(e) => Ok(format!("error:{e}")),
-            }
-        },
-    )?;
-
-    // host_nanosleep(ns) -> 0
-    target.register_host_function(
-        "host_nanosleep",
-        move |ns: u64| -> hyperlight_host::Result<i32> {
-            std::thread::sleep(Duration::from_nanos(ns.min(30_000_000_000))); // cap 30s
-            Ok(0)
         },
     )?;
 
@@ -890,7 +1070,7 @@ mod tests {
     use crate::net_policy::AllowList;
 
     fn open_net() -> Net {
-        Net::new(Some(NetworkPolicy::AllowAll), None)
+        Net::new(NetworkPolicy::AllowAll, None)
     }
 
     fn loopback(port: u16) -> SocketAddr {
@@ -913,6 +1093,21 @@ mod tests {
             "poll timed out waiting for {events:#x} on fd {fd}"
         );
         rev[0]
+    }
+
+    /// Connect as the guest's socket layer does: a connect in progress is
+    /// completed by waiting for `POLLOUT` and reading `SO_ERROR`.
+    fn connect_blocking(net: &Net, fd: i32, addr: SocketAddr) -> Res<()> {
+        match net.connect(fd, addr) {
+            Err(e) if e == errno::EINPROGRESS => {
+                wait(net, fd, POLLOUT);
+                match net.getsockopt(fd, SOL_SOCKET, SO_ERROR)? {
+                    0 => Ok(()),
+                    e => Err(e),
+                }
+            }
+            r => r,
+        }
     }
 
     /// Receive, retrying on EAGAIN until data or EOF arrives.  Like the
@@ -939,7 +1134,7 @@ mod tests {
 
         let cli = tcp(&net);
         assert_eq!(net.peer_addr(cli), Err(errno::ENOTCONN));
-        net.connect(cli, addr).unwrap();
+        connect_blocking(&net, cli, addr).unwrap();
         assert_eq!(net.connect(cli, addr), Err(errno::EISCONN));
         assert_eq!(net.peer_addr(cli).unwrap(), addr);
 
@@ -993,7 +1188,7 @@ mod tests {
         net.bind(srv, loopback(0)).unwrap();
         net.listen(srv, 1).unwrap();
         let cli = tcp(&net);
-        net.connect(cli, net.local_addr(srv).unwrap()).unwrap();
+        connect_blocking(&net, cli, net.local_addr(srv).unwrap()).unwrap();
         wait(&net, srv, POLLIN);
         let (conn, _) = net.accept(srv).unwrap();
 
@@ -1041,7 +1236,7 @@ mod tests {
         net.listen(srv, 1).unwrap();
         assert_eq!(net.poll(&[(srv, POLLIN | POLLOUT)], 0), (0, vec![0]));
         let cli = tcp(&net);
-        net.connect(cli, net.local_addr(srv).unwrap()).unwrap();
+        connect_blocking(&net, cli, net.local_addr(srv).unwrap()).unwrap();
         assert_eq!(
             wait(&net, srv, POLLIN | POLLOUT) & (POLLIN | POLLOUT),
             POLLIN
@@ -1067,7 +1262,7 @@ mod tests {
         assert_eq!(from, Some(net.local_addr(b).unwrap()));
 
         // Connected UDP can use plain send.
-        net.connect(b, a_addr).unwrap();
+        connect_blocking(&net, b, a_addr).unwrap();
         assert_eq!(net.send(b, b"x").unwrap(), 1);
         assert_eq!(recv(&net, a), b"x");
     }
@@ -1096,7 +1291,7 @@ mod tests {
         net.bind(closed, loopback(0)).unwrap();
         let c = tcp(&net);
         assert_eq!(
-            net.connect(c, net.local_addr(closed).unwrap()),
+            connect_blocking(&net, c, net.local_addr(closed).unwrap()),
             Err(errno::ECONNREFUSED)
         );
         // The fd survives a failed connect so the guest can close it.
@@ -1144,7 +1339,7 @@ mod tests {
     fn policy_denies_connect_and_sendto() {
         // An allow-list always blocks loopback.
         let al = AllowList::from_hosts(&["93.184.216.34"]).unwrap();
-        let net = Net::new(Some(NetworkPolicy::AllowList(al)), None);
+        let net = Net::new(NetworkPolicy::AllowList(al), None);
         let t = tcp(&net);
         assert_eq!(net.connect(t, loopback(80)), Err(errno::EACCES));
         let u = udp(&net);
@@ -1154,7 +1349,7 @@ mod tests {
     #[test]
     fn listen_ports_gate_bind() {
         let net = Net::new(
-            Some(NetworkPolicy::AllowAll),
+            NetworkPolicy::AllowAll,
             Some(ListenPorts::from_ports([8080])),
         );
         let s = tcp(&net);

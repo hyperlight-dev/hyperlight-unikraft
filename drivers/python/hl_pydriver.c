@@ -2,30 +2,25 @@
  * hl_pydriver — Python runtime driver for Hyperlight.
  *
  * Loaded by app-elfloader during boot (evolve).  Initializes CPython,
- * registers a dispatch callback, then halts the VM directly
+ * then serves named calls from the kernel's call queue (/dev/hlcall).
  *
  * Flow:
  *   boot (evolve):
- *     main() → parse env vars for kernel addresses
+ *     main() → hl_driver_init(): open /dev/hlcall
  *            → Py_Initialize()
- *            → *callback_slot = hl_py_dispatch
- *            → outl port 108 (halt VM, RAX = dispatch entry)
- *            → host: evolve() returns
+ *            → hl_driver_run(): block in read() on the call queue
+ *            → kernel: scheduler idle → yield to host; evolve() returns
  *
  *   host: call("Exec", "print(42)")
- *     dispatch → hyperlight_dispatch_function (kernel)
+ *     kernel pump queues the call, wakes this thread
  *              → hl_py_dispatch(fc, fc_len)   [shared, in hl_py.h]
- *              → restore FS_BASE
  *              → PyRun_SimpleString("print(42)")
  *              → print() → write(1,...) → works (fds still open)
- *              → halt
+ *              → back into read(): call reported complete on the next
+ *                yield; the host's run() returns
  *
- * The FS_BASE save/restore, env bridge and dispatch body are shared with
+ * The env bridge and dispatch body are shared with
  * hl_pywarmdriver via hl_py.h.
- *
- * TODO: HL_DISPATCH_CALLBACK_PTR / HL_DISPATCH_ENTRY are raw kernel
- * addresses injected as env vars.  Replace with a cleaner interface
- * (vDSO export, syscall, or device ioctl).
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -41,15 +36,20 @@
 
 /* ── Entry point ───────────────────────────────────────────────── */
 
-int main(int argc, char **argv, char **envp)
+int main(int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
 
-	/* Parse kernel addresses from env vars injected by
-	 * dispatch.c's uk_late_initcall. */
-	if (hl_driver_init(envp, "hl_pydriver"))
+	if (hl_driver_init("hl_pydriver"))
 		return 1;
+
+	/* The elfloader seeds PATH=/bin (CONFIG_LIBPOSIX_ENVIRON_ENVP0 in
+	 * defconfig-elfloader), where no interpreter lives, so a bare
+	 * subprocess.run(["python3", ...]) fails.  Replace it before
+	 * Py_Initialize copies environ into os.environ; a host --env PATH is
+	 * applied per call after this and still wins. */
+	setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
 
 	/* Initialize Python while VFS is fully alive — open(),
 	 * read(), etc. all work for loading /usr/lib/python3.12/ */
@@ -60,10 +60,6 @@ int main(int argc, char **argv, char **envp)
 		"import sys\n"
 		"sys.argv = ['hl_pydriver']\n");
 
-	/* Save FS_BASE after Python init — the host may clobber it
-	 * on dispatch (different thread context or snapshot restore). */
-	g_py_fsbase = rd_fsbase();
-
-	/* Register dispatch callback */
-	hl_driver_run(hl_py_dispatch);
+	/* Serve named calls from the kernel's queue; never returns */
+	hl_py_serve();
 }

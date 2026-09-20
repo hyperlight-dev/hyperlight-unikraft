@@ -1,12 +1,6 @@
 # .NET Native AOT on Hyperlight
 
-Publish a self-contained Native AOT binary targeting Alpine (musl):
-
-```bash
-dotnet publish -c Release -r linux-musl-x64 -o ./publish
-```
-
-The project file (`Hello.csproj`) must enable AOT compilation:
+Three small programs, one project each: `hello/` prints a line, `env_vars/` prints the host-provided environment, `caps/` exercises the guest and host filesystems and threads.  The AOT settings they share live in `Directory.Build.props`:
 
 ```xml
 <PropertyGroup>
@@ -19,7 +13,11 @@ The project file (`Hello.csproj`) must enable AOT compilation:
 </PropertyGroup>
 ```
 
-Build dependencies (Alpine): `clang gcc musl-dev zlib-dev`
+Publish a self-contained Native AOT binary targeting Alpine (musl); build dependencies on Alpine are `clang gcc musl-dev zlib-dev`:
+
+```bash
+dotnet publish hello -c Release -r linux-musl-x64 -o ./publish
+```
 
 **Note:** AOT binaries on Alpine link against musl.  The dotnet-aot rootfs includes the musl dynamic linker.
 

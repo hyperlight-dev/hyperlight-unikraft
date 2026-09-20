@@ -37,14 +37,14 @@ hluk run --initrd rootfs.cpio \
 From the Rust API (parameter order: host path, guest path):
 
 ```rust
-use hyperlight_unikraft::{Mount, SandboxBuilder, run};
+use hyperlight_unikraft::{Mount, SandboxBuilder};
 
-let (mut sandbox, _) = SandboxBuilder::from_initrd("rootfs.cpio")
+let mut guest = SandboxBuilder::from_initrd("rootfs.cpio")
     .scratch_mb(256)
     .mount(Mount::rw("/tmp/share", "/mnt/host"))
     .mount(Mount::ro("/data", "/mnt/data"))
     .boot()?;
-run(&mut sandbox, "open('/mnt/host/out.txt', 'w').write('hello')")?;
+guest.run("open('/mnt/host/out.txt', 'w').write('hello')")?;
 ```
 
 Windows drive-letter paths are supported: `C:\data:/mnt/data:ro`.
@@ -67,7 +67,9 @@ open("/mnt/host/foo.txt")
 
 Each mount corresponds to a `cap_std::fs::Dir` on the host side.  The guest kernel injects a mount index into every host call so the host routes operations to the correct directory.
 
-Reads and writes are transferred in chunks (32 KB by default).  The guest queries the chunk size from the host at mount time via `GetHostFsChunkSize`.
+Reads and writes are transferred in chunks: the host's preferred size (`GetHostFsChunkSize`, 32 KiB), or less if one host call cannot carry that much — the guest reads the limit out of the PEB I/O stack sizes the host chose.
+
+Two limits of the protocol as it stands.  A directory listing is one host call, so a directory whose names do not fit in it (about 3,000 entries) does not list: `readdir` fails with `EOVERFLOW` and the guest goes on (TODO: page `fs_list`).  `stat` carries the size and whether the entry is a file or a directory, nothing more: mode reads as `755` (`555` on a read-only file), timestamps as the epoch, and a symlink as the file it points at (TODO: carry the real mode, the times and an `lstat`).
 
 ### Supported operations
 

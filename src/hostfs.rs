@@ -26,9 +26,12 @@
 //! - **`i32` returns**: 0 on success, `-errno` on error.
 //! - **`Vec<u8>` returns**: first 4 bytes are `i32` status (0 or `-errno`),
 //!   followed by operation-specific data on success.
+//! - A reply is one host call, so at most [`HOST_CALL_MAX`] bytes: reads
+//!   are chunked ([`CHUNK`]), and a directory listing that would not fit
+//!   fails with `-EOVERFLOW` rather than break the call.  TODO: page
+//!   `fs_list` so a large directory lists in several calls.
 
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
@@ -36,7 +39,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use hyperlight_host::func::Registerable;
 use tracing::{debug, trace};
 
-use crate::errno;
+use crate::{HOST_CALL_MAX, Mount, errno};
 
 /// Maximum bytes per read/write host call.  The guest queries this
 /// value via `GetHostFsChunkSize` at mount time — changing it here
@@ -46,25 +49,27 @@ pub(crate) const CHUNK: usize = 32768;
 /// Register all `fs_*` host functions.
 ///
 /// Opens a [`Dir`] for each mount point in `mounts`. Each host function
-/// takes `mount_idx` as its first parameter to select the mount.
-/// The `bool` in each tuple indicates whether the mount is read-only.
-pub(crate) fn register(
-    target: &mut impl Registerable,
-    mounts: &[(String, PathBuf, bool)],
-) -> hyperlight_host::Result<()> {
+/// takes `mount_idx` as its first parameter to select the mount; a
+/// read-only mount refuses writes with `EROFS`.
+pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crate::Result<()> {
     if mounts.is_empty() {
         return Ok(());
     }
 
     let mut dirs_vec = Vec::with_capacity(mounts.len());
     let mut ro_vec = Vec::with_capacity(mounts.len());
-    for (i, (guest_path, host_path, readonly)) in mounts.iter().enumerate() {
-        let d = Dir::open_ambient_dir(host_path, ambient_authority()).map_err(|e| {
-            hyperlight_host::HyperlightError::Error(format!(
-                "hostfs: failed to open mount {i} ({} -> {}): {e}",
-                host_path.display(),
-                guest_path,
-            ))
+    for (i, m) in mounts.iter().enumerate() {
+        let Mount {
+            guest_path,
+            host_path,
+            readonly,
+        } = m;
+        let d = Dir::open_ambient_dir(host_path, ambient_authority()).map_err(|source| {
+            crate::Error::Mount {
+                host_path: host_path.clone(),
+                guest_path: guest_path.clone(),
+                source,
+            }
         })?;
         let ro_str = if *readonly { "ro" } else { "rw" };
         debug!(
@@ -125,6 +130,10 @@ pub(crate) fn register(
     //   [4..]   bytes data (length = returned_len - 4)
     //
     // EOF is implicit: data shorter than requested → at end.
+    //
+    // TODO: the protocol is stateless, so every chunk (here and in
+    // fs_write_bytes) reopens the file; a handle-based open/read/close
+    // would make a large transfer one open.
     {
         let dirs = dirs.clone();
         target.register_host_function(
@@ -238,6 +247,9 @@ pub(crate) fn register(
                     return Ok(-errno::EROFS);
                 }
                 // Try file first, then directory.
+                // TODO: removes a file or an empty directory alike; POSIX
+                // unlink refuses a directory with EISDIR and rmdir a file
+                // with ENOTDIR, which needs the call to say which it is.
                 Ok(match d.remove_file(&path) {
                     Ok(()) => 0,
                     Err(_) => match d.remove_dir(&path) {
@@ -282,13 +294,25 @@ pub(crate) fn register(
     //     u8   is_dir
     //     u16  name_len (LE)
     //     [name_len bytes] name (UTF-8, no NUL)
+    //
+    // An error reply carries a zero count too: the kernel's readdir wants
+    // the eight bytes before it looks at the status.
+    //
+    // TODO: an entry that cannot be read is skipped and a non-UTF-8 name
+    // is decoded lossily, neither reported to the guest.
     {
         let dirs = dirs.clone();
+        let list_error = |code: i32| {
+            let mut buf = Vec::with_capacity(8);
+            buf.extend((-code).to_le_bytes());
+            buf.extend(0u32.to_le_bytes());
+            buf
+        };
         target.register_host_function(
             "fs_list",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<Vec<u8>> {
                 let Some(d) = dirs.get(mount_idx as usize) else {
-                    return Ok({ -errno::EINVAL }.to_le_bytes().to_vec());
+                    return Ok(list_error(errno::EINVAL));
                 };
                 let path = if path.is_empty() {
                     ".".to_string()
@@ -305,6 +329,12 @@ pub(crate) fn register(
                             let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
                             let name = entry.file_name().to_string_lossy().into_owned();
                             let name_bytes = name.as_bytes();
+                            // One host call carries HOST_CALL_MAX bytes; a
+                            // listing past that would fail the call itself
+                            // (and with it the sandbox), so refuse it here.
+                            if buf.len() + 3 + name_bytes.len() > HOST_CALL_MAX {
+                                return Ok(list_error(errno::EOVERFLOW));
+                            }
                             buf.push(is_dir as u8);
                             buf.extend((name_bytes.len() as u16).to_le_bytes());
                             buf.extend_from_slice(name_bytes);
@@ -313,7 +343,7 @@ pub(crate) fn register(
                         buf[4..8].copy_from_slice(&count.to_le_bytes());
                         buf
                     }
-                    Err(e) => errno_vec(e),
+                    Err(e) => list_error(errno::from_io(&e)),
                 })
             },
         )?;

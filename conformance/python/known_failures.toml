@@ -95,24 +95,17 @@ modules = [
 reason = """hostsock individual ops work; threaded select/poll works after halt_irq fix. \
 Remaining failures: threaded server tests that crash on thread lifecycle bugs, \
 getaddrinfo V4MAPPED assertion crash, AF_UNIX and SSL unsupported."""
-todo = "Fix thread lifecycle crashes; getaddrinfo V4MAPPED assertion in net_resolve"
+todo = "Fix thread lifecycle crashes; getaddrinfo V4MAPPED assertion"
 modules = [
     "test_docxmlrpc",           # HANG  — XML-RPC over HTTP; threaded server's select() never wakes
-    "test_ftplib",              # CRASH — FTP client uses threaded server with select()
     "test_httplib",             # HANG  — 142/147 pass, 5 hang on threaded server's select() loop
     "test_httpservers",         # CRASH — HTTP server socket binding with threaded select()
     "test_imaplib",             # CRASH — IMAP client uses threaded server with select()
-    "test_poplib",              # CRASH — POP3 client uses threaded server with select()
     "test_robotparser",         # HANG  — 59/60 pass, 1 hangs on threaded server's select()
-    "test_smtplib",             # CRASH — SMTP client uses threaded server with select()
     "test_smtpnet",             # ERROR — SMTP network tests
     "test_socket",              # CRASH — non-threaded tests pass; threaded tests hang; getaddrinfo V4MAPPED crash
-    "test_timeout",             # CRASH — socket timeout tests crash (signal/select)
     "test_socketserver",        # CRASH — socket server with threaded select()
     "test_ssl",                 # ERROR — SSL/TLS (needs OpenSSL)
-    "test_urllib2",             # CRASH — urllib2 HTTP uses threaded server with select()
-    "test_urllib2_localnet",    # CRASH — urllib2 local network with threaded select()
-    "test_wsgiref",             # HANG  — 36/37 pass, 1 hangs on threaded server's select()
     "test_xmlrpc",              # CRASH — XML-RPC client/server with threaded select()
 ]
 
@@ -178,12 +171,6 @@ modules = [
     "test_stable_abi_ctypes",   # ERROR — stable ABI checks
 ]
 
-[unsupported.other]
-reason = "Miscellaneous unsupported features"
-modules = [
-    "test_perfmaps",            # FAIL  — Linux perf maps (/tmp/perf-*.map)
-]
-
 # ═══════════════════════════════════════════════════════════════
 # May-fix — could work with Unikraft improvements
 # ═══════════════════════════════════════════════════════════════
@@ -198,6 +185,7 @@ modules = [
     "test_concurrent_futures",  # CRASH — ThreadPoolExecutor / ProcessPoolExecutor
     "test_logging",             # CRASH — logging uses threads + socket handlers
     "test_tempfile",            # CRASH — tempfile thread-safety tests
+    "test_syslog",             # HANG  — threaded and subinterpreter syslog tests hang the scheduler
 ]
 
 [may-fix.signals]
@@ -215,11 +203,8 @@ modules = [
 reason = "Incomplete epoll/poll shim — breaks selector-based I/O and asyncio"
 todo = "Fix epoll shim or implement proper poll() in Unikraft's VFS layer"
 modules = [
-    "test_asyncgen",            # FAIL  — async generators depend on asyncio/epoll
-    "test_contextlib_async",    # FAIL  — async context managers depend on asyncio
     "test_epoll",               # FAIL  — epoll_create/epoll_ctl/epoll_wait
     "test_poll",                # CRASH — poll() shim
-    "test_select",              # CRASH — select/poll/epoll
     "test_selectors",           # FAIL  — selector abstraction over epoll/poll
 ]
 
@@ -227,7 +212,6 @@ modules = [
 reason = "Cooperative scheduler lacks preemption for concurrent interpreters"
 todo = "Requires preemptive scheduling or interpreter isolation in Unikraft"
 modules = [
-    "test__xxinterpchannels",   # CRASH — cross-interpreter channel API
     "test__xxsubinterpreters",  # FAIL  — sub-interpreter creation/management
     "test_interpreters",        # CRASH — interpreter lifecycle
 ]
@@ -247,15 +231,9 @@ reason = "Guest crashes on complex internal operations — root cause needs inve
 todo = "Profile each crash to identify specific Unikraft limitation (GC, recursion depth, memory)"
 modules = [
     "test_coroutines",          # CRASH — coroutine/async generator edge cases
-    "test_frame",               # CRASH — frame object internals
-    "test_generators",          # CRASH — generator edge cases
-    "test_graphlib",            # CRASH — topological sort (may timeout/OOM)
     "test_itertools",           # CRASH — itertools edge cases
-    "test_struct",              # CRASH — struct pack/unpack edge cases
-    "test_structseq",           # CRASH — structseq C type internals
     "test_sys_settrace",        # CRASH — settrace/setprofile callbacks
     "test_unicode",             # CRASH — unicode codec/memory edge cases
-    "test_unicodedata",         # CRASH — large unicode database loading
     "test_weakref",             # CRASH — weakref GC finalization
     "test_zipfile64",           # CRASH — large (>4GB) zip handling (OOM)
 ]
@@ -269,7 +247,6 @@ reason = "Minor filesystem behavior differences (permissions, symlinks, case sen
 todo = "Configure 9pfs or ramfs options; some may just need test-level workarounds"
 modules = [
     "test_filecmp",             # FAIL  — file comparison edge cases
-    "test_fileio",              # FAIL  — file I/O mode/permission checks
     "test_glob",                # FAIL  — glob pattern matching
     "test_mailbox",             # FAIL  — mailbox file locking/permissions
     "test_pathlib",             # FAIL  — path operations
@@ -287,5 +264,4 @@ modules = [
     "test_random",              # FAIL  — os.urandom fork-safety check (only vfork)
     "test_resource",            # FAIL  — getrlimit/setrlimit are stubs
     "test_stat",                # ERROR — stat mode bits not enforced
-    "test_type_params",         # FAIL  — type parameter edge case (minor)
 ]

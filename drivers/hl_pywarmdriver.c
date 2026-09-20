@@ -11,18 +11,17 @@
  * Imports are wrapped in try/except so the driver boots cleanly in
  * either rootfs — missing packages are silently skipped.
  *
- * The FS_BASE save/restore, env bridge and dispatch body are shared with
+ * The env bridge and dispatch body are shared with
  * hl_pydriver via hl_py.h; only the boot-time pre-warm below is specific
  * to this driver.
  *
  * Flow:
  *   boot (evolve):
- *     main() → parse env vars for kernel addresses
+ *     main() → hl_driver_init(): open /dev/hlcall
  *            → Py_Initialize()
  *            → pre-warm stdlib + data-science imports
- *            → *callback_slot = hl_py_dispatch
- *            → outl port 108 (halt VM, RAX = dispatch entry)
- *            → host: evolve() returns
+ *            → hl_driver_run(): block in read() on the call queue
+ *            → kernel: scheduler idle → yield to host; evolve() returns
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -38,15 +37,20 @@
 
 /* ── Entry point ───────────────────────────────────────────────── */
 
-int main(int argc, char **argv, char **envp)
+int main(int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
 
-	/* Parse kernel addresses from env vars injected by
-	 * dispatch.c's uk_late_initcall. */
-	if (hl_driver_init(envp, "hl_pywarmdriver"))
+	if (hl_driver_init("hl_pywarmdriver"))
 		return 1;
+
+	/* The elfloader seeds PATH=/bin (CONFIG_LIBPOSIX_ENVIRON_ENVP0 in
+	 * defconfig-elfloader), where no interpreter lives, so a bare
+	 * subprocess.run(["python3", ...]) fails.  Replace it before
+	 * Py_Initialize copies environ into os.environ; a host --env PATH is
+	 * applied per call after this and still wins. */
+	setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
 
 	/* Initialize Python while VFS is fully alive — open(),
 	 * read(), etc. all work for loading /usr/lib/python3.12/ */
@@ -111,10 +115,6 @@ int main(int argc, char **argv, char **envp)
 
 	PyRun_SimpleString("warnings.resetwarnings()\n");
 
-	/* Save FS_BASE after Python init — the host may clobber it
-	 * on dispatch (different thread context or snapshot restore). */
-	g_py_fsbase = rd_fsbase();
-
-	/* Register dispatch callback */
-	hl_driver_run(hl_py_dispatch);
+	/* Serve named calls from the kernel's queue; never returns */
+	hl_py_serve();
 }

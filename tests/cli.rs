@@ -3,16 +3,16 @@
 mod common;
 
 use common::require_rootfs;
-use hyperlight_unikraft::{Exec, SandboxBuilder, run};
+use hyperlight_unikraft::{Exec, SandboxBuilder};
 
 #[test]
 fn exec_file_not_found() {
     let rootfs = require_rootfs("python");
-    let (mut sandbox, _cfg) = SandboxBuilder::from_initrd(rootfs)
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    let result = run(&mut sandbox, Exec::File("/nonexistent/script.py".into()));
+    let result = sandbox.run(Exec::File("/nonexistent/script.py".into()));
     assert!(result.is_err());
 }
 

@@ -9,9 +9,13 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use hyperlight_unikraft::{
-    AllowList, BlockList, DEFAULT_SCRATCH_MB, Exec, ListenPorts, Mount, NetworkPolicy, OciTag,
-    SNAPSHOT_TAG, SandboxBuilder, Snapshot, run,
+    AllowList, AppSandbox, BlockList, DEFAULT_SCRATCH_MB, Error, Exec, ListenPorts, Mount,
+    NetworkPolicy, SandboxBuilder, load_snapshot,
 };
+
+/// The CLI's own errors are messages for the terminal; the library's
+/// come through as they are.
+type CliResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Minimal Hyperlight host for Unikraft unikernels.
 #[derive(Parser)]
@@ -28,7 +32,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Boot a Unikraft guest and dispatch exec commands.
+    /// Boot a guest and run a script, inline code, a guest command, or
+    /// its entry point.
     Run(RunArgs),
 
     /// Snapshot operations: save a post-evolve snapshot to disk,
@@ -284,42 +289,53 @@ struct BenchParallelArgs {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Parse `--env KEY=VALUE` strings into `(key, value)` pairs.
-///
-/// Entries without `=` are silently skipped. The first `=` is the
-/// split point, so values may contain `=`.
-fn parse_envs(raw: &[String]) -> Vec<(&str, &str)> {
-    raw.iter().filter_map(|e| e.split_once('=')).collect()
-}
-
-fn parse_mounts(raw: &[String]) -> Vec<Mount> {
+/// Parse `--env KEY=VALUE` strings into `(key, value)` pairs.  The first
+/// `=` is the split point, so values may contain `=`; an entry without
+/// one is an error rather than a variable silently not set.
+fn parse_envs(raw: &[String]) -> Result<Vec<(&str, &str)>, String> {
     raw.iter()
-        .filter_map(|m| {
-            // On Windows, "C:\foo:/mnt" would split wrong at the drive
-            // letter colon.  Detect "X:\" prefix and split after it.
-            let (host, rest) = if m.len() >= 3
-                && m.as_bytes()[0].is_ascii_alphabetic()
-                && m.as_bytes()[1] == b':'
-                && (m.as_bytes()[2] == b'\\' || m.as_bytes()[2] == b'/')
-            {
-                // Drive-letter prefix — split at the NEXT colon.
-                let after_drive = &m[2..];
-                let colon = after_drive.find(':')?;
-                (&m[..2 + colon], &after_drive[colon + 1..])
-            } else {
-                m.split_once(':')?
-            };
-            let (guest, readonly) = match rest.rsplit_once(':') {
-                Some((g, "ro")) => (g, true),
-                _ => (rest, false),
-            };
-            Some(Mount {
-                host_path: PathBuf::from(host),
-                guest_path: guest.to_string(),
-                readonly,
-            })
+        .map(|e| {
+            e.split_once('=')
+                .ok_or_else(|| format!("invalid --env {e:?}: expected KEY=VALUE"))
         })
         .collect()
+}
+
+/// Parse `--mount HOST:GUEST[:ro]` strings.  An entry with no `:` is an
+/// error rather than a mount silently left out.
+fn parse_mounts(raw: &[String]) -> Result<Vec<Mount>, String> {
+    raw.iter()
+        .map(|m| {
+            parse_mount(m).ok_or_else(|| format!("invalid --mount {m:?}: expected HOST:GUEST[:ro]"))
+        })
+        .collect()
+}
+
+/// One `HOST:GUEST[:ro]` entry, or `None` if it has no `:` to split on.
+fn parse_mount(m: &str) -> Option<Mount> {
+    // On Windows, "C:\foo:/mnt" would split wrong at the drive
+    // letter colon.  Detect "X:\" prefix and split after it.
+    let (host, rest) = if m.len() >= 3
+        && m.as_bytes()[0].is_ascii_alphabetic()
+        && m.as_bytes()[1] == b':'
+        && (m.as_bytes()[2] == b'\\' || m.as_bytes()[2] == b'/')
+    {
+        // Drive-letter prefix — split at the NEXT colon.
+        let after_drive = &m[2..];
+        let colon = after_drive.find(':')?;
+        (&m[..2 + colon], &after_drive[colon + 1..])
+    } else {
+        m.split_once(':')?
+    };
+    let (guest, readonly) = match rest.rsplit_once(':') {
+        Some((g, "ro")) => (g, true),
+        _ => (rest, false),
+    };
+    Some(Mount {
+        host_path: PathBuf::from(host),
+        guest_path: guest.to_string(),
+        readonly,
+    })
 }
 
 /// Convert CLI net flags into `(Option<NetworkPolicy>, Option<ListenPorts>)`.
@@ -330,9 +346,13 @@ fn parse_net_policy(
     ports: &[u16],
 ) -> Result<(Option<NetworkPolicy>, Option<ListenPorts>), String> {
     let policy = if !net_allow.is_empty() {
-        Some(NetworkPolicy::AllowList(AllowList::from_hosts(net_allow)?))
+        Some(NetworkPolicy::AllowList(
+            AllowList::from_hosts(net_allow).map_err(|e| e.to_string())?,
+        ))
     } else if !net_block.is_empty() {
-        Some(NetworkPolicy::BlockList(BlockList::from_hosts(net_block)?))
+        Some(NetworkPolicy::BlockList(
+            BlockList::from_hosts(net_block).map_err(|e| e.to_string())?,
+        ))
     } else if net {
         Some(NetworkPolicy::AllowAll)
     } else {
@@ -360,10 +380,7 @@ fn parse_net_policy(
 ///
 /// Text files are passed as scripts.  Compiled binaries are rejected
 /// with a helpful error — use `--mount` + `--exec` for those.
-fn resolve_exec(
-    script: Option<PathBuf>,
-    exec: Option<String>,
-) -> hyperlight_unikraft::hyperlight_host::Result<Option<Exec>> {
+fn resolve_exec(script: Option<PathBuf>, exec: Option<String>) -> CliResult<Option<Exec>> {
     match (script, exec) {
         (Some(path), _) => {
             // Verify the file is valid UTF-8 (i.e. a script, not a binary)
@@ -376,14 +393,13 @@ fn resolve_exec(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "binary".into());
-                return Err(
-                    hyperlight_unikraft::hyperlight_host::HyperlightError::Error(format!(
-                        "{} is a compiled binary, not a script.\n\
-                         To run compiled binaries, mount a directory containing the binary:\n  \
-                         hluk run --initrd <rootfs.cpio> --mount {dir}:/mnt/bin --exec /mnt/bin/{name}",
-                        path.display(),
-                    )),
-                );
+                return Err(format!(
+                    "{} is a compiled binary, not a script.\n\
+                     To run compiled binaries, mount a directory containing the binary:\n  \
+                     hluk run --initrd <rootfs.cpio> --mount {dir}:/mnt/bin --exec /mnt/bin/{name}",
+                    path.display(),
+                )
+                .into());
             }
             Ok(Some(Exec::File(path)))
         }
@@ -396,35 +412,28 @@ fn resolve_exec(
 
 /// Start a [`SandboxBuilder`] from the CLI's `--kernel` / `--initrd`.  A run
 /// needs a workload — an external kernel, a rootfs, or both — so neither is an
-/// error rather than a sandbox with nothing to boot.
-fn base_builder(
-    kernel: Option<PathBuf>,
-    initrd: Option<PathBuf>,
-) -> hyperlight_unikraft::hyperlight_host::Result<SandboxBuilder> {
+/// error rather than a guest with nothing to boot.
+fn base_builder(kernel: Option<PathBuf>, initrd: Option<PathBuf>) -> CliResult<SandboxBuilder> {
     match (kernel, initrd) {
         (Some(kernel), Some(initrd)) => Ok(SandboxBuilder::from_kernel(kernel).initrd(initrd)),
         (Some(kernel), None) => Ok(SandboxBuilder::from_kernel(kernel)),
         (None, Some(initrd)) => Ok(SandboxBuilder::from_initrd(initrd)),
-        (None, None) => Err(
-            hyperlight_unikraft::hyperlight_host::HyperlightError::Error(
-                "no workload: pass --initrd <rootfs.cpio> or --kernel <kernel>".to_string(),
-            ),
-        ),
+        (None, None) => Err("no workload: pass --initrd <rootfs.cpio> or --kernel <kernel>".into()),
     }
 }
 
-fn cmd_run(args: RunArgs) -> hyperlight_unikraft::hyperlight_host::Result<()> {
-    let mounts = parse_mounts(&args.mounts);
+fn cmd_run(args: RunArgs) -> CliResult<()> {
+    let mounts = parse_mounts(&args.mounts)?;
     let (policy, listen) =
-        parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)
-            .map_err(hyperlight_unikraft::hyperlight_host::HyperlightError::Error)?;
+        parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?;
 
     // Precedence: a host script or --exec code; else a guest command
     // (--guest-exec); else, with no workload at all, the rootfs's conventional
     // entrypoint. The last two are the model a container runtime (urunc) uses.
+    let no_workload = args.script.is_none() && args.exec.is_none() && args.guest_exec.is_none();
     let exec = resolve_exec(args.script, args.exec)?
         .unwrap_or_else(|| Exec::Guest(args.guest_exec.unwrap_or_default()));
-    let envs = parse_envs(&args.envs);
+    let envs = parse_envs(&args.envs)?;
 
     let mut builder = base_builder(args.kernel, args.initrd)?
         .scratch_mb(args.scratch_mb)
@@ -442,21 +451,39 @@ fn cmd_run(args: RunArgs) -> hyperlight_unikraft::hyperlight_host::Result<()> {
         builder = builder.env(key, value);
     }
     let t = Instant::now();
-    let (mut sandbox, _config) = builder.boot()?;
+    let mut sandbox = builder.boot()?;
     info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "boot");
 
-    let t = Instant::now();
-    run(&mut sandbox, exec)?;
-    info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "exec");
+    drive(&mut sandbox, no_workload, exec)
+}
 
+/// Run the workload in a booted guest.  With nothing to run and no driver
+/// to run it, the entry point is a plain program (`--entry /bin/server`):
+/// drive it to its exit the way a container runtime would, and exit with
+/// its status, as running it directly would.
+fn drive(sandbox: &mut AppSandbox, no_workload: bool, exec: Exec) -> CliResult<()> {
+    let t = Instant::now();
+    if no_workload && !sandbox.has_driver() {
+        info!("no driver in the guest; driving its entry point to exit");
+        let status = sandbox.join()?;
+        info!(
+            elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
+            status, "exec"
+        );
+        if status != 0 {
+            std::process::exit(status);
+        }
+        return Ok(());
+    }
+    sandbox.run(exec)?;
+    info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "exec");
     Ok(())
 }
 
-fn cmd_snapshot_save(args: SaveArgs) -> hyperlight_unikraft::hyperlight_host::Result<()> {
-    let mounts = parse_mounts(&args.mounts);
+fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
+    let mounts = parse_mounts(&args.mounts)?;
     let (policy, listen) =
-        parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)
-            .map_err(hyperlight_unikraft::hyperlight_host::HyperlightError::Error)?;
+        parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?;
     let mut builder = base_builder(args.kernel, args.initrd)?
         .scratch_mb(args.scratch_mb)
         .mounts(mounts);
@@ -469,23 +496,13 @@ fn cmd_snapshot_save(args: SaveArgs) -> hyperlight_unikraft::hyperlight_host::Re
     if let Some(listen) = listen {
         builder = builder.listen_ports(listen);
     }
-    let (mut sandbox, _config) = builder.boot()?;
+    let mut sandbox = builder.boot()?;
 
     let t = Instant::now();
-    let snap = sandbox.snapshot()?;
-    info!(
-        elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
-        "snapshot captured",
-    );
-
-    let tag: OciTag = SNAPSHOT_TAG.parse().expect("valid OCI tag");
-
-    let t = Instant::now();
-    let digest = snap.save(&args.output, &tag)?;
+    sandbox.snapshot_to(&args.output)?;
     let save_ms = t.elapsed().as_secs_f64() * 1000.0;
     info!(
         path = %args.output.display(),
-        digest = %digest,
         elapsed_ms = save_ms,
         "snapshot saved",
     );
@@ -499,24 +516,22 @@ fn cmd_snapshot_save(args: SaveArgs) -> hyperlight_unikraft::hyperlight_host::Re
     Ok(())
 }
 
-fn cmd_snapshot_run(args: SnapshotRunArgs) -> hyperlight_unikraft::hyperlight_host::Result<()> {
-    let tag: OciTag = SNAPSHOT_TAG.parse().expect("valid OCI tag");
-    let mounts = parse_mounts(&args.mounts);
+fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
+    let mounts = parse_mounts(&args.mounts)?;
     let (policy, listen) =
-        parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)
-            .map_err(hyperlight_unikraft::hyperlight_host::HyperlightError::Error)?;
+        parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?;
 
     let t = Instant::now();
-    let snap: Arc<Snapshot> = Arc::new(Snapshot::load(&args.snapshot, tag)?);
+    let builder = SandboxBuilder::from_snapshot_dir(&args.snapshot)?;
     info!(
         path = %args.snapshot.display(),
         elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
         "snapshot loaded",
     );
 
-    let envs = parse_envs(&args.envs);
+    let envs = parse_envs(&args.envs)?;
 
-    let mut builder = SandboxBuilder::from_snapshot(snap).mounts(mounts);
+    let mut builder = builder.mounts(mounts);
     if let Some(policy) = policy {
         builder = builder.network(policy);
     }
@@ -528,7 +543,7 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> hyperlight_unikraft::hyperlight_ho
     }
 
     let t = Instant::now();
-    let (mut sandbox, _config) = builder.boot()?;
+    let mut sandbox = builder.boot()?;
     info!(
         elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
         "restored from snapshot",
@@ -536,24 +551,18 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> hyperlight_unikraft::hyperlight_ho
 
     // Precedence: host script / --exec code; else --guest-exec; else the
     // rootfs's conventional entrypoint.
+    let no_workload = args.script.is_none() && args.exec.is_none() && args.guest_exec.is_none();
     let exec = resolve_exec(args.script, args.exec)?
         .unwrap_or_else(|| Exec::Guest(args.guest_exec.unwrap_or_default()));
-    let t = Instant::now();
-    run(&mut sandbox, exec)?;
-    info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "exec");
-    Ok(())
+    drive(&mut sandbox, no_workload, exec)
 }
 
 // ── Bench helpers ────────────────────────────────────────────────
 
 /// Read a script file and return its source for dispatch.
-fn read_script(path: &std::path::Path) -> hyperlight_unikraft::hyperlight_host::Result<String> {
-    std::fs::read_to_string(path).map_err(|e| {
-        hyperlight_unikraft::hyperlight_host::HyperlightError::Error(format!(
-            "failed to read {}: {e}",
-            path.display(),
-        ))
-    })
+fn read_script(path: &std::path::Path) -> CliResult<String> {
+    Ok(std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?)
 }
 
 /// Percentile from a **sorted** slice (linear interpolation).
@@ -570,6 +579,9 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 
 /// Print summary line: median, p95, min, max.
 fn print_summary(label: &str, field: &str, values: &[f64]) {
+    if values.is_empty() {
+        return;
+    }
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = percentile(&sorted, 50.0);
@@ -646,7 +658,7 @@ fn print_rss(label: &str) {
 // ── Bench commands ───────────────────────────────────────────────
 
 /// Cold start: fresh boot + dispatch, N independent samples.
-fn bench_cold(args: BenchColdArgs) -> hyperlight_unikraft::hyperlight_host::Result<()> {
+fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
     let mut boots = Vec::with_capacity(args.samples);
     let mut execs = Vec::with_capacity(args.samples);
@@ -654,13 +666,13 @@ fn bench_cold(args: BenchColdArgs) -> hyperlight_unikraft::hyperlight_host::Resu
 
     for i in 0..args.samples {
         let t0 = Instant::now();
-        let (mut sandbox, _) = SandboxBuilder::from_initrd(args.initrd.clone())
+        let mut sandbox = SandboxBuilder::from_initrd(args.initrd.clone())
             .scratch_mb(args.scratch_mb)
             .boot()?;
         let boot_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
-        run(&mut sandbox, source.as_str())?;
+        sandbox.run(source.as_str())?;
         let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -680,9 +692,8 @@ fn bench_cold(args: BenchColdArgs) -> hyperlight_unikraft::hyperlight_host::Resu
 }
 
 /// Cold snapshot: load from disk + restore + dispatch, N independent samples.
-fn bench_cold_snap(args: BenchSnapArgs) -> hyperlight_unikraft::hyperlight_host::Result<()> {
+fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
-    let tag: OciTag = SNAPSHOT_TAG.parse().expect("valid OCI tag");
     let mut loads = Vec::with_capacity(args.samples);
     let mut restores = Vec::with_capacity(args.samples);
     let mut execs = Vec::with_capacity(args.samples);
@@ -690,15 +701,15 @@ fn bench_cold_snap(args: BenchSnapArgs) -> hyperlight_unikraft::hyperlight_host:
 
     for i in 0..args.samples {
         let t0 = Instant::now();
-        let snap = Arc::new(Snapshot::load(&args.snapshot, tag.clone())?);
+        let builder = SandboxBuilder::from_snapshot_dir(&args.snapshot)?;
         let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
-        let (mut sandbox, _config) = SandboxBuilder::from_snapshot(snap).boot()?;
+        let mut sandbox = builder.boot()?;
         let restore_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
-        run(&mut sandbox, source.as_str())?;
+        sandbox.run(source.as_str())?;
         let exec_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -722,13 +733,12 @@ fn bench_cold_snap(args: BenchSnapArgs) -> hyperlight_unikraft::hyperlight_host:
 }
 
 /// Warm with restore: load snapshot once, then loop dispatch + restore.
-fn bench_warm_restore(args: BenchSnapArgs) -> hyperlight_unikraft::hyperlight_host::Result<()> {
+fn bench_warm_restore(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
-    let tag: OciTag = SNAPSHOT_TAG.parse().expect("valid OCI tag");
 
     let t0 = Instant::now();
-    let snap = Arc::new(Snapshot::load(&args.snapshot, tag)?);
-    let (mut sandbox, _config) = SandboxBuilder::from_snapshot(snap.clone()).boot()?;
+    let snap = load_snapshot(&args.snapshot)?;
+    let mut sandbox = SandboxBuilder::from_snapshot(snap.clone()).boot()?;
     let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("BENCH warm-restore setup_ms={setup_ms:.3}");
 
@@ -737,7 +747,7 @@ fn bench_warm_restore(args: BenchSnapArgs) -> hyperlight_unikraft::hyperlight_ho
 
     for i in 0..args.samples {
         let t1 = Instant::now();
-        run(&mut sandbox, source.as_str())?;
+        sandbox.run(source.as_str())?;
         let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
@@ -757,13 +767,12 @@ fn bench_warm_restore(args: BenchSnapArgs) -> hyperlight_unikraft::hyperlight_ho
 }
 
 /// Warm stateful: load snapshot once, then loop dispatch without restore.
-fn bench_warm_stateful(args: BenchSnapArgs) -> hyperlight_unikraft::hyperlight_host::Result<()> {
+fn bench_warm_stateful(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
-    let tag: OciTag = SNAPSHOT_TAG.parse().expect("valid OCI tag");
 
     let t0 = Instant::now();
-    let snap = Arc::new(Snapshot::load(&args.snapshot, tag)?);
-    let (mut sandbox, _config) = SandboxBuilder::from_snapshot(snap).boot()?;
+    let snap = load_snapshot(&args.snapshot)?;
+    let mut sandbox = SandboxBuilder::from_snapshot(snap).boot()?;
     let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("BENCH warm-stateful setup_ms={setup_ms:.3}");
 
@@ -771,7 +780,7 @@ fn bench_warm_stateful(args: BenchSnapArgs) -> hyperlight_unikraft::hyperlight_h
 
     for i in 0..args.samples {
         let t1 = Instant::now();
-        run(&mut sandbox, source.as_str())?;
+        sandbox.run(source.as_str())?;
         let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         println!("BENCH warm-stateful sample={i} exec_ms={exec_ms:.3}");
@@ -785,10 +794,9 @@ fn bench_warm_stateful(args: BenchSnapArgs) -> hyperlight_unikraft::hyperlight_h
 }
 
 /// Parallel VMs: spawn N threads, each restoring from the same snapshot.
-fn bench_parallel(args: BenchParallelArgs) -> hyperlight_unikraft::hyperlight_host::Result<()> {
+fn bench_parallel(args: BenchParallelArgs) -> CliResult<()> {
     let source = Arc::new(read_script(&args.script)?);
-    let tag: OciTag = SNAPSHOT_TAG.parse().expect("valid OCI tag");
-    let snap = Arc::new(Snapshot::load(&args.snapshot, tag)?);
+    let snap = load_snapshot(&args.snapshot)?;
 
     // Barrier so all VMs start at the same time.
     let barrier = Arc::new(Barrier::new(args.vms));
@@ -805,14 +813,14 @@ fn bench_parallel(args: BenchParallelArgs) -> hyperlight_unikraft::hyperlight_ho
                 barrier.wait();
                 let vm_start = Instant::now();
 
-                let (mut sandbox, _config) = SandboxBuilder::from_snapshot(snap.clone())
+                let mut sandbox = SandboxBuilder::from_snapshot(snap.clone())
                     .boot()
                     .map_err(|e| e.to_string())?;
                 let mut execs = Vec::with_capacity(iterations);
 
                 for iter in 0..iterations {
                     let t = Instant::now();
-                    run(&mut sandbox, source.as_str()).map_err(|e| e.to_string())?;
+                    sandbox.run(source.as_str()).map_err(|e| e.to_string())?;
                     let exec_ms = t.elapsed().as_secs_f64() * 1000.0;
 
                     let t = Instant::now();
@@ -861,16 +869,32 @@ fn bench_parallel(args: BenchParallelArgs) -> hyperlight_unikraft::hyperlight_ho
     print_rss("parallel");
 
     if !errors.is_empty() {
-        return Err(
-            hyperlight_unikraft::hyperlight_host::HyperlightError::Error(errors.join("; ")),
-        );
+        return Err(errors.join("; ").into());
     }
     Ok(())
 }
 
 // ── Main ─────────────────────────────────────────────────────────
 
-fn main() -> hyperlight_unikraft::hyperlight_host::Result<()> {
+fn main() {
+    let Err(e) = cli_main() else { return };
+    // A script that failed has said why in the guest's output, and its
+    // status is the command's, as when running it directly; a guest that
+    // exited under a call is reported, with its status likewise.
+    match e.downcast_ref::<Error>() {
+        Some(Error::CallFailed { status }) => std::process::exit(*status),
+        Some(Error::GuestExited { status }) => {
+            eprintln!("error: {e}");
+            std::process::exit(*status);
+        }
+        _ => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cli_main() -> CliResult<()> {
     let cli = Cli::parse();
 
     if let Some(level) = cli.log_level {
@@ -916,40 +940,40 @@ mod tests {
     #[test]
     fn parse_envs_basic() {
         let input = vec!["KEY=value".into(), "DEBUG=1".into()];
-        let envs = parse_envs(&input);
+        let envs = parse_envs(&input).unwrap();
         assert_eq!(envs, vec![("KEY", "value"), ("DEBUG", "1")]);
     }
 
     #[test]
     fn parse_envs_value_with_equals() {
         let input = vec!["CONN=host=db;port=5432".into()];
-        let envs = parse_envs(&input);
+        let envs = parse_envs(&input).unwrap();
         assert_eq!(envs, vec![("CONN", "host=db;port=5432")]);
     }
 
     #[test]
     fn parse_envs_empty_value() {
         let input = vec!["EMPTY=".into()];
-        let envs = parse_envs(&input);
+        let envs = parse_envs(&input).unwrap();
         assert_eq!(envs, vec![("EMPTY", "")]);
     }
 
     #[test]
-    fn parse_envs_skips_invalid() {
-        let input = vec!["GOOD=1".into(), "no_equals".into(), "ALSO=ok".into()];
-        let envs = parse_envs(&input);
-        assert_eq!(envs, vec![("GOOD", "1"), ("ALSO", "ok")]);
+    fn parse_envs_rejects_an_entry_without_equals() {
+        let input = vec!["GOOD=1".into(), "no_equals".into()];
+        let err = parse_envs(&input).unwrap_err();
+        assert!(err.contains("no_equals"), "got: {err}");
     }
 
     #[test]
     fn parse_envs_empty_input() {
-        let envs = parse_envs(&[]);
+        let envs = parse_envs(&[]).unwrap();
         assert!(envs.is_empty());
     }
 
     #[test]
     fn parse_unix_rw_mount() {
-        let mounts = parse_mounts(&["/tmp/share:/mnt/host".into()]);
+        let mounts = parse_mounts(&["/tmp/share:/mnt/host".into()]).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].host_path, PathBuf::from("/tmp/share"));
         assert_eq!(mounts[0].guest_path, "/mnt/host");
@@ -958,7 +982,7 @@ mod tests {
 
     #[test]
     fn parse_unix_ro_mount() {
-        let mounts = parse_mounts(&["/data:/mnt/data:ro".into()]);
+        let mounts = parse_mounts(&["/data:/mnt/data:ro".into()]).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].host_path, PathBuf::from("/data"));
         assert_eq!(mounts[0].guest_path, "/mnt/data");
@@ -967,7 +991,7 @@ mod tests {
 
     #[test]
     fn parse_multiple_mounts() {
-        let mounts = parse_mounts(&["/a:/mnt/a".into(), "/b:/mnt/b:ro".into()]);
+        let mounts = parse_mounts(&["/a:/mnt/a".into(), "/b:/mnt/b:ro".into()]).unwrap();
         assert_eq!(mounts.len(), 2);
         assert!(!mounts[0].readonly);
         assert!(mounts[1].readonly);
@@ -975,7 +999,7 @@ mod tests {
 
     #[test]
     fn parse_windows_drive_rw() {
-        let mounts = parse_mounts(&[r"C:\Users\data:/mnt/data".into()]);
+        let mounts = parse_mounts(&[r"C:\Users\data:/mnt/data".into()]).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].host_path, PathBuf::from(r"C:\Users\data"));
         assert_eq!(mounts[0].guest_path, "/mnt/data");
@@ -984,7 +1008,7 @@ mod tests {
 
     #[test]
     fn parse_windows_drive_ro() {
-        let mounts = parse_mounts(&[r"D:\share:/mnt/host:ro".into()]);
+        let mounts = parse_mounts(&[r"D:\share:/mnt/host:ro".into()]).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].host_path, PathBuf::from(r"D:\share"));
         assert_eq!(mounts[0].guest_path, "/mnt/host");
@@ -993,16 +1017,16 @@ mod tests {
 
     #[test]
     fn parse_relative_path() {
-        let mounts = parse_mounts(&["./data:/mnt".into()]);
+        let mounts = parse_mounts(&["./data:/mnt".into()]).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].host_path, PathBuf::from("./data"));
         assert_eq!(mounts[0].guest_path, "/mnt");
     }
 
     #[test]
-    fn parse_invalid_no_colon() {
-        let mounts = parse_mounts(&["invalid".into()]);
-        assert!(mounts.is_empty());
+    fn parse_mounts_rejects_an_entry_without_colon() {
+        let err = parse_mounts(&["invalid".into()]).unwrap_err();
+        assert!(err.contains("invalid"), "got: {err}");
     }
 
     #[test]
