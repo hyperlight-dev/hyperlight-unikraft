@@ -1418,6 +1418,12 @@ impl AppSandbox {
         loop {
             match self.step_with(None)? {
                 Yield::Exited { status } => return Ok(status),
+                // A driver's call finished, but a driver never exits on its
+                // own, so there is nothing more to join -- report it rather
+                // than loop forever on an idle driver.
+                Yield::CallDone | Yield::CallFailed { .. } if self.has_driver() => {
+                    return Err(Error::NothingToJoin);
+                }
                 Yield::CallDone | Yield::CallFailed { .. } | Yield::Blocked { .. } => {}
             }
         }

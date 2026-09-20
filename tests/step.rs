@@ -173,6 +173,24 @@ fn python_join_and_exit_are_reported() {
     assert_eq!(sandbox.join().expect("join after exit"), 0);
 }
 
+/// `join` after `submit` reports `NothingToJoin` rather than hanging: the
+/// submitted call runs to completion, but the driver stays alive for the
+/// next call, so a join can never return.  (It used to loop forever once
+/// the call finished.)
+#[test]
+fn python_join_after_submit_is_refused() {
+    let mut sandbox = boot_python();
+    sandbox
+        .submit("print('submitted', flush=True)")
+        .expect("submit");
+    let err = sandbox.join().expect_err("join after submit must fail");
+    assert!(matches!(err, Error::NothingToJoin), "{err}");
+    // The submitted call still ran, and the guest takes the next one.
+    assert!(sandbox.drain_output().contains("submitted"));
+    sandbox.run("print('again')").expect("run after join");
+    assert!(sandbox.drain_output().contains("again"));
+}
+
 /// The kernel serves one call at a time: while one is in flight, `submit`
 /// and `run` are refused up front, and the guest is untouched.
 #[test]
