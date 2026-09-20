@@ -52,6 +52,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{fmt, io, thread};
@@ -67,6 +68,15 @@ const MAX_LEARNED_IPS: usize = 4096;
 /// lookup runs while the VM is stopped inside the host call, so it is
 /// bounded; a name that has not answered by then counts as blocked.
 const LOOKUP_DEADLINE: Duration = Duration::from_millis(250);
+
+/// The most resolver threads a block list may have running at once, across
+/// all connects.  A `std` name lookup cannot be cancelled and runs to
+/// completion even after the caller stops waiting, so without a cap a guest
+/// that floods connects while DNS is slow could pile them up without limit.
+const MAX_INFLIGHT_LOOKUPS: usize = 32;
+
+/// Live resolver threads, counted against [`MAX_INFLIGHT_LOOKUPS`].
+static INFLIGHT_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
 
 /// AWS's IPv6 instance metadata endpoint, per the EC2 user guide
 /// ("Access instance metadata for an EC2 instance", IPv6 support).
@@ -346,18 +356,31 @@ fn resolves_to_now(names: &[String], ip: &IpAddr) -> Option<bool> {
         return Some(false);
     }
     let (tx, rx) = mpsc::channel();
+    let mut spawned = 0usize;
     for name in names {
+        // Bound the resolver threads a guest can have running at once.  A
+        // lookup cannot be cancelled and runs to completion even after we
+        // stop waiting on it, so over the cap the lookup is skipped and
+        // treated as no answer -- the block list then fails closed below,
+        // exactly as it does for a lookup that misses its deadline.
+        if INFLIGHT_LOOKUPS.fetch_add(1, Ordering::Relaxed) >= MAX_INFLIGHT_LOOKUPS {
+            INFLIGHT_LOOKUPS.fetch_sub(1, Ordering::Relaxed);
+            debug!("block list: resolver thread cap reached; refusing");
+            return None;
+        }
         let (tx, name) = (tx.clone(), name.clone());
         thread::spawn(move || {
             let ips = (name.as_str(), 0u16)
                 .to_socket_addrs()
                 .map(|addrs| addrs.map(|a| a.ip()).collect::<HashSet<_>>());
             let _ = tx.send((name, ips));
+            INFLIGHT_LOOKUPS.fetch_sub(1, Ordering::Relaxed);
         });
+        spawned += 1;
     }
     drop(tx);
     let deadline = Instant::now() + LOOKUP_DEADLINE;
-    let mut pending = names.len();
+    let mut pending = spawned;
     while pending > 0 {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok((_, Ok(ips))) if ips.contains(ip) => return Some(true),
