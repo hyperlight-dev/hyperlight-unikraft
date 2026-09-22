@@ -112,10 +112,11 @@ struct RunArgs {
     #[arg(long = "net-block", value_name = "HOST", conflicts_with = "net_allow")]
     net_block: Vec<String>,
 
-    /// Ports the guest may bind to for inbound connections.
-    /// Without this flag, bind() is rejected (outbound-only).
-    #[arg(long = "port", value_name = "PORT")]
-    ports: Vec<u16>,
+    /// Ports the guest may bind to for inbound connections: a port, a
+    /// range LOW-HIGH, or `all` (repeatable). Without this flag, bind()
+    /// is rejected (outbound-only).
+    #[arg(long = "port", value_name = "PORT|LOW-HIGH|all")]
+    ports: Vec<PortSpec>,
 
     /// Set an environment variable in the guest (repeatable).
     /// Format: KEY=VALUE (e.g. --env MY_VAR=hello --env DEBUG=1).
@@ -167,8 +168,8 @@ struct SaveArgs {
     net_block: Vec<String>,
 
     /// Ports the guest may bind to for inbound connections.
-    #[arg(long = "port", value_name = "PORT")]
-    ports: Vec<u16>,
+    #[arg(long = "port", value_name = "PORT|LOW-HIGH|all")]
+    ports: Vec<PortSpec>,
 }
 
 /// Arguments for `snapshot run`.
@@ -209,8 +210,8 @@ struct SnapshotRunArgs {
     net_block: Vec<String>,
 
     /// Ports the guest may bind to for inbound connections.
-    #[arg(long = "port", value_name = "PORT")]
-    ports: Vec<u16>,
+    #[arg(long = "port", value_name = "PORT|LOW-HIGH|all")]
+    ports: Vec<PortSpec>,
 
     /// Set an environment variable in the guest (repeatable).
     /// Format: KEY=VALUE (e.g. --env MY_VAR=hello --env DEBUG=1).
@@ -338,12 +339,47 @@ fn parse_mount(m: &str) -> Option<Mount> {
     })
 }
 
+/// A `--port` value: one port, an inclusive range `LOW-HIGH`, or `all`,
+/// which lets the guest bind any port -- what a container runtime asks for,
+/// since the container's network namespace already scopes what the guest
+/// exposes, the way `docker run -P` publishes every port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PortSpec {
+    All,
+    One(u16),
+    Range(u16, u16),
+}
+
+impl std::str::FromStr for PortSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(PortSpec::All);
+        }
+        let port = |p: &str| {
+            p.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("invalid port {p:?}: expected a port, LOW-HIGH or all"))
+        };
+        if let Some((lo, hi)) = s.split_once('-') {
+            let (lo, hi) = (port(lo)?, port(hi)?);
+            if lo > hi {
+                return Err(format!("empty port range {s:?}"));
+            }
+            return Ok(PortSpec::Range(lo, hi));
+        }
+        port(s).map(PortSpec::One)
+    }
+}
+
 /// Convert CLI net flags into `(Option<NetworkPolicy>, Option<ListenPorts>)`.
 fn parse_net_policy(
     net: bool,
     net_allow: &[String],
     net_block: &[String],
-    ports: &[u16],
+    ports: &[PortSpec],
 ) -> Result<(Option<NetworkPolicy>, Option<ListenPorts>), String> {
     let policy = if !net_allow.is_empty() {
         Some(NetworkPolicy::AllowList(
@@ -368,10 +404,21 @@ fn parse_net_policy(
                 .to_string(),
         );
     }
-    let listen = if !ports.is_empty() {
-        Some(ListenPorts::from_ports(ports.iter().copied()))
-    } else {
+    let listen = if ports.is_empty() {
         None
+    } else if ports.contains(&PortSpec::All) {
+        Some(ListenPorts::all())
+    } else {
+        let mut listen = ListenPorts::from_ports(ports.iter().filter_map(|p| match p {
+            PortSpec::One(port) => Some(*port),
+            _ => None,
+        }));
+        for spec in ports {
+            if let PortSpec::Range(lo, hi) = spec {
+                listen = listen.with_range(*lo..=*hi);
+            }
+        }
+        Some(listen)
     };
     Ok((policy, listen))
 }
@@ -1045,7 +1092,7 @@ mod tests {
 
     #[test]
     fn net_policy_port_with_net_sets_listen() {
-        let (policy, listen) = parse_net_policy(true, &[], &[], &[8080]).unwrap();
+        let (policy, listen) = parse_net_policy(true, &[], &[], &[PortSpec::One(8080)]).unwrap();
         assert!(matches!(policy, Some(NetworkPolicy::AllowAll)));
         assert!(listen.is_some());
     }
@@ -1053,16 +1100,47 @@ mod tests {
     #[test]
     fn net_policy_port_with_allow_list_sets_listen() {
         let (policy, listen) =
-            parse_net_policy(false, &["example.com".into()], &[], &[8080]).unwrap();
+            parse_net_policy(false, &["example.com".into()], &[], &[PortSpec::One(8080)]).unwrap();
         assert!(matches!(policy, Some(NetworkPolicy::AllowList(_))));
         assert!(listen.is_some());
+    }
+
+    #[test]
+    fn port_spec_parses_port_range_and_all() {
+        assert_eq!("8080".parse::<PortSpec>().unwrap(), PortSpec::One(8080));
+        assert_eq!(
+            "8000-8010".parse::<PortSpec>().unwrap(),
+            PortSpec::Range(8000, 8010)
+        );
+        assert_eq!("all".parse::<PortSpec>().unwrap(), PortSpec::All);
+        assert_eq!("ALL".parse::<PortSpec>().unwrap(), PortSpec::All);
+        assert!("8010-8000".parse::<PortSpec>().is_err());
+        assert!("http".parse::<PortSpec>().is_err());
+        assert!("70000".parse::<PortSpec>().is_err());
+    }
+
+    #[test]
+    fn net_policy_port_all_and_ranges() {
+        let (_, listen) = parse_net_policy(true, &[], &[], &[PortSpec::All]).unwrap();
+        assert!(listen.unwrap().allows(12345));
+        let (_, listen) = parse_net_policy(
+            true,
+            &[],
+            &[],
+            &[PortSpec::One(22), PortSpec::Range(8000, 8010)],
+        )
+        .unwrap();
+        let listen = listen.unwrap();
+        assert!(listen.allows(22));
+        assert!(listen.allows(8005));
+        assert!(!listen.allows(9000));
     }
 
     #[test]
     fn net_policy_port_without_net_is_rejected() {
         // --port alone would be a silent no-op (hostnet is only registered
         // when a policy is present), so it must be an error, not accepted.
-        let err = parse_net_policy(false, &[], &[], &[8080]).unwrap_err();
+        let err = parse_net_policy(false, &[], &[], &[PortSpec::One(8080)]).unwrap_err();
         assert!(err.contains("--port requires networking"), "got: {err}");
     }
 }

@@ -52,6 +52,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -404,23 +405,44 @@ fn resolves_to_now(names: &[String], ip: &IpAddr) -> Option<bool> {
 ///
 /// Orthogonal to [`NetworkPolicy`] (which governs *outbound* destinations).
 /// Without a `ListenPorts` allowlist, `net_bind` rejects every call
-/// (outbound-only mode).
+/// (outbound-only mode).  Single ports, ranges and "every port" compose:
+/// [`ListenPorts::all`] is for an embedder whose own boundary, such as a
+/// container's network namespace, already scopes what the guest exposes.
 #[derive(Clone, Debug)]
 pub struct ListenPorts {
+    all: bool,
     ports: HashSet<u16>,
+    ranges: Vec<RangeInclusive<u16>>,
 }
 
 impl ListenPorts {
     /// Create from an iterator of port numbers.
     pub fn from_ports(ports: impl IntoIterator<Item = u16>) -> Self {
         Self {
+            all: false,
             ports: ports.into_iter().collect(),
+            ranges: Vec::new(),
         }
     }
 
+    /// Every port: the guest may bind any of them.
+    pub fn all() -> Self {
+        Self {
+            all: true,
+            ports: HashSet::new(),
+            ranges: Vec::new(),
+        }
+    }
+
+    /// Also permit every port in `range`.
+    pub fn with_range(mut self, range: RangeInclusive<u16>) -> Self {
+        self.ranges.push(range);
+        self
+    }
+
     /// Whether the guest may bind `port`.
-    pub(crate) fn allows(&self, port: u16) -> bool {
-        self.ports.contains(&port)
+    pub fn allows(&self, port: u16) -> bool {
+        self.all || self.ports.contains(&port) || self.ranges.iter().any(|r| r.contains(&port))
     }
 }
 
@@ -935,6 +957,24 @@ mod tests {
     fn listen_ports_blocks_unlisted_port() {
         let lp = ListenPorts::from_ports([8080]);
         assert!(!lp.allows(9090));
+    }
+
+    #[test]
+    fn listen_ports_all_permits_every_port() {
+        let lp = ListenPorts::all();
+        assert!(lp.allows(1));
+        assert!(lp.allows(8080));
+        assert!(lp.allows(65535));
+    }
+
+    #[test]
+    fn listen_ports_range_is_inclusive() {
+        let lp = ListenPorts::from_ports([22]).with_range(8000..=8010);
+        assert!(lp.allows(22));
+        assert!(lp.allows(8000));
+        assert!(lp.allows(8010));
+        assert!(!lp.allows(7999));
+        assert!(!lp.allows(8011));
     }
 
     #[test]

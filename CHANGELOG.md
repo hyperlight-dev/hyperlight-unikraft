@@ -4,6 +4,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Added
+
+- `--port all` lets the guest bind any port and `--port LOW-HIGH` a range, next to single ports; the library gains `ListenPorts::all()` and `ListenPorts::with_range`. `all` is for a container runtime, whose network namespace already scopes what the guest exposes, the way `docker run -P` publishes every port.
+
 ### Fixed
 
 - `connect(2)` with `AF_UNSPEC` dissolves a datagram socket's association, as on Linux, instead of failing. glibc's `getaddrinfo` relies on it to probe every candidate of a dual-stack answer through one IPv6 socket, so a passive lookup -- `socket.getaddrinfo(None, port, AF_UNSPEC, SOCK_STREAM, 0, AI_PASSIVE)`, what Python's `http.server` does to bind -- no longer aborts the guest with a glibc assertion on the source address. Kernel: `hostsock` forwards it as the new `net_disconnect` host function.

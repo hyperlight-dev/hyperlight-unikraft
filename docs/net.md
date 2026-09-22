@@ -130,7 +130,7 @@ let mut guest = SandboxBuilder::from_initrd(rootfs)
     .boot()?;
 ```
 
-Ephemeral binds (port 0 — "assign any port") are always allowed.
+Ephemeral binds (port 0 — "assign any port") are always allowed.  `ListenPorts::all()` permits every port, and `with_range(8000..=8010)` a range; on the command line these are `--port all` and `--port 8000-8010`, next to `--port 80`.  `all` is for an embedder whose own boundary already scopes what the guest exposes, such as a container runtime, where the guest binds inside the container's network namespace the way any container process does.
 
 A guest restored from a snapshot binds its listeners again on its `resume` entry, so their ports must be in the restoring sandbox's `ListenPorts` too.
 
