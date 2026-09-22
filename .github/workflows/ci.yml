@@ -407,6 +407,7 @@ jobs:
           cargo clean -p hyperlight-host --release
 
       - name: Run benchmarks
+        id: bench
         shell: bash
         run: just bench ${{ matrix.runtime }}
 
@@ -425,8 +426,11 @@ jobs:
               else (.[] | "::error::" + .), ("\(length) ceiling(s) exceeded" | error) end
           ' bench-results.json
 
+      # Also after a failed "Check ceilings" (its summary table is the
+      # diagnosis), but not after a failed or cancelled bench: there is no
+      # results file then, and the ENOENT here would hide the real failure.
       - name: Store benchmark results
-        if: always()
+        if: ${{ !cancelled() && steps.bench.outcome == 'success' }}
         uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         with:
           name: ${{ matrix.runtime }} benchmarks
