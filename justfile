@@ -861,6 +861,25 @@ bench runtime *mode:
     outfile=$(mktemp)
     trap 'rm -f "$outfile"' EXIT
 
+    # Keep the BENCH lines, tagged with their workload: printed as they
+    # arrive (grep and sed sit on them when writing to a pipe, so a run
+    # that hangs would show nothing) and kept in $outfile for the summary.
+    # Fails, as the grep did, when hluk said nothing.
+    tag_bench() {
+        local hit=0 line
+        while IFS= read -r line; do
+            case "$line" in
+                "BENCH "*)
+                    hit=1
+                    line="BENCH [$1] ${line#BENCH }"
+                    echo "$line"
+                    echo "$line" >>"$outfile"
+                    ;;
+            esac
+        done
+        [ "$hit" -eq 1 ]
+    }
+
     for script in "${workloads[@]}"; do
         wname=$(basename "$script" | sed 's/\.\(py\|js\)$//')
         for m in $modes; do
@@ -873,33 +892,28 @@ bench runtime *mode:
                     "$hluk" bench cold \
                         --initrd "$rootfs" --scratch-mb "$scratch" \
                         --samples "$samples" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 cold-snap)
                     "$hluk" bench cold-snap \
                         --samples "$samples" "$snap_dir" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 warm-restore)
                     "$hluk" bench warm-restore \
                         --samples "$samples" "$snap_dir" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 warm-stateful)
                     "$hluk" bench warm-stateful \
                         --samples "$samples" "$snap_dir" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 parallel)
                     "$hluk" bench parallel \
                         --vms "$parallel_vms" --iterations "$parallel_iters" \
                         "$snap_dir" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 *)
                     echo "error: unknown mode '$m'" >&2
@@ -1028,6 +1042,9 @@ bench runtime *mode:
     if ($workloads.Count -eq 0) { Write-Error "no benchmark scripts in $benchDir" }
 
     # Every BENCH line, tagged with its workload, for the summary below.
+    # Each is also printed as it arrives (Write-Host: the pipeline's own
+    # output is what $out collects, so nothing of it shows until hluk
+    # exits), so a run that hangs shows how far it got.
     $lines = @()
     foreach ($script in $workloads) {
         $w = $script.BaseName
@@ -1044,9 +1061,8 @@ bench runtime *mode:
                 'parallel'      { @('parallel', '--vms', $parallelVms, '--iterations', $parallelIters, $snapDir, $script.FullName) }
                 default         { Write-Error "unknown mode '$m'" }
             }
-            $out = @(& $hluk bench @benchArgs 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match '^BENCH ' } | ForEach-Object { $_ -replace '^BENCH ', "BENCH [$w] " })
+            $out = @(& $hluk bench @benchArgs 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match '^BENCH ' } | ForEach-Object { $l = $_ -replace '^BENCH ', "BENCH [$w] "; Write-Host $l; $l })
             if ($LASTEXITCODE -ne 0) { Write-Error "hluk bench $m failed (exit $LASTEXITCODE)" }
-            $out | Write-Output
             $lines += $out
         }
     }
