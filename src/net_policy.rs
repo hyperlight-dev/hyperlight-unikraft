@@ -52,6 +52,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -120,8 +121,7 @@ impl NetworkPolicy {
             // 127.0.0.1 reaches host-only services.
             NetworkPolicy::AllowList(al) => {
                 !ip.is_loopback()
-                    && (al.is_allowed(&ip)
-                        || (udp && addr.port() == 53 && dns_resolvers().contains(&ip)))
+                    && (al.is_allowed(&ip) || (udp && addr.port() == 53 && al.is_resolver(&ip)))
             }
             NetworkPolicy::BlockList(bl) => !ip.is_loopback() && !bl.blocks(&ip),
         }
@@ -155,7 +155,7 @@ impl NetworkPolicy {
     pub(crate) fn learn_from_dns_answer(&self, from: SocketAddr, data: &[u8]) {
         if let NetworkPolicy::AllowList(al) = self
             && from.port() == 53
-            && dns_resolvers().contains(&canonical(from.ip()))
+            && al.is_resolver(&canonical(from.ip()))
         {
             learn_ips_from_dns_response(data, al);
         }
@@ -272,6 +272,9 @@ pub struct AllowList {
     allowed_ips: HashSet<IpAddr>,
     hostnames: Vec<String>,
     learned_ips: Arc<Mutex<HashSet<IpAddr>>>,
+    /// Resolvers the guest was given (its `/etc/resolv.conf`), exempt on
+    /// port 53 like the host's own.
+    resolvers: Arc<Mutex<HashSet<IpAddr>>>,
 }
 
 impl AllowList {
@@ -286,7 +289,26 @@ impl AllowList {
             allowed_ips,
             hostnames,
             learned_ips: Arc::new(Mutex::new(HashSet::new())),
+            resolvers: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    /// Also treat `ips` as DNS resolvers the guest may ask: the nameservers
+    /// of the `resolv.conf` it was given (see `resolv_conf_nameservers`).
+    pub fn exempt_resolvers(&self, ips: impl IntoIterator<Item = IpAddr>) {
+        if let Ok(mut resolvers) = self.resolvers.lock() {
+            resolvers.extend(ips.into_iter().map(canonical));
+        }
+    }
+
+    /// Whether `ip` is a resolver the guest may ask on port 53: the host's
+    /// own, a well-known public one, or one the guest was given.
+    fn is_resolver(&self, ip: &IpAddr) -> bool {
+        dns_resolvers().contains(ip)
+            || self
+                .resolvers
+                .lock()
+                .is_ok_and(|resolvers| resolvers.contains(ip))
     }
 
     fn is_allowed(&self, ip: &IpAddr) -> bool {
@@ -404,27 +426,58 @@ fn resolves_to_now(names: &[String], ip: &IpAddr) -> Option<bool> {
 ///
 /// Orthogonal to [`NetworkPolicy`] (which governs *outbound* destinations).
 /// Without a `ListenPorts` allowlist, `net_bind` rejects every call
-/// (outbound-only mode).
+/// (outbound-only mode).  Single ports, ranges and "every port" compose:
+/// [`ListenPorts::all`] is for an embedder whose own boundary, such as a
+/// container's network namespace, already scopes what the guest exposes.
 #[derive(Clone, Debug)]
 pub struct ListenPorts {
+    all: bool,
     ports: HashSet<u16>,
+    ranges: Vec<RangeInclusive<u16>>,
 }
 
 impl ListenPorts {
     /// Create from an iterator of port numbers.
     pub fn from_ports(ports: impl IntoIterator<Item = u16>) -> Self {
         Self {
+            all: false,
             ports: ports.into_iter().collect(),
+            ranges: Vec::new(),
         }
     }
 
+    /// Every port: the guest may bind any of them.
+    pub fn all() -> Self {
+        Self {
+            all: true,
+            ports: HashSet::new(),
+            ranges: Vec::new(),
+        }
+    }
+
+    /// Also permit every port in `range`.
+    pub fn with_range(mut self, range: RangeInclusive<u16>) -> Self {
+        self.ranges.push(range);
+        self
+    }
+
     /// Whether the guest may bind `port`.
-    pub(crate) fn allows(&self, port: u16) -> bool {
-        self.ports.contains(&port)
+    pub fn allows(&self, port: u16) -> bool {
+        self.all || self.ports.contains(&port) || self.ranges.iter().any(|r| r.contains(&port))
     }
 }
 
 // ── DNS resolver exemption ─────────────────────────────────────────
+
+/// The `nameserver` addresses of a `resolv.conf`.
+pub(crate) fn resolv_conf_nameservers(content: &str) -> Vec<IpAddr> {
+    content
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver"))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|ip| ip.parse::<IpAddr>().ok())
+        .collect()
+}
 
 /// DNS resolver IPs that the AllowList auto-exempts on port 53.
 ///
@@ -444,15 +497,7 @@ fn dns_resolvers() -> &'static HashSet<IpAddr> {
         #[cfg(unix)]
         {
             if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
-                for line in contents.lines() {
-                    let line = line.trim();
-                    if let Some(rest) = line.strip_prefix("nameserver")
-                        && let Some(ip_str) = rest.split_whitespace().next()
-                        && let Ok(ip) = ip_str.parse::<IpAddr>()
-                    {
-                        set.insert(ip);
-                    }
-                }
+                set.extend(resolv_conf_nameservers(&contents));
             }
         }
         #[cfg(windows)]
@@ -935,6 +980,39 @@ mod tests {
     fn listen_ports_blocks_unlisted_port() {
         let lp = ListenPorts::from_ports([8080]);
         assert!(!lp.allows(9090));
+    }
+
+    #[test]
+    fn listen_ports_all_permits_every_port() {
+        let lp = ListenPorts::all();
+        assert!(lp.allows(1));
+        assert!(lp.allows(8080));
+        assert!(lp.allows(65535));
+    }
+
+    #[test]
+    fn allowlist_exempts_the_guest_resolver_on_port_53() {
+        let al = AllowList::from_hosts(&["93.184.216.34"]).unwrap();
+        let resolver: SocketAddr = "10.96.0.10:53".parse().unwrap();
+        let policy = NetworkPolicy::AllowList(al.clone());
+        assert!(!policy.allows(&resolver, true));
+        al.exempt_resolvers(resolv_conf_nameservers(
+            "nameserver 10.96.0.10\nsearch default.svc.cluster.local\n",
+        ));
+        assert!(policy.allows(&resolver, true));
+        // Only as a resolver: not on other ports, not over TCP.
+        assert!(!policy.allows(&"10.96.0.10:80".parse().unwrap(), true));
+        assert!(!policy.allows(&resolver, false));
+    }
+
+    #[test]
+    fn listen_ports_range_is_inclusive() {
+        let lp = ListenPorts::from_ports([22]).with_range(8000..=8010);
+        assert!(lp.allows(22));
+        assert!(lp.allows(8000));
+        assert!(lp.allows(8010));
+        assert!(!lp.allows(7999));
+        assert!(!lp.allows(8011));
     }
 
     #[test]
