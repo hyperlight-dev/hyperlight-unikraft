@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - `connect(2)` with `AF_UNSPEC` dissolves a datagram socket's association, as on Linux, instead of failing. glibc's `getaddrinfo` relies on it to probe every candidate of a dual-stack answer through one IPv6 socket, so a passive lookup -- `socket.getaddrinfo(None, port, AF_UNSPEC, SOCK_STREAM, 0, AI_PASSIVE)`, what Python's `http.server` does to bind -- no longer aborts the guest with a glibc assertion on the source address. Kernel: `hostsock` forwards it as the new `net_disconnect` host function.
+- A script, `--exec` or `--guest-exec` on a rootfs with no runtime driver is an error that names `--entry`, instead of a guest that exits with status 0 having run nothing.
 
 ## [v0.14.0]
 

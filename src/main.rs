@@ -510,6 +510,14 @@ fn cmd_run(args: RunArgs) -> CliResult<()> {
 /// its status, as running it directly would.
 fn drive(sandbox: &mut AppSandbox, no_workload: bool, exec: Exec) -> CliResult<()> {
     let t = Instant::now();
+    if !no_workload && !sandbox.has_driver() {
+        return Err(
+            "the guest has no runtime driver to run the workload: a script, \
+                    --exec and --guest-exec need one in the rootfs (usr/local/bin/hl_*); \
+                    a plain program runs as the entry point with --entry"
+                .into(),
+        );
+    }
     if no_workload && !sandbox.has_driver() {
         info!("no driver in the guest; driving its entry point to exit");
         let status = sandbox.join()?;
