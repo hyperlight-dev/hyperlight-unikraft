@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `hluk --version`.
 - `--resolv-conf FILE` installs a resolver configuration as the guest's `/etc/resolv.conf`, at boot and again on a restore, so a snapshot resolves names where it now runs rather than where it was taken; the library has `SandboxBuilder::resolv_conf`. Without it the rootfs's own file stands, and `options single-request` is added unless present. Under an allow list, the file's nameservers are exempt on port 53 like the host's own. Kernel: the new `GetResolvConf` host function is read once the rootfs is mounted and on `resume`.
 
+### Changed
+
+- The urunc demo image (`demos/urunc`, published as `hello-urunc`) bakes its workload at `/app/hello.py` and declares it as the image's `CMD`, so `docker run` needs no command after the image name and the driver's fallback entrypoint stays out of the image contract. Its greeting now names Hyperlight.
+
 ### Fixed
 
 - `connect(2)` with `AF_UNSPEC` dissolves a datagram socket's association, as on Linux, instead of failing. glibc's `getaddrinfo` relies on it to probe every candidate of a dual-stack answer through one IPv6 socket, so a passive lookup -- `socket.getaddrinfo(None, port, AF_UNSPEC, SOCK_STREAM, 0, AI_PASSIVE)`, what Python's `http.server` does to bind -- no longer aborts the guest with a glibc assertion on the source address. Kernel: `hostsock` forwards it as the new `net_disconnect` host function.
