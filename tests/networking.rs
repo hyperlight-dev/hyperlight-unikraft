@@ -217,3 +217,28 @@ fn net_policy_blocklist_by_name_end_to_end() {
     assert!(out.contains("blocked address refused"), "{out:?}");
     assert!(out.contains("other address connected"), "{out:?}");
 }
+
+/// glibc's getaddrinfo() sorts a dual-stack answer by probing every
+/// candidate through one IPv6 UDP socket, disconnecting it with an
+/// AF_UNSPEC connect in between.  A passive lookup, what `http.server`
+/// does to bind, is the shortest path to that: it must not abort the guest.
+#[test]
+fn net_getaddrinfo_dual_stack_passive() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+    let result = sandbox.run(
+        "import socket\n\
+         ai = socket.getaddrinfo(None, 8000, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)\n\
+         print('FAMILIES', sorted({a[0] for a in ai}))\n\
+         print('GAI_OK')",
+    );
+    let output = sandbox.drain_output();
+    assert!(
+        result.is_ok() && output.contains("GAI_OK"),
+        "expected the dual-stack passive lookup to succeed, got result={result:?}, output={output:?}",
+    );
+}

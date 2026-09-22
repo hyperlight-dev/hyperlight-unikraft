@@ -223,6 +223,12 @@ impl SocketTable {
         }
     }
 
+    fn clear_peer(&mut self, fd: i32) {
+        if let Some(m) = self.meta.get_mut(&fd) {
+            m.peer = None;
+        }
+    }
+
     fn get(&self, fd: i32) -> Res<&OwnedFd> {
         self.sockets
             .get(&fd)
@@ -370,6 +376,24 @@ impl Net {
             Err(Errno::INPROGRESS) | Err(Errno::WOULDBLOCK) => Err(errno::EINPROGRESS),
             Err(e) => Err(from_rustix(e)),
         }
+    }
+
+    /// `connect(2)` with `AF_UNSPEC`: dissolve a datagram socket's
+    /// association, so a later `send` needs an address again and the next
+    /// connect picks a source address of its destination's family.  glibc's
+    /// `getaddrinfo` relies on it to probe every candidate through one IPv6
+    /// socket.  A stream socket has no association to dissolve this way.
+    fn disconnect(&self, fd: i32) -> Res<()> {
+        let mut tbl = self.table();
+        {
+            let sock = tbl.get(fd)?;
+            if sockopt::socket_type(sock) != Ok(SocketType::DGRAM) {
+                return Err(errno::EOPNOTSUPP);
+            }
+            net::connect_unspec(sock).map_err(from_rustix)?;
+        }
+        tbl.clear_peer(fd);
+        Ok(())
     }
 
     fn send(&self, fd: i32, data: &[u8]) -> Res<usize> {
@@ -940,6 +964,13 @@ pub(crate) fn register(
         move |fd: i32| -> hyperlight_host::Result<i32> { Ok(ret(n.close(fd), |()| 0)) },
     )?;
 
+    // net_disconnect(fd) -> 0 or -errno: connect(AF_UNSPEC) on a datagram socket
+    let n = net.clone();
+    target.register_host_function(
+        "net_disconnect",
+        move |fd: i32| -> hyperlight_host::Result<i32> { Ok(ret(n.disconnect(fd), |()| 0)) },
+    )?;
+
     // net_getpeername(fd) -> [i32 status | packed addr]
     let n = net.clone();
     target.register_host_function(
@@ -1281,6 +1312,44 @@ mod tests {
         }
         assert_eq!(net.local_addr(s).unwrap().ip(), addr.ip());
         assert!(net.getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY).is_ok());
+    }
+
+    /// What glibc's getaddrinfo() does to sort a dual-stack answer: one
+    /// IPv6 UDP socket, connected to an IPv6 candidate, disconnected, then
+    /// connected to an IPv4 one, whose source address must be v4-mapped.
+    #[test]
+    fn disconnect_resets_datagram_association() {
+        let net = open_net();
+        let Ok(s) = net.socket(AF_INET6, SOCK_DGRAM, 0) else {
+            eprintln!("SKIP: no IPv6");
+            return;
+        };
+        let v6 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8000);
+        if net.connect(s, v6).is_err() {
+            eprintln!("SKIP: no IPv6 loopback");
+            return;
+        }
+        assert_eq!(net.peer_addr(s).unwrap(), v6);
+
+        net.disconnect(s).unwrap();
+        assert_eq!(net.peer_addr(s), Err(errno::ENOTCONN));
+
+        // A dual-stack socket takes the IPv4 candidate as is on Linux, where
+        // glibc runs; Windows wants it spelled v4-mapped and refuses a raw
+        // IPv4 address on an IPv6 socket.
+        #[cfg(target_os = "linux")]
+        {
+            net.connect(s, loopback(8000)).unwrap();
+            assert_eq!(net.peer_addr(s).unwrap().port(), 8000);
+            let local = net.local_addr(s).unwrap();
+            assert!(
+                matches!(local.ip(), IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some()),
+                "source after an IPv4 reconnect must be v4-mapped, got {local}"
+            );
+        }
+
+        // A stream socket has no association to dissolve this way.
+        assert_eq!(net.disconnect(tcp(&net)), Err(errno::EOPNOTSUPP));
     }
 
     #[test]

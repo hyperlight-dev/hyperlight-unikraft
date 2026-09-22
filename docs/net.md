@@ -63,6 +63,7 @@ When `None` (the default), no `net_*` host functions are registered and guest so
 | `net_listen` | `(fd, backlog) → 0` | Start listening |
 | `net_accept` | `(fd) → [new_fd, addr]` | Accept a connection |
 | `net_connect` | `(fd, family, addr, port) → 0` | Connect to a remote address |
+| `net_disconnect` | `(fd) → 0` | Dissolve a datagram socket's association (`connect` with `AF_UNSPEC`) |
 | `net_send` | `(fd, data) → bytes_sent` | Send data |
 | `net_sendto` | `(fd, data, family, addr, port) → bytes_sent` | Send to a specific address |
 | `net_recvfrom` | `(fd, len) → [bytes, addr, data]` | Receive data |
