@@ -19,7 +19,7 @@ type CliResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Minimal Hyperlight host for Unikraft unikernels.
 #[derive(Parser)]
-#[command(name = "hluk")]
+#[command(name = "hluk", version)]
 struct Cli {
     /// Log level for hluk diagnostics: error, warn, info, debug, trace.
     /// Off by default; pass --log-level info to see timing.

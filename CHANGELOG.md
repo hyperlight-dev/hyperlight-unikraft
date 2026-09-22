@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `--port all` lets the guest bind any port and `--port LOW-HIGH` a range, next to single ports; the library gains `ListenPorts::all()` and `ListenPorts::with_range`. `all` is for a container runtime, whose network namespace already scopes what the guest exposes, the way `docker run -P` publishes every port.
+- `hluk --version`.
 
 ### Fixed
 
