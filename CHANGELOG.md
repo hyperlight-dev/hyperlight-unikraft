@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `--port all` lets the guest bind any port and `--port LOW-HIGH` a range, next to single ports; the library gains `ListenPorts::all()` and `ListenPorts::with_range`. `all` is for a container runtime, whose network namespace already scopes what the guest exposes, the way `docker run -P` publishes every port.
 - `hluk --version`.
+- `--resolv-conf FILE` installs a resolver configuration as the guest's `/etc/resolv.conf`, at boot and again on a restore, so a snapshot resolves names where it now runs rather than where it was taken; the library has `SandboxBuilder::resolv_conf`. Without it the rootfs's own file stands, and `options single-request` is added unless present. Under an allow list, the file's nameservers are exempt on port 53 like the host's own. Kernel: the new `GetResolvConf` host function is read once the rootfs is mounted and on `resume`.
 
 ### Fixed
 

@@ -451,6 +451,9 @@ pub(crate) struct GuestConfig {
     output: Arc<Mutex<String>>,
     /// NUL-separated KEY=VALUE pairs for guest env vars.
     env_str: Arc<Mutex<String>>,
+    /// The guest's `/etc/resolv.conf`, written by the kernel at boot and on
+    /// every restore; empty leaves the rootfs's own file in place.
+    resolv_conf: Arc<Mutex<String>>,
     /// Host networking state (`None` = networking disabled).  Shared with
     /// the `net_*` host functions; kept here for the inter-step wait of
     /// the cooperative step model.
@@ -485,6 +488,7 @@ impl GuestConfig {
             mounts,
             output: Arc::new(Mutex::new(String::new())),
             env_str: Arc::new(Mutex::new(String::new())),
+            resolv_conf: Arc::new(Mutex::new(String::new())),
             net,
             events: Arc::new(Mutex::new(Vec::new())),
             guest: Mutex::new(Guest::default()),
@@ -533,6 +537,18 @@ impl GuestConfig {
             s.push('\0');
         }
         *self.env_str.lock().unwrap() = s;
+    }
+
+    /// The resolver configuration the kernel writes as the guest's
+    /// `/etc/resolv.conf`: at boot, and again on every restore, so a
+    /// snapshot taken elsewhere resolves names where it now runs.  Empty
+    /// leaves the rootfs's own file in place.
+    ///
+    /// glibc's parallel A and AAAA queries do not work through the socket
+    /// layer, so `options single-request` is added unless the caller set
+    /// an options line of their own that has it.
+    fn set_resolv_conf(&self, content: &str) {
+        *self.resolv_conf.lock().unwrap() = with_single_request(content);
     }
 
     /// Drain captured guest output, clearing the buffer.
@@ -616,6 +632,13 @@ impl GuestConfig {
             .register_host_function("GetEnvVars", move || -> hyperlight_host::Result<String> {
                 Ok(env_str.lock().unwrap().clone())
             })?;
+
+        // ── Resolver configuration ────────────────────────────────
+        let resolv_conf = self.resolv_conf.clone();
+        target.register_host_function(
+            "GetResolvConf",
+            move || -> hyperlight_host::Result<String> { Ok(resolv_conf.lock().unwrap().clone()) },
+        )?;
 
         // ── Stdin ─────────────────────────────────────────────────
         target.register_host_function(
@@ -1058,6 +1081,7 @@ pub struct SandboxBuilder {
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     env_vars: Vec<(String, String)>,
+    resolv_conf: Option<String>,
 }
 
 impl SandboxBuilder {
@@ -1073,6 +1097,7 @@ impl SandboxBuilder {
             network: None,
             listen_ports: None,
             env_vars: Vec::new(),
+            resolv_conf: None,
         }
     }
 
@@ -1183,6 +1208,17 @@ impl SandboxBuilder {
         self
     }
 
+    /// The guest's `/etc/resolv.conf`: the kernel writes `content` there at
+    /// boot, and again on a restore, so a snapshot resolves names where it
+    /// now runs rather than where it was taken.  Without this the rootfs's
+    /// own file stands.  `options single-request` is added unless present,
+    /// since parallel A and AAAA queries do not work through the socket
+    /// layer.
+    pub fn resolv_conf(mut self, content: impl Into<String>) -> Self {
+        self.resolv_conf = Some(content.into());
+        self
+    }
+
     /// Register the host functions, bring the guest to a running state, and
     /// return it as a [`AppSandbox`].
     ///
@@ -1200,6 +1236,7 @@ impl SandboxBuilder {
             network,
             listen_ports,
             env_vars,
+            resolv_conf,
         } = self;
 
         let restored = snapshot.is_some();
@@ -1212,10 +1249,19 @@ impl SandboxBuilder {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        // A guest that may reach only listed names must still be able to
+        // ask the resolver it was given.
+        if let (Some(rc), Some(NetworkPolicy::AllowList(al))) = (&resolv_conf, &network) {
+            al.exempt_resolvers(net_policy::resolv_conf_nameservers(rc));
+        }
         let (sandbox, cfg) = match snapshot {
             Some(snapshot) => {
                 let (sandbox, cfg) = restore_snapshot(snapshot, mounts, network, listen_ports)?;
                 cfg.set_env_vars(&env_refs);
+                // Read by the resume entry below, which rewrites the file.
+                if let Some(rc) = &resolv_conf {
+                    cfg.set_resolv_conf(rc);
+                }
                 (sandbox, cfg)
             }
             None => {
@@ -1232,6 +1278,10 @@ impl SandboxBuilder {
                 // on its way to main(), so an entry-point program starts
                 // with these; a driver refreshes them on every call anyway.
                 cfg.set_env_vars(&env_refs);
+                // Likewise fetched once the rootfs is mounted, before main().
+                if let Some(rc) = &resolv_conf {
+                    cfg.set_resolv_conf(rc);
+                }
                 let sandbox = match usandbox.evolve() {
                     Ok(sandbox) => sandbox,
                     Err(e) => {
@@ -1274,6 +1324,40 @@ impl SandboxBuilder {
         }
         Ok(app)
     }
+}
+
+/// Whether a `resolv.conf` line is an `options` line carrying the
+/// `single-request` option itself: as a token, so `single-request-reopen`
+/// (another option) does not count, and not in a comment.
+fn options_line_has_single_request(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("options")
+        && line
+            .split_whitespace()
+            .skip(1)
+            .any(|t| t == "single-request")
+}
+
+/// `content` with `options single-request` in it: on its own options line if
+/// it has one, else on a new line.  Empty content stays empty (the rootfs's
+/// file stands).  glibc's parallel A and AAAA queries do not work through
+/// the socket layer, and the option makes them sequential.
+fn with_single_request(content: &str) -> String {
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    if !lines.is_empty() && !lines.iter().any(|l| options_line_has_single_request(l)) {
+        match lines
+            .iter_mut()
+            .find(|l| l.trim_start().starts_with("options"))
+        {
+            Some(options) => options.push_str(" single-request"),
+            None => lines.push("options single-request".into()),
+        }
+    }
+    let mut s = lines.join("\n");
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s
 }
 
 /// What to execute in the guest.
@@ -2240,6 +2324,33 @@ mod tests {
         assert_eq!(
             arg,
             " vfs.fstab=[0:/mnt/a:hostfs:0x0::mkmp 1:/mnt/b:hostfs:0x1::mkmp]"
+        );
+    }
+
+    #[test]
+    fn single_request_is_added_as_a_token_on_the_options_line() {
+        assert_eq!(with_single_request(""), "");
+        assert_eq!(
+            with_single_request("nameserver 10.0.0.1"),
+            "nameserver 10.0.0.1\noptions single-request\n"
+        );
+        assert_eq!(
+            with_single_request("nameserver 10.0.0.1\noptions ndots:5\n"),
+            "nameserver 10.0.0.1\noptions ndots:5 single-request\n"
+        );
+        // Already there: left alone.
+        assert_eq!(
+            with_single_request("options ndots:5 single-request\n"),
+            "options ndots:5 single-request\n"
+        );
+        // A different option, and a comment, are not the option.
+        assert_eq!(
+            with_single_request("options single-request-reopen\n"),
+            "options single-request-reopen single-request\n"
+        );
+        assert_eq!(
+            with_single_request("# single-request\nnameserver 10.0.0.1\n"),
+            "# single-request\nnameserver 10.0.0.1\noptions single-request\n"
         );
     }
 }

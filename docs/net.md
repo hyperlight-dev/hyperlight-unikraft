@@ -132,6 +132,10 @@ let mut guest = SandboxBuilder::from_initrd(rootfs)
 
 Ephemeral binds (port 0 — "assign any port") are always allowed.  `ListenPorts::all()` permits every port, and `with_range(8000..=8010)` a range; on the command line these are `--port all` and `--port 8000-8010`, next to `--port 80`.  `all` is for an embedder whose own boundary already scopes what the guest exposes, such as a container runtime, where the guest binds inside the container's network namespace the way any container process does.
 
+### Resolver configuration
+
+The rootfs images ship an `/etc/resolv.conf` naming public resolvers, which is right on a laptop and wrong in a pod, where names resolve through the cluster's resolver and a search list that includes the pod's namespace.  That file belongs to the place the guest runs, so it is handed over at run time: `hluk run --resolv-conf FILE`, or `SandboxBuilder::resolv_conf(content)` in the library.  The kernel fetches it through the `GetResolvConf` host function once the rootfs is mounted and writes it as `/etc/resolv.conf`, and does so again on every restore, so a snapshot taken on one machine resolves names where it is resumed.  Without it the rootfs's file stands.  `options single-request` is added unless the file has it: glibc's parallel A and AAAA queries do not work through the socket layer.  Under an allow list, the file's nameservers are exempt on port 53 like the host's own, so a guest that may only reach listed names can still ask the resolver it was given.
+
 A guest restored from a snapshot binds its listeners again on its `resume` entry, so their ports must be in the restoring sandbox's `ListenPorts` too.
 
 ### CLI usage

@@ -122,6 +122,12 @@ struct RunArgs {
     /// Format: KEY=VALUE (e.g. --env MY_VAR=hello --env DEBUG=1).
     #[arg(long = "env", value_name = "KEY=VALUE")]
     envs: Vec<String>,
+
+    /// A resolver configuration file to install as the guest's
+    /// /etc/resolv.conf, at boot and on a restore (nameservers, search
+    /// domains, options). Without it the rootfs's own file stands.
+    #[arg(long = "resolv-conf", value_name = "FILE")]
+    resolv_conf: Option<PathBuf>,
 }
 
 /// Arguments for `snapshot save`.
@@ -170,6 +176,11 @@ struct SaveArgs {
     /// Ports the guest may bind to for inbound connections.
     #[arg(long = "port", value_name = "PORT|LOW-HIGH|all")]
     ports: Vec<PortSpec>,
+
+    /// A resolver configuration file to install as the guest's
+    /// /etc/resolv.conf before the snapshot is taken.
+    #[arg(long = "resolv-conf", value_name = "FILE")]
+    resolv_conf: Option<PathBuf>,
 }
 
 /// Arguments for `snapshot run`.
@@ -217,6 +228,12 @@ struct SnapshotRunArgs {
     /// Format: KEY=VALUE (e.g. --env MY_VAR=hello --env DEBUG=1).
     #[arg(long = "env", value_name = "KEY=VALUE")]
     envs: Vec<String>,
+
+    /// A resolver configuration file to install as the guest's
+    /// /etc/resolv.conf, at boot and on a restore (nameservers, search
+    /// domains, options). Without it the rootfs's own file stands.
+    #[arg(long = "resolv-conf", value_name = "FILE")]
+    resolv_conf: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -374,6 +391,16 @@ impl std::str::FromStr for PortSpec {
     }
 }
 
+/// Read the `--resolv-conf` file, if given.
+fn read_resolv_conf(path: Option<&PathBuf>) -> CliResult<Option<String>> {
+    match path {
+        Some(p) => std::fs::read_to_string(p)
+            .map(Some)
+            .map_err(|e| format!("cannot read resolv.conf {}: {e}", p.display()).into()),
+        None => Ok(None),
+    }
+}
+
 /// Convert CLI net flags into `(Option<NetworkPolicy>, Option<ListenPorts>)`.
 fn parse_net_policy(
     net: bool,
@@ -497,6 +524,9 @@ fn cmd_run(args: RunArgs) -> CliResult<()> {
     for (key, value) in envs {
         builder = builder.env(key, value);
     }
+    if let Some(rc) = read_resolv_conf(args.resolv_conf.as_ref())? {
+        builder = builder.resolv_conf(rc);
+    }
     let t = Instant::now();
     let mut sandbox = builder.boot()?;
     info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "boot");
@@ -551,6 +581,9 @@ fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
     if let Some(listen) = listen {
         builder = builder.listen_ports(listen);
     }
+    if let Some(rc) = read_resolv_conf(args.resolv_conf.as_ref())? {
+        builder = builder.resolv_conf(rc);
+    }
     let mut sandbox = builder.boot()?;
 
     let t = Instant::now();
@@ -595,6 +628,9 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
     }
     for (key, value) in envs {
         builder = builder.env(key, value);
+    }
+    if let Some(rc) = read_resolv_conf(args.resolv_conf.as_ref())? {
+        builder = builder.resolv_conf(rc);
     }
 
     let t = Instant::now();
