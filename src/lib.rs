@@ -94,6 +94,12 @@ pub enum Error {
     /// kernel is not one of ours, or the entry failed.
     #[error("the guest halted without a word: its kernel reported neither a boundary nor an exit")]
     GuestSilent,
+    /// More mounts, or longer entries, than the kernel takes.
+    #[error(
+        "a mount table of {mounts} mounts and {bytes} bytes of entries; the kernel takes at \
+         most {MOUNTS_MAX} mounts and {FSTAB_ENTRIES_MAX} bytes"
+    )]
+    MountTable { mounts: usize, bytes: usize },
     /// A guest mount path the kernel's fstab list would misparse: not
     /// absolute, or containing whitespace, `:` or brackets.
     #[error(
@@ -583,6 +589,15 @@ impl GuestConfig {
                 Ok(cmdline.clone())
             })?;
 
+        // The mount table this host serves.  A restored guest makes its own
+        // match on `resume`; a fresh guest boots with the same list from its
+        // cmdline.
+        let mounts = fstab_entries(&self.mounts)?;
+        target
+            .register_host_function("GetMounts", move || -> hyperlight_host::Result<String> {
+                Ok(mounts.clone())
+            })?;
+
         let budget = self.paging_budget();
         target.register_host_function(
             "GetPagingBudget",
@@ -710,14 +725,10 @@ impl GuestConfig {
             },
         )?;
 
-        // The filesystem and networking host functions exist only when
-        // there is something for them to serve: no mounts, no `fs_*`; no
-        // policy, no `net_*`.  (A guest restored without the mounts its
-        // snapshot was saved with gets EIO on them, as the kernel treats
-        // a missing host function.)
-        if !self.mounts.is_empty() {
-            hostfs::register(target, &self.mounts)?;
-        }
+        // The `fs_*` functions are registered on every path, so a restore
+        // offers every host function the snapshot's guest can call.  The
+        // networking ones exist only under a policy.
+        hostfs::register(target, &self.mounts)?;
         if let Some(net) = &self.net {
             hostnet::register(target, net)?;
         }
@@ -918,39 +929,58 @@ fn resolve_entry(entry: &Option<String>, initrd: &Option<PathBuf>) -> Option<Str
 
 // ── Public API ─────────────────────────────────────────────────────────
 
-/// The kernel's `vfs.fstab` parameter for `mounts` (empty for none): one
+/// Mounts the kernel takes: its resume-time reconcile keeps this many
+/// (`HOSTFS_RESUME_MOUNTS_MAX` in lib/hostfs).
+pub const MOUNTS_MAX: usize = 32;
+
+/// Bytes of `vfs.fstab` entries the kernel takes: its cmdline buffer holds
+/// 4 KiB, less the program name, the entry point and the parameter's own
+/// syntax; its resume-time list buffer is larger.
+pub const FSTAB_ENTRIES_MAX: usize = 3584;
+
+/// The guest's mount table for `mounts`, as `vfs.fstab` entries: one
 /// hostfs entry per mount, whose source-device field is the mount's index
 /// (hostfs routes host calls by it) and whose options make the mount
-/// point.  The list is unquoted: entries are separated by spaces and
-/// fields by colons, so a guest path holding either would be misparsed
-/// by the kernel; such a path is refused here, where the error can say
-/// why.
-fn fstab_arg(mounts: &[Mount]) -> Result<String> {
-    let mut arg = String::new();
-    for m in mounts {
+/// point.  A fresh guest reads them off its cmdline ([`fstab_arg`]); a
+/// restored guest fetches them through `GetMounts` on its `resume` entry.
+/// The list is unquoted: entries are separated by spaces and fields by
+/// colons, so a guest path holding either is refused here, where the
+/// error can say why.
+fn fstab_entries(mounts: &[Mount]) -> Result<String> {
+    let mut entries = String::new();
+    for (i, m) in mounts.iter().enumerate() {
         let unfit = |c: char| c.is_whitespace() || matches!(c, ':' | '[' | ']');
         if !m.guest_path.starts_with('/') || m.guest_path.contains(unfit) {
             return Err(Error::MountPath {
                 guest_path: m.guest_path.clone(),
             });
         }
-    }
-    if mounts.is_empty() {
-        return Ok(arg);
-    }
-    arg.push_str(" vfs.fstab=[");
-    for (i, m) in mounts.iter().enumerate() {
         if i > 0 {
-            arg.push(' ');
+            entries.push(' ');
         }
         // Format: sdev:path:drv:flags:opts:ukopts.  flags: MNT_RDONLY is
         // 0x1.  ukopts: mkmp creates the mount point if missing.  No
         // quotes: uk_libparam does not strip them.
         let flags = if m.readonly { "0x1" } else { "0x0" };
-        write!(arg, "{i}:{}:hostfs:{flags}::mkmp", m.guest_path).unwrap();
+        write!(entries, "{i}:{}:hostfs:{flags}::mkmp", m.guest_path).unwrap();
     }
-    arg.push(']');
-    Ok(arg)
+    if mounts.len() > MOUNTS_MAX || entries.len() > FSTAB_ENTRIES_MAX {
+        return Err(Error::MountTable {
+            mounts: mounts.len(),
+            bytes: entries.len(),
+        });
+    }
+    Ok(entries)
+}
+
+/// The kernel's `vfs.fstab` cmdline parameter for `mounts` (empty for
+/// none): [`fstab_entries`] in the brackets uk_libparam expects.
+fn fstab_arg(mounts: &[Mount]) -> Result<String> {
+    let entries = fstab_entries(mounts)?;
+    if entries.is_empty() {
+        return Ok(entries);
+    }
+    Ok(format!(" vfs.fstab=[{entries}]"))
 }
 
 /// Assemble the uninitialized sandbox and its [`GuestConfig`] from the
@@ -1136,10 +1166,9 @@ impl SandboxBuilder {
     /// died with the old host read as closed.  Nothing needs to be saved
     /// beside the snapshot.
     ///
-    /// **Mounts must match.** The guest kernel's fstab entries are baked into
-    /// the snapshot; re-supply the same [`mount`](Self::mount)s the snapshot
-    /// was saved with so the host side serves them.  Missing or different
-    /// mounts cause guest I/O errors.
+    /// The [`mount`](Self::mount)s given here are the restored guest's: on
+    /// its `resume` entry the kernel makes its mount table match them, so a
+    /// snapshot saved without mounts serves any mount set.
     pub fn from_snapshot(snapshot: Arc<Snapshot>) -> Self {
         Self {
             snapshot: Some(snapshot),
@@ -1667,7 +1696,7 @@ impl AppSandbox {
 
     /// Restore a snapshot into this sandbox in place and put the restored
     /// guest right for this host with a `resume` entry, as
-    /// [`SandboxBuilder::boot`] does.
+    /// [`SandboxBuilder::boot`] does, with this sandbox's mounts.
     pub fn restore(&mut self, snapshot: Arc<Snapshot>) -> Result<()> {
         self.sandbox.restore(snapshot)?;
         // The host sockets belong to the guest state just discarded; the
@@ -1719,24 +1748,15 @@ impl AppSandbox {
 ///
 /// Creates a default [`GuestConfig`] (the snapshot already has the guest's
 /// cmdline/initrd), registers host functions, and rebuilds a
-/// [`MultiUseSandbox`] from the snapshot.  The caller must re-supply the same
-/// mounts the snapshot was saved with (see [`SandboxBuilder::from_snapshot`]).
-///
-/// TODO: Add a `GetMountConfig` host function so the kernel can query
-/// mount configuration at restore time and reconcile its VFS mount
-/// table — unmounting stale entries and mounting new ones — instead of
-/// requiring the caller to pass identical mounts.
+/// [`MultiUseSandbox`] from the snapshot.  `mounts` are the restored
+/// guest's: the kernel reads them through `GetMounts` on its `resume`
+/// entry and makes its mount table match.
 fn restore_snapshot(
     snapshot: Arc<Snapshot>,
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
 ) -> Result<(MultiUseSandbox, GuestConfig)> {
-    if mounts.is_empty() {
-        debug!(
-            "restore: no mounts provided — if the snapshot was saved with mounts, hostfs operations will fail"
-        );
-    }
     let config = GuestConfig::new(
         String::new(),
         DEFAULT_SCRATCH_MB * 1024 * 1024,
@@ -1935,6 +1955,41 @@ mod tests {
         assert_eq!(m.host_path, PathBuf::from("/host/dir"));
         assert_eq!(m.guest_path, "/guest/path");
         assert!(m.readonly);
+    }
+
+    #[test]
+    fn fstab_entries_are_the_arg_without_the_brackets() {
+        let mounts = [Mount::rw("/a", "/mnt/a"), Mount::ro("/b", "/mnt/b")];
+        let entries = fstab_entries(&mounts).unwrap();
+        assert_eq!(
+            entries,
+            "0:/mnt/a:hostfs:0x0::mkmp 1:/mnt/b:hostfs:0x1::mkmp"
+        );
+        assert_eq!(
+            fstab_arg(&mounts).unwrap(),
+            format!(" vfs.fstab=[{entries}]")
+        );
+        assert_eq!(fstab_entries(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn fstab_entries_stop_at_what_the_kernel_takes() {
+        let many: Vec<Mount> = (0..=MOUNTS_MAX)
+            .map(|i| Mount::rw("/tmp", format!("/mnt/{i}")))
+            .collect();
+        assert!(fstab_entries(&many[..MOUNTS_MAX]).is_ok());
+        assert!(matches!(
+            fstab_entries(&many),
+            Err(Error::MountTable { mounts, .. }) if mounts == MOUNTS_MAX + 1
+        ));
+        let long = [Mount::rw(
+            "/tmp",
+            format!("/mnt/{}", "x".repeat(FSTAB_ENTRIES_MAX)),
+        )];
+        assert!(matches!(
+            fstab_entries(&long),
+            Err(Error::MountTable { .. })
+        ));
     }
 
     #[test]

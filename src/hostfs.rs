@@ -50,12 +50,10 @@ pub(crate) const CHUNK: usize = 32768;
 ///
 /// Opens a [`Dir`] for each mount point in `mounts`. Each host function
 /// takes `mount_idx` as its first parameter to select the mount; a
-/// read-only mount refuses writes with `EROFS`.
+/// read-only mount refuses writes with `EROFS`.  With no mounts the
+/// functions are still registered and answer `EINVAL` for any index, so
+/// a restore offers every host function the snapshot's guest can call.
 pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crate::Result<()> {
-    if mounts.is_empty() {
-        return Ok(());
-    }
-
     let mut dirs_vec = Vec::with_capacity(mounts.len());
     let mut ro_vec = Vec::with_capacity(mounts.len());
     for (i, m) in mounts.iter().enumerate() {
