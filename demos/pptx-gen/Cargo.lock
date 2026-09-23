@@ -1070,13 +1070,15 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-unikraft"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "cap-std",
  "clap",
  "hyperlight-common",
  "hyperlight-host",
  "rustix",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",

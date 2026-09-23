@@ -94,7 +94,16 @@ Passing `:ro` sets `MNT_RDONLY` on the VFS mount.  The kernel rejects writes at 
 
 ### Snapshots
 
-When restoring from a snapshot, pass the same `--mount` flags (or `Mount` values) that were used when the snapshot was created.  The guest kernel's mount table is captured in the snapshot; the mounts re-register the host-side functions that serve those mount points.
+Mounts belong to the run: give them to `hluk run` or `hluk snapshot run` (or to the `SandboxBuilder` that boots or restores), and save a snapshot without any.  On its `resume` entry the kernel fetches the host's mount list through the `GetMounts` host function, the same `vfs.fstab` entries a boot carries, and makes its mount table match: it mounts what the list adds, unmounts what the list lacks, and remounts an entry whose index or read-only flag changed.  Every hostfs node names its mount by index, so the host directory behind a guest path can differ between save and restore.
+
+```sh
+hluk snapshot save --initrd rootfs.cpio --output .snapshots/python
+hluk snapshot run .snapshots/python --mount /tmp/share:/mnt/host script.py
+```
+
+A mount kept busy across the snapshot, by a file left open on it, stays mounted until a restore finds it free; meanwhile its operations fail with `ESTALE`, since the host serves other mounts under its index now.
+
+A mount table holds at most 32 mounts and 3.5 KiB of entries, the kernel's bounds; a boot or restore with more is refused with `Error::MountTable`.
 
 ### Security
 

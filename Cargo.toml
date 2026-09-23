@@ -1,11 +1,14 @@
 [package]
 name = "hyperlight-unikraft"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 description = "Run ordinary Linux programs inside Hyperlight micro-VMs using a Unikraft unikernel as the guest kernel — the hluk CLI and library."
 license = "Apache-2.0"
 repository = "https://github.com/hyperlight-dev/hyperlight-unikraft"
 readme = "README.md"
+
+[build-dependencies]
+sha2 = "0.11"
 
 [[bin]]
 name = "hluk"
@@ -22,6 +25,7 @@ mshv = ["hyperlight-host/mshv3"]
 
 [dependencies]
 hyperlight-common = "0.17"
+serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 

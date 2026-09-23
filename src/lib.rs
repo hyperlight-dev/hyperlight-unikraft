@@ -94,6 +94,25 @@ pub enum Error {
     /// kernel is not one of ours, or the entry failed.
     #[error("the guest halted without a word: its kernel reported neither a boundary nor an exit")]
     GuestSilent,
+    /// The snapshot in `dir` was saved by a build with another
+    /// [`SNAPSHOT_KEY`]: another kernel, or another host contract.
+    #[error(
+        "the snapshot in {} was saved by hyperlight-unikraft {saved_by}, whose kernel or host \
+         contract differs from this build's, {this}; save it again with this build (`hluk \
+         snapshot save`)",
+        dir.display()
+    )]
+    SnapshotRelease {
+        dir: PathBuf,
+        saved_by: String,
+        this: String,
+    },
+    /// More mounts, or longer entries, than the kernel takes.
+    #[error(
+        "a mount table of {mounts} mounts and {bytes} bytes of entries; the kernel takes at \
+         most {MOUNTS_MAX} mounts and {FSTAB_ENTRIES_MAX} bytes"
+    )]
+    MountTable { mounts: usize, bytes: usize },
     /// A guest mount path the kernel's fstab list would misparse: not
     /// absolute, or containing whitespace, `:` or brackets.
     #[error(
@@ -180,25 +199,52 @@ const IO_STACK_SIZE: usize = HOST_CALL_MAX + 4096;
 /// scratch instead.
 const HEAP_SIZE: u64 = 0x10_0000; // 1 MiB
 
-/// The name a snapshot is saved under in its directory: this crate's
-/// version.  A snapshot is only good for the release that wrote it -- the
-/// host functions and their behaviour move with the release -- so a load
-/// by another version fails, and the error names the versions the
-/// directory holds.  (The version must stay a valid OCI tag: no `+build`
-/// metadata; the unit test below keeps that honest.)
+/// What a snapshot depends on, as a tag suffix `k<kernel>-c<contract>`:
+/// the embedded kernel's SHA-256 (its first 16 hex digits; the kernel's
+/// code and host-call protocol are in the snapshot's memory) and the host
+/// contract number kept in `build.rs` (the host functions and their
+/// meaning, the buffer sizes, the layout, the MSRs, the hyperlight-host
+/// release).  A snapshot loads under any release with the same key, so a
+/// release that changes neither keeps every saved snapshot.
+pub const SNAPSHOT_KEY: &str = env!("HLUK_SNAPSHOT_KEY");
+
+/// The name a snapshot is saved under in its directory: this release and
+/// its [`SNAPSHOT_KEY`], `<release>-<key>`.  A load matches the key
+/// ([`load_snapshot`]); the release is for the message when none does.
+/// (Both must stay valid in an OCI tag: no `+build` metadata; the unit
+/// test below keeps that honest.)
 fn snapshot_tag() -> OciTag {
-    env!("CARGO_PKG_VERSION")
+    format!("{}-{SNAPSHOT_KEY}", env!("CARGO_PKG_VERSION"))
         .parse()
-        .expect("the crate version is a valid OCI tag")
+        .expect("the crate version and the snapshot key make a valid OCI tag")
+}
+
+/// The key of a snapshot tag, `<release>-<key>`, or `None` for a tag of
+/// another shape (a snapshot from before keys was tagged by release alone).
+fn snapshot_tag_key(tag: &str) -> Option<&str> {
+    let at = tag.rfind("-k")?;
+    let key = &tag[at + 1..];
+    let (kernel, contract) = key[1..].split_once("-c")?;
+    let hex = kernel.len() == 16 && kernel.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex && !contract.is_empty() && contract.bytes().all(|b| b.is_ascii_digit())).then_some(key)
+}
+
+/// A snapshot tag as a message names it: `0.14.1 (k…-c1)`, or the tag
+/// itself when it carries no key.
+fn describe_snapshot_tag(tag: &str) -> String {
+    match snapshot_tag_key(tag) {
+        Some(key) => format!("{} ({key})", &tag[..tag.len() - key.len() - 1]),
+        None => tag.to_string(),
+    }
 }
 
 /// Write a snapshot from [`AppSandbox::snapshot`] to `dir` as an OCI image
-/// layout, named by this crate's version.  Another process, or a later run
-/// of this one, reads it back with [`load_snapshot`],
-/// [`SandboxBuilder::from_snapshot_dir`] or [`AppSandbox::restore_from`];
-/// only this version of the crate can, since the host side a snapshot
-/// depends on moves with the release.  [`AppSandbox::snapshot_to`] does
-/// both steps in one.
+/// layout, named by this release and its [`SNAPSHOT_KEY`].  Another
+/// process, or a later run of this one, reads it back with
+/// [`load_snapshot`], [`SandboxBuilder::from_snapshot_dir`] or
+/// [`AppSandbox::restore_from`]; any build with the same key can, since
+/// the key is the kernel and the host contract a snapshot depends on.
+/// [`AppSandbox::snapshot_to`] does both steps in one.
 pub fn save_snapshot(snapshot: &Snapshot, dir: impl AsRef<Path>) -> Result<()> {
     let digest = snapshot.save(dir.as_ref(), &snapshot_tag())?;
     debug!(dir = %dir.as_ref().display(), %digest, "snapshot saved");
@@ -207,10 +253,55 @@ pub fn save_snapshot(snapshot: &Snapshot, dir: impl AsRef<Path>) -> Result<()> {
 
 /// Read a snapshot written by [`save_snapshot`] back into memory, to boot
 /// ([`SandboxBuilder::from_snapshot`]) or restore ([`AppSandbox::restore`])
-/// any number of guests from one load.  The snapshot must come from this
-/// version of the crate; see [`save_snapshot`].
+/// any number of guests from one load.  The snapshot must have been saved
+/// with this build's [`SNAPSHOT_KEY`]; see [`save_snapshot`].
 pub fn load_snapshot(dir: impl AsRef<Path>) -> Result<Arc<Snapshot>> {
-    Ok(Arc::new(Snapshot::load(dir.as_ref(), snapshot_tag())?))
+    let dir = dir.as_ref();
+    // The index names every save by release and key.  Load the one with
+    // this build's key, whichever release saved it; otherwise say which
+    // releases did, and what to do.  With no index to read, the layout
+    // code reports that.
+    let tag = match snapshot_tags(dir) {
+        Some(tags) => match tags
+            .iter()
+            .find(|t| snapshot_tag_key(t) == Some(SNAPSHOT_KEY))
+        {
+            Some(tag) => tag.parse::<OciTag>().map_err(|e| {
+                Error::Hyperlight(hyperlight_host::new_error!("snapshot tag {:?}: {}", tag, e))
+            })?,
+            None => {
+                return Err(Error::SnapshotRelease {
+                    dir: dir.to_path_buf(),
+                    saved_by: if tags.is_empty() {
+                        "an unknown release".to_string()
+                    } else {
+                        tags.iter()
+                            .map(|t| describe_snapshot_tag(t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
+                    this: format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION")),
+                });
+            }
+        },
+        None => snapshot_tag(),
+    };
+    Ok(Arc::new(Snapshot::load(dir, tag)?))
+}
+
+/// The tags of the OCI index in `dir`, one per save.  `None` when there
+/// is no index to read, which [`Snapshot::load`] reports.
+fn snapshot_tags(dir: &Path) -> Option<Vec<String>> {
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).ok()?).ok()?;
+    Some(
+        index["manifests"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| m["annotations"]["org.opencontainers.image.ref.name"].as_str())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// MSRs the Unikraft guest reads/writes, which hyperlight 0.17.0's
@@ -477,8 +568,9 @@ impl GuestConfig {
         network: Option<NetworkPolicy>,
         listen_ports: Option<ListenPorts>,
     ) -> Self {
-        // Networking is opt-in: no policy, no `net_*` host functions and
-        // nothing for the inter-step wait to watch.
+        // Networking is opt-in: no policy, no host sockets and nothing for
+        // the inter-step wait to watch (the `net_*` functions still exist,
+        // refusing; see `register`).
         let net = network.map(|policy| Arc::new(hostnet::Net::new(policy, listen_ports)));
         Self {
             cmdline,
@@ -581,6 +673,15 @@ impl GuestConfig {
         target
             .register_host_function("GetCmdLine", move || -> hyperlight_host::Result<String> {
                 Ok(cmdline.clone())
+            })?;
+
+        // The mount table this host serves.  A restored guest makes its own
+        // match on `resume`; a fresh guest boots with the same list from its
+        // cmdline.
+        let mounts = fstab_entries(&self.mounts)?;
+        target
+            .register_host_function("GetMounts", move || -> hyperlight_host::Result<String> {
+                Ok(mounts.clone())
             })?;
 
         let budget = self.paging_budget();
@@ -710,16 +811,16 @@ impl GuestConfig {
             },
         )?;
 
-        // The filesystem and networking host functions exist only when
-        // there is something for them to serve: no mounts, no `fs_*`; no
-        // policy, no `net_*`.  (A guest restored without the mounts its
-        // snapshot was saved with gets EIO on them, as the kernel treats
-        // a missing host function.)
-        if !self.mounts.is_empty() {
-            hostfs::register(target, &self.mounts)?;
-        }
-        if let Some(net) = &self.net {
-            hostnet::register(target, net)?;
+        // The `fs_*` and `net_*` functions are registered on every path, so
+        // a restore offers every host function the snapshot's guest can
+        // call.  Without a policy the network refuses every `socket()`, so
+        // a guest saved under one and restored without it has its sockets
+        // die on resume, and one saved without and restored under one gets
+        // to use the network.
+        hostfs::register(target, &self.mounts)?;
+        match &self.net {
+            Some(net) => hostnet::register(target, net)?,
+            None => hostnet::register(target, &Arc::new(hostnet::Net::disabled()))?,
         }
 
         Ok(())
@@ -918,39 +1019,58 @@ fn resolve_entry(entry: &Option<String>, initrd: &Option<PathBuf>) -> Option<Str
 
 // ── Public API ─────────────────────────────────────────────────────────
 
-/// The kernel's `vfs.fstab` parameter for `mounts` (empty for none): one
+/// Mounts the kernel takes: its resume-time reconcile keeps this many
+/// (`HOSTFS_RESUME_MOUNTS_MAX` in lib/hostfs).
+pub const MOUNTS_MAX: usize = 32;
+
+/// Bytes of `vfs.fstab` entries the kernel takes: its cmdline buffer holds
+/// 4 KiB, less the program name, the entry point and the parameter's own
+/// syntax; its resume-time list buffer is larger.
+pub const FSTAB_ENTRIES_MAX: usize = 3584;
+
+/// The guest's mount table for `mounts`, as `vfs.fstab` entries: one
 /// hostfs entry per mount, whose source-device field is the mount's index
 /// (hostfs routes host calls by it) and whose options make the mount
-/// point.  The list is unquoted: entries are separated by spaces and
-/// fields by colons, so a guest path holding either would be misparsed
-/// by the kernel; such a path is refused here, where the error can say
-/// why.
-fn fstab_arg(mounts: &[Mount]) -> Result<String> {
-    let mut arg = String::new();
-    for m in mounts {
+/// point.  A fresh guest reads them off its cmdline ([`fstab_arg`]); a
+/// restored guest fetches them through `GetMounts` on its `resume` entry.
+/// The list is unquoted: entries are separated by spaces and fields by
+/// colons, so a guest path holding either is refused here, where the
+/// error can say why.
+fn fstab_entries(mounts: &[Mount]) -> Result<String> {
+    let mut entries = String::new();
+    for (i, m) in mounts.iter().enumerate() {
         let unfit = |c: char| c.is_whitespace() || matches!(c, ':' | '[' | ']');
         if !m.guest_path.starts_with('/') || m.guest_path.contains(unfit) {
             return Err(Error::MountPath {
                 guest_path: m.guest_path.clone(),
             });
         }
-    }
-    if mounts.is_empty() {
-        return Ok(arg);
-    }
-    arg.push_str(" vfs.fstab=[");
-    for (i, m) in mounts.iter().enumerate() {
         if i > 0 {
-            arg.push(' ');
+            entries.push(' ');
         }
         // Format: sdev:path:drv:flags:opts:ukopts.  flags: MNT_RDONLY is
         // 0x1.  ukopts: mkmp creates the mount point if missing.  No
         // quotes: uk_libparam does not strip them.
         let flags = if m.readonly { "0x1" } else { "0x0" };
-        write!(arg, "{i}:{}:hostfs:{flags}::mkmp", m.guest_path).unwrap();
+        write!(entries, "{i}:{}:hostfs:{flags}::mkmp", m.guest_path).unwrap();
     }
-    arg.push(']');
-    Ok(arg)
+    if mounts.len() > MOUNTS_MAX || entries.len() > FSTAB_ENTRIES_MAX {
+        return Err(Error::MountTable {
+            mounts: mounts.len(),
+            bytes: entries.len(),
+        });
+    }
+    Ok(entries)
+}
+
+/// The kernel's `vfs.fstab` cmdline parameter for `mounts` (empty for
+/// none): [`fstab_entries`] in the brackets uk_libparam expects.
+fn fstab_arg(mounts: &[Mount]) -> Result<String> {
+    let entries = fstab_entries(mounts)?;
+    if entries.is_empty() {
+        return Ok(entries);
+    }
+    Ok(format!(" vfs.fstab=[{entries}]"))
 }
 
 /// Assemble the uninitialized sandbox and its [`GuestConfig`] from the
@@ -1136,10 +1256,9 @@ impl SandboxBuilder {
     /// died with the old host read as closed.  Nothing needs to be saved
     /// beside the snapshot.
     ///
-    /// **Mounts must match.** The guest kernel's fstab entries are baked into
-    /// the snapshot; re-supply the same [`mount`](Self::mount)s the snapshot
-    /// was saved with so the host side serves them.  Missing or different
-    /// mounts cause guest I/O errors.
+    /// The [`mount`](Self::mount)s given here are the restored guest's: on
+    /// its `resume` entry the kernel makes its mount table match them, so a
+    /// snapshot saved without mounts serves any mount set.
     pub fn from_snapshot(snapshot: Arc<Snapshot>) -> Self {
         Self {
             snapshot: Some(snapshot),
@@ -1667,7 +1786,7 @@ impl AppSandbox {
 
     /// Restore a snapshot into this sandbox in place and put the restored
     /// guest right for this host with a `resume` entry, as
-    /// [`SandboxBuilder::boot`] does.
+    /// [`SandboxBuilder::boot`] does, with this sandbox's mounts.
     pub fn restore(&mut self, snapshot: Arc<Snapshot>) -> Result<()> {
         self.sandbox.restore(snapshot)?;
         // The host sockets belong to the guest state just discarded; the
@@ -1719,24 +1838,15 @@ impl AppSandbox {
 ///
 /// Creates a default [`GuestConfig`] (the snapshot already has the guest's
 /// cmdline/initrd), registers host functions, and rebuilds a
-/// [`MultiUseSandbox`] from the snapshot.  The caller must re-supply the same
-/// mounts the snapshot was saved with (see [`SandboxBuilder::from_snapshot`]).
-///
-/// TODO: Add a `GetMountConfig` host function so the kernel can query
-/// mount configuration at restore time and reconcile its VFS mount
-/// table — unmounting stale entries and mounting new ones — instead of
-/// requiring the caller to pass identical mounts.
+/// [`MultiUseSandbox`] from the snapshot.  `mounts` are the restored
+/// guest's: the kernel reads them through `GetMounts` on its `resume`
+/// entry and makes its mount table match.
 fn restore_snapshot(
     snapshot: Arc<Snapshot>,
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
 ) -> Result<(MultiUseSandbox, GuestConfig)> {
-    if mounts.is_empty() {
-        debug!(
-            "restore: no mounts provided — if the snapshot was saved with mounts, hostfs operations will fail"
-        );
-    }
     let config = GuestConfig::new(
         String::new(),
         DEFAULT_SCRATCH_MB * 1024 * 1024,
@@ -1776,8 +1886,25 @@ mod tests {
     /// OCI tags forbid `+`, so a `+build` suffix on the crate version would
     /// make every snapshot save panic.
     #[test]
-    fn snapshot_tag_is_the_crate_version() {
-        assert_eq!(snapshot_tag().to_string(), env!("CARGO_PKG_VERSION"));
+    fn snapshot_tag_is_the_release_and_the_key() {
+        let tag = snapshot_tag().to_string();
+        assert_eq!(tag, format!("{}-{SNAPSHOT_KEY}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(snapshot_tag_key(&tag), Some(SNAPSHOT_KEY));
+        assert_eq!(
+            describe_snapshot_tag(&tag),
+            format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn snapshot_tag_key_reads_only_a_keyed_tag() {
+        assert_eq!(snapshot_tag_key("0.14.0"), None);
+        assert_eq!(
+            snapshot_tag_key("0.15.0-rc1-kdeadbeefdeadbeef-c2"),
+            Some("kdeadbeefdeadbeef-c2")
+        );
+        assert_eq!(snapshot_tag_key("0.15.0-kappa-c2"), None);
+        assert_eq!(describe_snapshot_tag("0.14.0"), "0.14.0");
     }
 
     #[test]
@@ -1935,6 +2062,108 @@ mod tests {
         assert_eq!(m.host_path, PathBuf::from("/host/dir"));
         assert_eq!(m.guest_path, "/guest/path");
         assert!(m.readonly);
+    }
+
+    /// An OCI layout directory whose index names one manifest per tag.
+    fn layout_with_tags(tags: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("oci-layout"),
+            r#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        let manifests: Vec<String> = tags
+            .iter()
+            .map(|t| {
+                format!(
+                    r#"{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":1,"annotations":{{"org.opencontainers.image.ref.name":"{t}"}}}}"#
+                )
+            })
+            .collect();
+        std::fs::write(
+            dir.path().join("index.json"),
+            format!(
+                r#"{{"schemaVersion":2,"manifests":[{}]}}"#,
+                manifests.join(",")
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn load_error(dir: &Path) -> Error {
+        match load_snapshot(dir) {
+            Err(e) => e,
+            Ok(_) => panic!("a snapshot with no blobs loaded"),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_with_another_key_names_the_release_that_saved_it() {
+        let dir = layout_with_tags(&["0.14.0", "0.0.1-k0000000000000000-c0"]);
+        let err = load_error(dir.path());
+        match &err {
+            Error::SnapshotRelease { saved_by, this, .. } => {
+                assert_eq!(saved_by, "0.14.0, 0.0.1 (k0000000000000000-c0)");
+                assert_eq!(
+                    *this,
+                    format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION"))
+                );
+            }
+            other => panic!("expected SnapshotRelease, got {other}"),
+        }
+        assert!(err.to_string().contains("save it again"));
+    }
+
+    #[test]
+    fn a_snapshot_with_this_key_loads_whatever_release_saved_it() {
+        // The tag matches on the key, so the load goes on to the layout
+        // code, which fails on the missing blob rather than on the tag.
+        let dir = layout_with_tags(&[&format!("0.0.1-{SNAPSHOT_KEY}")]);
+        let err = load_error(dir.path());
+        assert!(
+            !matches!(err, Error::SnapshotRelease { .. }),
+            "refused by key: {err}"
+        );
+        assert!(
+            !err.to_string().contains("no manifest tagged"),
+            "tag not matched: {err}"
+        );
+    }
+
+    #[test]
+    fn fstab_entries_are_the_arg_without_the_brackets() {
+        let mounts = [Mount::rw("/a", "/mnt/a"), Mount::ro("/b", "/mnt/b")];
+        let entries = fstab_entries(&mounts).unwrap();
+        assert_eq!(
+            entries,
+            "0:/mnt/a:hostfs:0x0::mkmp 1:/mnt/b:hostfs:0x1::mkmp"
+        );
+        assert_eq!(
+            fstab_arg(&mounts).unwrap(),
+            format!(" vfs.fstab=[{entries}]")
+        );
+        assert_eq!(fstab_entries(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn fstab_entries_stop_at_what_the_kernel_takes() {
+        let many: Vec<Mount> = (0..=MOUNTS_MAX)
+            .map(|i| Mount::rw("/tmp", format!("/mnt/{i}")))
+            .collect();
+        assert!(fstab_entries(&many[..MOUNTS_MAX]).is_ok());
+        assert!(matches!(
+            fstab_entries(&many),
+            Err(Error::MountTable { mounts, .. }) if mounts == MOUNTS_MAX + 1
+        ));
+        let long = [Mount::rw(
+            "/tmp",
+            format!("/mnt/{}", "x".repeat(FSTAB_ENTRIES_MAX)),
+        )];
+        assert!(matches!(
+            fstab_entries(&long),
+            Err(Error::MountTable { .. })
+        ));
     }
 
     #[test]
