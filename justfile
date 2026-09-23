@@ -829,11 +829,11 @@ bench runtime *mode:
 
     just build
 
-    # A snapshot loads only under the release that saved it (its manifest
-    # names the version); save one when it is missing or from another.
-    tag=$("$hluk" --version | awk '{print $2}')
-    if ! grep -qE "\"org.opencontainers.image.ref.name\":[[:space:]]*\"$tag\"" "$snap_dir/index.json" 2>/dev/null; then
-        echo "==> Snapshot missing or from another release, saving first..."
+    # A snapshot loads only under a build with its key (the manifest tag
+    # ends in it); save one when it is missing or made with another.
+    key=$("$hluk" snapshot key)
+    if ! grep -qE "\"org.opencontainers.image.ref.name\":[[:space:]]*\"[^\"]*-$key\"" "$snap_dir/index.json" 2>/dev/null; then
+        echo "==> Snapshot missing or made with another kernel or host contract, saving first..."
         rm -rf "$snap_dir"
         mkdir -p "$(dirname "$snap_dir")"
         "$hluk" snapshot save \
@@ -1039,13 +1039,13 @@ bench runtime *mode:
     just build
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    # A snapshot loads only under the release that saved it (its manifest
-    # names the version); save one when it is missing or from another.
-    $tag = (& $hluk --version).Split(' ')[1]
+    # A snapshot loads only under a build with its key (the manifest tag
+    # ends in it); save one when it is missing or made with another.
+    $key = (& $hluk snapshot key).Trim()
     $index = Join-Path $snapDir 'index.json'
-    $current = (Test-Path $index) -and ((Get-Content -Raw $index) -match ('"org.opencontainers.image.ref.name":\s*"' + [regex]::Escape($tag) + '"'))
+    $current = (Test-Path $index) -and ((Get-Content -Raw $index) -match ('"org.opencontainers.image.ref.name":\s*"[^"]*-' + [regex]::Escape($key) + '"'))
     if (-not $current) {
-        Write-Output "==> Snapshot missing or from another release, saving first..."
+        Write-Output "==> Snapshot missing or made with another kernel or host contract, saving first..."
         Remove-Item -Recurse -Force $snapDir -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force (Split-Path $snapDir) | Out-Null
         & $hluk snapshot save --initrd $rootfs --scratch-mb $scratch --output $snapDir

@@ -94,11 +94,12 @@ pub enum Error {
     /// kernel is not one of ours, or the entry failed.
     #[error("the guest halted without a word: its kernel reported neither a boundary nor an exit")]
     GuestSilent,
-    /// The snapshot in `dir` was saved by another release of this crate.
+    /// The snapshot in `dir` was saved by a build with another
+    /// [`SNAPSHOT_KEY`]: another kernel, or another host contract.
     #[error(
-        "the snapshot in {} was saved by hyperlight-unikraft {saved_by} and this is {this}; a \
-         snapshot works only with the release that saved it: save it again with this one \
-         (`hluk snapshot save`)",
+        "the snapshot in {} was saved by hyperlight-unikraft {saved_by}, whose kernel or host \
+         contract differs from this build's, {this}; save it again with this build (`hluk \
+         snapshot save`)",
         dir.display()
     )]
     SnapshotRelease {
@@ -198,25 +199,52 @@ const IO_STACK_SIZE: usize = HOST_CALL_MAX + 4096;
 /// scratch instead.
 const HEAP_SIZE: u64 = 0x10_0000; // 1 MiB
 
-/// The name a snapshot is saved under in its directory: this crate's
-/// version.  A snapshot is only good for the release that wrote it -- the
-/// host functions and their behaviour move with the release -- so a load
-/// by another version fails, and the error names the versions the
-/// directory holds.  (The version must stay a valid OCI tag: no `+build`
-/// metadata; the unit test below keeps that honest.)
+/// What a snapshot depends on, as a tag suffix `k<kernel>-c<contract>`:
+/// the embedded kernel's SHA-256 (its first 16 hex digits; the kernel's
+/// code and host-call protocol are in the snapshot's memory) and the host
+/// contract number kept in `build.rs` (the host functions and their
+/// meaning, the buffer sizes, the layout, the MSRs, the hyperlight-host
+/// release).  A snapshot loads under any release with the same key, so a
+/// release that changes neither keeps every saved snapshot.
+pub const SNAPSHOT_KEY: &str = env!("HLUK_SNAPSHOT_KEY");
+
+/// The name a snapshot is saved under in its directory: this release and
+/// its [`SNAPSHOT_KEY`], `<release>-<key>`.  A load matches the key
+/// ([`load_snapshot`]); the release is for the message when none does.
+/// (Both must stay valid in an OCI tag: no `+build` metadata; the unit
+/// test below keeps that honest.)
 fn snapshot_tag() -> OciTag {
-    env!("CARGO_PKG_VERSION")
+    format!("{}-{SNAPSHOT_KEY}", env!("CARGO_PKG_VERSION"))
         .parse()
-        .expect("the crate version is a valid OCI tag")
+        .expect("the crate version and the snapshot key make a valid OCI tag")
+}
+
+/// The key of a snapshot tag, `<release>-<key>`, or `None` for a tag of
+/// another shape (a snapshot from before keys was tagged by release alone).
+fn snapshot_tag_key(tag: &str) -> Option<&str> {
+    let at = tag.rfind("-k")?;
+    let key = &tag[at + 1..];
+    let (kernel, contract) = key[1..].split_once("-c")?;
+    let hex = kernel.len() == 16 && kernel.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex && !contract.is_empty() && contract.bytes().all(|b| b.is_ascii_digit())).then_some(key)
+}
+
+/// A snapshot tag as a message names it: `0.14.1 (k…-c1)`, or the tag
+/// itself when it carries no key.
+fn describe_snapshot_tag(tag: &str) -> String {
+    match snapshot_tag_key(tag) {
+        Some(key) => format!("{} ({key})", &tag[..tag.len() - key.len() - 1]),
+        None => tag.to_string(),
+    }
 }
 
 /// Write a snapshot from [`AppSandbox::snapshot`] to `dir` as an OCI image
-/// layout, named by this crate's version.  Another process, or a later run
-/// of this one, reads it back with [`load_snapshot`],
-/// [`SandboxBuilder::from_snapshot_dir`] or [`AppSandbox::restore_from`];
-/// only this version of the crate can, since the host side a snapshot
-/// depends on moves with the release.  [`AppSandbox::snapshot_to`] does
-/// both steps in one.
+/// layout, named by this release and its [`SNAPSHOT_KEY`].  Another
+/// process, or a later run of this one, reads it back with
+/// [`load_snapshot`], [`SandboxBuilder::from_snapshot_dir`] or
+/// [`AppSandbox::restore_from`]; any build with the same key can, since
+/// the key is the kernel and the host contract a snapshot depends on.
+/// [`AppSandbox::snapshot_to`] does both steps in one.
 pub fn save_snapshot(snapshot: &Snapshot, dir: impl AsRef<Path>) -> Result<()> {
     let digest = snapshot.save(dir.as_ref(), &snapshot_tag())?;
     debug!(dir = %dir.as_ref().display(), %digest, "snapshot saved");
@@ -225,32 +253,45 @@ pub fn save_snapshot(snapshot: &Snapshot, dir: impl AsRef<Path>) -> Result<()> {
 
 /// Read a snapshot written by [`save_snapshot`] back into memory, to boot
 /// ([`SandboxBuilder::from_snapshot`]) or restore ([`AppSandbox::restore`])
-/// any number of guests from one load.  The snapshot must come from this
-/// version of the crate; see [`save_snapshot`].
+/// any number of guests from one load.  The snapshot must have been saved
+/// with this build's [`SNAPSHOT_KEY`]; see [`save_snapshot`].
 pub fn load_snapshot(dir: impl AsRef<Path>) -> Result<Arc<Snapshot>> {
     let dir = dir.as_ref();
-    let tag = snapshot_tag();
-    // A snapshot is only good for the release that saved it.  Name that
-    // release and the fix, rather than pass on the layout's "no such tag".
-    if let Some(saved_by) =
-        snapshot_releases(dir).filter(|releases| !releases.iter().any(|t| t == tag.as_str()))
-    {
-        return Err(Error::SnapshotRelease {
-            dir: dir.to_path_buf(),
-            saved_by: if saved_by.is_empty() {
-                "an unknown release".to_string()
-            } else {
-                saved_by.join(", ")
-            },
-            this: tag.to_string(),
-        });
-    }
+    // The index names every save by release and key.  Load the one with
+    // this build's key, whichever release saved it; otherwise say which
+    // releases did, and what to do.  With no index to read, the layout
+    // code reports that.
+    let tag = match snapshot_tags(dir) {
+        Some(tags) => match tags
+            .iter()
+            .find(|t| snapshot_tag_key(t) == Some(SNAPSHOT_KEY))
+        {
+            Some(tag) => tag.parse::<OciTag>().map_err(|e| {
+                Error::Hyperlight(hyperlight_host::new_error!("snapshot tag {:?}: {}", tag, e))
+            })?,
+            None => {
+                return Err(Error::SnapshotRelease {
+                    dir: dir.to_path_buf(),
+                    saved_by: if tags.is_empty() {
+                        "an unknown release".to_string()
+                    } else {
+                        tags.iter()
+                            .map(|t| describe_snapshot_tag(t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
+                    this: format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION")),
+                });
+            }
+        },
+        None => snapshot_tag(),
+    };
     Ok(Arc::new(Snapshot::load(dir, tag)?))
 }
 
-/// The releases that saved into `dir`: the tags of its OCI index.  `None`
-/// when there is no index to read, which [`Snapshot::load`] reports.
-fn snapshot_releases(dir: &Path) -> Option<Vec<String>> {
+/// The tags of the OCI index in `dir`, one per save.  `None` when there
+/// is no index to read, which [`Snapshot::load`] reports.
+fn snapshot_tags(dir: &Path) -> Option<Vec<String>> {
     let index: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("index.json")).ok()?).ok()?;
     Some(
@@ -1840,8 +1881,25 @@ mod tests {
     /// OCI tags forbid `+`, so a `+build` suffix on the crate version would
     /// make every snapshot save panic.
     #[test]
-    fn snapshot_tag_is_the_crate_version() {
-        assert_eq!(snapshot_tag().to_string(), env!("CARGO_PKG_VERSION"));
+    fn snapshot_tag_is_the_release_and_the_key() {
+        let tag = snapshot_tag().to_string();
+        assert_eq!(tag, format!("{}-{SNAPSHOT_KEY}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(snapshot_tag_key(&tag), Some(SNAPSHOT_KEY));
+        assert_eq!(
+            describe_snapshot_tag(&tag),
+            format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn snapshot_tag_key_reads_only_a_keyed_tag() {
+        assert_eq!(snapshot_tag_key("0.14.0"), None);
+        assert_eq!(
+            snapshot_tag_key("0.15.0-rc1-kdeadbeefdeadbeef-c2"),
+            Some("kdeadbeefdeadbeef-c2")
+        );
+        assert_eq!(snapshot_tag_key("0.15.0-kappa-c2"), None);
+        assert_eq!(describe_snapshot_tag("0.14.0"), "0.14.0");
     }
 
     #[test]
@@ -2001,31 +2059,71 @@ mod tests {
         assert!(m.readonly);
     }
 
-    #[test]
-    fn a_snapshot_from_another_release_names_it() {
+    /// An OCI layout directory whose index names one manifest per tag.
+    fn layout_with_tags(tags: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("oci-layout"),
             r#"{"imageLayoutVersion":"1.0.0"}"#,
         )
         .unwrap();
+        let manifests: Vec<String> = tags
+            .iter()
+            .map(|t| {
+                format!(
+                    r#"{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":1,"annotations":{{"org.opencontainers.image.ref.name":"{t}"}}}}"#
+                )
+            })
+            .collect();
         std::fs::write(
             dir.path().join("index.json"),
-            r#"{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":1,"annotations":{"org.opencontainers.image.ref.name":"0.0.1"}}]}"#,
+            format!(
+                r#"{{"schemaVersion":2,"manifests":[{}]}}"#,
+                manifests.join(",")
+            ),
         )
         .unwrap();
-        let err = match load_snapshot(dir.path()) {
+        dir
+    }
+
+    fn load_error(dir: &Path) -> Error {
+        match load_snapshot(dir) {
             Err(e) => e,
-            Ok(_) => panic!("a snapshot from another release loaded"),
-        };
+            Ok(_) => panic!("a snapshot with no blobs loaded"),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_with_another_key_names_the_release_that_saved_it() {
+        let dir = layout_with_tags(&["0.14.0", "0.0.1-k0000000000000000-c0"]);
+        let err = load_error(dir.path());
         match &err {
             Error::SnapshotRelease { saved_by, this, .. } => {
-                assert_eq!(saved_by, "0.0.1");
-                assert_eq!(this, env!("CARGO_PKG_VERSION"));
+                assert_eq!(saved_by, "0.14.0, 0.0.1 (k0000000000000000-c0)");
+                assert_eq!(
+                    *this,
+                    format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION"))
+                );
             }
             other => panic!("expected SnapshotRelease, got {other}"),
         }
         assert!(err.to_string().contains("save it again"));
+    }
+
+    #[test]
+    fn a_snapshot_with_this_key_loads_whatever_release_saved_it() {
+        // The tag matches on the key, so the load goes on to the layout
+        // code, which fails on the missing blob rather than on the tag.
+        let dir = layout_with_tags(&[&format!("0.0.1-{SNAPSHOT_KEY}")]);
+        let err = load_error(dir.path());
+        assert!(
+            !matches!(err, Error::SnapshotRelease { .. }),
+            "refused by key: {err}"
+        );
+        assert!(
+            !err.to_string().contains("no manifest tagged"),
+            "tag not matched: {err}"
+        );
     }
 
     #[test]

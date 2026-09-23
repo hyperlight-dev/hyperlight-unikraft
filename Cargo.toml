@@ -7,6 +7,9 @@ license = "Apache-2.0"
 repository = "https://github.com/hyperlight-dev/hyperlight-unikraft"
 readme = "README.md"
 
+[build-dependencies]
+sha2 = "0.11"
+
 [[bin]]
 name = "hluk"
 path = "src/main.rs"

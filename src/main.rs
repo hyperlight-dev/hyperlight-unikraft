@@ -53,6 +53,10 @@ enum SnapshotCommand {
 
     /// Restore a guest from a saved snapshot and dispatch commands.
     Run(SnapshotRunArgs),
+
+    /// Print the snapshot key: what a saved snapshot must have been made
+    /// with to load under this build (its embedded kernel and host contract).
+    Key,
 }
 
 /// Arguments for `run` — boot the embedded kernel + initrd and dispatch.
@@ -1038,6 +1042,10 @@ fn cli_main() -> CliResult<()> {
         Command::Snapshot(cmd) => match cmd {
             SnapshotCommand::Save(args) => cmd_snapshot_save(args),
             SnapshotCommand::Run(args) => cmd_snapshot_run(args),
+            SnapshotCommand::Key => {
+                println!("{}", hyperlight_unikraft::SNAPSHOT_KEY);
+                Ok(())
+            }
         },
         Command::Bench(cmd) => match cmd {
             BenchCommand::Cold(args) => bench_cold(args),
