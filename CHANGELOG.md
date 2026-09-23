@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - A restored guest gets the mounts the restore names: on `resume` the kernel fetches the host's mount table (the new `GetMounts` host function) and makes its own match, mounting what is new, unmounting what is gone and remounting an entry whose index or read-only flag changed. A warm snapshot saved without mounts serves any mount set, so an embedder restores it to run a script over host directories, and `hluk snapshot run --mount` mounts what it is given. `hluk bench` takes `--mount`, and the new `mount` workload measures a mounted restore. A mount kept busy by a file open across the snapshot stays until a restore finds it free, its operations failing with `ESTALE` meanwhile; a mount table is at most 32 mounts and 3.5 KiB of entries (`MOUNTS_MAX`, `FSTAB_ENTRIES_MAX`).
+- Loading a snapshot saved by another release fails with `Error::SnapshotRelease`, which names that release and this one and says to save it again, in `hluk snapshot run`, `hluk bench` and the library alike. A snapshot works only with the release that saved it; the OCI layout's own "no manifest tagged" error said neither.
 - The urunc demo image (`demos/urunc`, published as `hello-urunc`) bakes its workload at `/app/hello.py` and declares it as the image's `CMD`, so `docker run` needs no command after the image name and the driver's fallback entrypoint stays out of the image contract. Its greeting now names Hyperlight.
 
 ### Fixed

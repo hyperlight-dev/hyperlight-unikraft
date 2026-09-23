@@ -779,6 +779,7 @@ dependencies = [
  "hyperlight-common",
  "hyperlight-host",
  "rustix",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

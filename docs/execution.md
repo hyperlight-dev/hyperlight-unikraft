@@ -191,4 +191,6 @@ sequenceDiagram
 
 **In the middle of a call, with `submit` + `step`.**  A snapshot taken between two steps captures the call in flight; the restored guest finishes it and reports `CallDone` on a later step.
 
+A snapshot works only with the release that saved it; loading one from another release fails with `Error::SnapshotRelease`, which names both and says to save it again.
+
 On `resume` the guest puts itself right for the new host: its hostfs mounts are made to match what the host serves (it fetches the list through `GetMounts`; see [fs.md](fs.md)), sockets are opened and bound again, connections whose peers died with the old host read as closed, the CSPRNG is reseeded (see [random.md](random.md)) and the wall clock re-anchored (see [clock.md](clock.md)).  The embedder supplies what lives on its side: the mounts, the listen ports, and any environment.  `restore(snap)` does the same in place, on an existing `AppSandbox`.

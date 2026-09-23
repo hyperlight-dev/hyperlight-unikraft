@@ -94,6 +94,18 @@ pub enum Error {
     /// kernel is not one of ours, or the entry failed.
     #[error("the guest halted without a word: its kernel reported neither a boundary nor an exit")]
     GuestSilent,
+    /// The snapshot in `dir` was saved by another release of this crate.
+    #[error(
+        "the snapshot in {} was saved by hyperlight-unikraft {saved_by} and this is {this}; a \
+         snapshot works only with the release that saved it: save it again with this one \
+         (`hluk snapshot save`)",
+        dir.display()
+    )]
+    SnapshotRelease {
+        dir: PathBuf,
+        saved_by: String,
+        this: String,
+    },
     /// More mounts, or longer entries, than the kernel takes.
     #[error(
         "a mount table of {mounts} mounts and {bytes} bytes of entries; the kernel takes at \
@@ -216,7 +228,39 @@ pub fn save_snapshot(snapshot: &Snapshot, dir: impl AsRef<Path>) -> Result<()> {
 /// any number of guests from one load.  The snapshot must come from this
 /// version of the crate; see [`save_snapshot`].
 pub fn load_snapshot(dir: impl AsRef<Path>) -> Result<Arc<Snapshot>> {
-    Ok(Arc::new(Snapshot::load(dir.as_ref(), snapshot_tag())?))
+    let dir = dir.as_ref();
+    let tag = snapshot_tag();
+    // A snapshot is only good for the release that saved it.  Name that
+    // release and the fix, rather than pass on the layout's "no such tag".
+    if let Some(saved_by) =
+        snapshot_releases(dir).filter(|releases| !releases.iter().any(|t| t == tag.as_str()))
+    {
+        return Err(Error::SnapshotRelease {
+            dir: dir.to_path_buf(),
+            saved_by: if saved_by.is_empty() {
+                "an unknown release".to_string()
+            } else {
+                saved_by.join(", ")
+            },
+            this: tag.to_string(),
+        });
+    }
+    Ok(Arc::new(Snapshot::load(dir, tag)?))
+}
+
+/// The releases that saved into `dir`: the tags of its OCI index.  `None`
+/// when there is no index to read, which [`Snapshot::load`] reports.
+fn snapshot_releases(dir: &Path) -> Option<Vec<String>> {
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).ok()?).ok()?;
+    Some(
+        index["manifests"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| m["annotations"]["org.opencontainers.image.ref.name"].as_str())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// MSRs the Unikraft guest reads/writes, which hyperlight 0.17.0's
@@ -1955,6 +1999,33 @@ mod tests {
         assert_eq!(m.host_path, PathBuf::from("/host/dir"));
         assert_eq!(m.guest_path, "/guest/path");
         assert!(m.readonly);
+    }
+
+    #[test]
+    fn a_snapshot_from_another_release_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("oci-layout"),
+            r#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.json"),
+            r#"{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":1,"annotations":{"org.opencontainers.image.ref.name":"0.0.1"}}]}"#,
+        )
+        .unwrap();
+        let err = match load_snapshot(dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("a snapshot from another release loaded"),
+        };
+        match &err {
+            Error::SnapshotRelease { saved_by, this, .. } => {
+                assert_eq!(saved_by, "0.0.1");
+                assert_eq!(this, env!("CARGO_PKG_VERSION"));
+            }
+            other => panic!("expected SnapshotRelease, got {other}"),
+        }
+        assert!(err.to_string().contains("save it again"));
     }
 
     #[test]
