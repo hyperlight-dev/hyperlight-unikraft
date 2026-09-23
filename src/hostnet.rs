@@ -253,7 +253,11 @@ pub(crate) struct Net {
     /// and never makes two host calls at once: the lock is uncontended
     /// and is held across the (non-blocking) syscalls without harm.
     table: Mutex<SocketTable>,
-    policy: NetworkPolicy,
+    /// `None` when the guest has no network: `socket()` is refused, so
+    /// nothing else can happen.  The `net_*` functions exist all the same,
+    /// since a restore must offer every host function the snapshot's
+    /// guest can call.
+    policy: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
 }
 
@@ -270,8 +274,18 @@ impl Net {
         }
         Self {
             table: Mutex::new(SocketTable::new()),
-            policy,
+            policy: Some(policy),
             listen_ports,
+        }
+    }
+
+    /// The network of a guest with no policy: every `socket()` is refused
+    /// with `EACCES`, as a policy refuses a destination.
+    pub(crate) fn disabled() -> Self {
+        Self {
+            table: Mutex::new(SocketTable::new()),
+            policy: None,
+            listen_ports: None,
         }
     }
 
@@ -281,7 +295,7 @@ impl Net {
 
     /// Outbound policy (connect, sendto), for a UDP socket or not.
     fn allow_outbound(&self, addr: &SocketAddr, udp: bool) -> Res<()> {
-        if self.policy.allows(addr, udp) {
+        if self.policy.as_ref().is_some_and(|p| p.allows(addr, udp)) {
             Ok(())
         } else {
             Err(errno::EACCES)
@@ -297,6 +311,9 @@ impl Net {
     }
 
     fn socket(&self, family: i32, ty: i32, proto: i32) -> Res<i32> {
+        if self.policy.is_none() {
+            return Err(errno::EACCES);
+        }
         let af = match family {
             AF_INET => AddressFamily::INET,
             AF_INET6 => AddressFamily::INET6,
@@ -402,7 +419,10 @@ impl Net {
         // checked here, where it still is one (see `NetworkPolicy::allows_query`).
         let meta = tbl.meta(fd)?;
         if meta.peer.is_some_and(|p| p.port() == 53)
-            && !self.policy.allows_query(dns_message(data, meta.udp))
+            && !self
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.allows_query(dns_message(data, meta.udp)))
         {
             return Err(errno::EACCES);
         }
@@ -415,7 +435,12 @@ impl Net {
         let udp = self.table().meta(fd)?.udp;
         self.allow_outbound(&addr, udp)?;
         // A DNS question sent unconnected: the same name check as `send`.
-        if addr.port() == 53 && !self.policy.allows_query(dns_message(data, udp)) {
+        if addr.port() == 53
+            && !self
+                .policy
+                .as_ref()
+                .is_some_and(|p| p.allows_query(dns_message(data, udp)))
+        {
             return Err(errno::EACCES);
         }
         let mut tbl = self.table();
@@ -451,8 +476,8 @@ impl Net {
         let from = from.and_then(|a| SocketAddr::try_from(a).ok());
         // A DNS answer: under an allow list, the addresses it gives for a
         // listed name are recorded, so the connect that follows is known.
-        if let Some(src) = from {
-            self.policy.learn_from_dns_answer(src, &buf);
+        if let (Some(src), Some(policy)) = (from, &self.policy) {
+            policy.learn_from_dns_answer(src, &buf);
         }
         Ok((buf, from))
     }

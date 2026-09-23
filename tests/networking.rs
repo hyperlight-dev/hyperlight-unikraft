@@ -6,7 +6,7 @@ use common::{UNUSED_PORT, host_ip, net_probe, require_rootfs};
 use hyperlight_unikraft::{AllowList, BlockList, NetworkPolicy, SandboxBuilder};
 
 /// Networking disabled by default — guest socket calls fail because
-/// net_* host functions aren't registered at all.
+/// every socket() is refused with EACCES, as a policy refuses a destination.
 #[test]
 fn net_policy_disabled_by_default() {
     let rootfs = require_rootfs("python");
@@ -14,15 +14,76 @@ fn net_policy_disabled_by_default() {
         .scratch_mb(256)
         .boot()
         .unwrap();
-    // socket() calls the net_socket host function which isn't registered,
-    // causing the guest to abort — run() returns an error.
-    let result = sandbox.run(
-        "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); print('SOCKET_OK')",
-    );
+    sandbox.run(SOCKET_PROBE).unwrap();
     let output = sandbox.drain_output();
     assert!(
-        result.is_err() || !output.contains("SOCKET_OK"),
-        "expected socket creation to fail when networking is disabled, got result={result:?}, output={output:?}",
+        output.contains("socket: errno 13"),
+        "expected socket creation to fail with EACCES when networking is disabled, got: {output:?}",
+    );
+}
+
+/// Prints whether a socket can be made, and its errno when it cannot.
+const SOCKET_PROBE: &str = r#"
+import socket
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    print('socket: ok')
+except OSError as e:
+    print('socket: errno', e.errno)
+"#;
+
+/// The net_* host functions exist on every path, so a snapshot saved under
+/// a policy restores without one: the restore is accepted and the guest
+/// simply has no network.
+#[test]
+fn snapshot_under_a_policy_restores_without_one() {
+    let dir = common::temp_dir("net-then-none");
+    let snap = dir.path().join("snap");
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+    sandbox.run(SOCKET_PROBE).unwrap();
+    assert!(sandbox.drain_output().contains("socket: ok"));
+    sandbox.snapshot_to(&snap).unwrap();
+    drop(sandbox);
+
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap)
+        .unwrap()
+        .boot()
+        .unwrap();
+    sandbox.run(SOCKET_PROBE).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("socket: errno 13"),
+        "expected no network after a restore without a policy, got: {output:?}",
+    );
+}
+
+/// And the other way round: a warm snapshot saved without a policy gets
+/// the network the restore names.
+#[test]
+fn snapshot_without_a_policy_restores_under_one() {
+    let dir = common::temp_dir("none-then-net");
+    let snap = dir.path().join("snap");
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox.snapshot_to(&snap).unwrap();
+    drop(sandbox);
+
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap)
+        .unwrap()
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+    sandbox.run(SOCKET_PROBE).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("socket: ok"),
+        "expected the network given at restore, got: {output:?}",
     );
 }
 

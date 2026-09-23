@@ -52,7 +52,7 @@ let mut guest = SandboxBuilder::from_initrd(rootfs)
     .boot()?;
 ```
 
-When `None` (the default), no `net_*` host functions are registered and guest socket calls fail.
+When `None` (the default), the `net_*` host functions refuse every `socket()` with `EACCES`, so guest socket calls fail.  They are registered either way, so a snapshot saved under a policy restores without one (its sockets die on resume, as their peers would have) and a snapshot saved without a policy restores under one.
 
 ## Host functions
 

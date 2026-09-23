@@ -568,8 +568,9 @@ impl GuestConfig {
         network: Option<NetworkPolicy>,
         listen_ports: Option<ListenPorts>,
     ) -> Self {
-        // Networking is opt-in: no policy, no `net_*` host functions and
-        // nothing for the inter-step wait to watch.
+        // Networking is opt-in: no policy, no host sockets and nothing for
+        // the inter-step wait to watch (the `net_*` functions still exist,
+        // refusing; see `register`).
         let net = network.map(|policy| Arc::new(hostnet::Net::new(policy, listen_ports)));
         Self {
             cmdline,
@@ -810,12 +811,16 @@ impl GuestConfig {
             },
         )?;
 
-        // The `fs_*` functions are registered on every path, so a restore
-        // offers every host function the snapshot's guest can call.  The
-        // networking ones exist only under a policy.
+        // The `fs_*` and `net_*` functions are registered on every path, so
+        // a restore offers every host function the snapshot's guest can
+        // call.  Without a policy the network refuses every `socket()`, so
+        // a guest saved under one and restored without it has its sockets
+        // die on resume, and one saved without and restored under one gets
+        // to use the network.
         hostfs::register(target, &self.mounts)?;
-        if let Some(net) = &self.net {
-            hostnet::register(target, net)?;
+        match &self.net {
+            Some(net) => hostnet::register(target, net)?,
+            None => hostnet::register(target, &Arc::new(hostnet::Net::disabled()))?,
         }
 
         Ok(())

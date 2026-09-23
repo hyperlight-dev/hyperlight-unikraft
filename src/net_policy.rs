@@ -87,9 +87,9 @@ const AWS_IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
 
 /// Controls which network destinations a guest sandbox can reach.
 ///
-/// By default, networking is **disabled** (no `net_*` host functions are
-/// registered).  Callers must opt in via the library API or the `--net`
-/// CLI flag.
+/// By default, networking is **disabled**: the `net_*` host functions
+/// refuse every `socket()` with `EACCES`.  Callers opt in via the library
+/// API or the `--net` CLI flag.
 #[derive(Clone, Debug)]
 pub enum NetworkPolicy {
     /// All outbound connections are allowed (no filtering).
