@@ -829,9 +829,12 @@ bench runtime *mode:
 
     just build
 
-    # Ensure snapshot exists
-    if [ ! -d "$snap_dir" ]; then
-        echo "==> Snapshot not found, saving first..."
+    # A snapshot loads only under the release that saved it (its manifest
+    # names the version); save one when it is missing or from another.
+    tag=$("$hluk" --version | awk '{print $2}')
+    if ! grep -qE "\"org.opencontainers.image.ref.name\":[[:space:]]*\"$tag\"" "$snap_dir/index.json" 2>/dev/null; then
+        echo "==> Snapshot missing or from another release, saving first..."
+        rm -rf "$snap_dir"
         mkdir -p "$(dirname "$snap_dir")"
         "$hluk" snapshot save \
             --initrd "$rootfs" \
@@ -857,9 +860,12 @@ bench runtime *mode:
         exit 1
     fi
 
+    # The host directory behind the mount workload's --mount.
+    mount_dir=$(mktemp -d)
+
     # Capture full output for summary extraction
     outfile=$(mktemp)
-    trap 'rm -f "$outfile"' EXIT
+    trap 'rm -rf "$outfile" "$mount_dir"' EXIT
 
     # Keep the BENCH lines, tagged with their workload: printed as they
     # arrive (grep and sed sit on them when writing to a pipe, so a run
@@ -882,6 +888,9 @@ bench runtime *mode:
 
     for script in "${workloads[@]}"; do
         wname=$(basename "$script" | sed 's/\.\(py\|js\)$//')
+        # The mount workload runs with a mount; the others as before.
+        mount_args=()
+        [ "$wname" = "mount" ] && mount_args=(--mount "$mount_dir:/mnt/bench")
         for m in $modes; do
             echo ""
             echo "════════════════════════════════════════════"
@@ -891,27 +900,32 @@ bench runtime *mode:
                 cold)
                     "$hluk" bench cold \
                         --initrd "$rootfs" --scratch-mb "$scratch" \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         --samples "$samples" "$script" \
                         2>&1 | tag_bench "$wname"
                     ;;
                 cold-snap)
                     "$hluk" bench cold-snap \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         --samples "$samples" "$snap_dir" "$script" \
                         2>&1 | tag_bench "$wname"
                     ;;
                 warm-restore)
                     "$hluk" bench warm-restore \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         --samples "$samples" "$snap_dir" "$script" \
                         2>&1 | tag_bench "$wname"
                     ;;
                 warm-stateful)
                     "$hluk" bench warm-stateful \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         --samples "$samples" "$snap_dir" "$script" \
                         2>&1 | tag_bench "$wname"
                     ;;
                 parallel)
                     "$hluk" bench parallel \
                         --vms "$parallel_vms" --iterations "$parallel_iters" \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         "$snap_dir" "$script" \
                         2>&1 | tag_bench "$wname"
                     ;;
@@ -1025,8 +1039,14 @@ bench runtime *mode:
     just build
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    if (-not (Test-Path $snapDir)) {
-        Write-Output "==> Snapshot not found, saving first..."
+    # A snapshot loads only under the release that saved it (its manifest
+    # names the version); save one when it is missing or from another.
+    $tag = (& $hluk --version).Split(' ')[1]
+    $index = Join-Path $snapDir 'index.json'
+    $current = (Test-Path $index) -and ((Get-Content -Raw $index) -match ('"org.opencontainers.image.ref.name":\s*"' + [regex]::Escape($tag) + '"'))
+    if (-not $current) {
+        Write-Output "==> Snapshot missing or from another release, saving first..."
+        Remove-Item -Recurse -Force $snapDir -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force (Split-Path $snapDir) | Out-Null
         & $hluk snapshot save --initrd $rootfs --scratch-mb $scratch --output $snapDir
         if ($LASTEXITCODE -ne 0) { Write-Error "snapshot save failed" }
@@ -1041,6 +1061,10 @@ bench runtime *mode:
     $workloads = @(Get-ChildItem $benchDir -File | Where-Object { $_.Extension -in '.py', '.js' } | Sort-Object Name)
     if ($workloads.Count -eq 0) { Write-Error "no benchmark scripts in $benchDir" }
 
+    # The host directory behind the mount workload's --mount.
+    $mountDir = Join-Path ([IO.Path]::GetTempPath()) ("hluk-bench-" + [IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Force $mountDir | Out-Null
+
     # Every BENCH line, tagged with its workload, for the summary below.
     # Each is also printed as it arrives (Write-Host: the pipeline's own
     # output is what $out collects, so nothing of it shows until hluk
@@ -1048,17 +1072,19 @@ bench runtime *mode:
     $lines = @()
     foreach ($script in $workloads) {
         $w = $script.BaseName
+        # The mount workload runs with a mount; the others as before.
+        $mountArgs = if ($w -eq 'mount') { @('--mount', "${mountDir}:/mnt/bench") } else { @() }
         foreach ($m in ($modes -split '\s+')) {
             Write-Output ""
             Write-Output "════════════════════════════════════════════"
             Write-Output "  {{runtime}} / $m / $w"
             Write-Output "════════════════════════════════════════════"
             $benchArgs = switch ($m) {
-                'cold'          { @('cold', '--initrd', $rootfs, '--scratch-mb', $scratch, '--samples', $samples, $script.FullName) }
-                'cold-snap'     { @('cold-snap', '--samples', $samples, $snapDir, $script.FullName) }
-                'warm-restore'  { @('warm-restore', '--samples', $samples, $snapDir, $script.FullName) }
-                'warm-stateful' { @('warm-stateful', '--samples', $samples, $snapDir, $script.FullName) }
-                'parallel'      { @('parallel', '--vms', $parallelVms, '--iterations', $parallelIters, $snapDir, $script.FullName) }
+                'cold'          { @('cold', '--initrd', $rootfs, '--scratch-mb', $scratch) + $mountArgs + @('--samples', $samples, $script.FullName) }
+                'cold-snap'     { @('cold-snap') + $mountArgs + @('--samples', $samples, $snapDir, $script.FullName) }
+                'warm-restore'  { @('warm-restore') + $mountArgs + @('--samples', $samples, $snapDir, $script.FullName) }
+                'warm-stateful' { @('warm-stateful') + $mountArgs + @('--samples', $samples, $snapDir, $script.FullName) }
+                'parallel'      { @('parallel', '--vms', $parallelVms, '--iterations', $parallelIters) + $mountArgs + @($snapDir, $script.FullName) }
                 default         { Write-Error "unknown mode '$m'" }
             }
             $out = @(& $hluk bench @benchArgs 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match '^BENCH ' } | ForEach-Object { $l = $_ -replace '^BENCH ', "BENCH [$w] "; Write-Host $l; $l })
@@ -1066,6 +1092,7 @@ bench runtime *mode:
             $lines += $out
         }
     }
+    Remove-Item -Recurse -Force $mountDir -ErrorAction SilentlyContinue
 
     # ── Compact summary table ──────────────────────────────────
     # Same rows, layout and JSON as the bash recipe above.

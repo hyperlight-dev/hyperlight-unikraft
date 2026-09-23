@@ -271,6 +271,11 @@ struct BenchColdArgs {
     /// Number of samples to run.
     #[arg(long, default_value_t = 20)]
     samples: usize,
+
+    /// Mount a host directory into the guest filesystem.
+    /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
+    #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
+    mounts: Vec<String>,
 }
 
 /// Arguments for snapshot-based bench modes (cold-snap, warm-restore, warm-stateful).
@@ -285,6 +290,11 @@ struct BenchSnapArgs {
     /// Number of iterations / samples.
     #[arg(long, default_value_t = 20)]
     samples: usize,
+
+    /// Mount a host directory into the guest filesystem.
+    /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
+    #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
+    mounts: Vec<String>,
 }
 
 /// Arguments for `bench parallel`.
@@ -303,6 +313,11 @@ struct BenchParallelArgs {
     /// Iterations per VM.
     #[arg(long, default_value_t = 10)]
     iterations: usize,
+
+    /// Mount a host directory into the guest filesystem.
+    /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
+    #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
+    mounts: Vec<String>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -751,6 +766,7 @@ fn print_rss(label: &str) {
 /// Cold start: fresh boot + dispatch, N independent samples.
 fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
+    let mounts = parse_mounts(&args.mounts)?;
     let mut boots = Vec::with_capacity(args.samples);
     let mut execs = Vec::with_capacity(args.samples);
     let mut totals = Vec::with_capacity(args.samples);
@@ -759,6 +775,7 @@ fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
         let t0 = Instant::now();
         let mut sandbox = SandboxBuilder::from_initrd(args.initrd.clone())
             .scratch_mb(args.scratch_mb)
+            .mounts(mounts.iter().cloned())
             .boot()?;
         let boot_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -785,6 +802,7 @@ fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
 /// Cold snapshot: load from disk + restore + dispatch, N independent samples.
 fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
+    let mounts = parse_mounts(&args.mounts)?;
     let mut loads = Vec::with_capacity(args.samples);
     let mut restores = Vec::with_capacity(args.samples);
     let mut execs = Vec::with_capacity(args.samples);
@@ -796,7 +814,7 @@ fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
         let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
-        let mut sandbox = builder.boot()?;
+        let mut sandbox = builder.mounts(mounts.iter().cloned()).boot()?;
         let restore_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
@@ -826,10 +844,13 @@ fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
 /// Warm with restore: load snapshot once, then loop dispatch + restore.
 fn bench_warm_restore(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
+    let mounts = parse_mounts(&args.mounts)?;
 
     let t0 = Instant::now();
     let snap = load_snapshot(&args.snapshot)?;
-    let mut sandbox = SandboxBuilder::from_snapshot(snap.clone()).boot()?;
+    let mut sandbox = SandboxBuilder::from_snapshot(snap.clone())
+        .mounts(mounts)
+        .boot()?;
     let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("BENCH warm-restore setup_ms={setup_ms:.3}");
 
@@ -860,10 +881,11 @@ fn bench_warm_restore(args: BenchSnapArgs) -> CliResult<()> {
 /// Warm stateful: load snapshot once, then loop dispatch without restore.
 fn bench_warm_stateful(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
+    let mounts = parse_mounts(&args.mounts)?;
 
     let t0 = Instant::now();
     let snap = load_snapshot(&args.snapshot)?;
-    let mut sandbox = SandboxBuilder::from_snapshot(snap).boot()?;
+    let mut sandbox = SandboxBuilder::from_snapshot(snap).mounts(mounts).boot()?;
     let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("BENCH warm-stateful setup_ms={setup_ms:.3}");
 
@@ -887,6 +909,7 @@ fn bench_warm_stateful(args: BenchSnapArgs) -> CliResult<()> {
 /// Parallel VMs: spawn N threads, each restoring from the same snapshot.
 fn bench_parallel(args: BenchParallelArgs) -> CliResult<()> {
     let source = Arc::new(read_script(&args.script)?);
+    let mounts = parse_mounts(&args.mounts)?;
     let snap = load_snapshot(&args.snapshot)?;
 
     // Barrier so all VMs start at the same time.
@@ -899,12 +922,14 @@ fn bench_parallel(args: BenchParallelArgs) -> CliResult<()> {
             let source = source.clone();
             let barrier = barrier.clone();
             let iterations = args.iterations;
+            let mounts = mounts.clone();
 
             std::thread::spawn(move || -> Result<Vec<f64>, String> {
                 barrier.wait();
                 let vm_start = Instant::now();
 
                 let mut sandbox = SandboxBuilder::from_snapshot(snap.clone())
+                    .mounts(mounts)
                     .boot()
                     .map_err(|e| e.to_string())?;
                 let mut execs = Vec::with_capacity(iterations);

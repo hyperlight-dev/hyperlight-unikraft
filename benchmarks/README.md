@@ -15,6 +15,7 @@
 - **hello.py** — Minimal (`print("ok")`). Measures pure dispatch overhead.
 - **compute.py** — CPU-bound (fibonacci + prime sieve). Measures compute performance.
 - **stdlib.py** — Stdlib-heavy (json, re, collections, hashlib). Measures real-world library usage.
+- **mount.py** — Writes and reads back a file on a host mount. It runs with `--mount`, and the snapshot is saved without mounts, so in the snapshot modes it measures the mount the kernel builds on resume: the path an embedder takes to run a script over host directories from a warm image.
 
 ## Usage
 
