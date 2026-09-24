@@ -30,10 +30,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The registry `init` renders into a project: the flag, else the
 /// environment, else the project's own.
 pub fn registry(flag: Option<String>) -> String {
-    flag.or_else(|| std::env::var("HLUK_REGISTRY").ok())
-        .unwrap_or_else(|| DEFAULT_REGISTRY.to_string())
-        .trim_end_matches('/')
-        .to_string()
+    let raw = flag
+        .or_else(|| std::env::var("HLUK_REGISTRY").ok())
+        .unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
+    // An image reference is host/path, never a URL; strip a scheme a
+    // user might paste in so the reference parses.
+    let stripped = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .unwrap_or(&raw);
+    stripped.trim_end_matches('/').to_string()
 }
 
 /// The release whose images `init` writes into a project: the flag, else
@@ -625,7 +631,12 @@ mod tests {
         assert_eq!(image_version(Some("  ".into())), VERSION);
         assert_eq!(
             registry(Some("https://r.example/".into())),
-            "https://r.example"
+            "r.example",
+            "the scheme is stripped so the reference parses as host/path"
+        );
+        assert_eq!(
+            registry(Some("http://localhost:5000/".into())),
+            "localhost:5000"
         );
     }
 
