@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Two `hluk init` templates: `python-shell`, a Python script that runs shell commands through `subprocess` on the python-shell rootfs (the one runtime that had only `http-python`), and `bash-repl`, an interactive shell whose read-eval loop takes commands from `hluk run`'s stdin until Ctrl-D.
+- `hluk init --template` takes a template of your own: a directory on disk, or `github.com/OWNER/REPO[/PATH][@REF]` (a browser's `…/tree/REF/PATH` URL too), downloaded as the repository's tarball through the GitHub API with no git on the host; `GITHUB_TOKEN` reaches a private repository and lifts the anonymous rate limit. The template's `runtime` is checked against the published ones, a template is held to 256 text files and 4 MiB, and `init` prints the `[build] command` and Dockerfile `hluk build` would run from a template that is not built in. `tier` is optional in such a template's `template.toml`. `docs/templates.md` is the guide to writing one, with `examples/templates/word-count` to copy from.
 
 ## [v0.14.2]
 
