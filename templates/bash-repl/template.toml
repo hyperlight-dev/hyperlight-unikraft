@@ -1,0 +1,4 @@
+[template]
+description = "An interactive shell on BusyBox (hush): type commands, the guest runs them"
+runtime = "bash"
+tier = 2

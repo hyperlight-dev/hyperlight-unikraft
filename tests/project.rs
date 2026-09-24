@@ -304,7 +304,17 @@ fn templates_lists_every_tier_one_runtime_first() {
         lines.next().unwrap().starts_with("python "),
         "python leads: {t}"
     );
-    for name in ["node", "bash", "dotnet", "go", "rust", "c", "http-python"] {
+    for name in [
+        "node",
+        "bash",
+        "bash-repl",
+        "python-shell",
+        "dotnet",
+        "go",
+        "rust",
+        "c",
+        "http-python",
+    ] {
         assert!(
             t.lines().any(|l| l.starts_with(&format!("{name} "))),
             "{name} missing from:\n{t}"

@@ -1,0 +1,27 @@
+# hluk.toml -- the manifest for `{{name}}`. `hluk run` runs what it describes;
+# see docs/manifest.md in hyperlight-unikraft for every key.
+manifest_version = 1
+
+[app]
+name = "{{name}}"
+
+[rootfs]
+# The published bash rootfs: BusyBox's hush shell and its applets (cat,
+# grep, sed, awk, sort, find, ...), pinned to the hluk release that wrote
+# this file.
+image = "{{image}}"
+
+[run]
+# A read-eval loop: `hluk run` hands it your terminal's stdin, one command
+# per line, until end of input (Ctrl-D).
+script = "repl.sh"
+# Guest memory in MiB. The default is the size this runtime's image is
+# tested with (256 here); set it when the rootfs or the workload outgrows that.
+# scratch_mb = 256
+warm = true
+# mounts = ["./data:/mnt/data"]
+# env = { PS1 = "$ " }
+# BusyBox runs in NOMMU mode here (the kernel has vfork, not fork): every
+# applet is its own process, and a pipe or a $(...) substitution between
+# processes is not supported yet -- so one command per line, and shell
+# builtins (echo, printf, read, test, arithmetic) wherever possible.
