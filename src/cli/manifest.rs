@@ -507,12 +507,12 @@ mod tests {
             base: "ghcr.io/example/hluk/x:v1.0.0",
         };
         for t in Template::all().unwrap() {
-            let (_, text) = t
+            let text = t
                 .render(&vars)
                 .into_iter()
-                .find(|(p, _)| *p == FILE_NAME)
+                .find(|f| f.path == FILE_NAME)
                 .unwrap();
-            let m = Manifest::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", t.name));
+            let m = Manifest::parse(&text.text).unwrap_or_else(|e| panic!("{}: {e}", t.name));
             assert_eq!(m.app.name, "demo");
             assert!(m.run.warm, "{}: templates start warm", t.name);
         }
