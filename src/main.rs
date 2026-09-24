@@ -9,13 +9,21 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use hyperlight_unikraft::{
-    AllowList, AppSandbox, BlockList, DEFAULT_SCRATCH_MB, Error, Exec, ListenPorts, Mount,
-    NetworkPolicy, SandboxBuilder, load_snapshot,
+    AllowList, AppSandbox, BlockList, Error, Exec, ListenPorts, Mount, NetworkPolicy,
+    SandboxBuilder, load_snapshot,
 };
+
+mod cli;
 
 /// The CLI's own errors are messages for the terminal; the library's
 /// come through as they are.
 type CliResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Milliseconds since `t`, to a tenth: what a timing log needs, without
+/// the six decimals an f64 would print.
+fn elapsed_ms(t: Instant) -> f64 {
+    (t.elapsed().as_secs_f64() * 10_000.0).round() / 10.0
+}
 
 /// Minimal Hyperlight host for Unikraft unikernels.
 #[derive(Parser)]
@@ -32,9 +40,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Boot a guest and run a script, inline code, a guest command, or
-    /// its entry point.
-    Run(RunArgs),
+    /// Start a project from a template: write its hluk.toml and starter
+    /// files, and pull the rootfs it runs on.
+    Init(cli::InitArgs),
+
+    /// Boot a guest and run a script, inline code, a guest command, or its
+    /// entry point: a rootfs named with --initrd or --runtime, or the
+    /// project described by the hluk.toml in this directory.
+    Run(cli::RunArgs),
+
+    /// Build the project: run its build command, and build its Dockerfile
+    /// into a rootfs.
+    Build(cli::ProjectArgs),
+
+    /// Fetch, or refresh, the rootfs image the project's hluk.toml names.
+    Pull(cli::ProjectArgs),
+
+    /// List the templates `init` can start from.
+    Templates,
+
+    /// The pulled rootfs images and warm snapshots: list or remove them.
+    Cache(cli::CacheArgs),
 
     /// Snapshot operations: save a post-evolve snapshot to disk,
     /// or restore from a saved snapshot and dispatch.
@@ -59,87 +85,22 @@ enum SnapshotCommand {
     Key,
 }
 
-/// Arguments for `run` — boot the embedded kernel + initrd and dispatch.
-#[derive(clap::Args)]
-struct RunArgs {
-    /// Script file (.py, .js, …) to execute in the guest.
-    #[arg(conflicts_with = "exec")]
-    script: Option<PathBuf>,
-
-    /// Path to a CPIO initrd to map into the guest.
-    #[arg(long)]
-    initrd: Option<PathBuf>,
-
-    /// Entry point binary path inside the initrd VFS.
-    /// Auto-detected from the initrd if not specified.
-    #[arg(long)]
-    entry: Option<String>,
-
-    /// Advanced: boot a kernel from this path instead of the embedded one.
-    /// Must match the host ABI this build expects, or the guest will fault.
-    /// Intended for kernel development.
-    #[arg(long, value_name = "PATH")]
-    kernel: Option<PathBuf>,
-
-    /// Scratch memory in MiB (default 256; increase for large rootfs).
-    #[arg(long, default_value_t = DEFAULT_SCRATCH_MB)]
-    scratch_mb: usize,
-
-    /// Inline code to execute (alternative to a script file).
-    #[arg(long, conflicts_with = "script")]
-    exec: Option<String>,
-
-    /// Run a command that already lives in the guest filesystem: a path plus
-    /// optional args (e.g. "/app/server --port 8080"). Unlike a script file
-    /// (read from the host) or --exec (host code), this runs a file baked into
-    /// the initrd. This is how urunc drives the guest. With no workload given,
-    /// the guest's conventional entrypoint (/entrypoint.py, /entrypoint, …) runs.
-    #[arg(long = "guest-exec", value_name = "COMMAND", conflicts_with_all = ["script", "exec"])]
-    guest_exec: Option<String>,
-
-    /// Mount a host directory into the guest filesystem.
-    /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
-    #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
-    mounts: Vec<String>,
-
-    /// Enable host networking with no policy (all destinations allowed).
-    #[arg(long, conflicts_with_all = ["net_allow", "net_block"])]
-    net: bool,
-
-    /// Allow-list: only permit connections to these hosts/IPs.
-    /// Implies --net. Mutually exclusive with --net-block.
-    #[arg(long = "net-allow", value_name = "HOST", conflicts_with = "net_block")]
-    net_allow: Vec<String>,
-
-    /// Block-list: deny connections to these hosts/IPs, allow everything else.
-    /// Implies --net. Mutually exclusive with --net-allow.
-    #[arg(long = "net-block", value_name = "HOST", conflicts_with = "net_allow")]
-    net_block: Vec<String>,
-
-    /// Ports the guest may bind to for inbound connections: a port, a
-    /// range LOW-HIGH, or `all` (repeatable). Without this flag, bind()
-    /// is rejected (outbound-only).
-    #[arg(long = "port", value_name = "PORT|LOW-HIGH|all")]
-    ports: Vec<PortSpec>,
-
-    /// Set an environment variable in the guest (repeatable).
-    /// Format: KEY=VALUE (e.g. --env MY_VAR=hello --env DEBUG=1).
-    #[arg(long = "env", value_name = "KEY=VALUE")]
-    envs: Vec<String>,
-
-    /// A resolver configuration file to install as the guest's
-    /// /etc/resolv.conf, at boot and on a restore (nameservers, search
-    /// domains, options). Without it the rootfs's own file stands.
-    #[arg(long = "resolv-conf", value_name = "FILE")]
-    resolv_conf: Option<PathBuf>,
-}
-
 /// Arguments for `snapshot save`.
 #[derive(clap::Args)]
 struct SaveArgs {
     /// Path to a CPIO initrd to map into the guest.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "runtime")]
     initrd: Option<PathBuf>,
+
+    /// A published runtime image by name (python, node, agent, …) or a
+    /// full image reference, pulled into the cache when missing.
+    #[arg(long, value_name = "NAME|IMAGE", conflicts_with = "kernel")]
+    runtime: Option<String>,
+
+    /// Code the runtime runs once before the snapshot is taken, so what it
+    /// loads is in it (e.g. "import flask, pandas").
+    #[arg(long = "warm-exec", value_name = "CODE")]
+    warm_exec: Option<String>,
 
     /// Entry point binary path inside the initrd VFS.
     /// Auto-detected from the initrd if not specified.
@@ -152,9 +113,10 @@ struct SaveArgs {
     #[arg(long, value_name = "PATH")]
     kernel: Option<PathBuf>,
 
-    /// Scratch memory in MiB (default 256; increase for large rootfs).
-    #[arg(long, default_value_t = DEFAULT_SCRATCH_MB)]
-    scratch_mb: usize,
+    /// Guest memory in MiB. Default: the size the rootfs's runtime image is
+    /// tested with.
+    #[arg(long, value_name = "MIB")]
+    scratch_mb: Option<usize>,
 
     /// Directory to save the snapshot (OCI Image Layout).
     #[arg(short, long)]
@@ -268,9 +230,10 @@ struct BenchColdArgs {
     /// Script file to execute.
     script: PathBuf,
 
-    /// Scratch memory in MiB.
-    #[arg(long, default_value_t = DEFAULT_SCRATCH_MB)]
-    scratch_mb: usize,
+    /// Guest memory in MiB. Default: the size the rootfs's runtime image is
+    /// tested with.
+    #[arg(long, value_name = "MIB")]
+    scratch_mb: Option<usize>,
 
     /// Number of samples to run.
     #[arg(long, default_value_t = 20)]
@@ -515,44 +478,6 @@ fn base_builder(kernel: Option<PathBuf>, initrd: Option<PathBuf>) -> CliResult<S
     }
 }
 
-fn cmd_run(args: RunArgs) -> CliResult<()> {
-    let mounts = parse_mounts(&args.mounts)?;
-    let (policy, listen) =
-        parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?;
-
-    // Precedence: a host script or --exec code; else a guest command
-    // (--guest-exec); else, with no workload at all, the rootfs's conventional
-    // entrypoint. The last two are the model a container runtime (urunc) uses.
-    let no_workload = args.script.is_none() && args.exec.is_none() && args.guest_exec.is_none();
-    let exec = resolve_exec(args.script, args.exec)?
-        .unwrap_or_else(|| Exec::Guest(args.guest_exec.unwrap_or_default()));
-    let envs = parse_envs(&args.envs)?;
-
-    let mut builder = base_builder(args.kernel, args.initrd)?
-        .scratch_mb(args.scratch_mb)
-        .mounts(mounts);
-    if let Some(entry) = args.entry {
-        builder = builder.entry(entry);
-    }
-    if let Some(policy) = policy {
-        builder = builder.network(policy);
-    }
-    if let Some(listen) = listen {
-        builder = builder.listen_ports(listen);
-    }
-    for (key, value) in envs {
-        builder = builder.env(key, value);
-    }
-    if let Some(rc) = read_resolv_conf(args.resolv_conf.as_ref())? {
-        builder = builder.resolv_conf(rc);
-    }
-    let t = Instant::now();
-    let mut sandbox = builder.boot()?;
-    info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "boot");
-
-    drive(&mut sandbox, no_workload, exec)
-}
-
 /// Run the workload in a booted guest.  With nothing to run and no driver
 /// to run it, the entry point is a plain program (`--entry /bin/server`):
 /// drive it to its exit the way a container runtime would, and exit with
@@ -570,17 +495,14 @@ fn drive(sandbox: &mut AppSandbox, no_workload: bool, exec: Exec) -> CliResult<(
     if no_workload && !sandbox.has_driver() {
         info!("no driver in the guest; driving its entry point to exit");
         let status = sandbox.join()?;
-        info!(
-            elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
-            status, "exec"
-        );
+        info!(elapsed_ms = elapsed_ms(t), status, "exec");
         if status != 0 {
             std::process::exit(status);
         }
         return Ok(());
     }
     sandbox.run(exec)?;
-    info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "exec");
+    info!(elapsed_ms = elapsed_ms(t), "exec");
     Ok(())
 }
 
@@ -588,9 +510,25 @@ fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
     let mounts = parse_mounts(&args.mounts)?;
     let (policy, listen) =
         parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?;
-    let mut builder = base_builder(args.kernel, args.initrd)?
-        .scratch_mb(args.scratch_mb)
-        .mounts(mounts);
+    let mut builder = match &args.runtime {
+        Some(runtime) => {
+            cli::check_runtime_name(runtime)?;
+            let (path, _) =
+                cli::rootfs::ensure_initrd(&cli::registry::runtime_image(runtime), false)?;
+            let mut b = SandboxBuilder::from_initrd(path);
+            if let Some(mb) = cli::registry::runtime_name(runtime)
+                .and_then(hyperlight_unikraft::runtime_scratch_mb)
+            {
+                b = b.scratch_mb(mb);
+            }
+            b
+        }
+        None => base_builder(args.kernel, args.initrd)?,
+    }
+    .mounts(mounts);
+    if let Some(mb) = args.scratch_mb {
+        builder = builder.scratch_mb(mb);
+    }
     if let Some(entry) = args.entry {
         builder = builder.entry(entry);
     }
@@ -604,10 +542,17 @@ fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
         builder = builder.resolv_conf(rc);
     }
     let mut sandbox = builder.boot()?;
+    // What the snapshot should have loaded, run before it is taken.
+    if let Some(code) = &args.warm_exec {
+        if !sandbox.has_driver() {
+            return Err("--warm-exec needs a runtime driver in the rootfs".into());
+        }
+        sandbox.run(code.as_str())?;
+    }
 
     let t = Instant::now();
     sandbox.snapshot_to(&args.output)?;
-    let save_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let save_ms = elapsed_ms(t);
     info!(
         path = %args.output.display(),
         elapsed_ms = save_ms,
@@ -632,7 +577,7 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
     let builder = SandboxBuilder::from_snapshot_dir(&args.snapshot)?;
     info!(
         path = %args.snapshot.display(),
-        elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
+        elapsed_ms = elapsed_ms(t),
         "snapshot loaded",
     );
 
@@ -654,10 +599,7 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
 
     let t = Instant::now();
     let mut sandbox = builder.boot()?;
-    info!(
-        elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
-        "restored from snapshot",
-    );
+    info!(elapsed_ms = elapsed_ms(t), "restored from snapshot");
 
     // Precedence: host script / --exec code; else --guest-exec; else the
     // rootfs's conventional entrypoint.
@@ -777,10 +719,12 @@ fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
 
     for i in 0..args.samples {
         let t0 = Instant::now();
-        let mut sandbox = SandboxBuilder::from_initrd(args.initrd.clone())
-            .scratch_mb(args.scratch_mb)
-            .mounts(mounts.iter().cloned())
-            .boot()?;
+        let mut builder =
+            SandboxBuilder::from_initrd(args.initrd.clone()).mounts(mounts.iter().cloned());
+        if let Some(mb) = args.scratch_mb {
+            builder = builder.scratch_mb(mb);
+        }
+        let mut sandbox = builder.boot()?;
         let boot_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
@@ -1018,10 +962,11 @@ fn cli_main() -> CliResult<()> {
     let cli = Cli::parse();
 
     if let Some(level) = cli.log_level {
-        // RUST_LOG overrides --log-level when set; otherwise scope to
-        // our crate only so library noise doesn't leak through.
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(format!("hyperlight_unikraft={level}")));
+        // RUST_LOG overrides --log-level when set; otherwise scope to the
+        // library and this binary, so dependency noise doesn't leak through.
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(format!("hyperlight_unikraft={level},hluk={level}"))
+        });
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
@@ -1038,7 +983,12 @@ fn cli_main() -> CliResult<()> {
     });
 
     match cli.command {
-        Command::Run(args) => cmd_run(args),
+        Command::Init(args) => cli::init(args),
+        Command::Run(args) => cli::run(args),
+        Command::Build(args) => cli::build(args),
+        Command::Pull(args) => cli::pull(args),
+        Command::Templates => cli::templates(),
+        Command::Cache(args) => cli::cache(args),
         Command::Snapshot(cmd) => match cmd {
             SnapshotCommand::Save(args) => cmd_snapshot_save(args),
             SnapshotCommand::Run(args) => cmd_snapshot_run(args),

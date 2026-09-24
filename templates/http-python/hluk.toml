@@ -1,0 +1,31 @@
+# hluk.toml -- the manifest for `{{name}}`. `hluk build` builds the rootfs
+# and `hluk run` serves; see docs/manifest.md in hyperlight-unikraft for
+# every key.
+manifest_version = 1
+
+[app]
+name = "{{name}}"
+
+[rootfs]
+# A rootfs of your own: the Dockerfile starts from the published
+# python-shell base and pip-installs requirements.txt into it. `hluk build`
+# runs Docker and writes .hluk/rootfs.cpio.
+dockerfile = "Dockerfile"
+
+[run]
+script = "server.py"
+# Guest memory in MiB. The default is the size this runtime's image is
+# tested with (256 here); set it when the rootfs or the workload outgrows that.
+# scratch_mb = 256
+# The first `hluk run` snapshots the booted guest; later ones restore it.
+# The snapshot has whatever warm_exec loaded: the python-shell driver
+# already imports numpy and pandas when they are installed, and this adds
+# Flask, so the server's imports are done before it starts.
+warm = true
+warm_exec = "import flask"
+
+[run.net]
+# The guest may reach anything and listen on 8080, which the host exposes
+# at http://127.0.0.1:8080. Tighten with `allow = [...]` or `block = [...]`.
+all = true
+ports = [8080]

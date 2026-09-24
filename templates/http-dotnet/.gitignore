@@ -1,0 +1,4 @@
+# What `hluk build` writes next to the manifest (a rootfs built from a Dockerfile).
+.hluk/
+bin/
+obj/

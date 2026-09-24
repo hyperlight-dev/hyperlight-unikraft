@@ -1,0 +1,4 @@
+[template]
+description = "A Flask HTTP server on a rootfs you extend with pip packages (Dockerfile)"
+runtime = "python-shell"
+tier = 2

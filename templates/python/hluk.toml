@@ -1,0 +1,28 @@
+# hluk.toml -- the manifest for `{{name}}`. `hluk run` runs what it describes;
+# see docs/manifest.md in hyperlight-unikraft for every key.
+manifest_version = 1
+
+[app]
+name = "{{name}}"
+
+[rootfs]
+# The guest's root filesystem: the published python rootfs, pinned to the
+# hluk release that wrote this file. `hluk pull` fetches it into the local
+# cache (~/.cache/hluk); `hluk run` does the same when it is missing.
+image = "{{image}}"
+
+[run]
+# The host file the runtime driver runs inside the guest.
+script = "main.py"
+# Guest memory in MiB. The default is the size this runtime's image is
+# tested with (256 here); set it when the rootfs or the workload outgrows that.
+# scratch_mb = 256
+# Snapshot the booted guest (interpreter up, driver parked) on the first
+# `hluk run` and restore it on the next ones, skipping boot and startup.
+warm = true
+# The guest reaches nothing on the host unless you say so:
+# mounts = ["./data:/mnt/data:ro"]     # host directories, HOST:GUEST[:ro]
+# env = { GREETING = "hi" }            # environment variables
+# [run.net]
+# allow = ["pypi.org", "files.pythonhosted.org"]   # or `all = true`, or `block = [...]`
+# ports = [8080]                                   # ports the guest may listen on

@@ -1,0 +1,4 @@
+[template]
+description = "A C program, built on the host as a static PIE binary and run through the exec driver"
+runtime = "c"
+tier = 3

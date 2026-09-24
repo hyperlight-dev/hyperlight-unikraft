@@ -1,0 +1,4 @@
+[template]
+description = "C# top-level statements, compiled inside the guest by Roslyn (.NET 9 JIT)"
+runtime = "dotnet-jit"
+tier = 2

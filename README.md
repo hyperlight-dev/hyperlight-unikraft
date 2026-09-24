@@ -16,24 +16,24 @@ hyperlight-unikraft ships as both a Rust library and a CLI. `hluk` (the CLI) boo
 
 ```bash
 # 1. Install the CLI (the Unikraft kernel is baked into the binary)
-cargo install hyperlight-unikraft          # provides the `hluk` command
+curl -fsSL https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.sh | sh
+#    or, with a Rust toolchain: cargo install hyperlight-unikraft
 
-# 2. Clone the repo for the rootfs recipes and examples
-git clone https://github.com/hyperlight-dev/hyperlight-unikraft.git
-cd hyperlight-unikraft
+# 2. Start a project from a template; the matching rootfs is pulled from GHCR
+hluk init hello --template python          # or plain `hluk init` to be asked
+cd hello
 
-# 3. Build a guest rootfs (python-shell = Python + a BusyBox shell; needs Docker and `just`)
-just build-rootfs python-shell
+# 3. Run it inside a micro-VM
+hluk run                                    # boots the guest and runs main.py
+hluk run                                    # restores the warm snapshot the first run saved: milliseconds
 
-# 4. Run a Python hello world inside a micro-VM
-hluk run --initrd build-elfloader/python-shell-rootfs.cpio --scratch-mb 256 examples/python/hello.py
-
-# 5. Snapshot a warmed guest, then restore and run from it
-hluk snapshot save --initrd build-elfloader/python-shell-rootfs.cpio --scratch-mb 256 --output .snapshots/python-shell
-hluk snapshot run .snapshots/python-shell examples/python/hello.py
+# Or skip the project: a published image by name, warm by default
+hluk run --runtime python examples/python/hello.py
 ```
 
-Run `hluk --help` for the full option set (`--mount`, `--net`, `--net-allow`, `--net-block`, `--port`, `--exec`, `--scratch-mb`, …). The `just` recipes (`just run <runtime> <script>`, `just snapshot-save`, `just bench`) wrap a locally built `./target/release/hluk`, which is handy when developing on the repo.
+`hluk templates` lists what `init` can start from: a script for Python, Node.js, Bash, C# (compiled in the guest by Roslyn) and PowerShell; a compiled program for Go, Rust, C and .NET Native AOT (`hluk build` runs the compiler, `hluk run` mounts the result); an HTTP server on a rootfs you extend with pip, npm or the .NET SDK through a Dockerfile (`hluk build` builds it with Docker); and the `agent` image with numpy, pandas, scipy and scikit-learn preloaded. The project's `hluk.toml` says what runs and with which capabilities; [`docs/manifest.md`](docs/manifest.md) is the reference.
+
+Without a project, `hluk run` takes the same settings as flags (`--initrd`, `--mount`, `--net`, `--net-allow`, `--net-block`, `--port`, `--exec`, `--scratch-mb`, …), and `hluk snapshot save` / `hluk snapshot run` save and restore a guest by hand; `hluk --help` has the full set. To build a rootfs from this repository's recipes instead of pulling one, `just build-rootfs python` (needs Docker and `just`) writes `build-elfloader/python-rootfs.cpio`, which `hluk run --initrd` or a manifest's `[rootfs] path` takes. The `just` recipes (`just run <runtime> <script>`, `just snapshot-save`, `just bench`) wrap a locally built `./target/release/hluk`, which is handy when developing on the repo.
 
 ## Runtimes and platforms
 
@@ -45,7 +45,7 @@ Guest runtimes include **Python**, **Node.js**, **.NET** (JIT and AOT), **Bash**
 
 Guest scripts under `examples/` run with `hluk run` (or `just run <runtime> <script>`):
 
-- **HTTP servers** — `examples/http-server/{flask,express,kestrel}/` also show how to build a custom guest image on top of hluk's base runtime rootfs images (Python, Node, .NET AOT); see e.g., [`examples/http-server/flask/Dockerfile`](examples/http-server/flask/Dockerfile).
+- **HTTP servers** — `examples/http-server/{flask,express,kestrel}/` also show how to build a custom guest image on top of hluk's base runtime rootfs images (Python, Node, .NET AOT); see e.g., [`examples/http-server/flask/Dockerfile`](examples/http-server/flask/Dockerfile). The `http-python`, `http-node` and `http-dotnet` templates of `hluk init` are the same three as projects.
 - **Concurrency** — `examples/python/threading_demo.py` and `examples/python/subprocess_demo.py` exercise guest threads and subprocesses.
 - **Agents** — `examples/agent-framework/` runs a Microsoft Agent Framework agent with fully offline llama.cpp inference (`local.py`) or a remote model call (`remote.py`).
 
@@ -62,7 +62,7 @@ Larger, self-contained demos live under `demos/`, each with its own `Justfile` a
 3. **Sandbox** — by default the guest reaches nothing on the host. Capabilities are opt-in: `--mount` preopens a host directory, `--net` (with optional `--net-allow`/`--net-block` lists) enables networking, and `--port` lets the guest listen.
 4. **Snapshot** — once a guest is warmed (interpreter initialised, imports loaded), its state can be saved and restored, so later invocations skip startup.
 
-More details are in [`docs/`](docs/): how a guest is driven and the ways to run one ([`execution.md`](docs/execution.md)), the contract between a runtime driver and the kernel ([`driver.md`](docs/driver.md)), the host filesystem sandbox ([`fs.md`](docs/fs.md)), guest networking ([`net.md`](docs/net.md)), guest concurrency and snapshot restore ([`concurrency.md`](docs/concurrency.md)), the guest's clocks ([`clock.md`](docs/clock.md)) and its random source ([`random.md`](docs/random.md)).
+More details are in [`docs/`](docs/): projects, the manifest and the published images ([`manifest.md`](docs/manifest.md)), how a guest is driven and the ways to run one ([`execution.md`](docs/execution.md)), the contract between a runtime driver and the kernel ([`driver.md`](docs/driver.md)), the host filesystem sandbox ([`fs.md`](docs/fs.md)), guest networking ([`net.md`](docs/net.md)), guest concurrency and snapshot restore ([`concurrency.md`](docs/concurrency.md)), the guest's clocks ([`clock.md`](docs/clock.md)) and its random source ([`random.md`](docs/random.md)).
 
 ## Development
 

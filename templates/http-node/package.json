@@ -1,0 +1,7 @@
+{
+  "name": "{{name}}",
+  "private": true,
+  "dependencies": {
+    "express": "^4"
+  }
+}

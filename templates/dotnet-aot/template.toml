@@ -1,0 +1,4 @@
+[template]
+description = "A .NET 9 Native AOT program, published on the host and run through the exec driver"
+runtime = "dotnet-aot"
+tier = 2

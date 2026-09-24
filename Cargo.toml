@@ -1,6 +1,6 @@
 [package]
 name = "hyperlight-unikraft"
-version = "0.14.1"
+version = "0.14.2"
 edition = "2024"
 description = "Run ordinary Linux programs inside Hyperlight micro-VMs using a Unikraft unikernel as the guest kernel — the hluk CLI and library."
 license = "Apache-2.0"
@@ -9,6 +9,7 @@ readme = "README.md"
 
 [build-dependencies]
 sha2 = "0.11"
+# build.rs also embeds the `hluk init` templates (templates/) into the binary.
 
 [[bin]]
 name = "hluk"
@@ -16,7 +17,16 @@ path = "src/main.rs"
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:tracing-subscriber"]
+cli = [
+    "dep:clap",
+    "dep:tracing-subscriber",
+    "dep:serde",
+    "dep:toml",
+    "dep:ureq",
+    "dep:flate2",
+    "dep:tar",
+    "dep:sha2",
+]
 # Also target the Microsoft Hypervisor (Azure Linux / Mariner) on Linux, in
 # addition to the default KVM.  Off by default because enabling mshv3 opts the
 # whole build out of the MADV_DONTNEED fast restore path (see the dependency
@@ -39,6 +49,17 @@ rustix = { version = "1", features = ["net", "event"] }
 # Optional — CLI only.
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# `hluk init` / `hluk run`: the app manifest is TOML, and the published rootfs
+# is pulled straight from the registry -- an HTTPS client, gzip and tar for
+# the one-layer image -- so a project runs on any host with no Docker.  The
+# sha2 that build.rs already uses checks the layer against its digest.
+serde = { version = "1", features = ["derive"], optional = true }
+toml = { version = "1", optional = true }
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+sha2 = { version = "0.11", optional = true }
 
 # hyperlight-host's hypervisor backend is chosen at compile time by feature.
 # We keep every backend hyperlight supports reachable, but tune the default:
