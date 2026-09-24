@@ -23,6 +23,8 @@ User-facing changes are recorded in [`CHANGELOG.md`](../CHANGELOG.md) (Keep a Ch
 
 Nothing is pushed to crates.io as part of this — that is deliberate.
 
+`install.sh` at the repository root fetches the Linux tarball of the latest release (or `HLUK_VERSION`); when a release carries a `SHA256SUMS` asset listing it, the download is checked against it.
+
 ## What's published
 
 - **GitHub Release**: `hluk` binaries for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, plus release notes extracted from the matching [`CHANGELOG.md`](../CHANGELOG.md) section.

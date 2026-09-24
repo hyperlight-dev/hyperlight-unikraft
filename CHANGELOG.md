@@ -4,6 +4,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+## [v0.14.2]
+
+### Changed
+
+- A guest with no memory size asked for gets the size its runtime image is tested with, from a table the library carries (`RUNTIME_SCRATCH_MB`: c and rust 64 MiB, go 128, bash, python, python-shell and dotnet-aot 256, node 512, dotnet-jit 768, powershell 1024, agent 1536), instead of a flat 256 MiB: `SandboxBuilder::boot` looks the driver in the initrd up (`default_scratch_mb`), `hluk run --scratch-mb` is optional, and a manifest's `scratch_mb` is an override, with the runtime read from the image's name when the rootfs is a published one. A rootfs that has grown past half of that memory is reported by `hluk build` and `hluk run` with a size to set.
+
+### Added
+
+- **Projects.** `hluk init` starts a project from a template: it writes a `hluk.toml` manifest and starter files, and pulls the published rootfs the template runs on from GHCR into a local cache (`~/.cache/hluk`; `HLUK_CACHE_DIR` overrides), pinned to the tag of this `hluk` release (`<runtime>:initrd-v<version>`) so a project keeps running under the `hluk` that made it. `hluk run` with no `--initrd` runs the project the manifest describes, its flags standing in for the manifest's keys where given; `hluk build` runs its `[build]` command and builds its `[rootfs] dockerfile` with Docker into `.hluk/rootfs.cpio`; `hluk pull` refreshes the rootfs image; `hluk templates` lists the templates; `hluk cache` lists and removes what was pulled and snapshotted. With no arguments `init` asks for the template and the name. The pull speaks the registry API itself (anonymous token, manifest, one digest-checked layer), so a project runs on any host `hluk` runs on with no Docker. See `docs/manifest.md`.
+- `hluk run --runtime <name|image>` runs a published runtime image by name (`python`, `node`, `agent`, …) or full reference with no project and no local build: pulled into the cache when missing, warm by default. `hluk snapshot save --runtime` saves one the same way, and its `--warm-exec CODE` runs code before the snapshot is taken.
+- `--log-level info` timings are printed to a tenth of a millisecond.
+- Thirteen templates, one per runtime, compiled into the binary: `python`, `agent`, `node`, `bash`, `dotnet` (C# compiled in the guest by Roslyn), `powershell`, `go`, `rust`, `c`, `dotnet-aot` (compiled on the host with a `[build]` command and mounted into the guest), and `http-python`, `http-node`, `http-dotnet` (a Flask, Express or Kestrel server on a rootfs the project's Dockerfile extends with pip, npm or the .NET SDK, `FROM` the published `<runtime>:v<version>` base).
+- **Warm starts.** A manifest with `warm = true` (every template's default), `hluk run --warm`, or `hluk run --runtime` has the first run snapshot the booted guest before the workload runs, and every later run restore it instead of booting; `--cold` boots fresh. Snapshots live in the cache, one per distinct guest and shared by every project that runs it; a rebuilt rootfs replaces the snapshots of its old file. `warm_exec` is code the runtime driver runs once before that snapshot, so what it loads is in it (`http-python` sets `import flask`, `http-node` `require('express')`). The snapshot is stamped with the rootfs file, `scratch_mb`, `entry`, `warm_exec` and the build's snapshot key, and is taken again when any of them changes; mounts, network policy and environment are supplied on restore and need no new snapshot.
+- `install.sh`: `curl -fsSL https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.sh | sh` installs the latest release's Linux binary into `~/.local/bin` with no Rust toolchain (`HLUK_VERSION`, `HLUK_INSTALL_DIR`), verifying it against a `SHA256SUMS` when the release has one.
+- `hluk init --image-version X.Y.Z` (or `HLUK_IMAGE_VERSION`) pins another release's images than this build's, for a build between releases.
+- A program the exec driver runs from a mount is checked to be position-independent before the boot (`hluk build` after its command, `hluk run` before booting), and refused with the build flag that makes it one, instead of the guest's "Image format not recognized".
+- `hluk build` converts a Docker image's filesystem to the initrd CPIO in Rust (`docker export` streamed through a tar-to-newc converter that lays entries out as `find . | cpio -o -H newc` does and restores the `/etc/hosts`, `/etc/nsswitch.conf` and `/etc/resolv.conf` that `docker export` empties), so the host needs Docker and nothing else, on Windows and macOS too.
+
 ## [v0.14.1]
 
 ### Added
