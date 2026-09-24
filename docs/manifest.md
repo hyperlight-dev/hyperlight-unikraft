@@ -15,7 +15,7 @@ hluk cache                               # what has been pulled and snapshotted,
 
 Without a project: `hluk run --runtime python main.py` runs the published python image, warm by default (`--cold` boots fresh), and `hluk run --initrd build-elfloader/python-rootfs.cpio main.py` runs a CPIO you built, cold unless `--warm`. `--runtime` also takes a full image reference. `hluk snapshot save --runtime python --warm-exec "import json" -o warm` saves such a guest by hand, for `hluk snapshot run`, `hluk bench` or an embedder to restore.
 
-`hluk init` with no arguments asks for the template and a project name. A template is a starter for one runtime: the interpreted ones (`python`, `agent`, `node`, `bash`, `dotnet`, `powershell`) run a script from the host; the compiled ones (`go`, `rust`, `c`, `dotnet-aot`) carry a `[build]` command and mount its output into the guest; the `http-*` ones serve on port 8080 from a rootfs their Dockerfile extends. `hluk templates` lists them with the [support tier](guest-support-tiers.md) of their runtime.
+`hluk init` with no arguments asks for the template and a project name. A template is a starter for one runtime: the interpreted ones (`python`, `python-shell`, `agent`, `node`, `bash`, `dotnet`, `powershell`) run a script from the host, and `bash-repl` runs a read-eval loop on `hluk run`'s stdin; the compiled ones (`go`, `rust`, `c`, `dotnet-aot`) carry a `[build]` command and mount its output into the guest; the `http-*` ones serve on port 8080 from a rootfs their Dockerfile extends. `hluk templates` lists them with the [support tier](guest-support-tiers.md) of their runtime.
 
 Where the rootfs comes from decides the next step:
 
