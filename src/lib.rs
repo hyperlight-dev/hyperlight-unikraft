@@ -164,12 +164,119 @@ static KERNEL: &[u8] = include_bytes!("../kernel/elfloader_hyperlight-x86_64");
 /// with KVM's in-kernel IRQCHIP reservation.
 const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
 
-/// Default scratch memory budget in MiB.
+/// Scratch memory in MiB for a guest with no initrd to size from (a
+/// native kernel), and the fallback when the initrd cannot be read.  A
+/// guest booted from an initrd is sized by [`default_scratch_mb`].
 ///
-/// The frame allocator gets 75% of this; the rest covers CoW faults
-/// and boot overhead.  Override with `--scratch-mb` for large rootfs
-/// images (e.g. Node's 100 MiB binary needs ~512 MiB).
+/// The frame allocator gets 75% of the scratch; the rest covers CoW
+/// faults and boot overhead.
 pub const DEFAULT_SCRATCH_MB: usize = 256;
+
+/// Guest memory per runtime image, in MiB: the sizes the repository's
+/// tests and benchmarks run each published image with (the justfile's
+/// `scratch_*`).  A rootfs is unpacked into this memory, so an image that
+/// has grown past what these leave free needs more, and `hluk` says so.
+pub const RUNTIME_SCRATCH_MB: &[(&str, usize)] = &[
+    ("c", 64),
+    ("rust", 64),
+    ("go", 128),
+    ("bash", 256),
+    ("python", 256),
+    ("python-shell", 256),
+    ("dotnet-aot", 256),
+    ("node", 512),
+    ("dotnet-jit", 768),
+    ("powershell", 1024),
+    ("agent", 1536),
+];
+
+/// The runtime image a driver binary belongs to, for an initrd that is
+/// only a file.  The two Python variants share a driver and resolve to the
+/// smaller; the `agent` image is known by name (see
+/// [`runtime_scratch_mb`]).
+const DRIVER_RUNTIME: &[(&str, &str)] = &[
+    ("hl_pydriver", "python"),
+    ("hl_pywarmdriver", "python-shell"),
+    ("hl_nodedriver", "node"),
+    ("hl_dotnetdriver", "dotnet-jit"),
+    ("hl_pwshdriver", "powershell"),
+    ("hl_bashdriver", "bash"),
+    ("hl_godriver", "go"),
+    ("hl_cdriver", "c"),
+    ("hl_rustdriver", "rust"),
+    ("hl_dotnetaotdriver", "dotnet-aot"),
+];
+
+/// The tested memory for a runtime image, by name (`python`, `node`,
+/// `agent`, …): [`RUNTIME_SCRATCH_MB`].
+pub fn runtime_scratch_mb(runtime: &str) -> Option<usize> {
+    RUNTIME_SCRATCH_MB
+        .iter()
+        .find(|(name, _)| *name == runtime)
+        .map(|(_, mb)| *mb)
+}
+
+/// The scratch memory a guest booted from `initrd` gets when none is asked
+/// for: the runtime named in `etc/hluk-runtime` if the image carries one,
+/// else the tested size of the runtime image its driver belongs to
+/// ([`RUNTIME_SCRATCH_MB`]), else [`DEFAULT_SCRATCH_MB`].
+/// [`SandboxBuilder::boot`] uses it when
+/// [`scratch_mb`](SandboxBuilder::scratch_mb) was not called.
+pub fn default_scratch_mb(initrd: &Path) -> usize {
+    let scan = scan_cpio(initrd);
+    // A runtime marker takes priority: images that share a driver binary
+    // (agent and python-shell both use hl_pywarmdriver) write it so the
+    // right scratch size is chosen without --scratch-mb.
+    if let Some(mb) = scan.runtime.as_deref().and_then(runtime_scratch_mb) {
+        return mb;
+    }
+    scan.entry
+        .as_deref()
+        .and_then(|p| p.rsplit('/').next())
+        .and_then(driver_scratch_mb)
+        .unwrap_or(DEFAULT_SCRATCH_MB)
+}
+
+/// [`default_scratch_mb`] from the driver's file name.
+fn driver_scratch_mb(driver: &str) -> Option<usize> {
+    DRIVER_RUNTIME
+        .iter()
+        .find(|(d, _)| *d == driver)
+        .and_then(|(_, runtime)| runtime_scratch_mb(runtime))
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    #[test]
+    fn every_driver_maps_to_a_tested_size() {
+        for (driver, runtime) in DRIVER_RUNTIME {
+            assert!(
+                runtime_scratch_mb(runtime).is_some(),
+                "{driver}: {runtime} is not in RUNTIME_SCRATCH_MB"
+            );
+        }
+        assert_eq!(runtime_scratch_mb("python"), Some(256));
+        assert_eq!(runtime_scratch_mb("agent"), Some(1536));
+        assert_eq!(runtime_scratch_mb("cobol"), None);
+        assert_eq!(driver_scratch_mb("hl_nodedriver"), Some(512));
+        assert_eq!(
+            driver_scratch_mb("hl_pywarmdriver"),
+            Some(256),
+            "the shared Python driver resolves to the smaller image"
+        );
+        assert_eq!(driver_scratch_mb("hl_execdriver"), None);
+    }
+
+    #[test]
+    fn an_unreadable_initrd_gets_the_flat_default() {
+        assert_eq!(
+            default_scratch_mb(Path::new("/nonexistent/rootfs.cpio")),
+            DEFAULT_SCRATCH_MB
+        );
+    }
+}
 
 /// Largest payload of one host call, in either direction.
 ///
@@ -959,16 +1066,40 @@ impl GuestConfig {
 /// Used internally by [`SandboxBuilder::boot`] to auto-detect the entry
 /// point so callers don't need to set one manually.
 fn find_cpio_entry(path: &Path) -> Option<String> {
+    scan_cpio(path).entry
+}
+
+/// What a single pass over a CPIO archive found.
+#[derive(Default)]
+struct CpioScan {
+    /// The driver entry point (`/usr/local/bin/hl_pydriver`), if any.
+    entry: Option<String>,
+    /// The runtime name from `etc/hluk-runtime`, if the image carries
+    /// one.  Images that share a driver binary (the `agent` image and
+    /// `python-shell` both use `hl_pywarmdriver`) write this file so
+    /// [`default_scratch_mb`] sizes them correctly; without it, the
+    /// driver-based fallback applies and the scratch hint fires when
+    /// the rootfs outgrows that.
+    runtime: Option<String>,
+}
+
+/// Scan a CPIO archive in one pass for the driver entry point and an
+/// optional runtime marker file.
+fn scan_cpio(path: &Path) -> CpioScan {
+    scan_cpio_inner(path).unwrap_or_default()
+}
+
+fn scan_cpio_inner(path: &Path) -> Option<CpioScan> {
     let mut file = File::open(path).ok()?;
     let mut header = [0u8; 110];
+    let mut entry = None;
+    let mut runtime = None;
 
     loop {
         if file.read_exact(&mut header).is_err() {
             break;
         }
 
-        // Every newc CPIO entry starts with magic "070701" (or "070702"
-        // for CRC variant).  Anything else means corrupt or non-CPIO data.
         let magic = std::str::from_utf8(&header[0..6]).ok()?;
         if magic != "070701" && magic != "070702" {
             break;
@@ -981,26 +1112,49 @@ fn find_cpio_entry(path: &Path) -> Option<String> {
         file.read_exact(&mut name_buf).ok()?;
         let name = std::str::from_utf8(&name_buf).ok()?.trim_end_matches('\0');
 
-        // "TRAILER!!!" is the standard CPIO end-of-archive marker.
         if name == "TRAILER!!!" {
             break;
         }
 
-        // Pad past filename to 4-byte boundary (CPIO alignment rule)
         let name_padding = (4 - ((110 + namesize) % 4)) % 4;
         file.seek(SeekFrom::Current(name_padding as i64)).ok()?;
 
-        if name.starts_with("usr/local/bin/hl_") || name.starts_with("usr/bin/hl_") {
-            return Some(format!("/{name}"));
+        if entry.is_none()
+            && (name.starts_with("usr/local/bin/hl_") || name.starts_with("usr/bin/hl_"))
+        {
+            entry = Some(format!("/{name}"));
         }
 
-        // Skip file data + padding to 4-byte boundary
+        // A rootfs may carry its runtime name so scratch memory can be
+        // sized even when the driver binary is shared between images.
+        if runtime.is_none() && name == "etc/hluk-runtime" && filesize < 64 {
+            let mut buf = vec![0u8; filesize as usize];
+            if file.read_exact(&mut buf).is_ok() {
+                if let Ok(s) = std::str::from_utf8(&buf) {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        runtime = Some(s.to_string());
+                    }
+                }
+                let data_padding = (4 - (filesize % 4)) % 4;
+                file.seek(SeekFrom::Current(data_padding as i64)).ok()?;
+                if entry.is_some() {
+                    break;
+                }
+                continue;
+            }
+        }
+
         let data_padding = (4 - (filesize % 4)) % 4;
         file.seek(SeekFrom::Current((filesize + data_padding) as i64))
             .ok()?;
+
+        if entry.is_some() && runtime.is_some() {
+            break;
+        }
     }
 
-    None
+    Some(CpioScan { entry, runtime })
 }
 
 /// Resolve the entry point: explicit value → auto-detected from initrd → None.
@@ -1087,6 +1241,7 @@ fn assemble_sandbox(
     listen_ports: Option<ListenPorts>,
 ) -> Result<(UninitializedSandbox, GuestConfig)> {
     let scratch_size = scratch_mb * 1024 * 1024;
+    info!(scratch_mb, "guest memory");
     let mut cfg = SandboxConfiguration::default();
     cfg.set_scratch_size(scratch_size);
     cfg.set_heap_size(HEAP_SIZE);
@@ -1291,7 +1446,8 @@ impl SandboxBuilder {
         self
     }
 
-    /// Scratch memory in MiB (default [`DEFAULT_SCRATCH_MB`]).
+    /// Scratch memory in MiB.  Without it, [`default_scratch_mb`] of the
+    /// initrd, or [`DEFAULT_SCRATCH_MB`] for a kernel with none.
     pub fn scratch_mb(mut self, mb: usize) -> Self {
         self.scratch_mb = Some(mb);
         self
@@ -1384,11 +1540,38 @@ impl SandboxBuilder {
                 (sandbox, cfg)
             }
             None => {
+                // Scan the initrd once for the driver entry point and
+                // the optional runtime marker; the result sizes the
+                // scratch memory and resolves the entry so
+                // `assemble_sandbox` does not scan a second time.
+                let scan = if scratch_mb.is_none() || entry.is_none() {
+                    initrd.as_deref().map(scan_cpio).unwrap_or_default()
+                } else {
+                    CpioScan::default()
+                };
+                let scratch = scratch_mb.unwrap_or_else(|| {
+                    scan.runtime
+                        .as_deref()
+                        .and_then(runtime_scratch_mb)
+                        .or_else(|| {
+                            scan.entry
+                                .as_deref()
+                                .and_then(|p| p.rsplit('/').next())
+                                .and_then(driver_scratch_mb)
+                        })
+                        .unwrap_or(DEFAULT_SCRATCH_MB)
+                });
+                let entry = entry.or_else(|| {
+                    if let Some(ref d) = scan.entry {
+                        info!(entry = %d, "auto-detected driver entry point");
+                    }
+                    scan.entry
+                });
                 let (usandbox, cfg) = assemble_sandbox(
                     &kernel,
                     &initrd,
                     &entry,
-                    scratch_mb.unwrap_or(DEFAULT_SCRATCH_MB),
+                    scratch,
                     mounts,
                     network,
                     listen_ports,
@@ -2581,5 +2764,53 @@ mod tests {
             with_single_request("# single-request\nnameserver 10.0.0.1\n"),
             "# single-request\nnameserver 10.0.0.1\noptions single-request\n"
         );
+    }
+
+    #[test]
+    fn default_scratch_follows_the_driver_in_the_initrd() {
+        let dir = std::env::temp_dir().join(format!("hluk-scratch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = write_cpio(
+            &dir,
+            "node.cpio",
+            &[("usr/local/bin/hl_nodedriver", b"ELF")],
+        );
+        assert_eq!(default_scratch_mb(&node), 512);
+        let plain = write_cpio(&dir, "plain.cpio", &[("bin/app", b"ELF")]);
+        assert_eq!(default_scratch_mb(&plain), DEFAULT_SCRATCH_MB);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_marker_overrides_driver_detection() {
+        let dir = test_dir("cpio-marker");
+        // The agent image shares hl_pywarmdriver with python-shell but
+        // carries etc/hluk-runtime naming the actual runtime.
+        let agent = write_cpio(
+            &dir,
+            "agent.cpio",
+            &[
+                ("usr/local/bin/hl_pywarmdriver", b"ELF"),
+                ("etc/hluk-runtime", b"agent\n"),
+            ],
+        );
+        assert_eq!(default_scratch_mb(&agent), 1536, "marker wins over driver");
+        let scan = scan_cpio(&agent);
+        assert_eq!(scan.runtime.as_deref(), Some("agent"));
+        assert_eq!(
+            scan.entry.as_deref(),
+            Some("/usr/local/bin/hl_pywarmdriver")
+        );
+
+        // Without the marker the same driver maps to python-shell.
+        let shell = write_cpio(
+            &dir,
+            "shell.cpio",
+            &[("usr/local/bin/hl_pywarmdriver", b"ELF")],
+        );
+        assert_eq!(default_scratch_mb(&shell), 256);
+        assert!(scan_cpio(&shell).runtime.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
