@@ -1,0 +1,4 @@
+[template]
+description = "A Node.js 22 script"
+runtime = "node"
+tier = 2

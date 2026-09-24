@@ -1,0 +1,4 @@
+[template]
+description = "A PowerShell 7 script"
+runtime = "powershell"
+tier = 3

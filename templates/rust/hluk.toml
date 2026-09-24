@@ -1,0 +1,24 @@
+# hluk.toml -- the manifest for `{{name}}`. `hluk build` compiles it and
+# `hluk run` runs it; see docs/manifest.md in hyperlight-unikraft for every key.
+manifest_version = 1
+
+[app]
+name = "{{name}}"
+
+[rootfs]
+# The published rust rootfs: just the exec driver. Your binary is mounted
+# from the host at run time.
+image = "{{image}}"
+
+[build]
+# .cargo/config.toml makes this a static PIE, which the guest's ELF loader
+# needs.
+command = "cargo build --release"
+
+[run]
+mounts = ["./target/release:/mnt/app:ro"]
+exec = "/mnt/app/app"
+# Guest memory in MiB. The default is the size this runtime's image is
+# tested with (64 here); set it when the rootfs or the workload outgrows that.
+# scratch_mb = 64
+warm = true

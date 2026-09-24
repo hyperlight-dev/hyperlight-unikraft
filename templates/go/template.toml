@@ -1,0 +1,4 @@
+[template]
+description = "A Go program, built on the host as a PIE binary and run through the exec driver"
+runtime = "go"
+tier = 3

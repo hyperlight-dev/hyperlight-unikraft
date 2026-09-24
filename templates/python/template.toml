@@ -1,0 +1,7 @@
+# Metadata for `hluk init --template python`. Every other file in this
+# directory is copied into the new project, with {{name}}, {{version}},
+# {{registry}}, {{image}} and {{base}} filled in.
+[template]
+description = "A Python 3.12 script"
+runtime = "python"
+tier = 1

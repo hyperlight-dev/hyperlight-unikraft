@@ -1,0 +1,4 @@
+[template]
+description = "A Rust program, built on the host as a static PIE binary and run through the exec driver"
+runtime = "rust"
+tier = 3

@@ -1,0 +1,5 @@
+# The guest's ELF loader needs a position-independent binary; static CRT
+# linking keeps it free of the host's shared libraries, which the rust
+# rootfs does not carry.
+[build]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=pie"]

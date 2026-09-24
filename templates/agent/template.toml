@@ -1,0 +1,4 @@
+[template]
+description = "Python 3.12 with numpy, pandas, scipy, scikit-learn and friends preloaded -- an agent code executor"
+runtime = "agent"
+tier = 2

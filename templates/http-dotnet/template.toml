@@ -1,0 +1,4 @@
+[template]
+description = "An ASP.NET Core (Kestrel) HTTP server, published in Docker onto the dotnet-aot rootfs"
+runtime = "dotnet-aot"
+tier = 2

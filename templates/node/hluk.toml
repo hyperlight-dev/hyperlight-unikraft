@@ -1,0 +1,24 @@
+# hluk.toml -- the manifest for `{{name}}`. `hluk run` runs what it describes;
+# see docs/manifest.md in hyperlight-unikraft for every key.
+manifest_version = 1
+
+[app]
+name = "{{name}}"
+
+[rootfs]
+# The published node rootfs, pinned to the hluk release that wrote this file.
+image = "{{image}}"
+
+[run]
+script = "main.js"
+# Guest memory in MiB. The default is the size this runtime's image is
+# tested with (512 here); set it when the rootfs or the workload outgrows that.
+# scratch_mb = 512
+# Snapshot the booted guest (Node up, driver parked) on the first `hluk run`
+# and restore it on the next ones.
+warm = true
+# mounts = ["./data:/mnt/data:ro"]
+# env = { GREETING = "hi" }
+# [run.net]
+# all = true
+# ports = [8080]
