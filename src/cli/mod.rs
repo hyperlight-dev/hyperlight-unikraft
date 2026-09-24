@@ -10,6 +10,7 @@
 //! still be given on the command line.
 
 pub mod cpio;
+pub mod github;
 pub mod manifest;
 pub mod prompt;
 pub mod registry;
@@ -36,7 +37,7 @@ use crate::{
 };
 use manifest::{Manifest, RootfsSource, Workload};
 use rootfs::Fetch;
-use template::{Template, Vars};
+use template::{Origin, Template, Vars};
 
 /// Arguments for `init`.
 #[derive(Args)]
@@ -45,9 +46,10 @@ pub struct InitArgs {
     /// Without it the project name is asked for and becomes the directory.
     dir: Option<PathBuf>,
 
-    /// Template to start from; `hluk templates` lists them.  Asked for
-    /// when omitted and a terminal is attached.
-    #[arg(short, long, value_name = "NAME")]
+    /// Template to start from: a built-in one (`hluk templates` lists
+    /// them), a template directory, or github.com/OWNER/REPO[/PATH][@REF].
+    /// Asked for when omitted and a terminal is attached.
+    #[arg(short, long, value_name = "NAME|DIR|URL")]
     template: Option<String>,
 
     /// Project name (default: the directory's name).  Letters, digits,
@@ -224,16 +226,15 @@ enum CacheCommand {
 // ── init ─────────────────────────────────────────────────────────
 
 pub fn init(args: InitArgs) -> CliResult<()> {
-    let templates = Template::all()?;
     let template = match args.template {
-        Some(name) => Template::find(&name)?
-            .ok_or_else(|| format!("no template {name:?}; `hluk templates` lists them"))?,
+        Some(spec) => Template::resolve(&spec)?,
         None if prompt::interactive() => {
+            let templates = Template::all()?;
             let width = templates.iter().map(|t| t.name.len()).max().unwrap_or(0);
             let chosen = prompt::select("Pick a template to start from:", &templates, |t| {
                 format!("{:<width$}  {}", t.name, t.meta.description)
             })?;
-            Template::find(chosen.name)?.expect("listed")
+            Template::find(&chosen.name)?.expect("listed")
         }
         None => {
             return Err(
@@ -251,7 +252,7 @@ pub fn init(args: InitArgs) -> CliResult<()> {
         }
         (None, Some(name)) => (PathBuf::from(&name), name),
         (None, None) if prompt::interactive() => {
-            let name = prompt::ask("Project name", Some(&format!("hello-{}", template.name)))?;
+            let name = prompt::ask("Project name", Some(&suggested_name(&template.name)))?;
             (PathBuf::from(&name), name)
         }
         (None, None) => return Err("pass a directory to create the project in".into()),
@@ -270,45 +271,63 @@ pub fn init(args: InitArgs) -> CliResult<()> {
         base: &base,
     });
 
+    // The manifest is validated the way a hand-edited one is, and before
+    // anything is written: a template with a bad one leaves no half-made
+    // project behind.
+    let rendered = files
+        .iter()
+        .find(|f| f.path == manifest::FILE_NAME)
+        .ok_or_else(|| format!("template {}: no {}", template.name, manifest::FILE_NAME))?;
+    Manifest::parse(&rendered.text)
+        .map_err(|e| format!("template {}: {}: {e}", template.name, manifest::FILE_NAME))?;
+
     // An existing .gitignore is added to, never replaced: `hluk init .` in
     // a repository is the common case.  Anything else that exists needs
     // --force.
     if !args.force
-        && let Some((rel, _)) = files
+        && let Some(f) = files
             .iter()
-            .find(|(rel, _)| *rel != GITIGNORE && dir.join(native(rel)).exists())
+            .find(|f| f.path != GITIGNORE && dir.join(native(f.path)).exists())
     {
         return Err(format!(
             "{} exists; pass --force to overwrite the files the template provides",
-            dir.join(native(rel)).display()
+            dir.join(native(f.path)).display()
         )
         .into());
     }
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    for (rel, text) in &files {
-        let path = dir.join(native(rel));
+    for f in &files {
+        let path = dir.join(native(f.path));
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        let text = if *rel == GITIGNORE && path.is_file() {
-            merge_gitignore(&fs::read_to_string(&path)?, text)
+        if f.path == GITIGNORE && path.is_file() {
+            let merged = merge_gitignore(&fs::read_to_string(&path)?, &f.text);
+            fs::write(&path, merged)
         } else {
-            text.clone()
-        };
-        fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            fs::write(&path, &f.text)
+        }
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        if f.executable {
+            set_executable(&path)?;
+        }
     }
-    eprintln!(
-        "Created {name} from the {} template in {}:",
-        template.name,
-        dir.display()
-    );
-    for (rel, _) in &files {
-        eprintln!("  {rel}");
+    match &template.origin {
+        Origin::BuiltIn => eprintln!(
+            "Created {name} from the {} template in {}:",
+            template.name,
+            dir.display()
+        ),
+        origin => eprintln!(
+            "Created {name} from the template at {origin} in {}:",
+            dir.display()
+        ),
+    }
+    for f in &files {
+        eprintln!("  {}", f.path);
     }
 
-    // Read back what was written: a template's manifest is validated the
-    // same way a hand-edited one is.
     let manifest = Manifest::load(&dir.join(manifest::FILE_NAME))?;
     if let RootfsSource::Image(image) = manifest.rootfs()
         && !args.no_pull
@@ -324,6 +343,30 @@ pub fn init(args: InitArgs) -> CliResult<()> {
         }
     }
 
+    // A template that is not built in is someone else's code: say what
+    // `hluk build` would run on this host, and what of the host `hluk run`
+    // would hand the guest, before anyone runs it.
+    if template.origin != Origin::BuiltIn {
+        for mount in &manifest.run.mounts {
+            eprintln!("Note: `hluk run` mounts this host directory into the guest: {mount}");
+        }
+        if manifest.run.net.is_some() {
+            eprintln!("Note: `hluk run` gives the guest network access ([run.net] in hluk.toml)");
+        }
+        if let Some(build) = &manifest.build {
+            eprintln!(
+                "Note: `hluk build` runs this template's command on this host: {}",
+                build.command
+            );
+        }
+        if let RootfsSource::Dockerfile(dockerfile) = manifest.rootfs() {
+            eprintln!(
+                "Note: `hluk build` builds this template's {} with Docker",
+                dockerfile.display()
+            );
+        }
+    }
+
     eprintln!();
     eprintln!("Next:");
     if dir != Path::new(".") {
@@ -333,6 +376,37 @@ pub fn init(args: InitArgs) -> CliResult<()> {
         eprintln!("  hluk build");
     }
     eprintln!("  hluk run");
+    Ok(())
+}
+
+/// A project name to offer for `template`: `hello-<template>`, with what a
+/// project name cannot hold (a repository's `.`, a directory's spaces)
+/// turned into `-`.
+fn suggested_name(template: &str) -> String {
+    let name: String = template
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("hello-{}", name.trim_matches('-'))
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> CliResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o111);
+    fs::set_permissions(path, perms)
+        .map_err(|e| format!("cannot make {} executable: {e}", path.display()).into())
+}
+
+#[cfg(not(unix))]
+fn set_executable(_: &Path) -> CliResult<()> {
     Ok(())
 }
 
@@ -422,12 +496,19 @@ pub fn templates() -> CliResult<()> {
     for t in &templates {
         println!(
             "{:<name_w$}  {:>4}  {:<runtime_w$}  {}",
-            t.name, t.meta.tier, t.meta.runtime, t.meta.description
+            t.name,
+            t.meta.tier.map(|t| t.to_string()).unwrap_or_default(),
+            t.meta.runtime,
+            t.meta.description
         );
     }
     println!();
     println!(
         "Start one with `hluk init <dir> --template <name>`; tiers are docs/guest-support-tiers.md."
+    );
+    println!(
+        "--template also takes a template directory or github.com/OWNER/REPO[/PATH][@REF]; \
+         docs/templates.md shows how to write one."
     );
     Ok(())
 }
@@ -1032,6 +1113,19 @@ pub fn cache(args: CacheArgs) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_suggested_name_is_a_valid_one() {
+        for (template, want) in [
+            ("python", "hello-python"),
+            ("my.template", "hello-my-template"),
+            ("My Template!", "hello-My-Template"),
+        ] {
+            let name = suggested_name(template);
+            assert_eq!(name, want);
+            validate_name(&name).unwrap();
+        }
+    }
 
     #[test]
     fn names_are_checked() {
