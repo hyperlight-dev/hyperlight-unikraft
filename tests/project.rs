@@ -70,15 +70,26 @@ fn read_stamp(cache: &Path) -> String {
 /// `hluk init` the python template into `dir` and swap its published
 /// image for the local rootfs, as a manifest with `[rootfs] path` would.
 fn init_python(root: &Path, cache: &Path, dir: &str) -> std::path::PathBuf {
+    init_local(root, cache, dir, "python", "python")
+}
+
+/// `hluk init` `template` into `dir`, pointed at the local `runtime` rootfs.
+fn init_local(
+    root: &Path,
+    cache: &Path,
+    dir: &str,
+    template: &str,
+    runtime: &str,
+) -> std::path::PathBuf {
     let out = hluk(
         root,
         cache,
-        &["init", dir, "--template", "python", "--no-pull"],
+        &["init", dir, "--template", template, "--no-pull"],
     );
     assert!(out.status.success(), "init failed: {}", text(&out));
     let project = root.join(dir);
     let manifest = project.join("hluk.toml");
-    let rootfs = require_rootfs("python");
+    let rootfs = require_rootfs(runtime);
     let rewritten: String = std::fs::read_to_string(&manifest)
         .unwrap()
         .lines()
@@ -320,6 +331,88 @@ fn templates_lists_every_tier_one_runtime_first() {
             "{name} missing from:\n{t}"
         );
     }
+}
+
+#[test]
+fn init_takes_a_template_directory() {
+    let root = temp_dir("project-dir-template");
+    let cache = temp_dir("project-dir-template-cache");
+    let template = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/templates/word-count");
+    let project = init_local(
+        root.path(),
+        cache.path(),
+        "counted",
+        template.to_str().unwrap(),
+        "python",
+    );
+    assert!(
+        !project.join("template.toml").exists(),
+        "template.toml is not part of the project"
+    );
+    assert!(project.join("data/about.txt").is_file());
+
+    let out = hluk(&project, cache.path(), &["run"]);
+    assert!(out.status.success(), "run failed: {}", text(&out));
+    assert!(text(&out).contains("40  total"), "got: {}", text(&out));
+}
+
+/// `hluk` with `input` on its stdin.
+fn hluk_stdin(cwd: &Path, cache: &Path, args: &[&str], input: &[u8]) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hluk"))
+        .args(args)
+        .current_dir(cwd)
+        .env("HLUK_CACHE_DIR", cache)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run hluk");
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn the_python_shell_template_runs_shell_commands() {
+    let root = temp_dir("project-python-shell");
+    let cache = temp_dir("project-python-shell-cache");
+    let project = init_local(
+        root.path(),
+        cache.path(),
+        "pysh",
+        "python-shell",
+        "python-shell",
+    );
+    let out = hluk(&project, cache.path(), &["run"]);
+    assert!(out.status.success(), "run failed: {}", text(&out));
+    let t = text(&out);
+    assert!(t.contains("Hello from pysh!"), "got: {t}");
+    assert!(t.contains("/bin/sh"), "`which sh` did not run: {t}");
+}
+
+#[test]
+fn the_bash_repl_template_runs_each_line_until_end_of_input() {
+    let root = temp_dir("project-bash-repl");
+    let cache = temp_dir("project-bash-repl-cache");
+    let project = init_local(root.path(), cache.path(), "repl", "bash-repl", "bash");
+    // State carries from line to line, and a last line with no newline
+    // still runs before the loop stops at end of input.
+    // Each check looks for output the command's own text does not contain,
+    // since the input is echoed back next to it.
+    let input = b"X=4\ncd /etc\necho x=$X\npwd\necho $((6 * 7))";
+    let out = hluk_stdin(&project, cache.path(), &["run"], input);
+    assert!(out.status.success(), "run failed: {}", text(&out));
+    let t = text(&out);
+    assert!(t.contains("x=4"), "a variable did not carry over: {t}");
+    assert!(
+        t.lines().any(|l| l.trim() == "/etc"),
+        "cd did not carry over: {t}"
+    );
+    assert!(
+        t.contains("42"),
+        "the unterminated last line did not run: {t}"
+    );
 }
 
 #[test]

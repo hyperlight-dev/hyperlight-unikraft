@@ -1,0 +1,1 @@
+Put the files to count in data/; main.py sees them at /mnt/data.
