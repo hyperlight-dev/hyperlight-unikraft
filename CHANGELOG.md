@@ -4,6 +4,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Added
+
+- Two `hluk init` templates: `python-shell`, a Python script that runs shell commands through `subprocess` on the python-shell rootfs (the one runtime that had only `http-python`), and `bash-repl`, an interactive shell whose read-eval loop takes commands from `hluk run`'s stdin until Ctrl-D.
+
 ## [v0.14.2]
 
 ### Changed
