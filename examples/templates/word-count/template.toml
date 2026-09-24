@@ -1,0 +1,6 @@
+# The one file hluk reads to know what this directory is. It is not copied
+# into the project; everything else here is, with {{name}}, {{image}} and
+# the other placeholders filled in.
+[template]
+description = "Count the words in the files of a host directory, read-only inside the guest"
+runtime = "python"

@@ -1,0 +1,2 @@
+Each hluk run boots, or restores, a Hyperlight micro-VM with a Unikraft guest kernel.
+The guest reads this directory through a read-only mount and cannot write to it.

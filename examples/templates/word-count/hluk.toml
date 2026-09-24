@@ -1,0 +1,18 @@
+# hluk.toml -- the manifest for `{{name}}`. `hluk run` runs what it describes;
+# see docs/manifest.md in hyperlight-unikraft for every key.
+manifest_version = 1
+
+[app]
+name = "{{name}}"
+
+[rootfs]
+# {{image}} is the published rootfs of the runtime template.toml names,
+# pinned to the hluk release that ran `hluk init`.
+image = "{{image}}"
+
+[run]
+script = "main.py"
+warm = true
+# The project's data/ directory, read-only at /mnt/data: the guest sees
+# these files and nothing else of the host.
+mounts = ["./data:/mnt/data:ro"]
