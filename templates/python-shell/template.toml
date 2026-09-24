@@ -1,0 +1,4 @@
+[template]
+description = "A Python 3.12 script with a BusyBox shell to run commands through subprocess"
+runtime = "python-shell"
+tier = 2

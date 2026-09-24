@@ -1,0 +1,23 @@
+# hluk.toml -- the manifest for `{{name}}`. `hluk run` runs what it describes;
+# see docs/manifest.md in hyperlight-unikraft for every key.
+manifest_version = 1
+
+[app]
+name = "{{name}}"
+
+[rootfs]
+# The published python-shell rootfs: Python 3.12 plus BusyBox's hush shell
+# and its applets, and the SSL support `pip install` needs. Pinned to the
+# hluk release that wrote this file.
+image = "{{image}}"
+
+[run]
+script = "main.py"
+# Guest memory in MiB. The default is the size this runtime's image is
+# tested with (256 here); set it when the rootfs or the workload outgrows that.
+# scratch_mb = 256
+warm = true
+# mounts = ["./data:/mnt/data:ro"]
+# env = { GREETING = "hi" }
+# [run.net]
+# allow = ["pypi.org", "files.pythonhosted.org"]   # `pip install` from inside the guest
