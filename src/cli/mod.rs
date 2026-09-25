@@ -32,7 +32,7 @@ use hyperlight_unikraft::{
 };
 
 use crate::{
-    CliResult, PortSpec, base_builder, drive, elapsed_ms, parse_envs, parse_mounts,
+    Call, CliResult, PortSpec, base_builder, drive, elapsed_ms, parse_envs, parse_mounts,
     parse_net_policy, read_resolv_conf, resolve_exec,
 };
 use manifest::{Manifest, RootfsSource, Workload};
@@ -136,6 +136,19 @@ pub struct RunArgs {
     /// the guest's conventional entrypoint (/entrypoint.py, /entrypoint, …) runs.
     #[arg(long = "guest-exec", value_name = "COMMAND", conflicts_with_all = ["script", "exec"])]
     guest_exec: Option<String>,
+
+    /// Call a function the guest has defined, once the workload has run,
+    /// and print its result: a handler the script defined, an export of the
+    /// WebAssembly library --guest-exec loaded. With no workload, only the
+    /// call runs (on a handler --warm-exec defined, say). The quickjs, node,
+    /// python, dotnet-jit and wasmtime images serve guest function calls.
+    #[arg(long, value_name = "FUNCTION")]
+    call: Option<String>,
+
+    /// The call's input: JSON, passed to the function as its argument (for
+    /// WebAssembly, an array of its arguments). Default: none.
+    #[arg(long, value_name = "JSON", requires = "call")]
+    input: Option<String>,
 
     /// Mount a host directory into the guest filesystem.
     /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
@@ -975,7 +988,12 @@ pub fn run(args: RunArgs) -> CliResult<()> {
         }
     }
 
-    drive(&mut sandbox, no_workload, exec)
+    drive(
+        &mut sandbox,
+        no_workload,
+        exec,
+        Call::new(args.call.clone(), args.input.clone()),
+    )
 }
 
 /// A bare `--runtime` name must be one of the published images; a full

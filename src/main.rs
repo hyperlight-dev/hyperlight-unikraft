@@ -169,6 +169,15 @@ struct SnapshotRunArgs {
     #[arg(long = "guest-exec", value_name = "COMMAND", conflicts_with_all = ["script", "exec"])]
     guest_exec: Option<String>,
 
+    /// Call a function the guest has defined once the workload has run,
+    /// and print its result. See `hluk run --help`.
+    #[arg(long, value_name = "FUNCTION")]
+    call: Option<String>,
+
+    /// The call's input, JSON. See `hluk run --help`.
+    #[arg(long, value_name = "JSON", requires = "call")]
+    input: Option<String>,
+
     /// Mount a host directory into the guest filesystem.
     /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
     #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
@@ -478,19 +487,54 @@ fn base_builder(kernel: Option<PathBuf>, initrd: Option<PathBuf>) -> CliResult<S
     }
 }
 
-/// Run the workload in a booted guest.  With nothing to run and no driver
-/// to run it, the entry point is a plain program (`--entry /bin/server`):
-/// drive it to its exit the way a container runtime would, and exit with
-/// its status, as running it directly would.
-fn drive(sandbox: &mut AppSandbox, no_workload: bool, exec: Exec) -> CliResult<()> {
+/// A function to call once the workload has run (`--call`, `--input`).
+struct Call {
+    function: String,
+    input: String,
+}
+
+impl Call {
+    fn new(function: Option<String>, input: Option<String>) -> Option<Self> {
+        function.map(|function| Call {
+            function,
+            input: input.unwrap_or_default(),
+        })
+    }
+}
+
+/// Run the workload in a booted guest, then the call, printing its
+/// result; with a call and nothing else to run, only the call.  With
+/// nothing to run and no driver to run it, the entry point is a plain
+/// program (`--entry /bin/server`): drive it to its exit the way a
+/// container runtime would, and exit with its status, as running it
+/// directly would.
+fn drive(
+    sandbox: &mut AppSandbox,
+    no_workload: bool,
+    exec: Exec,
+    call: Option<Call>,
+) -> CliResult<()> {
     let t = Instant::now();
-    if !no_workload && !sandbox.has_driver() {
+    if (!no_workload || call.is_some()) && !sandbox.has_driver() {
         return Err(
             "the guest has no runtime driver to run the workload: a script, \
-                    --exec and --guest-exec need one in the rootfs (usr/local/bin/hl_*); \
+                    --exec, --guest-exec and --call need one in the rootfs (usr/local/bin/hl_*); \
                     a plain program runs as the entry point with --entry"
                 .into(),
         );
+    }
+    if let Some(call) = call {
+        if !no_workload {
+            sandbox.run(exec)?;
+            info!(elapsed_ms = elapsed_ms(t), "exec");
+        }
+        let t = Instant::now();
+        let result = sandbox.call(&call.function, &call.input)?;
+        info!(elapsed_ms = elapsed_ms(t), "call");
+        if !result.is_empty() {
+            println!("{result}");
+        }
+        return Ok(());
     }
     if no_workload && !sandbox.has_driver() {
         info!("no driver in the guest; driving its entry point to exit");
@@ -606,7 +650,12 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
     let no_workload = args.script.is_none() && args.exec.is_none() && args.guest_exec.is_none();
     let exec = resolve_exec(args.script, args.exec)?
         .unwrap_or_else(|| Exec::Guest(args.guest_exec.unwrap_or_default()));
-    drive(&mut sandbox, no_workload, exec)
+    drive(
+        &mut sandbox,
+        no_workload,
+        exec,
+        Call::new(args.call, args.input),
+    )
 }
 
 // ── Bench helpers ────────────────────────────────────────────────

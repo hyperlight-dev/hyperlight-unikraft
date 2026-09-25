@@ -217,3 +217,40 @@ fn bash_exit_ends_the_call() {
     sandbox.run("echo still here").unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 }
+
+/// Reading past the end of stdin keeps returning end of input: before,
+/// the second `read` after it waited forever and the guest deadlocked.
+#[test]
+fn bash_read_past_end_of_input() {
+    let rootfs = require_rootfs("bash");
+    let dir = temp_dir("bash-eof");
+    let script = dir.path().join("eof.sh");
+    std::fs::write(
+        &script,
+        "read a; echo \"first:$? a=$a\"\nread b; echo \"second:$?\"\nread c; echo \"third:$?\"\n",
+    )
+    .unwrap();
+    // No newline after the last byte: the first read gets it and the end.
+    let output = hluk_with_stdin(&rootfs, &script, b"x");
+    for line in ["first:1 a=x", "second:1", "third:1"] {
+        assert!(output.contains(line), "{line} missing from: {output:?}");
+    }
+}
+
+/// `call` on an image whose driver does not serve calls fails the call
+/// and runs nothing: the function name is not taken for code.
+#[test]
+fn bash_refuses_a_call() {
+    let rootfs = require_rootfs("bash");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs).boot().unwrap();
+    let err = sandbox.call("echo ran-as-code", "{}").unwrap_err();
+    assert!(
+        matches!(err, hyperlight_unikraft::Error::CallFailed { .. }),
+        "{err}"
+    );
+    let output = sandbox.drain_output();
+    assert!(!output.contains("ran-as-code"), "{output}");
+    assert!(output.contains("does not serve Call calls"), "{output}");
+    // The driver serves the next call as usual.
+    sandbox.run("echo still-here").unwrap();
+}

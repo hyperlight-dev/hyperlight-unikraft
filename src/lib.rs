@@ -138,6 +138,15 @@ pub enum Error {
          kernel/initrd/entry/scratch_mb do not apply to from_snapshot"
     )]
     SnapshotSettings,
+    /// A name given to [`SandboxBuilder::host_function`] cannot be one:
+    /// empty (it asks for the list of functions) or with a line break
+    /// (the list has one name per line).
+    #[error("{name:?} cannot name a host function: it must be non-empty and on one line")]
+    HostFunctionName { name: String },
+    /// A call's result was not UTF-8 text; [`AppSandbox::take_result`]
+    /// hands it over as bytes.
+    #[error("the call's result is not UTF-8 text")]
+    ResultNotText,
     /// The script of an [`Exec::File`] could not be read.
     #[error("failed to read script {}: {source}", path.display())]
     Script {
@@ -152,6 +161,66 @@ pub enum Error {
 
 /// The result of a sandbox operation.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A function the embedder offers the guest (see
+/// [`SandboxBuilder::host_function`]): its argument text in, its result
+/// text out, or an error message the guest raises as its own error.  The
+/// drivers speak JSON on both sides; the library passes the text through.
+pub type HostFunction =
+    Arc<dyn Fn(&str) -> std::result::Result<String, String> + Send + Sync + 'static>;
+
+/// The host functions a sandbox offers, by name.
+type HostFunctionTable = Arc<std::collections::BTreeMap<String, HostFunction>>;
+
+/// What `HostCall` answers: a tag byte, then the result or the error
+/// message.  The drivers read it back (`hl_driver.h`'s `hl_host_call`).
+const HOST_CALL_OK: u8 = 0;
+const HOST_CALL_ERR: u8 = 1;
+
+/// Run the host function `name` for the guest and encode its reply.  The
+/// empty name, which no function can have, lists the registered names one
+/// per line: how a driver learns what to offer before anything is called
+/// (the quickjs driver builds its `host:` modules from it).
+fn dispatch_host_call(table: &HostFunctionTable, name: &str, args: &[u8]) -> Vec<u8> {
+    // The name is the guest's: quoted in an error, it is cut short, so a
+    // long one cannot push the reply past what the guest can take.
+    let shown = || name.chars().take(128).collect::<String>();
+    let reply = if name.is_empty() {
+        Ok(table
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    } else {
+        match (table.get(name), std::str::from_utf8(args)) {
+            (Some(f), Ok(args)) => f(args),
+            (Some(_), Err(_)) => Err(format!("{}: the arguments are not UTF-8 text", shown())),
+            (None, _) => Err(format!("no host function {:?}", shown())),
+        }
+    };
+    let (tag, text) = match reply {
+        Ok(text) => (HOST_CALL_OK, text),
+        Err(message) => (HOST_CALL_ERR, message),
+    };
+    // A reply the guest's buffer cannot take would arrive cut short; it
+    // becomes an error the guest can report instead.
+    let (tag, text) = if text.len() + 1 > HOST_CALL_MAX {
+        (
+            HOST_CALL_ERR,
+            format!(
+                "{}: a {}-byte result exceeds the {HOST_CALL_MAX}-byte host call limit",
+                shown(),
+                text.len()
+            ),
+        )
+    } else {
+        (tag, text)
+    };
+    let mut out = Vec::with_capacity(text.len() + 1);
+    out.push(tag);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -179,10 +248,12 @@ pub const DEFAULT_SCRATCH_MB: usize = 256;
 pub const RUNTIME_SCRATCH_MB: &[(&str, usize)] = &[
     ("c", 64),
     ("rust", 64),
+    ("quickjs", 64),
     ("go", 128),
     ("bash", 256),
     ("python", 256),
     ("python-shell", 256),
+    ("wasmtime", 256),
     ("dotnet-aot", 256),
     ("node", 512),
     ("dotnet-jit", 768),
@@ -200,6 +271,8 @@ const DRIVER_RUNTIME: &[(&str, &str)] = &[
     ("hl_nodedriver", "node"),
     ("hl_dotnetdriver", "dotnet-jit"),
     ("hl_pwshdriver", "powershell"),
+    ("hl_quickjsdriver", "quickjs"),
+    ("hl_wasmtimedriver", "wasmtime"),
     ("hl_bashdriver", "bash"),
     ("hl_godriver", "go"),
     ("hl_cdriver", "c"),
@@ -659,6 +732,11 @@ pub(crate) struct GuestConfig {
     /// Events from the guest's last entry, in order; shared with the event
     /// host functions, which push, and drained by [`absorb`](Self::absorb).
     events: Arc<Mutex<Vec<Event>>>,
+    /// What the call in flight returned (`CallResult`), taken by
+    /// [`AppSandbox::take_result`]; cleared when a call is submitted.
+    result: Arc<Mutex<Option<Vec<u8>>>>,
+    /// The embedder's functions, served through `HostCall`.
+    host_functions: HostFunctionTable,
     /// What those events add up to.
     guest: Mutex<Guest>,
 }
@@ -690,8 +768,16 @@ impl GuestConfig {
             resolv_conf: Arc::new(Mutex::new(String::new())),
             net,
             events: Arc::new(Mutex::new(Vec::new())),
+            result: Arc::new(Mutex::new(None)),
+            host_functions: HostFunctionTable::default(),
             guest: Mutex::new(Guest::default()),
         }
+    }
+
+    /// The embedder's host functions; set before [`register`](Self::register).
+    fn with_host_functions(mut self, table: HostFunctionTable) -> Self {
+        self.host_functions = table;
+        self
     }
 
     /// How much scratch memory to give the paging frame allocator (75%).
@@ -898,6 +984,24 @@ impl GuestConfig {
                 Ok(0)
             },
         )?;
+        // What the call returned, sent just before its CallDone.
+        let result = self.result.clone();
+        target.register_host_function(
+            "CallResult",
+            move |bytes: Vec<u8>| -> hyperlight_host::Result<i32> {
+                *result.lock().unwrap() = Some(bytes);
+                Ok(0)
+            },
+        )?;
+        // The embedder's functions, all behind one name: the kernel
+        // forwards a driver's HLCALL_IOC_HOSTCALL here as it is.
+        let table = self.host_functions.clone();
+        target.register_host_function(
+            "HostCall",
+            move |name: String, args: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
+                Ok(dispatch_host_call(&table, &name, &args))
+            },
+        )?;
         let events = self.events.clone();
         target.register_host_function(
             "CallRejected",
@@ -994,6 +1098,11 @@ impl GuestConfig {
                 }
                 Event::Outcome(done @ (Yield::CallDone | Yield::CallFailed { .. })) => {
                     guest.call_in_flight = false;
+                    // A failed call's result, should a driver send one, is
+                    // not the call's.
+                    if matches!(done, Yield::CallFailed { .. }) {
+                        *self.result.lock().unwrap() = None;
+                    }
                     terminal = Some(done);
                 }
                 Event::DriverReady => guest.has_driver = true,
@@ -1012,6 +1121,8 @@ impl GuestConfig {
     /// follows has the guest say again what still holds.
     fn forget(&self) {
         self.events.lock().unwrap().clear();
+        // A result from the timeline the restore discarded is not this one's.
+        *self.result.lock().unwrap() = None;
         *self.guest.lock().unwrap() = Guest::default();
     }
 
@@ -1231,6 +1342,7 @@ fn fstab_arg(mounts: &[Mount]) -> Result<String> {
 /// pieces a [`SandboxBuilder`] gathered.  `kernel` is `None` for the
 /// embedded [`KERNEL`], `Some` for an external one; `initrd` is `None`
 /// for a self-contained kernel that carries its own workload.
+#[allow(clippy::too_many_arguments)]
 fn assemble_sandbox(
     kernel: &Option<PathBuf>,
     initrd: &Option<PathBuf>,
@@ -1239,6 +1351,7 @@ fn assemble_sandbox(
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    host_functions: HostFunctionTable,
 ) -> Result<(UninitializedSandbox, GuestConfig)> {
     let scratch_size = scratch_mb * 1024 * 1024;
     info!(scratch_mb, "guest memory");
@@ -1310,7 +1423,8 @@ fn assemble_sandbox(
         mounts,
         network,
         listen_ports,
-    );
+    )
+    .with_host_functions(host_functions);
 
     config.register(&mut usandbox)?;
 
@@ -1357,6 +1471,7 @@ pub struct SandboxBuilder {
     listen_ports: Option<ListenPorts>,
     env_vars: Vec<(String, String)>,
     resolv_conf: Option<String>,
+    host_functions: std::collections::BTreeMap<String, HostFunction>,
 }
 
 impl SandboxBuilder {
@@ -1373,6 +1488,7 @@ impl SandboxBuilder {
             listen_ports: None,
             env_vars: Vec::new(),
             resolv_conf: None,
+            host_functions: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1494,6 +1610,39 @@ impl SandboxBuilder {
         self
     }
 
+    /// Offer the guest a function of the host's, by name: the way to give
+    /// code in the sandbox one capability rather than a directory or the
+    /// network.  It takes the guest's argument text and returns its result
+    /// text, or an error message the guest raises; the drivers pass JSON.
+    /// JavaScript calls it as `host.call(name, ...args)` (quickjs, node),
+    /// and in quickjs `a.b` is also the export `b` of the module `host:a`;
+    /// Python as `hyperlight.call(name, *args)` or `hyperlight.host.a.b()`
+    /// (python, python-shell, agent); C# as `Host.Call(name, args)`
+    /// (dotnet-jit); the wasmtime image satisfies a module's or a
+    /// component's import `a.b` with it.
+    ///
+    /// ```no_run
+    /// # use hyperlight_unikraft::SandboxBuilder;
+    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/quickjs.cpio")
+    ///     .host_function("math.add", |args| {
+    ///         let [a, b]: [f64; 2] = serde_json::from_str(args).map_err(|e| e.to_string())?;
+    ///         Ok((a + b).to_string())
+    ///     })
+    ///     .boot()?;
+    /// sandbox.run("import { add } from 'host:math'; console.log(add(2, 3))")?;
+    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// ```
+    ///
+    /// Registered with the sandbox, not the guest, so a guest restored from
+    /// a snapshot calls the functions of the builder that restores it.
+    pub fn host_function<F>(mut self, name: impl Into<String>, function: F) -> Self
+    where
+        F: Fn(&str) -> std::result::Result<String, String> + Send + Sync + 'static,
+    {
+        self.host_functions.insert(name.into(), Arc::new(function));
+        self
+    }
+
     /// Register the host functions, bring the guest to a running state, and
     /// return it as a [`AppSandbox`].
     ///
@@ -1512,7 +1661,17 @@ impl SandboxBuilder {
             listen_ports,
             env_vars,
             resolv_conf,
+            host_functions,
         } = self;
+        // The empty name asks for the list of functions, one per line, so
+        // neither it nor a line break can be in a function's name.
+        if let Some(name) = host_functions
+            .keys()
+            .find(|n| n.is_empty() || n.contains(['\n', '\r']))
+        {
+            return Err(Error::HostFunctionName { name: name.clone() });
+        }
+        let host_functions: HostFunctionTable = Arc::new(host_functions);
 
         let restored = snapshot.is_some();
         if restored
@@ -1531,7 +1690,8 @@ impl SandboxBuilder {
         }
         let (sandbox, cfg) = match snapshot {
             Some(snapshot) => {
-                let (sandbox, cfg) = restore_snapshot(snapshot, mounts, network, listen_ports)?;
+                let (sandbox, cfg) =
+                    restore_snapshot(snapshot, mounts, network, listen_ports, host_functions)?;
                 cfg.set_env_vars(&env_refs);
                 // Read by the resume entry below, which rewrites the file.
                 if let Some(rc) = &resolv_conf {
@@ -1575,6 +1735,7 @@ impl SandboxBuilder {
                     mounts,
                     network,
                     listen_ports,
+                    host_functions,
                 )?;
                 // Before the boot: the kernel fetches the environment once
                 // on its way to main(), so an entry-point program starts
@@ -1681,6 +1842,16 @@ pub enum Exec {
     /// `/entrypoint`, …). Dispatched at the same point as any other `Exec`, so
     /// it works identically on a fresh boot or a restored snapshot.
     Guest(String),
+    /// Call the function `function` the guest has defined, with `input`,
+    /// for its result: in the quickjs and node images a global function,
+    /// in the python ones a function of `__main__`, in dotnet-jit a public
+    /// static method, called with `input` parsed as JSON and its return
+    /// value (awaited) serialized back; in the wasmtime image an export of
+    /// the module or component the guest has loaded, `input` a JSON array
+    /// of its arguments.  Other images fail the call.  [`AppSandbox::call`] waits for the result;
+    /// [`AppSandbox::take_result`] collects it after a
+    /// [`submit`](AppSandbox::submit).
+    Call { function: String, input: String },
 }
 
 impl From<&str> for Exec {
@@ -1775,6 +1946,43 @@ impl AppSandbox {
         }
     }
 
+    /// Call a function the guest has defined and wait for its result: a
+    /// handler loaded once (by a [`run`](Self::run), or in a warm snapshot)
+    /// and called many times with different input.  See [`Exec::Call`] for
+    /// what each image does with `function` and `input`.
+    ///
+    /// ```no_run
+    /// # use hyperlight_unikraft::SandboxBuilder;
+    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/quickjs.cpio").boot()?;
+    /// sandbox.run("function greet(event) { return { message: 'Hello, ' + event.name } }")?;
+    /// let out = sandbox.call("greet", r#"{"name":"World"}"#)?;
+    /// assert_eq!(out, r#"{"message":"Hello, World"}"#);
+    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// ```
+    ///
+    /// Errors as [`run`](Self::run) does, and with
+    /// [`Error::ResultNotText`] when the result is not UTF-8.
+    pub fn call(&mut self, function: &str, input: &str) -> Result<String> {
+        self.run(Exec::Call {
+            function: function.to_string(),
+            input: input.to_string(),
+        })?;
+        let bytes = self.take_result().unwrap_or_default();
+        String::from_utf8(bytes).map_err(|e| {
+            // Put it back, so take_result hands it over as bytes.
+            *self.config.result.lock().unwrap() = Some(e.into_bytes());
+            Error::ResultNotText
+        })
+    }
+
+    /// The result of the last call, if its driver sent one: for a call
+    /// submitted with [`submit`](Self::submit) and driven with
+    /// [`step`](Self::step) to [`Yield::CallDone`].  Taken, so a second
+    /// take returns `None`.
+    pub fn take_result(&self) -> Option<Vec<u8>> {
+        self.config.result.lock().unwrap().take()
+    }
+
     /// Keep the guest running until its process exits, and return its exit
     /// status.
     ///
@@ -1850,21 +2058,34 @@ impl AppSandbox {
         if self.config.call_in_flight() {
             return Err(Error::CallInFlight);
         }
-        let (name, arg) = match exec.into() {
-            Exec::Code(code) => ("Exec", code),
+        // A finished outcome still waiting for a step (the call a restored
+        // snapshot had in flight, finishing on its resume) is not this
+        // call's: it must not end this call's wait.
+        if matches!(
+            self.pending,
+            Some(Yield::CallDone | Yield::CallFailed { .. })
+        ) {
+            self.pending = None;
+        }
+        *self.config.result.lock().unwrap() = None;
+        let yielded = match exec.into() {
+            Exec::Code(code) => self.config.enter(&mut self.sandbox, "Exec", code)?,
             Exec::File(path) => {
                 let code = std::fs::read_to_string(&path).map_err(|source| Error::Script {
                     path: path.clone(),
                     source,
                 })?;
-                ("Exec", code)
+                self.config.enter(&mut self.sandbox, "Exec", code)?
             }
             // Dispatched under its own name so the driver runs the named
             // guest file (empty command → its conventional entrypoint)
             // rather than treating the payload as inline code.
-            Exec::Guest(cmd) => ("GuestExec", cmd),
+            Exec::Guest(cmd) => self.config.enter(&mut self.sandbox, "GuestExec", cmd)?,
+            Exec::Call { function, input } => {
+                self.config
+                    .enter(&mut self.sandbox, "Call", (function, input))?
+            }
         };
-        let yielded = self.config.enter(&mut self.sandbox, name, arg)?;
         match self.note(yielded) {
             Yield::Blocked { .. } => {}
             terminal => self.pending = Some(terminal),
@@ -2029,6 +2250,7 @@ fn restore_snapshot(
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    host_functions: HostFunctionTable,
 ) -> Result<(MultiUseSandbox, GuestConfig)> {
     let config = GuestConfig::new(
         String::new(),
@@ -2038,7 +2260,8 @@ fn restore_snapshot(
         mounts,
         network,
         listen_ports,
-    );
+    )
+    .with_host_functions(host_functions);
     let mut hf = HostFunctions::default();
     config.register(&mut hf)?;
 

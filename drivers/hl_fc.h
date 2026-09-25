@@ -113,17 +113,17 @@ static inline size_t fb_follow(const uint8_t *b, size_t len, size_t tbl, uint16_
 /* ── FunctionCall string extraction ────────────────────────────── */
 
 /*
- * Extract the first parameter as a string from a FunctionCall FlatBuffer.
+ * Extract parameter `index` as a string from a FunctionCall FlatBuffer.
  *
  * Returns a pointer into `fc` and sets *out_len to the string length,
- * or returns NULL if the first parameter isn't a string, or the buffer
- * is malformed.
+ * or returns NULL if there is no parameter `index`, it isn't a string,
+ * or the buffer is malformed.
  *
  * The returned pointer is NOT NUL-terminated — the caller must copy
  * and terminate before passing to string APIs.
  */
-static inline const char *fc_arg0_string(const uint8_t *fc, size_t fc_len,
-					 size_t *out_len)
+static inline const char *fc_arg_string(const uint8_t *fc, size_t fc_len,
+					size_t index, size_t *out_len)
 {
 	size_t root, params, p0_pos, p0, tf, hs, s;
 	uint32_t count, off, slen;
@@ -135,11 +135,11 @@ static inline const char *fc_arg0_string(const uint8_t *fc, size_t fc_len,
 	/* FunctionCall.parameters (vtable offset 6) → vector of Parameter */
 	params = fb_follow(fc, fc_len, root, 6);
 	if (!params || params == FB_BAD ||
-	    !fb_get_u32(fc, fc_len, params, &count) || count == 0)
+	    !fb_get_u32(fc, fc_len, params, &count) || index >= count)
 		return NULL;
 
-	/* First parameter: the vector's first uoffset */
-	p0_pos = params + 4;
+	/* Parameter `index`: the vector's uoffset at that position */
+	p0_pos = params + 4 + 4 * index;
 	if (!fb_get_u32(fc, fc_len, p0_pos, &off))
 		return NULL;
 	p0 = p0_pos + (size_t)off;
@@ -162,6 +162,14 @@ static inline const char *fc_arg0_string(const uint8_t *fc, size_t fc_len,
 
 	*out_len = slen;
 	return (const char *)(fc + s + 4);
+}
+
+/* The first parameter as a string: an Exec's code, a GuestExec's command
+ * line, a Call's function name. */
+static inline const char *fc_arg0_string(const uint8_t *fc, size_t fc_len,
+					 size_t *out_len)
+{
+	return fc_arg_string(fc, fc_len, 0, out_len);
 }
 
 /* ── FunctionCall name ─────────────────────────────────────────── */
