@@ -4,7 +4,7 @@ A driver is the program the kernel starts in a runtime image.  It brings its run
 
 ## The device
 
-The whole contract is one character device, `/dev/hlcall`, and five operations on it, listed in the order a driver uses them:
+The whole contract is one character device, `/dev/hlcall`, and six operations on it, listed in the order a driver uses them:
 
 | Operation | Meaning |
 |---|---|
@@ -12,9 +12,10 @@ The whole contract is one character device, `/dev/hlcall`, and five operations o
 | `ioctl(HLCALL_IOC_MAXLEN)` | How large a call can be, a `uint64_t` the kernel knows from the host's PEB.  The driver allocates its read buffer from it, once. |
 | `read()` | Blocks until the host issues a call, then returns it whole: the FunctionCall FlatBuffer as the host encoded it.  Reading again completes the previous call. |
 | `ioctl(HLCALL_IOC_GETENV)` | The variables the embedder set (`--env`, `set_env_vars`) as they are now, `KEY=VALUE` entries separated by NUL, into a buffer the driver provides.  Asked at the top of every call. |
-| `write()` | An `int32_t` status for the call being served, written only when it failed.  Refused when no call is in flight. |
+| `ioctl(HLCALL_IOC_HOSTCALL)` | Call one of the embedder's functions (`SandboxBuilder::host_function`) by name and get its reply. The kernel forwards it as the host function `HostCall(name, args)`. Only while a call is in flight. |
+| `write()` | An `int32_t` status for the call being served, optionally followed by its result, which the kernel sends as `CallResult` before `CallDone`. Written when the call failed or has a result. Refused when no call is in flight. |
 
-The ioctl numbers, `_IOR('H', 1, uint64_t)` and `_IOWR('H', 2, struct hlcall_env)`, are built with the standard macros, so the argument's size is part of the number and a layout mismatch between the two sides reads as `ENOTTY`.  The kernel's `plat/hyperlight/include/hyperlight-x86/step.h` is the source of truth; `hl_driver.h` mirrors it.
+The ioctl numbers, `_IOR('H', 1, uint64_t)`, `_IOWR('H', 2, struct hlcall_env)` and `_IOWR('H', 3, struct hlcall_hostcall)`, are built with the standard macros, so the argument's size is part of the number and a layout mismatch between the two sides reads as `ENOTTY`.  The kernel's `plat/hyperlight/include/hyperlight-x86/step.h` is the source of truth; `hl_driver.h` mirrors it.
 
 ## From boot to a call
 
@@ -56,7 +57,15 @@ A call can block.  `run("time.sleep(2)")` puts the driver thread to sleep, and t
 
 ## What a call carries
 
-`Exec` carries source: `run("print(6*7)")` arrives as `Exec` with that string as its one parameter, and the callback runs it in the runtime (an `Exec::File` is read on the host and sent the same way).  `GuestExec` carries a command line for a program already in the image: `run(Exec::Guest("/app/server --port 8080"))` arrives as `GuestExec` with that line, the callback runs the file with that argv, and an empty line runs the image's conventional entrypoint, `/entrypoint.py` in the python image.  [`hl_fc.h`](../drivers/hl_fc.h) reads the name and the parameter out of the FlatBuffer.  One call at a time: the host finishes one before it issues the next.
+`Exec` carries source: `run("print(6*7)")` arrives as `Exec` with that string as its one parameter, and the callback runs it in the runtime (an `Exec::File` is read on the host and sent the same way).  `GuestExec` carries a command line for a program already in the image: `run(Exec::Guest("/app/server --port 8080"))` arrives as `GuestExec` with that line, the callback runs the file with that argv, and an empty line runs the image's conventional entrypoint, `/entrypoint.py` in the python image.  [`hl_fc.h`](../drivers/hl_fc.h) reads the name and the parameters out of the FlatBuffer.  One call at a time: the host finishes one before it issues the next.
+
+`Call` carries a function name and an input. `call("greet", r#"{"name":"World"}"#)` asks the driver to run the guest's `greet` and send back its result with `hl_set_result()`. A driver opts in with `hl_driver_serve_calls()`. Without it, `hl_driver_run` fails a `Call` itself, so a callback written for `Exec` never runs a function name as code. A result is at most 64 KiB; the kernel refuses a larger one and the call fails. [calls.md](calls.md) covers what each image does with a call.
+
+## Host functions
+
+`hl_host_call("math.add", "[2,3]", ...)` runs the embedder's `math.add` and returns 0 with its result, 1 with its error message, or -1 if the call couldn't be made (no call in flight, or a host without `HostCall`). Every embedder function travels as one host function, `HostCall(name, args)`, which the library dispatches by name, so a new function needs no kernel change. The bytes pass through untouched; the drivers use JSON. The empty name lists the registered functions, one per line.
+
+Call it from the thread serving the call. The node and dotnet-jit runtimes are child processes, so the child sends each host function call up its pipe and the driver makes it.
 
 ## The environment
 
@@ -70,9 +79,9 @@ A snapshot taken while the driver is parked in `read()` is a warm image: restore
 
 The loop is the same in every driver; what differs is where the runtime lives, and that decides how a call and the environment reach it.
 
-Python is embedded: `hl_pydriver` and `hl_pywarmdriver` link `libpython` and run the code with `PyRun_SimpleString` in their own process, which is why those images can set `os.environ` through the C API.
+Python is embedded: `hl_pydriver` and `hl_pywarmdriver` link `libpython` and run the code with `PyRun_SimpleString` in their own process, which is why those images can set `os.environ` through the C API.  `hl_quickjsdriver` embeds quickjs-ng the same way. `hl_wasmtimedriver` embeds Wasmtime and is written in Rust, with its own port of these headers in `drivers/wasmtime/driver/src/hlcall.rs`.
 
-Node and .NET (the dotnet-jit image) ship as programs, so `hl_nodedriver` and `hl_dotnetdriver` spawn one child at boot and keep it: the child sits in a read on a pipe from the driver, gets each call as length-prefixed code, runs it and writes back an ack byte.  Kept across calls it stays warm, and a snapshot keeps it warm.  `hl_bashdriver` does the same with a BusyBox `hush`, except that the call goes into a file and the byte on the pipe says "source it".  Such a child can only be reached through the source it is fed, hence the quoted assignments in front of each call.
+Node and .NET (the dotnet-jit image) ship as programs, so `hl_nodedriver` and `hl_dotnetdriver` spawn one child at boot and keep it: the child sits in a read on a pipe from the driver, gets each call as length-prefixed code, runs it and writes back its status.  Both children also take a `Call` (a function name and input) and write back its result, and send each host function call up the same pipe for the driver to make; [`hl_child.h`](../drivers/hl_child.h) has the protocol.  Kept across calls it stays warm, and a snapshot keeps it warm.  `hl_bashdriver` does the same with a BusyBox `hush`, except that the call goes into a file and the byte on the pipe says "source it".  Such a child can only be reached through the source it is fed, hence the quoted assignments in front of each call.
 
 `hl_pwshdriver` starts a fresh `pwsh` per call, and `hl_execdriver`, behind the c, go, rust and dotnet-aot images, simply runs the program the call names, seeing its exit as EOF on a pipe.  A process spawned per call inherits `environ`, so `setenv()` alone reaches it.
 

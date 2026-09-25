@@ -31,7 +31,7 @@ runtime = "python"   # the published rootfs the project runs on
 tier = 2             # optional: the runtime's support tier, for ordering
 ```
 
-`runtime` is one of the images every release publishes: `python`, `python-shell`, `agent`, `node`, `bash`, `c`, `go`, `rust`, `dotnet-aot`, `dotnet-jit` or `powershell`. It decides which image `{{image}}` and `{{base}}` name. Unknown keys are errors.
+`runtime` is one of the images every release publishes: `python`, `python-shell`, `agent`, `node`, `bash`, `c`, `go`, `rust`, `dotnet-aot`, `dotnet-jit`, `powershell`, `quickjs` or `wasmtime`. It decides which image `{{image}}` and `{{base}}` name. Unknown keys are errors.
 
 Every other file is copied into the project with its path kept, and one that is executable stays executable (on Unix), so a `build.sh` the `[build] command` runs works. A file named `X.tmpl` is written as `X`, which is how a template that is itself inside a Rust crate ships a `Cargo.toml` (a real one would make `cargo package` treat the directory as a nested crate and leave it out). Symlinks are skipped, and so are `.git` and `.hluk` (what `hluk build` and `hluk run` leave when you try a template in place); other build output left in the directory is copied like any file, so clean it out first. Files are text: each one goes through placeholder substitution, so a file that is not UTF-8 is refused, and a template is held to 256 files and 4 MiB so a mistyped path does not copy a whole tree.
 
