@@ -22,6 +22,10 @@ public static class RoslynCompiler
     private static object? _state;
     private static int _compilationId;
 
+    /// <summary>The snippets run so far, oldest first: where a guest
+    /// function call looks for the method it names.</summary>
+    internal static readonly List<Assembly> Loaded = new();
+
     // Common using directives prepended to user code so simple scripts
     // work without explicit imports (same UX as Python/Node drivers).
     private const string Preamble = @"
@@ -31,6 +35,8 @@ using System.Linq;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Text.Json;
+using Hyperlight;
 ";
 
     /// <summary>
@@ -74,6 +80,20 @@ using System.Threading.Tasks;
             using var ms = new MemoryStream();
             var emitResult = compilation.Emit(ms);
 
+            // Only definitions, no statements: a library, for guest
+            // function calls to find its methods (CS5001: no Main).
+            bool library = false;
+            if (!emitResult.Success && emitResult.Diagnostics
+                    .Where(d => d.Severity == DiagnosticSeverity.Error)
+                    .All(d => d.Id == "CS5001"))
+            {
+                compilation = compilation.WithOptions(
+                    compilation.Options.WithOutputKind(OutputKind.DynamicallyLinkedLibrary));
+                ms.SetLength(0);
+                emitResult = compilation.Emit(ms);
+                library = true;
+            }
+
             if (!emitResult.Success)
             {
                 var errors = emitResult.Diagnostics
@@ -84,6 +104,9 @@ using System.Threading.Tasks;
 
             ms.Seek(0, SeekOrigin.Begin);
             var assembly = Assembly.Load(ms.ToArray());
+            Loaded.Add(assembly);
+            if (library)
+                return (true, null);
             var entryPoint = assembly.EntryPoint;
 
             if (entryPoint == null)

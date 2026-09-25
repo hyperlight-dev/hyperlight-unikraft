@@ -348,3 +348,139 @@ fn dotnet_jit_out_of_memory_is_an_exception() {
     sandbox.run("Console.WriteLine(\"still here\");").unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 }
+
+/// A public static method of a snippet run earlier, called with JSON in
+/// and out: a snippet of only definitions loads as a library, statics
+/// persist, a task is awaited, and a newer definition wins.
+#[test]
+fn dotnet_jit_calls_a_guest_function() {
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("dotnet-jit"))
+        .scratch_mb(768)
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "public record Event(string Name);\n\
+             public static class Handlers {\n\
+                 static int calls;\n\
+                 public static object Greet(Event e) => new { Greeting = $\"Hello, {e.Name}!\", Calls = ++calls };\n\
+                 public static async Task<int> Later(JsonElement e) { await Task.Delay(10); return e.GetProperty(\"x\").GetInt32() * 2; }\n\
+                 public static void Nothing() => Console.WriteLine(\"ran\");\n\
+                 public static int Bad(JsonElement e) => throw new InvalidOperationException(\"handler boom\");\n\
+             }",
+        )
+        .unwrap();
+    assert_eq!(
+        sandbox.call("Greet", r#"{"name":"World"}"#).unwrap(),
+        r#"{"greeting":"Hello, World!","calls":1}"#
+    );
+    assert_eq!(
+        sandbox
+            .call("Handlers.Greet", r#"{"name":"again"}"#)
+            .unwrap(),
+        r#"{"greeting":"Hello, again!","calls":2}"#
+    );
+    assert_eq!(sandbox.call("Later", r#"{"x":21}"#).unwrap(), "42");
+    assert_eq!(sandbox.call("Nothing", "").unwrap(), "");
+    assert!(matches!(
+        sandbox.call("Bad", "{}"),
+        Err(hyperlight_unikraft::Error::CallFailed { status: 1 })
+    ));
+    assert!(sandbox.call("Missing", "{}").is_err());
+    assert!(sandbox.call("Greet", "not json").is_err());
+    let output = sandbox.drain_output();
+    assert!(output.contains("ran"), "{output}");
+    assert!(output.contains("handler boom"), "{output}");
+    assert!(
+        output.contains("no public static method Missing"),
+        "{output}"
+    );
+    // A snippet with statements still runs, and its definitions are found.
+    sandbox
+        .run("Console.WriteLine(\"statements\");\npublic static class More { public static string Greet(JsonElement e) => \"newer\"; }")
+        .unwrap();
+    assert_eq!(sandbox.call("Greet", "{}").unwrap(), r#""newer""#);
+}
+
+/// The embedder's functions through `Host.Call`; a host error is a
+/// `HostException`.
+#[test]
+fn dotnet_jit_calls_host_functions() {
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("dotnet-jit"))
+        .scratch_mb(768)
+        .host_function("math.add", |args| {
+            let v: Vec<f64> = serde_json::from_str(args).map_err(|e| e.to_string())?;
+            Ok(v.iter().sum::<f64>().to_string())
+        })
+        .host_function("math.fail", |_| Err("no can do".to_string()))
+        .host_function("db.lookup", |args| {
+            let id = args.trim_matches(|c| c == '[' || c == ']');
+            Ok(format!(r#"{{"id": {id}, "name": "Ada"}}"#))
+        })
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "Console.WriteLine(Host.Call<int>(\"math.add\", 2, 3));\n\
+             Console.WriteLine(Host.Call(\"db.lookup\", 7)?.GetProperty(\"name\"));\n\
+             try { Host.Call(\"math.fail\"); } catch (HostException e) { Console.WriteLine($\"caught {e.Message}\"); }",
+        )
+        .unwrap();
+    assert_eq!(sandbox.drain_output(), "5\r\nAda\r\ncaught no can do\r\n");
+    sandbox
+        .run("public static class H { public static double Total(double[] v) => Host.Call<double>(\"math.add\", v.Cast<object>().ToArray()); }")
+        .unwrap();
+    assert_eq!(sandbox.call("Total", "[1,2,3]").unwrap(), "6");
+}
+
+/// A host function call from a thread the guest function left behind,
+/// after the call ended, is refused rather than interleaved with the
+/// next call on the pipe.
+#[test]
+fn dotnet_jit_host_call_after_the_call_is_refused() {
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("dotnet-jit"))
+        .scratch_mb(768)
+        .host_function("log", |_| Ok(String::new()))
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "public static class Bg {\n\
+                 public static void Start() => Task.Run(async () => {\n\
+                     await Task.Delay(50);\n\
+                     try { Host.Call(\"log\"); Console.WriteLine(\"bg: called\"); }\n\
+                     catch (InvalidOperationException) { Console.WriteLine(\"bg: refused\"); }\n\
+                 });\n\
+                 public static int Echo(int x) => x;\n\
+             }",
+        )
+        .unwrap();
+    sandbox.call("Start", "").unwrap();
+    // Calls go on working while the background thread tries the host.
+    for i in 0..5 {
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(sandbox.call("Echo", &i.to_string()).unwrap(), i.to_string());
+    }
+    sandbox.run("Thread.Sleep(100);").unwrap();
+    let output = sandbox.drain_output();
+    assert!(!output.contains("bg: called"), "{output}");
+}
+
+/// `examples/dotnet-jit/Handler.cs`: loaded once, called twice, its state carried over.
+#[test]
+fn dotnet_jit_handler_example() {
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dotnet-jit/Handler.cs");
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("dotnet-jit"))
+        .scratch_mb(768)
+        .boot()
+        .unwrap();
+    sandbox.run(Exec::File(example)).unwrap();
+    assert_eq!(
+        sandbox.call("Handler", r#"{"name":"World"}"#).unwrap(),
+        r#"{"greeting":"Hello, World!","calls":1}"#
+    );
+    assert_eq!(
+        sandbox.call("Handler", r#"{"name":"again"}"#).unwrap(),
+        r#"{"greeting":"Hello, again!","calls":2}"#
+    );
+}
