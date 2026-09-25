@@ -1,0 +1,24 @@
+# hluk.toml -- the manifest for `{{name}}`. `hluk build` compiles it and
+# `hluk run` runs it; see docs/manifest.md in hyperlight-unikraft for every key.
+manifest_version = 1
+
+[app]
+name = "{{name}}"
+
+[rootfs]
+# The published wasmtime rootfs: Wasmtime and its WASI 0.1-0.3 host, nothing
+# else. Your component is mounted from the host at run time.
+image = "{{image}}"
+
+[build]
+# .cargo/config.toml builds for wasm32-wasip2 (`rustup target add
+# wasm32-wasip2` once).
+command = "cargo build --release"
+
+[run]
+mounts = ["./target/wasm32-wasip2/release:/mnt/app:ro"]
+guest_exec = "/mnt/app/app.wasm"
+# Guest memory in MiB. The default is the size this runtime's image is
+# tested with (256 here); set it when the workload outgrows that.
+# scratch_mb = 256
+warm = true

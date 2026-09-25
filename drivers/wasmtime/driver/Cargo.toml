@@ -1,0 +1,34 @@
+# hl_wasmtimedriver: the wasmtime image's driver.  Its own package (and
+# lockfile), built inside drivers/wasmtime/Dockerfile for the guest; the
+# hyperlight-unikraft crate does not depend on it.
+[package]
+name = "hl_wasmtimedriver"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "hl_wasmtimedriver"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+wasmtime = { version = "49", default-features = false, features = [
+    "cranelift", "wat", "runtime", "component-model", "component-model-async", "std",
+    "addr2line", "demangle",
+] }
+wasmtime-wasi = { version = "49", default-features = false, features = ["p1", "p3"] }
+wasmparser = "0.240"
+wat = "1"
+serde_json = "1"
+rand_core = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
+
+[workspace]

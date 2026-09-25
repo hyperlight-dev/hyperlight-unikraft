@@ -1,0 +1,4 @@
+[template]
+description = "A Rust program compiled to a WASI 0.2 component on the host, run by Wasmtime in the guest"
+runtime = "wasmtime"
+tier = 3

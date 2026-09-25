@@ -1,0 +1,4 @@
+# Build for WASI 0.2: a component, which the guest's Wasmtime runs.
+# `rustup target add wasm32-wasip2` once.
+[build]
+target = "wasm32-wasip2"

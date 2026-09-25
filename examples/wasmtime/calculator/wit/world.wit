@@ -1,0 +1,14 @@
+package my:app;
+
+/// Provided by the embedder: hluk links each function of an interface it
+/// does not know (anything but WASI) to the host function `math.<name>`.
+interface math {
+    add: func(a: s32, b: s32) -> s32;
+}
+
+world calculator {
+    import math;
+    export sum-of-squares: func(a: s32, b: s32) -> s32;
+    /// WASI 0.3: an async export, awaiting a timer before it answers.
+    export slow-sum-of-squares: async func(a: s32, b: s32, delay-ms: u64) -> s32;
+}
