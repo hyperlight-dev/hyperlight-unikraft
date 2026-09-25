@@ -32,8 +32,8 @@
 
 #include "hl_fc.h"
 #include "hl_env.h"
-#include "hl_py.h"
 #include "hl_driver.h"
+#include "hl_py.h"
 
 /* ── Entry point ───────────────────────────────────────────────── */
 
@@ -55,6 +55,7 @@ int main(int argc, char **argv)
 	/* Initialize Python while VFS is fully alive — open(),
 	 * read(), etc. all work for loading /usr/lib/python3.12/ */
 	Py_UTF8Mode = 1;
+	hl_py_preinit();
 	Py_Initialize();
 
 	PyRun_SimpleString(
