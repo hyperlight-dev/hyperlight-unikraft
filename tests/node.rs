@@ -313,3 +313,140 @@ fn node_exit_ends_the_call() {
         "the exit stopped an earlier call's background work"
     );
 }
+
+/// A global function, called with JSON in and out; a promise is awaited,
+/// an error fails the call, and the timers the call starts run first.
+#[test]
+fn node_calls_a_function_with_json() {
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("node"))
+        .scratch_mb(512)
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "var n = 0;\n\
+             function greet(event) { return { message: 'Hello, ' + event.name, n: ++n } }\n\
+             async function later(event) { await new Promise((r) => setTimeout(r, 10)); return event.x * 2 }\n\
+             function nothing() { setTimeout(() => console.log('timer ran'), 5) }\n\
+             function bad() { throw new Error('handler boom') }\n\
+             function never() { return new Promise(() => {}) }\n\
+             function leave() { process.exit(3) }",
+        )
+        .unwrap();
+    assert_eq!(
+        sandbox.call("greet", r#"{"name":"World"}"#).unwrap(),
+        r#"{"message":"Hello, World","n":1}"#
+    );
+    assert_eq!(sandbox.call("later", r#"{"x":21}"#).unwrap(), "42");
+    assert_eq!(sandbox.call("nothing", "").unwrap(), "");
+    // Empty input is no argument at all.
+    sandbox
+        .run("function count(...args) { return args.length }")
+        .unwrap();
+    assert_eq!(sandbox.call("count", "").unwrap(), "0");
+    assert_eq!(sandbox.call("count", "1").unwrap(), "1");
+    assert!(matches!(
+        sandbox.call("bad", "{}"),
+        Err(hyperlight_unikraft::Error::CallFailed { status: 1 })
+    ));
+    assert!(matches!(
+        sandbox.call("leave", "{}"),
+        Err(hyperlight_unikraft::Error::CallFailed { status: 3 })
+    ));
+    assert!(sandbox.call("never", "{}").is_err());
+    assert!(sandbox.call("missing", "{}").is_err());
+    assert!(sandbox.call("greet", "not json").is_err());
+    let output = sandbox.drain_output();
+    assert!(output.contains("timer ran"), "{output}");
+    assert!(output.contains("handler boom"), "{output}");
+    assert!(output.contains("never settled"), "{output}");
+    assert!(output.contains("no function missing"), "{output}");
+    assert_eq!(
+        sandbox.call("greet", r#"{"name":"x"}"#).unwrap(),
+        r#"{"message":"Hello, x","n":2}"#
+    );
+}
+
+/// The embedder's functions through `host.call`; a host error is an
+/// `Error` with its message.
+#[test]
+fn node_calls_host_functions() {
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("node"))
+        .scratch_mb(512)
+        .host_function("math.add", |args| {
+            let v: Vec<f64> = serde_json::from_str(args).map_err(|e| e.to_string())?;
+            Ok(v.iter().sum::<f64>().to_string())
+        })
+        .host_function("math.fail", |_| Err("no can do".to_string()))
+        .host_function("big", |_| Ok(format!("\"{}\"", "x".repeat(40_000))))
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "console.log(host.call('math.add', 2, 3), host.call('big').length);\n\
+             try { host.call('math.fail') } catch (e) { console.log('caught', e.message) }\n\
+             try { host.call('nope') } catch (e) { console.log('caught', e.message) }\n\
+             for (const n of ['\\uD800', '']) {\n\
+               try { host.call(n); console.log('no throw') } catch (e) { console.log('threw') }\n\
+             }",
+        )
+        .unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.starts_with("5 40000\r\ncaught no can do\r\n"),
+        "{output}"
+    );
+    assert!(output.contains("no host function"), "{output}");
+    assert!(output.ends_with("threw\r\nthrew\r\n"), "{output}");
+    sandbox
+        .run("function total(event) { return host.call('math.add', ...event.values) }")
+        .unwrap();
+    assert_eq!(sandbox.call("total", r#"{"values":[1,2,3]}"#).unwrap(), "6");
+}
+
+/// An export of the module `--guest-exec` ran can be called: a module's
+/// top-level functions are not globals.
+#[test]
+fn node_calls_an_export_of_a_guest_exec_module() {
+    let dir = temp_dir("node-guest-exec-call");
+    std::fs::write(
+        dir.path().join("handler.js"),
+        "exports.handler = (event) => ({ hi: event.name });\n\
+         exports.fetch = (event) => `fetched ${event.url}`;\n",
+    )
+    .unwrap();
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("node"))
+        .scratch_mb(512)
+        .mount(Mount::ro(dir.path(), "/app"))
+        .boot()
+        .unwrap();
+    sandbox.run(Exec::Guest("/app/handler.js".into())).unwrap();
+    assert_eq!(
+        sandbox.call("handler", r#"{"name":"js"}"#).unwrap(),
+        r#"{"hi":"js"}"#
+    );
+    // The module's export, not Node's global fetch.
+    assert_eq!(
+        sandbox.call("fetch", r#"{"url":"x"}"#).unwrap(),
+        r#""fetched x""#
+    );
+}
+
+/// `examples/node/handler.js`: loaded once, called twice, its state carried over.
+#[test]
+fn node_handler_example() {
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/node/handler.js");
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("node"))
+        .scratch_mb(512)
+        .boot()
+        .unwrap();
+    sandbox.run(Exec::File(example)).unwrap();
+    assert_eq!(
+        sandbox.call("handler", r#"{"name":"World"}"#).unwrap(),
+        r#"{"greeting":"Hello, World!","calls":1}"#
+    );
+    assert_eq!(
+        sandbox.call("handler", r#"{"name":"again"}"#).unwrap(),
+        r#"{"greeting":"Hello, again!","calls":2}"#
+    );
+}
