@@ -79,6 +79,7 @@ CONFIG_LIBHOSTSOCK=y
 # Route stdin through the console driver (not /dev/null) so the guest
 # can read host-provided input via sys.stdin, process.stdin, etc.
 CONFIG_LIBPOSIX_TTY_STDIN_SERIAL=y
+CONFIG_LIBPOSIX_TTY_SERIAL_EOF_FINAL=y
 # Disable compile-date embedding for reproducible builds — same source
 # always produces the same binary.
 CONFIG_LIBUKLIBID_INFO_COMPILEDATE=n
