@@ -18,16 +18,20 @@
  *
  *   host: call("Exec", <C# source code>)
  *     read() returns the call → dotnet_dispatch(fc, fc_len)
- *              → write [len:u64][payload] to pipe
- *              → read status byte (blocks, scheduler switches to
- *                child, Roslyn compile + execute, writes the status)
+ *              → send it down the pipe (hl_child.h)
+ *              → read the status and result (blocks, scheduler switches
+ *                to child, Roslyn compile + execute, writes them),
+ *                making any host function call it asks for on the way
  *              → back into read(): the call is done
+ *
+ *   A guest function call ("Call") names a public static method of a
+ *   snippet run earlier; the child calls it by reflection.
  *
  * Roslyn is warmed up during boot so snapshots capture the
  * initialized state — dispatches after restore are fast.
  *
  * The .NET process stays alive across dispatches.  Each dispatch
- * compiles and runs independently (no shared state between calls).
+ * compiles to its own assembly, which stays loaded, statics and all.
  * Environment.Exit() ends the process, which is the runtime: the call
  * ends with that exit status, and the next call starts a fresh one,
  * warm-up included.  Until the kernel returns an exited process's
@@ -44,6 +48,7 @@
 #include "../hl_fc.h"
 #include "../hl_env.h"
 #include "../hl_driver.h"
+#include "../hl_child.h"
 
 /* ── State ─────────────────────────────────────────────────────── */
 
@@ -55,21 +60,15 @@ static int g_pipe_from_dotnet = -1;  /* parent reads the status here */
 
 /*
  * The persistent .NET child was spawned at boot and does not see the
- * parent's setenv(), so each call's source is prefixed with an
- * `Environment.SetEnvironmentVariable(<key>, <value>);` line per host
- * variable, key and value as JSON string literals, which C# reads the
- * same way.  RoslynCompiler.cs prepends `using System;`, so the call
- * resolves without a namespace qualifier.
+ * parent's setenv(), so each call carries the host's variables as
+ * KEY NUL VALUE NUL pairs, which the child sets before the call runs.
  */
 static void dotnet_env_visitor(const char *key, const char *val, void *ctx)
 {
 	struct hl_strbuf *env = ctx;
 
-	hl_strbuf_puts(env, "Environment.SetEnvironmentVariable(");
-	hl_strbuf_put_json(env, key);
-	hl_strbuf_puts(env, ", ");
-	hl_strbuf_put_json(env, val);
-	hl_strbuf_puts(env, ");\n");
+	hl_strbuf_put(env, key, strlen(key) + 1);
+	hl_strbuf_put(env, val, strlen(val) + 1);
 }
 
 /* ── The child ─────────────────────────────────────────────────── */
@@ -206,16 +205,22 @@ static int dotnet_dispatch(const uint8_t *fc, size_t fc_len)
 	}
 
 	struct hl_strbuf env = { 0 };
-	unsigned char status;
-	uint64_t len64;
+	const char *input = NULL;
+	size_t input_len = 0;
+	int is_call = fc_name_is(fc, fc_len, "Call");
 	int rc = -1;
+
+	if (is_call) {
+		input = fc_arg_string(fc, fc_len, 1, &input_len);
+		if (!code_len || !input)
+			goto out;
+	}
 
 	/* The call after one that ended the child starts a new one. */
 	if (g_dotnet_pid < 0 && dotnet_spawn() < 0)
 		goto out;
 
-	/* Refresh env vars: setenv() here, SetEnvironmentVariable lines for
-	 * the child. */
+	/* Refresh env vars: setenv() here, KEY/VALUE pairs for the child. */
 	hl_env_refresh(dotnet_env_visitor, &env);
 	if (env.err) {
 		fprintf(stderr, "hl_dotnetdriver: out of memory for the environment\n");
@@ -223,14 +228,11 @@ static int dotnet_dispatch(const uint8_t *fc, size_t fc_len)
 		goto out;
 	}
 
-	/* Send length (8 bytes LE) + env prefix + code, then wait for the
-	 * status byte: 0 on success, 1 on error.  The read blocks and
-	 * yields to the cooperative scheduler, which switches to the child
-	 * .NET thread. */
-	len64 = (uint64_t)(env.len + code_len);
-	if (hl_write_all(g_pipe_to_dotnet, &len64, 8) < 0 ||
-	    hl_write_all(g_pipe_to_dotnet, env.buf, env.len) < 0 ||
-	    hl_write_all(g_pipe_to_dotnet, code, code_len) < 0) {
+	/* Send the call (hl_child.h), then wait for its status.  The read
+	 * blocks and yields to the cooperative scheduler, which switches to
+	 * the child .NET thread. */
+	if (hl_child_send(g_pipe_to_dotnet, is_call, env.buf, env.len, code, code_len,
+			  input, input_len) < 0) {
 		/* The child had ended before the call reached it, so the call
 		 * did not run and fails; the next one starts a fresh child. */
 		fprintf(stderr, "hl_dotnetdriver: .NET had exited with status %d\n",
@@ -238,13 +240,13 @@ static int dotnet_dispatch(const uint8_t *fc, size_t fc_len)
 		fflush(stderr);
 		goto out;
 	}
-	if (read(g_pipe_from_dotnet, &status, 1) != 1) {
+	rc = hl_child_await(g_pipe_to_dotnet, g_pipe_from_dotnet, "hl_dotnetdriver");
+	if (rc < 0) {
 		/* The child ended under the call (Environment.Exit, a crash):
 		 * its exit status is the call's. */
 		rc = dotnet_reap();
 		goto out;
 	}
-	rc = status;
 
 out:
 	hl_strbuf_free(&env);
@@ -303,6 +305,7 @@ int main(int argc, char **argv)
 
 	if (dotnet_spawn() < 0)
 		return 1;
+	hl_driver_serve_calls();
 
 	/* Serve named calls from the kernel's queue; never returns */
 	hl_driver_run(dotnet_dispatch);
