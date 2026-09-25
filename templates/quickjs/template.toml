@@ -1,0 +1,4 @@
+[template]
+description = "A JavaScript script or ES module on QuickJS, small and fast to start"
+runtime = "quickjs"
+tier = 3
