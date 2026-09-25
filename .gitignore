@@ -11,3 +11,7 @@ __pycache__/
 bin/
 obj/
 publish/
+/drivers/wasmtime/driver/target
+/examples/wasmtime/hello/target
+/examples/wasmtime/calculator/target
+/examples/wasmtime/hello-p3/target
