@@ -27,10 +27,11 @@ The guest reports to the host through named host functions, one fact each:
 | `Yield(ns)` | Every thread is blocked; the next timer fires in `ns` (0: none). |
 | `DriverReady()` | A runtime driver opened `/dev/hlcall`: named calls are served. |
 | `CallStarted()` / `CallDone(status)` | A named call was taken / returned (0: success). |
+| `CallResult(bytes)` | What that call returned, when its driver sent a result; just before `CallDone`. |
 | `CallRejected()` | A named call had no reader: it never ran. |
 | `Exited(status)` | The guest process ended; the kernel is shutting down. |
 
-The host folds them into one [`Yield`](../src/lib.rs) per entry: `Blocked { until }`, `CallDone`, `CallFailed { status }`, or `Exited { status }`.  A `Blocked` with no timer and no host socket that could wake the guest, while a call's return or a program's exit is still owed, is a deadlock: `step`, `run` and `join` return `Error::Deadlocked` rather than wait forever.
+One more host function, `HostCall(name, args)`, runs the embedder's function of that name for a driver and returns its reply ([calls.md](calls.md)).  The host folds the reports into one [`Yield`](../src/lib.rs) per entry: `Blocked { until }`, `CallDone`, `CallFailed { status }`, or `Exited { status }`.  A `Blocked` with no timer and no host socket that could wake the guest, while a call's return or a program's exit is still owed, is a deadlock: `step`, `run` and `join` return `Error::Deadlocked` rather than wait forever.
 
 ## The verbs
 
@@ -42,6 +43,7 @@ Everything a caller does with an [`AppSandbox`](../src/lib.rs) is one of these. 
 | `submit(exec)` | Hands the driver a call and returns at the first boundary, without waiting for the call to finish. Example: `submit("import http.server … serve_forever()")` returns as soon as the server is parked in `accept()`; the embedder drives it with `step` from there, and `step` reports `CallDone` if the call ever returns. |
 | `step(timeout)` | Advances the guest by one boundary and returns control to the embedder. The host thread waits, with the VM halted, until the guest has something to do (a timer due, a socket ready) or `timeout` runs out. If the guest is due, the host enters the VM and the guest runs until every thread blocks again; `step` then returns why the guest stopped. If the timeout ran out first, nothing was entered and the last `Blocked` comes back.|
 | `run(exec)` | `submit`, then `step` until the call returns. |
+| `call(function, input)` | `run(Exec::Call { function, input })`, returning the result of a function the guest defined ([calls.md](calls.md)). |
 | `join()` | `step` until the process exits, and hand back its status. |
 | `snapshot()` / `snapshot_to(dir)` | Captures the guest at the current boundary, a call in flight included; `snapshot_to` also writes it to a directory. |
 | `restore(snapshot)` / `restore_from(dir)` | Replaces the guest with the snapshot in place and runs its `resume` entry. |

@@ -51,7 +51,7 @@ A tier 3 runtime has a Dockerfile that produces a rootfs and a small **smoke tes
 - **Smoke test** covering boot + execution and a snapshot round-trip (e.g. `tests/compiled.rs`, `tests/powershell.rs`).
 - **Example script** in `examples/<runtime>/` (recommended but not required).
 
-**Current tier 3 runtimes:** C, Rust, Go, PowerShell
+**Current tier 3 runtimes:** C, Rust, Go, PowerShell, QuickJS, Wasmtime
 
 ## Promotion and Demotion
 
