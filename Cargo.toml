@@ -1,6 +1,6 @@
 [package]
 name = "hyperlight-unikraft"
-version = "0.14.2"
+version = "0.15.0"
 edition = "2024"
 description = "Run ordinary Linux programs inside Hyperlight micro-VMs using a Unikraft unikernel as the guest kernel — the hluk CLI and library."
 license = "Apache-2.0"

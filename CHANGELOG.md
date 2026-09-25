@@ -4,10 +4,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+## [v0.15.0]
+
 ### Added
 
+- **quickjs** and **wasmtime** runtime images (tier 3), with `hluk init` templates.
+  - quickjs: QuickJS (quickjs-ng 0.17) with `qjs:std` and `qjs:os`, in a 2 MiB rootfs. Scripts and ES modules both run, and globals persist between calls. A call returns once the jobs and timers it started have run.
+  - wasmtime: Wasmtime 49 with Cranelift. Runs WebAssembly text, `.wasm` and `.cwasm` modules and components under WASI 0.1, 0.2 and 0.3 (0.3 is experimental in Wasmtime).
+- **Guest function calls**: `AppSandbox::call(function, input)` runs a function the guest defined and returns its result, JSON in and out. Served by quickjs, node, python, python-shell, agent, dotnet-jit and wasmtime. `hluk run --call FUNCTION --input JSON` does it from the CLI. See `docs/calls.md`.
+- **Host function calls**: `SandboxBuilder::host_function(name, f)` gives the guest one of your functions. It's `host.call` in JavaScript (and `host:` modules in quickjs), `hyperlight.call` in Python and `Host.Call` in C#. In wasmtime, any import outside WASI is linked to one, so a component can import a WIT interface you implement.
+- Kernel: a driver's `write()` can carry a result after the status (sent as `CallResult`), and `HLCALL_IOC_HOSTCALL` calls the embedder's functions through one host function, `HostCall(name, args)`. `hl_driver.h` has `hl_set_result` and `hl_host_call`.
 - Two `hluk init` templates: `python-shell`, a Python script that runs shell commands through `subprocess` on the python-shell rootfs (the one runtime that had only `http-python`), and `bash-repl`, an interactive shell whose read-eval loop takes commands from `hluk run`'s stdin until Ctrl-D.
 - `hluk init --template` takes a template of your own: a directory on disk, or `github.com/OWNER/REPO[/PATH][@REF]` (a browser's `…/tree/REF/PATH` URL too), downloaded as the repository's tarball through the GitHub API with no git on the host; `GITHUB_TOKEN` reaches a private repository and lifts the anonymous rate limit. The template's `runtime` is checked against the published ones, a template is held to 256 text files and 4 MiB, and `init` prints the `[build] command` and Dockerfile `hluk build` would run from a template that is not built in. `tier` is optional in such a template's `template.toml`. `docs/templates.md` is the guide to writing one, with `examples/templates/word-count` to copy from.
+
+### Changed
+
+- `Exec` has a new variant, `Call`, so an exhaustive `match` on it needs another arm.
+
+### Fixed
+
+- Programs, most often .NET, could resume at a wild address after a snapshot restore (`dotnet_jit_snapshot_round_trip` failed about half the time). A page fault inside a page fault handler reused the top of the exception stack and overwrote the outer fault's registers. Exception handlers now stay on the stack they were entered on, so a nested fault lands below the outer frame. The fix is in the native x86_64 platform, shared with KVM.
+- Reading stdin past its end deadlocked the guest: `poll()` and `select()` waited forever for more input, so a second shell `read` or Python's `input()` after `EOFError` hung. The end of input is now final on Hyperlight (`CONFIG_LIBPOSIX_TTY_SERIAL_EOF_FINAL`).
+- `openat()` from a directory fd never crossed into a mount below that directory, so WASI programs couldn't see mounts. Generic Unikraft bug, reproduced on QEMU/KVM.
+- A relative path starting with a dotfile (`.profile`) was glued to its directory without a `/`. Generic Unikraft bug, reproduced on QEMU/KVM.
 
 ## [v0.14.2]
 
