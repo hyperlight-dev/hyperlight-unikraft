@@ -35,6 +35,8 @@ scratch_dotnet_aot := "256"
 scratch_node       := "512"
 scratch_dotnet_jit := "768"
 scratch_powershell := "1024"
+scratch_quickjs    := "64"
+scratch_wasmtime   := "256"
 scratch_agent        := "1536"
 scratch_python_shell   := "256"
 scratch_agent_custom := "256"
@@ -53,6 +55,8 @@ _scratch-mb runtime:
         else if runtime == "node" { scratch_node } \
         else if runtime == "dotnet-jit" { scratch_dotnet_jit } \
         else if runtime == "powershell" { scratch_powershell } \
+        else if runtime == "quickjs" { scratch_quickjs } \
+        else if runtime == "wasmtime" { scratch_wasmtime } \
         else if runtime == "agent" { scratch_agent } \
         else if runtime == "python-shell" { scratch_python_shell } \
         else if runtime == "agent-custom" { scratch_agent_custom } \
@@ -645,6 +649,9 @@ example-dotnet-jit: (run "dotnet-jit" (examples_dir / "dotnet-jit" / "Hello.cs")
 # Run the PowerShell hello world example
 example-powershell: (run "powershell" (examples_dir / "powershell" / "hello.ps1"))
 
+# Run the QuickJS hello world example
+example-quickjs: (run "quickjs" (examples_dir / "quickjs" / "hello.js"))
+
 # Compiled runtime examples (C, Rust, Go, dotnet-aot) require compiling
 # on the host first.  See examples/<runtime>/README.md for instructions,
 # then: just run <runtime> ./hello
@@ -662,7 +669,7 @@ build-test-bins:
     set -euo pipefail
     bins="{{build_dir}}/bins"
     rm -rf "$bins"
-    mkdir -p "$bins/c" "$bins/rust" "$bins/go" "$bins/dotnet-aot"
+    mkdir -p "$bins/c" "$bins/rust" "$bins/go" "$bins/dotnet-aot" "$bins/wasmtime"
     echo "==> C / C++"
     for src in hello goodbye env_vars status; do
         gcc -O2 -Wall -static-pie -fPIE -o "$bins/c/$src" "{{examples_dir}}/c/$src.c"
@@ -678,6 +685,23 @@ build-test-bins:
         CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildmode=pie -ldflags='-s -w' \
             -o "$bins/go/$src" "{{examples_dir}}/go/$src.go"
     done
+    echo "==> WebAssembly"
+    rustup target add wasm32-wasip1 wasm32-wasip2 >/dev/null
+    for target in wasm32-wasip1 wasm32-wasip2; do
+        cargo build -q --release --target "$target" \
+            --manifest-path "{{examples_dir}}/wasmtime/hello/Cargo.toml"
+        cp "{{examples_dir}}/wasmtime/hello/target/$target/release/hello.wasm" \
+            "$bins/wasmtime/hello-${target#wasm32-wasi}.wasm"
+    done
+    # WASI 0.3: a command, and a library with an async export.
+    for crate in hello-p3 calculator; do
+        cargo build -q --release --target wasm32-wasip2 \
+            --manifest-path "{{examples_dir}}/wasmtime/$crate/Cargo.toml"
+    done
+    cp "{{examples_dir}}/wasmtime/hello-p3/target/wasm32-wasip2/release/hello_p3.wasm" \
+        "$bins/wasmtime/hello-p3.wasm"
+    cp "{{examples_dir}}/wasmtime/calculator/target/wasm32-wasip2/release/calculator.wasm" \
+        "$bins/wasmtime/calculator.wasm"
     echo "==> .NET AOT"
     for proj in hello env_vars caps; do
         dotnet publish "{{examples_dir}}/dotnet-aot/$proj" -c Release -r linux-musl-x64 -v q --nologo \
