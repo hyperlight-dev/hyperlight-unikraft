@@ -2,9 +2,11 @@
  * hl_nodedriver — Node.js runtime driver for Hyperlight.
  *
  * Spawns a persistent Node.js child process during boot via
- * vfork+exec.  The child runs a dispatch loop that reads code
- * from a pipe (asynchronously, so its event loop keeps turning
- * between calls), evals it, and writes the call's status back.
+ * vfork+exec.  The child runs a dispatch loop that reads code, or a
+ * function to call, from a pipe (asynchronously, so its event loop
+ * keeps turning between calls), runs it, and writes the call's status
+ * and result back.  A host.call() in the child goes up the same pipe;
+ * the driver makes it and writes the reply down the code pipe.
  *
  * Flow:
  *   boot (evolve):
@@ -17,9 +19,10 @@
  *
  *   host: call("Exec", "console.log(42)")
  *     read() returns the call → node_dispatch(fc, fc_len)
- *              → write [len:u64][code] to pipe
- *              → read status byte (blocks, scheduler switches to
- *                child, child evals code, writes the status)
+ *              → write ['E'][len:u64][env][code] to pipe
+ *              → read 'S', the status and a result (blocks, scheduler
+ *                switches to child, child evals code, writes them),
+ *                serving any 'H' host call on the way
  *              → back into read(): the call is done
  *
  * The child Node process stays alive across dispatches: no V8 startup
@@ -40,6 +43,7 @@
 #include "../hl_fc.h"
 #include "../hl_env.h"
 #include "../hl_driver.h"
+#include "../hl_child.h"
 
 /* ── State ─────────────────────────────────────────────────────── */
 
@@ -170,6 +174,51 @@ static int write_bootstrap(int fd_in, int fd_out)
 		"// end(status) settles the call in flight; null between calls.\n"
 		"let end = null;\n"
 		"\n"
+		"function readSyncExactly(n) {\n"
+		"  const buf = Buffer.alloc(n);\n"
+		"  for (let off = 0; off < n;) {\n"
+		"    const got = fs.readSync(fd_in, buf, off, n - off, null);\n"
+		"    if (got <= 0) throw new Error('hl_nodedriver: the driver went away');\n"
+		"    off += got;\n"
+		"  }\n"
+		"  return buf;\n"
+		"}\n"
+		"function u64(n) { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; }\n"
+		"function writeAll(b) { for (let off = 0; off < b.length;) off += fs.writeSync(fd_out, b, off); }\n"
+		"\n"
+		"// host.call(name, ...args): the embedder's function `name`, its\n"
+		"// arguments and result as JSON.  The driver makes the call (the\n"
+		"// device is its), so the request goes up the status pipe and the\n"
+		"// reply comes down the code pipe, which is idle while a call runs.\n"
+		"globalThis.host = Object.freeze({ call(name, ...args) {\n"
+		"  if (typeof name !== 'string' || !name)\n"
+		"    throw new TypeError('host.call(name, ...args): a function name is required');\n"
+		"  if (!name.isWellFormed()) throw new TypeError('host.call: the name is not UTF-8');\n"
+		"  if (!end) throw new Error('host.call: only while a call runs');\n"
+		"  const n = Buffer.from(name, 'utf8');\n"
+		"  const a = Buffer.from(JSON.stringify(args), 'utf8');\n"
+		"  writeAll(Buffer.concat([Buffer.from('H'), u64(n.length), n, u64(a.length), a]));\n"
+		"  const hdr = readSyncExactly(9);\n"
+		"  const len = Number(hdr.readBigUInt64LE(1));\n"
+		"  const body = len ? readSyncExactly(len).toString('utf8') : '';\n"
+		"  if (hdr[0] === 0) return len ? JSON.parse(body) : undefined;\n"
+		"  throw new Error(hdr[0] === 1 ? body : `host function ${name}: ${body}`);\n"
+		"} });\n"
+		"\n"
+		"// A call: the function `name` with `input` parsed as JSON;\n"
+		"// what it returns, awaited, as JSON.\n"
+		"// An export of the module --guest-exec ran last, else a global: the\n"
+		"// module first, so an export named like a built-in (fetch) is found.\n"
+		"async function callFunction(name, input) {\n"
+		"  const exported = globalThis[Symbol.for('hl.main')]?.[name];\n"
+		"  const fn = typeof exported === 'function' ? exported : globalThis[name];\n"
+		"  if (typeof fn !== 'function')\n"
+		"    throw new Error(`no function ${name}: define it (function ${name}(input) {...}), or export it from the module --guest-exec ran`);\n"
+		"  // Empty input is no argument, not one undefined.\n"
+		"  const r = await (input.length ? fn(JSON.parse(input)) : fn());\n"
+		"  return r === undefined ? undefined : JSON.stringify(r);\n"
+		"}\n"
+		"\n"
 		"// An exit, or an error nothing caught: the call in flight ends\n"
 		"// with the code (1 for an error, as node exits with), and what was\n"
 		"// left running stops, as it would have with the process.  Between\n"
@@ -184,16 +233,31 @@ static int write_bootstrap(int fd_in, int fd_out)
 		"process.on('uncaughtException', exited);\n"
 		"process.on('unhandledRejection', exited);\n"
 		"\n"
+		"// Each message: a kind, 'E' (code) or 'C' (a call), and its length,\n"
+		"// then the environment's code, then the code, or a call's name and\n"
+		"// input, each after its length.\n"
 		"(async () => {\n"
 		"  while (true) {\n"
-		"    const hdr = await readExactly(8);\n"
+		"    const hdr = await readExactly(9);\n"
 		"    if (!hdr) break;\n"
-		"    const len = Number(hdr.readBigUInt64LE(0));\n"
+		"    const len = Number(hdr.readBigUInt64LE(1));\n"
 		"    const buf = len ? await readExactly(len) : Buffer.alloc(0);\n"
 		"    if (!buf) break;\n"
-		"    const code = buf.toString('utf8');\n"
+		"    let off = 0;\n"
+		"    const field = () => {\n"
+		"      const n = Number(buf.readBigUInt64LE(off));\n"
+		"      off += 8 + n;\n"
+		"      return buf.toString('utf8', off - n, off);\n"
+		"    };\n"
+		"    const env = field();\n"
+		"    const isCall = hdr[0] === 0x43;\n"
+		"    const code = field();\n"
+		"    const input = isCall ? field() : '';\n"
 		"    liveTimers = new Set();\n"
 		"    handlesBefore = new Set(activeHandles());\n"
+		"    // A call's result, and whether its promise settled: one that\n"
+		"    // is still pending when the loop drains never will.\n"
+		"    let result, settled = !isCall;\n"
 		"    const status = await new Promise((resolve) => {\n"
 		"      // The call ends when the event loop drains: 'beforeExit' fires\n"
 		"      // once nothing ref'd is pending (setTimeout, http.get, a\n"
@@ -201,19 +265,31 @@ static int write_bootstrap(int fd_in, int fd_out)
 		"      // starts only after the status is written, so an unref'd\n"
 		"      // leftover ends the call and goes on running while the child\n"
 		"      // waits.  process.exitCode is then the status, as at an exit.\n"
-		"      const drained = () => end(process.exitCode ?? 0);\n"
+		"      const drained = () => {\n"
+		"        if (settled) return end(process.exitCode ?? 0);\n"
+		"        console.error(`hl_nodedriver: ${code}'s promise never settled`);\n"
+		"        end(1);\n"
+		"      };\n"
 		"      end = (s) => { end = null; process.off('beforeExit', drained); resolve(s); };\n"
 		"      process.once('beforeExit', drained);\n"
 		"      try {\n"
-		"        const result = (0, eval)(code);\n"
-		"        // A returned promise's rejection is the call's error\n"
-		"        if (result && typeof result.then === 'function') result.then(undefined, exited);\n"
+		"        (0, eval)(env);\n"
+		"        if (isCall) {\n"
+		"          callFunction(code, input).then((r) => { result = r; settled = true; }, exited);\n"
+		"        } else {\n"
+		"          const r = (0, eval)(code);\n"
+		"          // A returned promise's rejection is the call's error\n"
+		"          if (r && typeof r.then === 'function') r.then(undefined, exited);\n"
+		"        }\n"
 		"      } catch (e) {\n"
 		"        exited(e);\n"
 		"      }\n"
 		"    });\n"
 		"    process.exitCode = undefined;\n"
-		"    fs.writeSync(fd_out, Buffer.from([status & 0xff]));\n"
+		"    // 'S', the status, and the result's length and bytes: none for a\n"
+		"    // failed call, or a function that returned nothing.\n"
+		"    const out = status === 0 && result !== undefined ? Buffer.from(result, 'utf8') : Buffer.alloc(0);\n"
+		"    writeAll(Buffer.concat([Buffer.from([0x53, status & 0xff]), u64(out.length), out]));\n"
 		"  }\n"
 		"})();\n",
 		fd_in, fd_out);
@@ -314,9 +390,9 @@ static int node_spawn(void)
 static int node_dispatch(const uint8_t *fc, size_t fc_len)
 {
 	struct hl_strbuf env = { 0 };
-	unsigned char status;
-	uint64_t len64;
-	int rc = -1;
+	const char *input = NULL;
+	size_t input_len = 0;
+	int is_call, rc = -1;
 
 	/* The call after one that ended the child starts a new one. */
 	if (g_node_pid < 0 && node_spawn() < 0)
@@ -328,6 +404,13 @@ static int node_dispatch(const uint8_t *fc, size_t fc_len)
 	if (!code)
 		return -1;
 
+	is_call = fc_name_is(fc, fc_len, "Call");
+	if (is_call) {
+		input = fc_arg_string(fc, fc_len, 1, &input_len);
+		if (!code_len || !input)
+			return -1;
+	}
+
 	/* Guest command (--guest-exec / autonomous): the command is written to a
 	 * temp file and a fixed launcher reads it, sets process.argv, and requires
 	 * the named guest module; an empty command requires /entrypoint.js. */
@@ -337,8 +420,9 @@ static int node_dispatch(const uint8_t *fc, size_t fc_len)
 		"const fs=require('fs');\n"
 		"let _c='';try{_c=fs.readFileSync('/tmp/hl_gx','utf8').trim();}catch(e){}\n"
 		"const _a=_c.length?_c.split(/\\s+/):[];\n"
-		"if(_a.length){process.argv=['node',..._a];require(_a[0]);}\n"
-		"else if(fs.existsSync('/entrypoint.js')){require('/entrypoint.js');}\n"
+		"const _m=Symbol.for('hl.main');\n"
+		"if(_a.length){process.argv=['node',..._a];globalThis[_m]=require(_a[0]);}\n"
+		"else if(fs.existsSync('/entrypoint.js')){globalThis[_m]=require('/entrypoint.js');}\n"
 		"else{console.log('hl: no /entrypoint.js in rootfs; nothing to run');}\n";
 	if (gx) {
 		FILE *gf = fopen("/tmp/hl_gx", "w");
@@ -362,13 +446,11 @@ static int node_dispatch(const uint8_t *fc, size_t fc_len)
 		goto out;
 	}
 
-	/* Send length (8 bytes LE) + env prefix + code, then wait for the
-	 * status byte.  The read blocks and yields to the cooperative
-	 * scheduler, which switches to the child Node thread. */
-	len64 = (uint64_t)(env.len + code_len);
-	if (hl_write_all(g_pipe_to_node, &len64, 8) < 0 ||
-	    hl_write_all(g_pipe_to_node, env.buf, env.len) < 0 ||
-	    hl_write_all(g_pipe_to_node, code, code_len) < 0) {
+	/* Send the call (hl_child.h), then wait for its status.  The read
+	 * blocks and yields to the cooperative scheduler, which switches to
+	 * the child Node thread. */
+	if (hl_child_send(g_pipe_to_node, is_call, env.buf, env.len, code, code_len,
+			  input, input_len) < 0) {
 		/* The child had ended before the call reached it, so the call
 		 * did not run and fails; the next one starts a fresh child. */
 		fprintf(stderr, "hl_nodedriver: node had exited with status %d\n",
@@ -376,12 +458,12 @@ static int node_dispatch(const uint8_t *fc, size_t fc_len)
 		fflush(stderr);
 		goto out;
 	}
-	if (read(g_pipe_from_node, &status, 1) != 1) {
+	rc = hl_child_await(g_pipe_to_node, g_pipe_from_node, "hl_nodedriver");
+	if (rc < 0) {
 		/* The child ended under the call: its exit status is the call's. */
 		rc = node_reap();
 		goto out;
 	}
-	rc = status;
 out:
 	hl_strbuf_free(&env);
 	return rc;
@@ -403,6 +485,7 @@ int main(int argc, char **argv)
 
 	if (node_spawn() < 0)
 		return 1;
+	hl_driver_serve_calls();
 
 	/* Serve named calls from the kernel's queue; never returns */
 	hl_driver_run(node_dispatch);

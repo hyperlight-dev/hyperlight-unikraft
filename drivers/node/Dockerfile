@@ -6,6 +6,7 @@ RUN apk add --no-cache gcc musl-dev
 COPY drivers/hl_fc.h /src/drivers/hl_fc.h
 COPY drivers/hl_env.h /src/drivers/hl_env.h
 COPY drivers/hl_driver.h /src/drivers/hl_driver.h
+COPY drivers/hl_child.h /src/drivers/hl_child.h
 COPY drivers/node/hl_nodedriver.c /src/drivers/node/hl_nodedriver.c
 
 RUN gcc -O2 -Wall -Wextra -Wno-unused-parameter \
