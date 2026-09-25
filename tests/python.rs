@@ -5,7 +5,7 @@ mod common;
 use std::path::PathBuf;
 
 use common::{hluk_with_stdin, require_rootfs, temp_dir};
-use hyperlight_unikraft::{Exec, ListenPorts, Mount, NetworkPolicy, SandboxBuilder};
+use hyperlight_unikraft::{Error, Exec, ListenPorts, Mount, NetworkPolicy, SandboxBuilder};
 
 #[test]
 fn python_inline_code() {
@@ -635,4 +635,194 @@ fn python_huge_directory_listing_fails_cleanly() {
     assert!(out.contains("missing errno True"), "{out:?}");
     sandbox.run("print('still here')").unwrap();
     assert!(sandbox.drain_output().contains("still here"));
+}
+
+/// At the end of stdin, input() raises EOFError every time, read()
+/// returns "", and select() reports stdin readable (the end is there to
+/// read): before, stdin polled as not readable and anything that waited
+/// on it deadlocked the guest.
+#[test]
+fn python_stdin_past_the_end() {
+    let rootfs = require_rootfs("python");
+    let dir = temp_dir("python-eof");
+    let script = dir.path().join("eof.py");
+    std::fs::write(
+        &script,
+        "import select, sys\n\
+         print('line', repr(sys.stdin.readline()))\n\
+         for i in range(2):\n    \
+             try:\n        input()\n    \
+             except EOFError:\n        print('EOFError', i)\n\
+         print('read', repr(sys.stdin.read()))\n\
+         r, _, _ = select.select([sys.stdin], [], [], None)\n\
+         print('select', bool(r))\n",
+    )
+    .unwrap();
+    let output = hluk_with_stdin(&rootfs, &script, b"hello\n");
+    for line in [
+        "line 'hello\\n'",
+        "EOFError 0",
+        "EOFError 1",
+        "read ''",
+        "select True",
+    ] {
+        assert!(output.contains(line), "{line} missing from: {output:?}");
+    }
+}
+
+/// A function defined in `__main__`, called with JSON in and out; a
+/// coroutine is awaited, an exception fails the call.
+#[test]
+fn python_calls_a_function_with_json() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "calls = 0\n\
+             def greet(event):\n    \
+                 global calls\n    \
+                 calls += 1\n    \
+                 return {'message': 'Hello, ' + event['name'], 'n': calls}\n\
+             async def later(event):\n    \
+                 return event['x'] * 2\n\
+             def nothing():\n    \
+                 print('ran')\n\
+             def bad(event):\n    \
+                 raise ValueError('handler boom')\n\
+             def leave(event):\n    \
+                 raise SystemExit(3)\n",
+        )
+        .unwrap();
+    assert_eq!(
+        sandbox.call("greet", r#"{"name":"World"}"#).unwrap(),
+        r#"{"message": "Hello, World", "n": 1}"#
+    );
+    assert_eq!(
+        sandbox.call("greet", r#"{"name":"again"}"#).unwrap(),
+        r#"{"message": "Hello, again", "n": 2}"#
+    );
+    assert_eq!(sandbox.call("later", r#"{"x":21}"#).unwrap(), "42");
+    // No input, no argument; None, no result.
+    assert_eq!(sandbox.call("nothing", "").unwrap(), "");
+    assert!(matches!(
+        sandbox.call("bad", "{}"),
+        Err(Error::CallFailed { status: 1 })
+    ));
+    assert!(matches!(
+        sandbox.call("leave", "{}"),
+        Err(Error::CallFailed { status: 3 })
+    ));
+    assert!(sandbox.call("missing", "{}").is_err());
+    assert!(sandbox.call("greet", "not json").is_err());
+    let output = sandbox.drain_output();
+    assert!(output.contains("ran"), "{output}");
+    assert!(output.contains("handler boom"), "{output}");
+    assert!(output.contains("no function 'missing'"), "{output}");
+    // The interpreter serves on, its state intact.
+    assert_eq!(
+        sandbox.call("greet", r#"{"name":"x"}"#).unwrap(),
+        r#"{"message": "Hello, x", "n": 3}"#
+    );
+}
+
+/// The embedder's functions, as `hyperlight.call` and through
+/// `hyperlight.host`; a host error is a `hyperlight.HostError`.
+#[test]
+fn python_calls_host_functions() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .host_function("math.add", |args| {
+            let v: Vec<f64> = serde_json::from_str(args).map_err(|e| e.to_string())?;
+            Ok(v.iter().sum::<f64>().to_string())
+        })
+        .host_function("math.fail", |_| Err("no can do".to_string()))
+        .host_function("nothing", |_| Ok(String::new()))
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "import hyperlight\n\
+             from hyperlight import host\n\
+             print(hyperlight.call('math.add', 2, 3), host.math.add(1, 2, 3), host.nothing())\n\
+             try:\n    \
+                 host.math.fail()\n\
+             except hyperlight.HostError as e:\n    \
+                 print('caught', e)\n\
+             for n in ['', '\\ud800']:\n    \
+                 try:\n        \
+                     hyperlight.call(n)\n    \
+                 except Exception as e:\n        \
+                     print('threw', type(e).__name__)\n",
+        )
+        .unwrap();
+    assert_eq!(
+        sandbox.drain_output(),
+        "5 6 None\r\ncaught no can do\r\nthrew ValueError\r\nthrew UnicodeEncodeError\r\n"
+    );
+    // A handler can call the host too.
+    sandbox
+        .run("def total(event):\n    return host.math.add(*event['values'])\n")
+        .unwrap();
+    assert_eq!(sandbox.call("total", r#"{"values":[1,2,3]}"#).unwrap(), "6");
+    // Another thread cannot: only the one running the call can reach the
+    // host (see hl_host_call).
+    sandbox
+        .run(
+            "import threading\n\
+             def other():\n    \
+                 try:\n        \
+                     host.math.add(1)\n    \
+                 except RuntimeError as e:\n        \
+                     print('refused:', e)\n\
+             t = threading.Thread(target=other)\n\
+             t.start()\n\
+             t.join()\n",
+        )
+        .unwrap();
+    assert!(sandbox.drain_output().contains("refused:"));
+}
+
+/// A function defined by the file `--guest-exec` ran can be called:
+/// runpy runs it in a module of its own, not `__main__`.
+#[test]
+fn python_calls_a_function_from_a_guest_exec_file() {
+    let dir = temp_dir("py-guest-exec-call");
+    std::fs::write(
+        dir.path().join("handler.py"),
+        "def handler(event):\n    return {'hi': event['name']}\n",
+    )
+    .unwrap();
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
+        .scratch_mb(256)
+        .mount(Mount::ro(dir.path(), "/app"))
+        .boot()
+        .unwrap();
+    sandbox.run(Exec::Guest("/app/handler.py".into())).unwrap();
+    assert_eq!(
+        sandbox.call("handler", r#"{"name":"py"}"#).unwrap(),
+        r#"{"hi": "py"}"#
+    );
+}
+
+/// `examples/python/handler.py`: loaded once, called twice, its state carried over.
+#[test]
+fn python_handler_example() {
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/handler.py");
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox.run(Exec::File(example)).unwrap();
+    assert_eq!(
+        sandbox.call("handler", r#"{"name":"World"}"#).unwrap(),
+        r#"{"greeting": "Hello, World!", "calls": 1}"#
+    );
+    assert_eq!(
+        sandbox.call("handler", r#"{"name":"again"}"#).unwrap(),
+        r#"{"greeting": "Hello, again!", "calls": 2}"#
+    );
 }
