@@ -150,6 +150,12 @@ pub struct RunArgs {
     #[arg(long, value_name = "JSON", requires = "call")]
     input: Option<String>,
 
+    /// Print where the time went, host side, when the run ends: each VM
+    /// entry (guest and host function time, VM exits), each host function,
+    /// boot and restore. Also HLUK_PROFILE=1.
+    #[arg(long)]
+    profile: bool,
+
     /// Mount a host directory into the guest filesystem.
     /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
     #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
@@ -912,6 +918,9 @@ pub fn run(args: RunArgs) -> CliResult<()> {
         }
     };
     builder = builder.mounts(mounts);
+    if args.profile {
+        builder = builder.profile(true);
+    }
     if let Some(policy) = policy {
         builder = builder.network(policy);
     }

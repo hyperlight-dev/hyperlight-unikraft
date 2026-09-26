@@ -867,23 +867,28 @@ fn ret_vec(r: Res<Vec<u8>>) -> Vec<u8> {
 pub(crate) fn register(
     target: &mut impl Registerable,
     net: &Arc<Net>,
+    profile: &Arc<crate::profile::Profile>,
 ) -> hyperlight_host::Result<()> {
     let net = net.clone();
 
     // net_socket(family, type, protocol) -> fd or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_socket",
         move |family: i32, ty: i32, proto: i32| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_socket");
             Ok(ret(n.socket(family, ty, proto), |fd| fd))
         },
     )?;
 
     // net_bind(fd, family, addr, port) -> 0 or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_bind",
         move |fd: i32, family: i32, addr: String, port: i32| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_bind");
             let Some(sa) = parse_addr(family, &addr, port) else {
                 return Ok(-errno::EINVAL);
             };
@@ -893,18 +898,22 @@ pub(crate) fn register(
 
     // net_listen(fd, backlog) -> 0 or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_listen",
         move |fd: i32, backlog: i32| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_listen");
             Ok(ret(n.listen(fd, backlog), |()| 0))
         },
     )?;
 
     // net_accept(fd) -> [i32 new_fd | packed peer addr]
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_accept",
         move |fd: i32| -> hyperlight_host::Result<Vec<u8>> {
+            let _profile = prof.host("net_accept");
             Ok(ret_vec(n.accept(fd).map(|(new_fd, peer)| {
                 let mut buf = Vec::with_capacity(32);
                 buf.extend(new_fd.to_le_bytes());
@@ -918,9 +927,11 @@ pub(crate) fn register(
 
     // net_connect(fd, family, addr, port) -> 0 or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_connect",
         move |fd: i32, family: i32, addr: String, port: i32| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_connect");
             let Some(sa) = parse_addr(family, &addr, port) else {
                 return Ok(-errno::EINVAL);
             };
@@ -930,15 +941,18 @@ pub(crate) fn register(
 
     // net_send(fd, data) -> bytes_sent or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_send",
         move |fd: i32, data: Vec<u8>| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_send");
             Ok(ret(n.send(fd, &data), |sent| sent as i32))
         },
     )?;
 
     // net_sendto(fd, data, family, addr, port) -> bytes_sent or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_sendto",
         move |fd: i32,
@@ -947,6 +961,7 @@ pub(crate) fn register(
               addr: String,
               port: i32|
               -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_sendto");
             let Some(sa) = parse_addr(family, &addr, port) else {
                 return Ok(-errno::EINVAL);
             };
@@ -956,9 +971,11 @@ pub(crate) fn register(
 
     // net_recvfrom(fd, len) -> [i32 len | packed src addr | data]
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_recvfrom",
         move |fd: i32, len: i32| -> hyperlight_host::Result<Vec<u8>> {
+            let _profile = prof.host("net_recvfrom");
             let len = usize::try_from(len).unwrap_or(0);
             Ok(ret_vec(n.recvfrom(fd, len).map(|(data, from)| {
                 let mut buf = Vec::with_capacity(32 + data.len());
@@ -975,59 +992,77 @@ pub(crate) fn register(
 
     // net_shutdown(fd, how) -> 0 or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_shutdown",
         move |fd: i32, how: i32| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_shutdown");
             Ok(ret(n.shutdown(fd, how), |()| 0))
         },
     )?;
 
     // net_close(fd) -> 0 or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_close",
-        move |fd: i32| -> hyperlight_host::Result<i32> { Ok(ret(n.close(fd), |()| 0)) },
+        move |fd: i32| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_close");
+            Ok(ret(n.close(fd), |()| 0))
+        },
     )?;
 
     // net_disconnect(fd) -> 0 or -errno: connect(AF_UNSPEC) on a datagram socket
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_disconnect",
-        move |fd: i32| -> hyperlight_host::Result<i32> { Ok(ret(n.disconnect(fd), |()| 0)) },
+        move |fd: i32| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_disconnect");
+            Ok(ret(n.disconnect(fd), |()| 0))
+        },
     )?;
 
     // net_getpeername(fd) -> [i32 status | packed addr]
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_getpeername",
         move |fd: i32| -> hyperlight_host::Result<Vec<u8>> {
+            let _profile = prof.host("net_getpeername");
             Ok(ret_vec(n.peer_addr(fd).map(|sa| addr_result(&sa))))
         },
     )?;
 
     // net_getsockname(fd) -> [i32 status | packed addr]
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_getsockname",
         move |fd: i32| -> hyperlight_host::Result<Vec<u8>> {
+            let _profile = prof.host("net_getsockname");
             Ok(ret_vec(n.local_addr(fd).map(|sa| addr_result(&sa))))
         },
     )?;
 
     // net_getsockopt(fd, level, optname) -> value or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_getsockopt",
         move |fd: i32, level: i32, optname: i32| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_getsockopt");
             Ok(ret(n.getsockopt(fd, level, optname), |v| v))
         },
     )?;
 
     // net_setsockopt(fd, level, optname, value) -> 0 or -errno
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_setsockopt",
         move |fd: i32, level: i32, optname: i32, value: i32| -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("net_setsockopt");
             Ok(ret(n.setsockopt(fd, level, optname, value), |()| 0))
         },
     )?;
@@ -1036,9 +1071,11 @@ pub(crate) fn register(
     //
     // Input is 8 bytes per fd: i32 fd, i16 events, i16 pad.
     let n = net.clone();
+    let prof = profile.clone();
     target.register_host_function(
         "net_poll",
         move |pollfds: Vec<u8>, timeout_ms: i32| -> hyperlight_host::Result<Vec<u8>> {
+            let _profile = prof.host("net_poll");
             let entries: Vec<(i32, i16)> = pollfds
                 .as_chunks::<8>()
                 .0

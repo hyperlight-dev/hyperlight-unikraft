@@ -178,6 +178,11 @@ struct SnapshotRunArgs {
     #[arg(long, value_name = "JSON", requires = "call")]
     input: Option<String>,
 
+    /// Print where the time went, host side, when the run ends (also
+    /// HLUK_PROFILE=1).
+    #[arg(long)]
+    profile: bool,
+
     /// Mount a host directory into the guest filesystem.
     /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
     #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
@@ -523,6 +528,26 @@ fn drive(
                 .into(),
         );
     }
+    let result = drive_inner(sandbox, no_workload, exec, call, t);
+    if sandbox.profile().enabled() {
+        eprint!("{}", sandbox.profile().report());
+    }
+    // The entry program's status, after the report: exiting in
+    // `drive_inner` would lose it.
+    match result? {
+        0 => Ok(()),
+        status => std::process::exit(status),
+    }
+}
+
+/// The entry program's exit status when it is driven to its exit, else 0.
+fn drive_inner(
+    sandbox: &mut AppSandbox,
+    no_workload: bool,
+    exec: Exec,
+    call: Option<Call>,
+    t: Instant,
+) -> CliResult<i32> {
     if let Some(call) = call {
         if !no_workload {
             sandbox.run(exec)?;
@@ -534,20 +559,17 @@ fn drive(
         if !result.is_empty() {
             println!("{result}");
         }
-        return Ok(());
+        return Ok(0);
     }
     if no_workload && !sandbox.has_driver() {
         info!("no driver in the guest; driving its entry point to exit");
         let status = sandbox.join()?;
         info!(elapsed_ms = elapsed_ms(t), status, "exec");
-        if status != 0 {
-            std::process::exit(status);
-        }
-        return Ok(());
+        return Ok(status);
     }
     sandbox.run(exec)?;
     info!(elapsed_ms = elapsed_ms(t), "exec");
-    Ok(())
+    Ok(0)
 }
 
 fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
@@ -628,6 +650,9 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
     let envs = parse_envs(&args.envs)?;
 
     let mut builder = builder.mounts(mounts);
+    if args.profile {
+        builder = builder.profile(true);
+    }
     if let Some(policy) = policy {
         builder = builder.network(policy);
     }
