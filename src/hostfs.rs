@@ -53,7 +53,11 @@ pub(crate) const CHUNK: usize = 32768;
 /// read-only mount refuses writes with `EROFS`.  With no mounts the
 /// functions are still registered and answer `EINVAL` for any index, so
 /// a restore offers every host function the snapshot's guest can call.
-pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crate::Result<()> {
+pub(crate) fn register(
+    target: &mut impl Registerable,
+    mounts: &[Mount],
+    profile: &std::sync::Arc<crate::profile::Profile>,
+) -> crate::Result<()> {
     let mut dirs_vec = Vec::with_capacity(mounts.len());
     let mut ro_vec = Vec::with_capacity(mounts.len());
     for (i, m) in mounts.iter().enumerate() {
@@ -93,9 +97,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     //   [17]     u8   is_file
     {
         let dirs = dirs.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_stat",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("fs_stat");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok({ -errno::EINVAL }.to_le_bytes().to_vec());
                 };
@@ -134,6 +140,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     // would make a large transfer one open.
     {
         let dirs = dirs.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_read_bytes",
             move |mount_idx: i32,
@@ -141,6 +148,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                   offset: u64,
                   len: u64|
                   -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("fs_read_bytes");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok({ -errno::EINVAL }.to_le_bytes().to_vec());
                 };
@@ -176,6 +184,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_write_bytes",
             move |mount_idx: i32,
@@ -184,6 +193,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                   append: i32,
                   data: Vec<u8>|
                   -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("fs_write_bytes");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(-errno::EINVAL);
                 };
@@ -214,9 +224,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_mkdir",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("fs_mkdir");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(-errno::EINVAL);
                 };
@@ -235,9 +247,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_unlink",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("fs_unlink");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(-errno::EINVAL);
                 };
@@ -263,9 +277,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_truncate",
             move |mount_idx: i32, path: String, length: u64| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("fs_truncate");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(-errno::EINVAL);
                 };
@@ -306,9 +322,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
             buf.extend(0u32.to_le_bytes());
             buf
         };
+        let prof = profile.clone();
         target.register_host_function(
             "fs_list",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("fs_list");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(list_error(errno::EINVAL));
                 };
@@ -351,9 +369,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_rename",
             move |mount_idx: i32, from: String, to: String| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("fs_rename");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(-errno::EINVAL);
                 };
@@ -372,12 +392,14 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_symlink",
             move |mount_idx: i32,
                   link_path: String,
                   target_path: String|
                   -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("fs_symlink");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(-errno::EINVAL);
                 };
@@ -405,9 +427,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     //   [4..]   bytes target path (UTF-8)
     {
         let dirs = dirs.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_readlink",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("fs_readlink");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok({ -errno::EINVAL }.to_le_bytes().to_vec());
                 };
@@ -429,9 +453,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_link",
             move |mount_idx: i32, src: String, dst: String| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("fs_link");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(-errno::EINVAL);
                 };
@@ -450,9 +476,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let prof = profile.clone();
         target.register_host_function(
             "fs_chmod",
             move |mount_idx: i32, path: String, mode: u32| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("fs_chmod");
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(-errno::EINVAL);
                 };

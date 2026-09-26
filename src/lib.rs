@@ -39,8 +39,10 @@ mod errno;
 mod hostfs;
 mod hostnet;
 pub mod net_policy;
+mod profile;
 
 pub use net_policy::{AllowList, BlockList, ListenPorts, NetworkPolicy, ResolveError};
+pub use profile::Profile;
 
 // ── Errors ──────────────────────────────────────────────────────────────
 
@@ -763,6 +765,8 @@ pub(crate) struct GuestConfig {
     host_functions: HostFunctionTable,
     /// What those events add up to.
     guest: Mutex<Guest>,
+    /// Where this sandbox's time goes (off unless asked for).
+    profile: Arc<profile::Profile>,
     /// The environment's version, sent with every call (see
     /// [`next_env_version`]): new when it changes, and on every restore.
     env_version: std::sync::atomic::AtomicU64,
@@ -798,6 +802,7 @@ impl GuestConfig {
             result: Arc::new(Mutex::new(None)),
             host_functions: HostFunctionTable::default(),
             guest: Mutex::new(Guest::default()),
+            profile: profile::Profile::new(),
             env_version: std::sync::atomic::AtomicU64::new(next_env_version()),
         }
     }
@@ -884,9 +889,11 @@ impl GuestConfig {
         // green ANSI on stdout) — send guest output to stdout uncolored,
         // and capture it for programmatic access.
         let output = self.output.clone();
+        let prof = self.profile.clone();
         target.register_host_function(
             "HostPrint",
             move |msg: String| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("HostPrint");
                 use std::io::Write;
                 let len = msg.len() as i32;
                 print!("{msg}");
@@ -897,68 +904,106 @@ impl GuestConfig {
         )?;
 
         let cmdline = self.cmdline.clone();
-        target
-            .register_host_function("GetCmdLine", move || -> hyperlight_host::Result<String> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetCmdLine",
+            move || -> hyperlight_host::Result<String> {
+                let _profile = prof.host("GetCmdLine");
                 Ok(cmdline.clone())
-            })?;
+            },
+        )?;
 
         // The mount table this host serves.  A restored guest makes its own
         // match on `resume`; a fresh guest boots with the same list from its
         // cmdline.
         let fstab = fstab_entries(&self.mounts)?;
         let mounts = fstab.clone();
-        target
-            .register_host_function("GetMounts", move || -> hyperlight_host::Result<String> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetMounts",
+            move || -> hyperlight_host::Result<String> {
+                let _profile = prof.host("GetMounts");
                 Ok(mounts.clone())
-            })?;
+            },
+        )?;
 
         let budget = self.paging_budget();
+        let prof = self.profile.clone();
         target.register_host_function(
             "GetPagingBudget",
-            move || -> hyperlight_host::Result<u64> { Ok(budget) },
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetPagingBudget");
+                Ok(budget)
+            },
         )?;
 
         let base = self.initrd_base;
-        target
-            .register_host_function("GetInitrdBase", move || -> hyperlight_host::Result<u64> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetInitrdBase",
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetInitrdBase");
                 Ok(base)
-            })?;
+            },
+        )?;
 
         let size = self.initrd_size;
-        target
-            .register_host_function("GetInitrdSize", move || -> hyperlight_host::Result<u64> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetInitrdSize",
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetInitrdSize");
                 Ok(size)
-            })?;
+            },
+        )?;
 
         let est = self.exn_stack_top();
-        target
-            .register_host_function("GetExnStackTop", move || -> hyperlight_host::Result<u64> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetExnStackTop",
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetExnStackTop");
                 Ok(est)
-            })?;
+            },
+        )?;
 
-        target
-            .register_host_function("GetWallClockNs", move || -> hyperlight_host::Result<u64> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetWallClockNs",
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetWallClockNs");
                 Ok(wall_clock_ns())
-            })?;
+            },
+        )?;
 
         // The guest's clock is the TSC, whose frequency KVM does not tell
         // it (no CPUID.15H, no hypervisor leaf); without this it assumes
         // 2.5 GHz and its clock runs fast or slow by the difference.
+        let prof = self.profile.clone();
         target.register_host_function("GetTscHz", move || -> hyperlight_host::Result<u64> {
+            let _profile = prof.host("GetTscHz");
             Ok(host_tsc_hz())
         })?;
 
+        let prof = self.profile.clone();
         target.register_host_function(
             "GetHostFsChunkSize",
-            move || -> hyperlight_host::Result<u64> { Ok(hostfs::CHUNK as u64) },
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetHostFsChunkSize");
+                Ok(hostfs::CHUNK as u64)
+            },
         )?;
 
         // ── Environment variables ─────────────────────────────────
         let env_str = self.env_str.clone();
-        target
-            .register_host_function("GetEnvVars", move || -> hyperlight_host::Result<String> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetEnvVars",
+            move || -> hyperlight_host::Result<String> {
+                let _profile = prof.host("GetEnvVars");
                 Ok(env_str.lock().unwrap().clone())
-            })?;
+            },
+        )?;
 
         // ── Resume state ──────────────────────────────────────────
         // What a restored guest asks its new host for on `resume`, in one
@@ -967,9 +1012,11 @@ impl GuestConfig {
         // bytes, as GetMounts and GetResolvConf answer them.
         let mounts = fstab;
         let resolv_conf = self.resolv_conf.clone();
+        let prof = self.profile.clone();
         target.register_host_function(
             "GetResumeState",
             move || -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("GetResumeState");
                 // The same answers GetWallClockNs, GetMounts and
                 // GetResolvConf give, one exit for all three.
                 let resolv = resolv_conf.lock().unwrap();
@@ -985,15 +1032,21 @@ impl GuestConfig {
 
         // ── Resolver configuration ────────────────────────────────
         let resolv_conf = self.resolv_conf.clone();
+        let prof = self.profile.clone();
         target.register_host_function(
             "GetResolvConf",
-            move || -> hyperlight_host::Result<String> { Ok(resolv_conf.lock().unwrap().clone()) },
+            move || -> hyperlight_host::Result<String> {
+                let _profile = prof.host("GetResolvConf");
+                Ok(resolv_conf.lock().unwrap().clone())
+            },
         )?;
 
         // ── Stdin ─────────────────────────────────────────────────
+        let prof = self.profile.clone();
         target.register_host_function(
             "ReadStdin",
             move || -> hyperlight_host::Result<String> {
+                let _profile = prof.host("ReadStdin");
                 use std::io::Read;
                 let mut data = vec![0u8; 4096];
                 let n = std::io::stdin().read(&mut data).unwrap_or(0);
@@ -1007,6 +1060,7 @@ impl GuestConfig {
         // They are only recorded here, in order; `absorb` reads them once
         // the entry has halted.
         let events = self.events.clone();
+        let prof = self.profile.clone();
         let result = self.result.clone();
         target.register_host_function(
             "Yield",
@@ -1015,6 +1069,7 @@ impl GuestConfig {
                   status: i32,
                   bytes: Vec<u8>|
                   -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("Yield");
                 let mut events = events.lock().unwrap();
                 // What the entry saw of the call in flight rides on its
                 // Yield, so a call costs no exit of its own: still running,
@@ -1040,12 +1095,16 @@ impl GuestConfig {
             },
         )?;
         let events = self.events.clone();
+        let prof = self.profile.clone();
         target.register_host_function("DriverReady", move || -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("DriverReady");
             events.lock().unwrap().push(Event::DriverReady);
             Ok(0)
         })?;
         let events = self.events.clone();
+        let prof = self.profile.clone();
         target.register_host_function("CallStarted", move || -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("CallStarted");
             events.lock().unwrap().push(Event::CallStarted);
             Ok(0)
         })?;
@@ -1053,9 +1112,11 @@ impl GuestConfig {
         // nothing), in one exit.
         let events = self.events.clone();
         let result = self.result.clone();
+        let prof = self.profile.clone();
         target.register_host_function(
             "CallDone",
             move |status: i32, bytes: Vec<u8>| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("CallDone");
                 if !bytes.is_empty() {
                     *result.lock().unwrap() = Some(bytes);
                 }
@@ -1071,24 +1132,30 @@ impl GuestConfig {
         // The embedder's functions, all behind one name: the kernel
         // forwards a driver's HLCALL_IOC_HOSTCALL here as it is.
         let table = self.host_functions.clone();
+        let prof = self.profile.clone();
         target.register_host_function(
             "HostCall",
             move |name: String, args: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("HostCall");
                 Ok(dispatch_host_call(&table, &name, &args))
             },
         )?;
         let events = self.events.clone();
+        let prof = self.profile.clone();
         target.register_host_function(
             "CallRejected",
             move || -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("CallRejected");
                 events.lock().unwrap().push(Event::CallRejected);
                 Ok(0)
             },
         )?;
         let events = self.events.clone();
+        let prof = self.profile.clone();
         target.register_host_function(
             "Exited",
             move |status: i32| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("Exited");
                 events
                     .lock()
                     .unwrap()
@@ -1103,10 +1170,10 @@ impl GuestConfig {
         // a guest saved under one and restored without it has its sockets
         // die on resume, and one saved without and restored under one gets
         // to use the network.
-        hostfs::register(target, &self.mounts)?;
+        hostfs::register(target, &self.mounts, &self.profile)?;
         match &self.net {
-            Some(net) => hostnet::register(target, net)?,
-            None => hostnet::register(target, &Arc::new(hostnet::Net::disabled()))?,
+            Some(net) => hostnet::register(target, net, &self.profile)?,
+            None => hostnet::register(target, &Arc::new(hostnet::Net::disabled()), &self.profile)?,
         }
 
         Ok(())
@@ -1140,7 +1207,8 @@ impl GuestConfig {
         // An entry starts with an empty inbox: a previous one that failed
         // in the hypervisor may have left events behind.
         self.events.lock().unwrap().clear();
-        sandbox.call::<()>(name, args)?;
+        self.profile
+            .entry(name, || sandbox.call::<()>(name, args))?;
         let yielded = self.absorb()?;
         debug!(?yielded, name, "entry");
         Ok(yielded)
@@ -1550,6 +1618,7 @@ pub struct SandboxBuilder {
     env_vars: Vec<(String, String)>,
     resolv_conf: Option<String>,
     host_functions: std::collections::BTreeMap<String, HostFunction>,
+    profile: Option<bool>,
 }
 
 impl SandboxBuilder {
@@ -1567,6 +1636,7 @@ impl SandboxBuilder {
             env_vars: Vec::new(),
             resolv_conf: None,
             host_functions: std::collections::BTreeMap::new(),
+            profile: None,
         }
     }
 
@@ -1688,6 +1758,15 @@ impl SandboxBuilder {
         self
     }
 
+    /// Profile where this sandbox's time goes, host side: each VM entry
+    /// split into guest and host function time, each host function, and
+    /// Hyperlight's boot and restore.  [`AppSandbox::profile`] reports it.
+    /// Also on with `HLUK_PROFILE=1`; `profile(false)` overrides that.
+    pub fn profile(mut self, on: bool) -> Self {
+        self.profile = Some(on);
+        self
+    }
+
     /// Offer the guest a function of the host's, by name: the way to give
     /// code in the sandbox one capability rather than a directory or the
     /// network.  It takes the guest's argument text and returns its result
@@ -1740,6 +1819,7 @@ impl SandboxBuilder {
             env_vars,
             resolv_conf,
             host_functions,
+            profile,
         } = self;
         // The empty name asks for the list of functions, one per line, so
         // neither it nor a line break can be in a function's name.
@@ -1768,8 +1848,14 @@ impl SandboxBuilder {
         }
         let (sandbox, cfg) = match snapshot {
             Some(snapshot) => {
+                let started = Instant::now();
                 let (sandbox, cfg) =
                     restore_snapshot(snapshot, mounts, network, listen_ports, host_functions)?;
+                if let Some(on) = profile {
+                    cfg.profile.set_enabled(on);
+                }
+                cfg.profile
+                    .record("boot: sandbox from snapshot", started.elapsed());
                 cfg.set_env_vars(&env_refs);
                 // Read by the resume entry below, which rewrites the file.
                 if let Some(rc) = &resolv_conf {
@@ -1823,7 +1909,13 @@ impl SandboxBuilder {
                 if let Some(rc) = &resolv_conf {
                     cfg.set_resolv_conf(rc);
                 }
-                let sandbox = match usandbox.evolve() {
+                if let Some(on) = profile {
+                    cfg.profile.set_enabled(on);
+                }
+                let sandbox = match cfg
+                    .profile
+                    .time("boot: evolve (cold boot)", || usandbox.evolve())
+                {
                     Ok(sandbox) => sandbox,
                     Err(e) => {
                         // The guest's last words are the diagnosis.
@@ -2275,7 +2367,10 @@ impl AppSandbox {
     /// guest right for this host with a `resume` entry, as
     /// [`SandboxBuilder::boot`] does, with this sandbox's mounts.
     pub fn restore(&mut self, snapshot: Arc<Snapshot>) -> Result<()> {
-        self.sandbox.restore(snapshot)?;
+        let sandbox = &mut self.sandbox;
+        self.config
+            .profile
+            .time("restore: hyperlight", || sandbox.restore(snapshot))?;
         // The host sockets belong to the guest state just discarded; the
         // restored guest re-creates the ones it holds on its resume entry.
         if let Some(net) = &self.config.net {
@@ -2305,6 +2400,13 @@ impl AppSandbox {
     /// Take the guest output captured so far.
     pub fn drain_output(&self) -> String {
         self.config.drain_output()
+    }
+
+    /// This sandbox's profile ([`SandboxBuilder::profile`]): print its
+    /// [`report`](Profile::report), or [`reset`](Profile::reset) it after a
+    /// warm-up.  Empty unless profiling is on.
+    pub fn profile(&self) -> &Profile {
+        &self.config.profile
     }
 
     /// Set guest environment variables for the next call.
