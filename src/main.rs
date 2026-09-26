@@ -25,7 +25,7 @@ fn elapsed_ms(t: Instant) -> f64 {
     (t.elapsed().as_secs_f64() * 10_000.0).round() / 10.0
 }
 
-/// Minimal Hyperlight host for Unikraft unikernels.
+/// Run Linux programs in Hyperlight micro-VMs, with Unikraft as the guest kernel.
 #[derive(Parser)]
 #[command(name = "hluk", version)]
 struct Cli {
