@@ -11,9 +11,9 @@ The whole contract is one character device, `/dev/hlcall`, and six operations on
 | `open()` | The driver is here.  The kernel tells the host `DriverReady`; a call that arrives before any open is refused with `CallRejected`, which is what an image without a driver produces. |
 | `ioctl(HLCALL_IOC_MAXLEN)` | How large a call can be, a `uint64_t` the kernel knows from the host's PEB.  The driver allocates its read buffer from it, once. |
 | `read()` | Blocks until the host issues a call, then returns it whole: the FunctionCall FlatBuffer as the host encoded it.  Reading again completes the previous call. |
-| `ioctl(HLCALL_IOC_GETENV)` | The variables the embedder set (`--env`, `set_env_vars`) as they are now, `KEY=VALUE` entries separated by NUL, into a buffer the driver provides.  Asked at the top of every call. |
+| `ioctl(HLCALL_IOC_GETENV)` | The variables the embedder set (`--env`, `set_env_vars`) as they are now, `KEY=VALUE` entries separated by NUL, into a buffer the driver provides.  Asked at the top of every call; the kernel answers from its own copy unless the embedder changed the variables since (each call carries the host's version of them), so an unchanged environment costs no host call. |
 | `ioctl(HLCALL_IOC_HOSTCALL)` | Call one of the embedder's functions (`SandboxBuilder::host_function`) by name and get its reply. The kernel forwards it as the host function `HostCall(name, args)`. Only while a call is in flight. |
-| `write()` | An `int32_t` status for the call being served, optionally followed by its result, which the kernel sends as `CallResult` before `CallDone`. Written when the call failed or has a result. Refused when no call is in flight. |
+| `write()` | An `int32_t` status for the call being served, optionally followed by its result, which the kernel reports with the entry's `Yield`. Written when the call failed or has a result. Refused when no call is in flight. |
 
 The ioctl numbers, `_IOR('H', 1, uint64_t)`, `_IOWR('H', 2, struct hlcall_env)` and `_IOWR('H', 3, struct hlcall_hostcall)`, are built with the standard macros, so the argument's size is part of the number and a layout mismatch between the two sides reads as `ENOTTY`.  The kernel's `plat/hyperlight/include/hyperlight-x86/step.h` is the source of truth; `hl_driver.h` mirrors it.
 
@@ -37,15 +37,14 @@ sequenceDiagram
     K-->>H: Yield, boot() returns
 
     H->>K: run("print(6*7)"): Exec
-    K-->>H: CallStarted
     K-->>D: the read returns the call
     D->>K: ioctl(GETENV)
     Note over D: PyRun_SimpleString prints 42
     D->>K: read()
-    K-->>H: CallDone(0), Yield: run() returns
+    K-->>H: Yield(returned 0): run() returns
 ```
 
-`boot()` returns when the driver is parked in its first `read()`, so every call the host ever makes finds a reader waiting.  Two things complete a call: the callback returning, and the driver reading again.  The kernel reports `CallDone` at that second read, which is why the driver never says "done" explicitly.  When the callback returns is each runtime's own rule: Node when its event loop drains, so a live timer or server keeps the call open until it is cleared or `unref()`ed; an exec'd program when it exits, taking its threads with it as any process does; Python and .NET when the main code returns, so a thread it started, daemon or not, foreground or background, is left behind and makes progress on the steps that follow like any blocked guest thread.  Python and .NET differ from their standalone programs here, which wait for non-daemon and foreground threads before exiting; a long-lived interpreter cannot run the exit-time machinery that makes that safe (a module-level thread pool would hold the call forever), so the call is the main code.  What the runtime prints to stdout and stderr is the guest's output on the host.
+`boot()` returns when the driver is parked in its first `read()`, so every call the host ever makes finds a reader waiting.  Two things complete a call: the callback returning, and the driver reading again.  The kernel notes the return at that second read and reports it with the entry's `Yield`, which is why the driver never says "done" explicitly.  When the callback returns is each runtime's own rule: Node when its event loop drains, so a live timer or server keeps the call open until it is cleared or `unref()`ed; an exec'd program when it exits, taking its threads with it as any process does; Python and .NET when the main code returns, so a thread it started, daemon or not, foreground or background, is left behind and makes progress on the steps that follow like any blocked guest thread.  Python and .NET differ from their standalone programs here, which wait for non-daemon and foreground threads before exiting; a long-lived interpreter cannot run the exit-time machinery that makes that safe (a module-level thread pool would hold the call forever), so the call is the main code.  What the runtime prints to stdout and stderr is the guest's output on the host.
 
 An exit inside a call (`sys.exit()`, `process.exit()`, `Environment.Exit()`, a shell's `exit`, a program's exit code) ends the call with that status, as it would end a script.  The runtime is there for the next call: Python and Node catch the exit and keep their state; .NET and bash cannot, so the next call starts a fresh one.
 
@@ -53,7 +52,7 @@ A call can block.  `run("time.sleep(2)")` puts the driver thread to sleep, and t
 
 ## A call that fails
 
-`run("1/0")` makes Python raise.  The callback returns 1, `hl_driver_run` writes that status to the device, and the next `read()` reports `CallDone(1)`: the host's `run()` fails with status 1 and the traceback in the output, and `step()` reports `Yield::CallFailed { status: 1 }`.  The status is the driver's to choose: a program's or an `exit()`'s own code, 1 for an uncaught exception (what the runtime's script would exit with), -1 when the driver could not run the call at all.  A call the driver reads past without a status is a success.  The kernel never waits for a write, so nothing can hang on one.
+`run("1/0")` makes Python raise.  The callback returns 1, `hl_driver_run` writes that status to the device, and the next `read()` marks the call returned with status 1: the host's `run()` fails with status 1 and the traceback in the output, and `step()` reports `Yield::CallFailed { status: 1 }`.  The status is the driver's to choose: a program's or an `exit()`'s own code, 1 for an uncaught exception (what the runtime's script would exit with), -1 when the driver could not run the call at all.  A call the driver reads past without a status is a success.  The kernel never waits for a write, so nothing can hang on one.
 
 ## What a call carries
 

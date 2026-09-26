@@ -154,4 +154,4 @@ Wasmtime 49 marks its 0.3 support as experimental, so treat it as such. Build a 
 
 ## How it works
 
-A guest function call is a `Call(function, input)` that the kernel queues on `/dev/hlcall`, like `Exec`. The driver writes the result after the status, and the kernel sends it to the host as `CallResult` before `CallDone`. Host function calls all travel as one kernel host function, `HostCall(name, args)`, which the library dispatches by name, so adding one needs no kernel change. [driver.md](driver.md) has the device protocol, and [execution.md](execution.md) has the host side.
+A guest function call is a `Call(function, input)` that the kernel queues on `/dev/hlcall`, like `Exec`. The driver writes the result after the status, and the kernel reports both with the entry's final `Yield`, so a call that returns within one entry costs a single VM exit. Host function calls all travel as one kernel host function, `HostCall(name, args)`, which the library dispatches by name, so adding one needs no kernel change. [driver.md](driver.md) has the device protocol, and [execution.md](execution.md) has the host side.
