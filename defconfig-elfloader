@@ -61,6 +61,10 @@ CONFIG_LIBVFSCORE=y
 CONFIG_LIBVFSCORE_AUTOMOUNT=y
 CONFIG_LIBVFSCORE_AUTOMOUNT_CI=y
 CONFIG_LIBVFSCORE_AUTOMOUNT_CI_INITRD=y
+# Files extracted from the initrd reference it instead of being copied into
+# guest memory: the rootfs no longer takes scratch at boot, nor a second copy
+# in every snapshot.
+CONFIG_LIBVFSCORE_AUTOMOUNT_EXTRACT_BORROW=y
 CONFIG_LIBVFSCORE_AUTOMOUNT_UP=y
 CONFIG_LIBVFSCORE_NONLARGEFILE=y
 # Command-line parameter parsing — needed for vfs.fstab= cmdline arg

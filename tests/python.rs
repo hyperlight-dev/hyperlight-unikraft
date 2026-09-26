@@ -826,3 +826,67 @@ fn python_handler_example() {
         r#"{"greeting": "Hello, again!", "calls": 2}"#
     );
 }
+
+/// The kernel keeps the environment it last fetched and refetches only
+/// when the host changed it: every change reaches the next call, whether
+/// or not a snapshot restore came in between.
+#[test]
+fn python_environment_changes_reach_every_call() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    let read = |sandbox: &mut hyperlight_unikraft::AppSandbox| {
+        sandbox
+            .run("import os; print(os.environ.get('VERSIONED', '-'))")
+            .unwrap();
+        sandbox.drain_output().trim().to_string()
+    };
+    sandbox.set_env_vars(&[("VERSIONED", "one")]);
+    assert_eq!(read(&mut sandbox), "one");
+    assert_eq!(read(&mut sandbox), "one");
+    sandbox.set_env_vars(&[("VERSIONED", "two")]);
+    assert_eq!(read(&mut sandbox), "two");
+    let snapshot = sandbox.snapshot().unwrap();
+    sandbox.set_env_vars(&[("VERSIONED", "three")]);
+    assert_eq!(read(&mut sandbox), "three");
+    // Restored to a snapshot whose kernel copy says "two": the host's
+    // "three" still wins.
+    sandbox.restore(snapshot.clone()).unwrap();
+    assert_eq!(read(&mut sandbox), "three");
+    sandbox.restore(snapshot).unwrap();
+    sandbox.set_env_vars(&[("VERSIONED", "four")]);
+    assert_eq!(read(&mut sandbox), "four");
+}
+
+/// Files extracted from the initrd reference it rather than a copy, so the
+/// initrd has to survive a snapshot whole: modules no one imported before
+/// the snapshot load after a restore, in place and in a new sandbox, and a
+/// rootfs file changed after the snapshot is back to its contents on the
+/// next restore.
+#[test]
+fn python_rootfs_reads_after_restore() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    let snapshot = sandbox.snapshot().unwrap();
+    let code = "import decimal, email.parser, http.client, json\n\
+                p = json.__file__\n\
+                before = open(p).read()\n\
+                with open(p, 'a') as f: f.write('# changed')\n\
+                print('rootfs-ok', '# changed' not in before,\n\
+                      open(p).read() == before + '# changed')";
+    let run = |sandbox: &mut hyperlight_unikraft::AppSandbox| {
+        sandbox.run(code).unwrap();
+        sandbox.drain_output().trim().to_string()
+    };
+    sandbox.restore(snapshot.clone()).unwrap();
+    assert_eq!(run(&mut sandbox), "rootfs-ok True True");
+    sandbox.restore(snapshot.clone()).unwrap();
+    assert_eq!(run(&mut sandbox), "rootfs-ok True True");
+    let mut fresh = SandboxBuilder::from_snapshot(snapshot).boot().unwrap();
+    assert_eq!(run(&mut fresh), "rootfs-ok True True");
+}

@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 /// MSR list, and the hyperlight-host release that reads a snapshot.  Bump
 /// it when any of those changes in a way a snapshot would notice; a
 /// kernel change rolls the key by itself.
-const SNAPSHOT_CONTRACT: u32 = 1;
+const SNAPSHOT_CONTRACT: u32 = 2;
 
 /// The embedded kernel, whose code and host-call protocol a snapshot
 /// carries in its memory.

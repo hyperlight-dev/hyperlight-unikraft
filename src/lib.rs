@@ -519,6 +519,30 @@ const GUEST_MSRS: &[u32] = &[
 /// and sleeps run fast or slow by the ratio; the resume entry should ask
 /// again and re-base the clock (the wall clock is already re-anchored
 /// there).
+/// Yield flags (plat/hyperlight/step.c): the call in flight started and is
+/// still running; it returned, with a status and a result.
+const YIELD_CALL_STARTED: i32 = 1;
+const YIELD_CALL_DONE: i32 = 2;
+
+/// A fresh environment version: the kernel answers a driver's GETENV
+/// from its copy while calls carry the version it fetched under.  Unique
+/// across processes in practice (seeded from the clock), so a snapshot
+/// taken by one never matches a version another hands out.
+fn next_env_version() -> u64 {
+    static NEXT: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    NEXT.get_or_init(|| std::sync::atomic::AtomicU64::new(wall_clock_ns() | 1))
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The host's wall clock, in ns since the Unix epoch (0 if it is set
+/// before it): GetWallClockNs's answer, and GetResumeState's.
+fn wall_clock_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 fn host_tsc_hz() -> u64 {
     static HZ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *HZ.get_or_init(|| {
@@ -732,13 +756,16 @@ pub(crate) struct GuestConfig {
     /// Events from the guest's last entry, in order; shared with the event
     /// host functions, which push, and drained by [`absorb`](Self::absorb).
     events: Arc<Mutex<Vec<Event>>>,
-    /// What the call in flight returned (`CallResult`), taken by
+    /// What the call in flight returned (with `CallDone`), taken by
     /// [`AppSandbox::take_result`]; cleared when a call is submitted.
     result: Arc<Mutex<Option<Vec<u8>>>>,
     /// The embedder's functions, served through `HostCall`.
     host_functions: HostFunctionTable,
     /// What those events add up to.
     guest: Mutex<Guest>,
+    /// The environment's version, sent with every call (see
+    /// [`next_env_version`]): new when it changes, and on every restore.
+    env_version: std::sync::atomic::AtomicU64,
 }
 
 impl GuestConfig {
@@ -771,6 +798,7 @@ impl GuestConfig {
             result: Arc::new(Mutex::new(None)),
             host_functions: HostFunctionTable::default(),
             guest: Mutex::new(Guest::default()),
+            env_version: std::sync::atomic::AtomicU64::new(next_env_version()),
         }
     }
 
@@ -822,6 +850,12 @@ impl GuestConfig {
             s.push('\0');
         }
         *self.env_str.lock().unwrap() = s;
+        self.env_version
+            .store(next_env_version(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn env_version(&self) -> u64 {
+        self.env_version.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The resolver configuration the kernel writes as the guest's
@@ -871,7 +905,8 @@ impl GuestConfig {
         // The mount table this host serves.  A restored guest makes its own
         // match on `resume`; a fresh guest boots with the same list from its
         // cmdline.
-        let mounts = fstab_entries(&self.mounts)?;
+        let fstab = fstab_entries(&self.mounts)?;
+        let mounts = fstab.clone();
         target
             .register_host_function("GetMounts", move || -> hyperlight_host::Result<String> {
                 Ok(mounts.clone())
@@ -901,24 +936,22 @@ impl GuestConfig {
                 Ok(est)
             })?;
 
-        target.register_host_function("GetWallClockNs", || -> hyperlight_host::Result<u64> {
-            Ok(std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0))
-        })?;
+        target
+            .register_host_function("GetWallClockNs", move || -> hyperlight_host::Result<u64> {
+                Ok(wall_clock_ns())
+            })?;
 
         // The guest's clock is the TSC, whose frequency KVM does not tell
         // it (no CPUID.15H, no hypervisor leaf); without this it assumes
         // 2.5 GHz and its clock runs fast or slow by the difference.
-        target.register_host_function("GetTscHz", || -> hyperlight_host::Result<u64> {
+        target.register_host_function("GetTscHz", move || -> hyperlight_host::Result<u64> {
             Ok(host_tsc_hz())
         })?;
 
-        target
-            .register_host_function("GetHostFsChunkSize", || -> hyperlight_host::Result<u64> {
-                Ok(hostfs::CHUNK as u64)
-            })?;
+        target.register_host_function(
+            "GetHostFsChunkSize",
+            move || -> hyperlight_host::Result<u64> { Ok(hostfs::CHUNK as u64) },
+        )?;
 
         // ── Environment variables ─────────────────────────────────
         let env_str = self.env_str.clone();
@@ -926,6 +959,29 @@ impl GuestConfig {
             .register_host_function("GetEnvVars", move || -> hyperlight_host::Result<String> {
                 Ok(env_str.lock().unwrap().clone())
             })?;
+
+        // ── Resume state ──────────────────────────────────────────
+        // What a restored guest asks its new host for on `resume`, in one
+        // exit rather than three: the wall clock (u64 ns), then the mount
+        // table and the resolver configuration, each a u32 length and its
+        // bytes, as GetMounts and GetResolvConf answer them.
+        let mounts = fstab;
+        let resolv_conf = self.resolv_conf.clone();
+        target.register_host_function(
+            "GetResumeState",
+            move || -> hyperlight_host::Result<Vec<u8>> {
+                // The same answers GetWallClockNs, GetMounts and
+                // GetResolvConf give, one exit for all three.
+                let resolv = resolv_conf.lock().unwrap();
+                let mut state = Vec::with_capacity(16 + mounts.len() + resolv.len());
+                state.extend_from_slice(&wall_clock_ns().to_le_bytes());
+                for part in [mounts.as_bytes(), resolv.as_bytes()] {
+                    state.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                    state.extend_from_slice(part);
+                }
+                Ok(state)
+            },
+        )?;
 
         // ── Resolver configuration ────────────────────────────────
         let resolv_conf = self.resolv_conf.clone();
@@ -951,16 +1007,38 @@ impl GuestConfig {
         // They are only recorded here, in order; `absorb` reads them once
         // the entry has halted.
         let events = self.events.clone();
-        target.register_host_function("Yield", move |ns: u64| -> hyperlight_host::Result<i32> {
-            // Keep the absolute deadline so time the host spends elsewhere
-            // counts against it and the guest timer still fires on schedule.
-            let until = (ns != 0).then(|| Instant::now() + Duration::from_nanos(ns));
-            events
-                .lock()
-                .unwrap()
-                .push(Event::Outcome(Yield::Blocked { until }));
-            Ok(0)
-        })?;
+        let result = self.result.clone();
+        target.register_host_function(
+            "Yield",
+            move |ns: u64,
+                  flags: i32,
+                  status: i32,
+                  bytes: Vec<u8>|
+                  -> hyperlight_host::Result<i32> {
+                let mut events = events.lock().unwrap();
+                // What the entry saw of the call in flight rides on its
+                // Yield, so a call costs no exit of its own: still running,
+                // or returned with its status and result.
+                if flags & YIELD_CALL_STARTED != 0 {
+                    events.push(Event::CallStarted);
+                }
+                if flags & YIELD_CALL_DONE != 0 {
+                    if !bytes.is_empty() {
+                        *result.lock().unwrap() = Some(bytes);
+                    }
+                    events.push(Event::Outcome(if status == 0 {
+                        Yield::CallDone
+                    } else {
+                        Yield::CallFailed { status }
+                    }));
+                }
+                // Keep the absolute deadline so time the host spends elsewhere
+                // counts against it and the guest timer still fires on schedule.
+                let until = (ns != 0).then(|| Instant::now() + Duration::from_nanos(ns));
+                events.push(Event::Outcome(Yield::Blocked { until }));
+                Ok(0)
+            },
+        )?;
         let events = self.events.clone();
         target.register_host_function("DriverReady", move || -> hyperlight_host::Result<i32> {
             events.lock().unwrap().push(Event::DriverReady);
@@ -971,25 +1049,22 @@ impl GuestConfig {
             events.lock().unwrap().push(Event::CallStarted);
             Ok(0)
         })?;
+        // The call returned: its status, and what it returned (empty:
+        // nothing), in one exit.
         let events = self.events.clone();
+        let result = self.result.clone();
         target.register_host_function(
             "CallDone",
-            move |status: i32| -> hyperlight_host::Result<i32> {
+            move |status: i32, bytes: Vec<u8>| -> hyperlight_host::Result<i32> {
+                if !bytes.is_empty() {
+                    *result.lock().unwrap() = Some(bytes);
+                }
                 let done = if status == 0 {
                     Yield::CallDone
                 } else {
                     Yield::CallFailed { status }
                 };
                 events.lock().unwrap().push(Event::Outcome(done));
-                Ok(0)
-            },
-        )?;
-        // What the call returned, sent just before its CallDone.
-        let result = self.result.clone();
-        target.register_host_function(
-            "CallResult",
-            move |bytes: Vec<u8>| -> hyperlight_host::Result<i32> {
-                *result.lock().unwrap() = Some(bytes);
                 Ok(0)
             },
         )?;
@@ -1124,6 +1199,9 @@ impl GuestConfig {
         // A result from the timeline the restore discarded is not this one's.
         *self.result.lock().unwrap() = None;
         *self.guest.lock().unwrap() = Guest::default();
+        // The kernel's copy of the environment is the snapshot's.
+        self.env_version
+            .store(next_env_version(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether anything can make the guest runnable again: a pending
@@ -2068,22 +2146,27 @@ impl AppSandbox {
             self.pending = None;
         }
         *self.config.result.lock().unwrap() = None;
+        // Trailing on every call: the kernel answers the driver's
+        // environment refresh from its copy while this matches.
+        let env = self.config.env_version();
         let yielded = match exec.into() {
-            Exec::Code(code) => self.config.enter(&mut self.sandbox, "Exec", code)?,
+            Exec::Code(code) => self.config.enter(&mut self.sandbox, "Exec", (code, env))?,
             Exec::File(path) => {
                 let code = std::fs::read_to_string(&path).map_err(|source| Error::Script {
                     path: path.clone(),
                     source,
                 })?;
-                self.config.enter(&mut self.sandbox, "Exec", code)?
+                self.config.enter(&mut self.sandbox, "Exec", (code, env))?
             }
             // Dispatched under its own name so the driver runs the named
             // guest file (empty command → its conventional entrypoint)
             // rather than treating the payload as inline code.
-            Exec::Guest(cmd) => self.config.enter(&mut self.sandbox, "GuestExec", cmd)?,
+            Exec::Guest(cmd) => self
+                .config
+                .enter(&mut self.sandbox, "GuestExec", (cmd, env))?,
             Exec::Call { function, input } => {
                 self.config
-                    .enter(&mut self.sandbox, "Call", (function, input))?
+                    .enter(&mut self.sandbox, "Call", (function, input, env))?
             }
         };
         match self.note(yielded) {
