@@ -4,6 +4,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+## [v0.16.0]
+
+### Added
+
+- `hluk run --profile` (also `HLUK_PROFILE=1` and `SandboxBuilder::profile`) prints where a sandbox's time goes, host side: each VM entry split into guest and host function time with its VM exits, each host function, and boot and restore. See `docs/profiling.md`.
+
+### Changed
+
+- Snapshot restore takes about 0.9 ms instead of 1.9–2.7 ms, now about the same for every runtime. After a restore the kernel's frame allocator takes its memory in 512 KiB chunks as it needs them, next to the copy-on-write pages, instead of writing its metadata over most of the scratch memory. Only the memory exception delivery writes is pre-faulted, and the exception stacks get fresh pages instead of copies. The new host function `GetResumeState` brings the clock, mounts and resolver in one exit instead of three.
+- A guest function call costs one VM exit instead of five: its start and return (with the result) ride on the entry's `Yield`, and the kernel refetches the environment only when the embedder changed it. `CallResult` is gone; `CallStarted` and `CallDone(status, result)` remain for an entry that ends without a `Yield`.
+- The rootfs is no longer copied into guest memory at boot: files extracted from the initrd reference it until they are changed (`CONFIG_LIBVFSCORE_AUTOMOUNT_EXTRACT_BORROW`). Python boots in 178 ms instead of 296, its snapshot is 74 MiB instead of 114, and it runs in 48 MiB of scratch instead of 128. The initrd is now mapped with 4 KiB pages, since Hyperlight's snapshot does not take large pages.
+- Snapshots saved by an earlier release are refused (the host functions changed); save them again.
+
+### Fixed
+
+- The copy-on-write page fault handler no longer changes SSE registers. It copied the page with an SSE `memcpy`, and exception entry doesn't save those registers, so the vectorised store that faulted could write the wrong data.
+- The buddy frame allocator cleared its bitmaps with an SSE `memset` when memory was added from a page fault, changing the registers of the code that faulted. Generic Unikraft bug, reproduced on QEMU/KVM.
+- A ramfs file shrunk and then grown again (by `truncate` or a write past its end) read back the bytes the shrink had cut instead of zeros. Generic Unikraft bug, reproduced on QEMU/KVM.
+
 ## [v0.15.0]
 
 ### Added
