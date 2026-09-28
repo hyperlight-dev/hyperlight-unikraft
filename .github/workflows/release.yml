@@ -1,5 +1,5 @@
 # Cut a release: tag the version in Cargo.toml, create a GitHub Release with
-# auto-generated notes and the `hluk` binaries, and kick off the GHCR image
+# the CHANGELOG section as notes and the `hluk` binaries, and kick off the GHCR image
 # publish. Run it manually (Actions → Create release → Run workflow) after
 # bumping `version` in Cargo.toml on main.
 #
@@ -62,8 +62,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          # Release notes are the matching CHANGELOG.md section (curated), not
-          # an auto-generated PR list.
+          # Release notes are the matching CHANGELOG.md section (curated),
+          # followed by GitHub's generated PR list.
           just changelog-notes "v$VERSION" > RELEASE_NOTES.md
           if [ ! -s RELEASE_NOTES.md ]; then
             echo "::error::No CHANGELOG.md section for v$VERSION — add one before releasing"
@@ -71,7 +71,10 @@ jobs:
           fi
           git tag "v$VERSION"
           git push origin "v$VERSION"
-          gh release create "v$VERSION" \
+          # A draft until every binary and SHA256SUMS are attached (the
+          # checksums job publishes it): an installer never meets a release
+          # missing its platform or its checksums.
+          gh release create "v$VERSION" --draft \
             --title "v$VERSION" \
             --notes-file RELEASE_NOTES.md \
             "hluk-v$VERSION-x86_64-unknown-linux-gnu.tar.gz"
@@ -105,3 +108,71 @@ jobs:
           $v = "${{ needs.release-linux.outputs.version }}"
           Compress-Archive -Path target\release\hluk.exe -DestinationPath "hluk-v$v-x86_64-pc-windows-msvc.zip"
           gh release upload "v$v" "hluk-v$v-x86_64-pc-windows-msvc.zip"
+
+  # arm64 Linux, built natively on an arm64 runner (it embeds the arm64
+  # kernel).
+  release-linux-arm64:
+    needs: release-linux
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ needs.release-linux.outputs.version }}
+
+      - name: Build hluk (Linux arm64)
+        run: cargo build --release --locked
+
+      - name: Package and upload binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.release-linux.outputs.version }}"
+          tar -C target/release -czf "hluk-v$VERSION-aarch64-unknown-linux-gnu.tar.gz" hluk
+          gh release upload "v$VERSION" "hluk-v$VERSION-aarch64-unknown-linux-gnu.tar.gz"
+
+  # macOS on Apple silicon.  Signed (ad hoc) with the hypervisor
+  # entitlement, which Hypervisor.framework requires; install.sh signs it
+  # again where it installs it.
+  release-macos:
+    needs: release-linux
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ needs.release-linux.outputs.version }}
+
+      - name: Build hluk (macOS arm64)
+        run: cargo build --release --locked
+
+      - name: Sign, package and upload binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.release-linux.outputs.version }}"
+          codesign -f -s - --entitlements dev/macos-entitlements.plist target/release/hluk
+          tar -C target/release -czf "hluk-v$VERSION-aarch64-apple-darwin.tar.gz" hluk
+          gh release upload "v$VERSION" "hluk-v$VERSION-aarch64-apple-darwin.tar.gz"
+
+  # One checksum file over every binary, which install.sh and install.ps1
+  # verify their download against; then the draft is published.
+  checksums:
+    needs: [release-linux, release-windows, release-linux-arm64, release-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Write and upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.release-linux.outputs.version }}"
+          mkdir assets && cd assets
+          gh release download "v$VERSION" --pattern 'hluk-*'
+          sha256sum hluk-* > SHA256SUMS
+          gh release upload "v$VERSION" SHA256SUMS --clobber
+          gh release edit "v$VERSION" --draft=false
