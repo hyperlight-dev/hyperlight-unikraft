@@ -693,10 +693,19 @@ fn shell(command: &str, dir: &Path) -> std::io::Result<ExitStatus> {
     cmd.current_dir(dir).status()
 }
 
+/// The ELF machine (`e_machine`) of a program the guest can run, and its
+/// name: the host's architecture.
+const GUEST_ELF_ARCH: (u16, &str) = if cfg!(target_arch = "aarch64") {
+    (183, "aarch64")
+} else {
+    (62, "x86_64")
+};
+
 /// A program the exec driver runs from a host mount must be a PIE: the
 /// guest's ELF loader maps it into its own address space.  Read the header
 /// here and say how to fix it, rather than let the guest report "Image
-/// format not recognized".  Anything that is not an ELF file under a mount
+/// format not recognized", as it does for a binary for the host's OS or for
+/// another architecture too.  Anything that is not an ELF file under a mount
 /// is left alone: code for an interpreter, a path inside the rootfs.
 fn check_pie(command: &str, mounts: &[Mount]) -> CliResult<()> {
     let Some(program) = command.split_whitespace().next() else {
@@ -708,9 +717,38 @@ fn check_pie(command: &str, mounts: &[Mount]) -> CliResult<()> {
     let Ok(mut file) = fs::File::open(&host) else {
         return Ok(());
     };
-    let mut header = [0u8; 18];
-    if file.read_exact(&mut header).is_err() || &header[..4] != b"\x7fELF" {
+    let mut header = [0u8; 20];
+    if file.read_exact(&mut header).is_err() {
         return Ok(());
+    }
+    // A binary the host's own compiler made (Mach-O, PE) rather than a
+    // Linux one: the usual slip on macOS and Windows.
+    if matches!(
+        &header[..4],
+        [0xcf, 0xfa, 0xed, 0xfe] | [0xca, 0xfe, 0xba, 0xbe]
+    ) || &header[..2] == b"MZ"
+    {
+        return Err(format!(
+            "{} is a binary for the host OS, not a Linux ELF the guest can run: build it for \
+             Linux on this CPU ({})",
+            host.display(),
+            GUEST_ELF_ARCH.1
+        )
+        .into());
+    }
+    if &header[..4] != b"\x7fELF" {
+        return Ok(());
+    }
+    // e_machine at offset 18.
+    let machine = u16::from_le_bytes([header[18], header[19]]);
+    if machine != GUEST_ELF_ARCH.0 {
+        return Err(format!(
+            "{} is built for another architecture (ELF machine {machine}); this host runs {} \
+             guests",
+            host.display(),
+            GUEST_ELF_ARCH.1
+        )
+        .into());
     }
     // e_type at offset 16: 2 is ET_EXEC (linked at a fixed address), 3 is
     // ET_DYN (a PIE, or a shared object).
@@ -1251,16 +1289,33 @@ mod tests {
         let mut exec = vec![0u8; 64];
         exec[..4].copy_from_slice(b"\x7fELF");
         exec[16..18].copy_from_slice(&2u16.to_le_bytes());
+        exec[18..20].copy_from_slice(&GUEST_ELF_ARCH.0.to_le_bytes());
         fs::write(dir.path().join("fixed"), &exec).unwrap();
         let mut pie = exec.clone();
         pie[16..18].copy_from_slice(&3u16.to_le_bytes());
         fs::write(dir.path().join("pie"), &pie).unwrap();
+        // A PIE for the other architecture, and a macOS binary.
+        let mut foreign = pie.clone();
+        foreign[18..20]
+            .copy_from_slice(&(if GUEST_ELF_ARCH.0 == 62 { 183u16 } else { 62 }).to_le_bytes());
+        fs::write(dir.path().join("foreign"), &foreign).unwrap();
+        let mut macho = vec![0u8; 64];
+        macho[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        fs::write(dir.path().join("macho"), &macho).unwrap();
         fs::write(dir.path().join("script"), b"print('hi')").unwrap();
         let mounts = [Mount::ro(dir.path(), "/mnt/app")];
         let err = check_pie("/mnt/app/fixed --flag", &mounts)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not position-independent"), "{err}");
+        let err = check_pie("/mnt/app/foreign", &mounts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another architecture"), "{err}");
+        let err = check_pie("/mnt/app/macho", &mounts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a Linux ELF"), "{err}");
         check_pie("/mnt/app/pie", &mounts).unwrap();
         check_pie("/mnt/app/script", &mounts).unwrap();
         check_pie("/mnt/app/missing", &mounts).unwrap();

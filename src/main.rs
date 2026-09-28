@@ -1027,6 +1027,21 @@ fn main() {
         }
         _ => {
             eprintln!("error: {e}");
+            #[cfg(target_os = "macos")]
+            if e.to_string().contains("HVF error: 0xfae94007") {
+                // HV_DENIED: the binary lacks the hypervisor entitlement.
+                // The command signs this binary, wherever it came from, via a
+                // private temporary file.
+                let exe = std::env::current_exe()
+                    .map(|p| p.display().to_string().replace('\'', "'\\''"))
+                    .unwrap_or_else(|_| "hluk".into());
+                eprintln!(
+                    "hint: sign hluk with the hypervisor entitlement:\n  \
+                     p=$(mktemp) && printf '<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+                     <key>com.apple.security.hypervisor</key><true/></dict></plist>' > \"$p\" \
+                     && codesign -f -s - --entitlements \"$p\" '{exe}'"
+                );
+            }
             std::process::exit(1);
         }
     }
