@@ -1,0 +1,161 @@
+name: arm64
+
+# Guests on arm64: the images and test binaries built on a hosted arm64
+# runner, then the integration tests on hyperlight-dev's self-hosted arm64
+# runners (Linux/KVM and macOS/Hypervisor.framework), which hosted runners
+# cannot stand in for.  Those runners are few and shared with hyperlight, so
+# this runs on main, on demand, and on pull requests labelled ci/arm64 (only
+# maintainers can label).  A pull request from a fork runs when it is
+# labelled, not on its later pushes: remove and re-add the label to test new
+# commits.  That keeps honest runs deliberate; it is no security boundary,
+# since a fork's pull request brings its own copy of this file.  Outside
+# code is kept off the runners by the setting that requires approval before
+# a fork's workflows run.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  rootfs-arm64:
+    # On a pull request labelled ci/arm64: when that label is added, or on a
+    # push to a branch of this repository (not a fork's), and not when some
+    # other label is added.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (contains(github.event.pull_request.labels.*.name, 'ci/arm64') &&
+       (github.event.action == 'labeled' && github.event.label.name == 'ci/arm64' ||
+        github.event.action != 'labeled' &&
+        github.event.pull_request.head.repo.full_name == github.repository))
+    # Per job, not per workflow: a run whose jobs are skipped (another label
+    # added) must not cancel one that is testing.
+    concurrency:
+      group: arm64-rootfs-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Cache key
+        id: key
+        run: echo "key=rootfs-arm64-rust199beta-muslaot-${{ hashFiles('drivers/**', 'examples/agent/custom/Dockerfile', 'examples/c/**', 'examples/rust/**', 'examples/go/**', 'examples/wasmtime/**', 'examples/dotnet-aot/**') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache guest images and test binaries
+        id: rootfs-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build-elfloader
+          key: ${{ steps.key.outputs.key }}
+          # Saved on Linux, restored on macOS too.
+          enableCrossOsArchive: true
+
+      - name: Install cpio
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends cpio
+
+      - name: Install .NET SDK
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Install Go
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Build rootfs images and test binaries
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: |
+          just build-all-rootfs
+          # Rust 1.98 links no static PIE for arm64, so the Rust test
+          # programs come from the 1.99 beta, pinned by date: the beta
+          # channel moved on to 1.100, whose wasip2 programs exit with
+          # their own status rather than 1.  Drop this (and "rust199beta"
+          # in the cache key) once 1.99 is stable and rust-toolchain.toml
+          # names it.  ("muslaot": the .NET AOT test programs moved to a
+          # musl toolchain, invalidating earlier entries.)
+          rustup toolchain install beta-2026-09-27 --profile minimal
+          RUSTUP_TOOLCHAIN=beta-2026-09-27 just build-test-bins
+
+      # For the test jobs: an artifact, since a macOS runner cannot restore
+      # a cache entry Linux saved without zstd, which the self-hosted Macs
+      # lack.
+      - name: Hand the images to the test jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rootfs-arm64
+          path: build-elfloader
+          retention-days: 1
+          if-no-files-found: error
+
+  test-arm64:
+    name: test (${{ matrix.os }}-arm64)
+    needs: rootfs-arm64
+    concurrency:
+      group: arm64-test-${{ matrix.os }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The labels hyperlight's own arm64 jobs use (dep_build_test.yml).
+          # The Linux runner is a small VM (2 CPUs, 3 GB) whose guests run
+          # under nested virtualization: a large guest there takes 10-20
+          # minutes per test.  It runs the suites with small guests; macOS
+          # runs everything, the agent, node, .NET JIT and PowerShell
+          # suites included.
+          - os: linux
+            runner: [self-hosted, Linux, arm64, kvm]
+            targets: >-
+              --lib --bins --test bash --test cli --test compiled
+              --test native_kernel --test networking --test project
+              --test python --test python_shell --test quickjs --test resolv
+              --test snapshot_mounts --test step --test wasmtime
+          - os: macos
+            runner: [self-hosted, macos, arm64, hvf]
+            targets: --all-targets
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Self-hosted runners come without a Rust toolchain: install the one
+      # rust-toolchain.toml pins, as hyperlight's jobs do.
+      - name: Rust toolchain version
+        id: rust
+        run: echo "toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ steps.rust.outputs.toolchain }}
+
+      - name: Fetch guest images and test binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rootfs-arm64
+          path: build-elfloader
+
+      # On macOS, cargo signs each test binary with the hypervisor
+      # entitlement first and runs its tests one at a time
+      # (dev/macos-sign-and-run.sh).
+      - name: cargo test
+        run: cargo test --locked ${{ matrix.targets }}
+        env:
+          RUST_TEST_THREADS: 1
