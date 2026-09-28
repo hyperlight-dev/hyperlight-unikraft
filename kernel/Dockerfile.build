@@ -2,9 +2,11 @@
 # Pinned to Ubuntu 24.04 (gcc-13) so every machine produces the same binary.
 FROM ubuntu:24.04
 
+# gcc-aarch64-linux-gnu cross-builds the arm64 kernel.
 RUN apt-get update -q && \
     apt-get install -y --no-install-recommends \
-        build-essential bison flex libncurses-dev python3 make && \
+        build-essential bison flex libncurses-dev python3 make \
+        gcc-aarch64-linux-gnu && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /kernel

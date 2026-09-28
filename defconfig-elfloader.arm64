@@ -1,0 +1,7 @@
+# arm64 on top of defconfig-elfloader (see `just build-kernel arm64`).
+CONFIG_ARCH_ARM_64=y
+# Linux binaries use FP/SIMD registers: save them across context switches.
+CONFIG_FPSIMD=y
+# The CPU's generator (RNDR) is optional on arm64 and missing on Apple's
+# cores; libukrandom is seeded from the host instead (HYPERLIGHT_RANDOM).
+# CONFIG_LIBUKRANDOM_LCPU is not set
