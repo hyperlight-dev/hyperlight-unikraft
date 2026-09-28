@@ -4,3 +4,4 @@
 * text=auto eol=lf
 *.cpio binary
 kernel/elfloader_hyperlight-x86_64 binary
+kernel/elfloader_hyperlight-arm64 binary

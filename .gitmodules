@@ -4,8 +4,9 @@
 	branch = plat-hyperlight-v2
 [submodule "kernel/app-elfloader"]
 	path = kernel/app-elfloader
-	url = https://github.com/unikraft/app-elfloader.git
-	branch = staging
+	# The fork until unikraft/app-elfloader#105 (arm64 AT_HWCAP) merges.
+	url = https://github.com/danbugs/app-elfloader.git
+	branch = arm64-at-hwcap
 [submodule "kernel/libs/libelf"]
 	path = kernel/libs/libelf
 	url = https://github.com/unikraft/lib-libelf.git
