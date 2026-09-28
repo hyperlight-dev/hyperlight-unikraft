@@ -847,6 +847,7 @@ dependencies = [
  "cap-std",
  "clap",
  "flate2",
+ "getrandom 0.4.3",
  "hyperlight-common",
  "hyperlight-host",
  "rustix",

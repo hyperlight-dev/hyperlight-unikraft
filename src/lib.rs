@@ -226,13 +226,22 @@ fn dispatch_host_call(table: &HostFunctionTable, name: &str, args: &[u8]) -> Vec
 
 // ── Constants ───────────────────────────────────────────────────────────
 
-/// Embedded Unikraft app-elfloader kernel binary.
+/// Embedded Unikraft app-elfloader kernel binary, built for the host's
+/// architecture: a guest runs on the host CPU.
+#[cfg(target_arch = "x86_64")]
 static KERNEL: &[u8] = include_bytes!("../kernel/elfloader_hyperlight-x86_64");
+#[cfg(target_arch = "aarch64")]
+static KERNEL: &[u8] = include_bytes!("../kernel/elfloader_hyperlight-arm64");
+
+/// Most bytes one GetRandomBytes answers: far more than a CSPRNG seed.
+const RANDOM_BYTES_MAX: u64 = 4096;
 
 /// GPA where the initrd is mapped via `map_file_cow`.
 ///
 /// Past the x86 LAPIC MMIO page (0xFEE0_0000) to avoid collisions
-/// with KVM's in-kernel IRQCHIP reservation.
+/// with KVM's in-kernel IRQCHIP reservation.  On arm64 nothing sits
+/// there; the address is aligned for HVF's 16 KiB pages and well inside
+/// its 36-bit guest physical space.
 const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
 
 /// Scratch memory in MiB for a guest with no initrd to size from (a
@@ -487,7 +496,7 @@ fn snapshot_tags(dir: &Path) -> Option<Vec<String>> {
 }
 
 /// MSRs the Unikraft guest reads/writes, which hyperlight 0.17.0's
-/// default-deny KVM MSR filter must permit.
+/// default-deny KVM MSR filter must permit (x86 only).
 ///
 /// From 0.17.0 the vCPU runs behind a KVM MSR filter that faults (#GP)
 /// on any guest rdmsr/wrmsr of an MSR the host has not declared.  The
@@ -498,6 +507,7 @@ fn snapshot_tags(dir: &Path) -> Option<Vec<String>> {
 /// [`SandboxBuilder::boot`]) must declare the SAME set: a snapshot persists exactly
 /// the declared MSRs and restore rejects any it cannot map back onto the
 /// restoring VM's declared set.
+#[cfg(target_arch = "x86_64")]
 const GUEST_MSRS: &[u32] = &[
     0x277,       // IA32_PAT   — page-attribute table (paging init)
     0xC000_0081, // IA32_STAR  — syscall CS/SS selectors
@@ -586,10 +596,17 @@ fn host_tsc_hz() -> u64 {
 }
 
 /// Declare [`GUEST_MSRS`] on a sandbox configuration.
+#[cfg(target_arch = "x86_64")]
 fn apply_guest_msrs(cfg: &mut SandboxConfiguration) -> Result<()> {
     cfg.guest_msrs(GUEST_MSRS).map_err(|e| {
         Error::Hyperlight(hyperlight_host::new_error!("declaring guest MSRs: {}", e))
     })?;
+    Ok(())
+}
+
+/// arm64 has no MSRs to declare.
+#[cfg(not(target_arch = "x86_64"))]
+fn apply_guest_msrs(_cfg: &mut SandboxConfiguration) -> Result<()> {
     Ok(())
 }
 
@@ -984,6 +1001,21 @@ impl GuestConfig {
             let _profile = prof.host("GetTscHz");
             Ok(host_tsc_hz())
         })?;
+
+        // Entropy for the guest's CSPRNG where the CPU has no generator the
+        // kernel can use (arm64 without FEAT_RNG).  The guest asks at boot
+        // and again when it reseeds after a restore, so clones diverge.
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetRandomBytes",
+            move |len: u64| -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("GetRandomBytes");
+                let mut buf = vec![0u8; len.min(RANDOM_BYTES_MAX) as usize];
+                getrandom::fill(&mut buf)
+                    .map_err(|e| hyperlight_host::new_error!("host entropy unavailable: {}", e))?;
+                Ok(buf)
+            },
+        )?;
 
         let prof = self.profile.clone();
         target.register_host_function(
@@ -1650,7 +1682,7 @@ impl SandboxBuilder {
     }
 
     /// Boot an external kernel that carries its own workload — a native
-    /// app-in-kernel build, or a locally built `elfloader_hyperlight-x86_64`
+    /// app-in-kernel build, or a locally built `elfloader_hyperlight-<arch>`
     /// for kernel development.
     ///
     /// **Advanced.** The embedded kernel is the only combination this crate is
