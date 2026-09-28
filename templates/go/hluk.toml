@@ -12,8 +12,9 @@ image = "{{image}}"
 
 [build]
 # The guest's ELF loader needs a position-independent binary, hence
-# -buildmode=pie; CGO_ENABLED=0 keeps it free of a host libc.
-command = "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildmode=pie -ldflags='-s -w' -o bin/app ."
+# -buildmode=pie; CGO_ENABLED=0 keeps it free of a host libc.  The guest is
+# Linux on the host's CPU: GOOS names the OS, and GOARCH defaults to the CPU.
+command = "CGO_ENABLED=0 GOOS=linux go build -buildmode=pie -ldflags='-s -w' -o bin/app ."
 
 [run]
 # The build output, mounted read-only into the guest and run from there.

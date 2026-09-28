@@ -16,7 +16,7 @@ Three small programs, one project each: `hello/` prints a line, `env_vars/` prin
 Publish a self-contained Native AOT binary targeting Alpine (musl); build dependencies on Alpine are `clang gcc musl-dev zlib-dev`:
 
 ```bash
-dotnet publish hello -c Release -r linux-musl-x64 -o ./publish
+dotnet publish hello -c Release --os linux-musl -o ./publish
 ```
 
 **Note:** AOT binaries on Alpine link against musl.  The dotnet-aot rootfs includes the musl dynamic linker.

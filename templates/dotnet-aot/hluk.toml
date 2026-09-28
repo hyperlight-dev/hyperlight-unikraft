@@ -11,9 +11,16 @@ name = "{{name}}"
 image = "{{image}}"
 
 [build]
-# Native AOT for Alpine (musl); on Debian/Ubuntu hosts install clang and
-# zlib1g-dev first.
-command = "dotnet publish -c Release -r linux-musl-x64 -v q --nologo -o bin"
+# Native AOT for Alpine (musl) on the host's CPU, built in Alpine's .NET SDK
+# image so the toolchain is musl's too (a glibc toolchain links symbols the
+# guest lacks).  Needs Docker: Linux on either CPU, or macOS with Docker
+# Desktop; on Windows run it in WSL.
+command = """docker run --rm -v "$PWD:/src" -w /src -e HOME=/tmp \
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+  mcr.microsoft.com/dotnet/sdk:9.0-alpine sh -c '\
+    apk add --no-cache clang lld build-base zlib-dev >/dev/null && \
+    dotnet publish -c Release -v q --nologo -o bin && rm -f bin/*.dbg && \
+    chown -R "$HOST_UID:$HOST_GID" bin obj'"""
 
 [run]
 mounts = ["./bin:/mnt/app:ro"]

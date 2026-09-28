@@ -12,8 +12,10 @@ image = "{{image}}"
 
 [build]
 # The guest's ELF loader needs a position-independent binary (-fPIE);
-# -static-pie keeps it free of the host's shared libraries.
-command = "mkdir -p bin && gcc -O2 -Wall -static-pie -fPIE -o bin/app main.c"
+# -static-pie keeps it free of the host's shared libraries.  The compiler
+# must make a Linux binary for the host's CPU: on macOS point CC at a Linux
+# cross compiler, e.g. CC="zig cc -target aarch64-linux-musl".
+command = "mkdir -p bin && ${CC:-gcc} -O2 -Wall -static-pie -fPIE -o bin/app main.c"
 
 [run]
 mounts = ["./bin:/mnt/app:ro"]
