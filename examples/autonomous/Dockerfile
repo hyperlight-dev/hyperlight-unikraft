@@ -3,5 +3,8 @@
 # code, only the fixed launcher (see README / launch.py).
 #
 # Build:  just build-rootfs autonomous examples/autonomous/Dockerfile
-FROM hluk-python-rootfs:latest
+# -arm64 when `just build-rootfs` builds for another platform
+# (HLUK_ROOTFS_PLATFORM), so the base is that platform's image too.
+ARG ROOTFS_SUFFIX=
+FROM hluk-python-rootfs${ROOTFS_SUFFIX}:latest
 COPY examples/autonomous/entrypoint.py /entrypoint.py
