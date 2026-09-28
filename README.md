@@ -15,8 +15,10 @@ hyperlight-unikraft ships as both a Rust library and a CLI. `hluk` (the CLI) boo
 ## Quick start
 
 ```bash
-# 1. Install the CLI (the Unikraft kernel is baked into the binary)
+# 1. Install the CLI (the Unikraft kernel is baked into the binary): Linux, macOS
 curl -fsSL https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.sh | sh
+#    Windows (PowerShell)
+irm https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.ps1 | iex
 #    or, with a Rust toolchain: cargo install hyperlight-unikraft
 
 # 2. Start a project from a template; the matching rootfs is pulled from GHCR
@@ -37,7 +39,7 @@ Without a project, `hluk run` takes the same settings as flags (`--initrd`, `--m
 
 ## Runtimes and platforms
 
-hyperlight-unikraft runs on **Linux** (KVM, or MSHV with `cargo build --features mshv`), **Windows** (WHP), and **macOS** (HVF).
+hyperlight-unikraft runs on **Linux** (KVM, or MSHV with `cargo build --features mshv`), **Windows** (WHP), and **macOS** on Apple silicon (HVF). On an arm64 host it embeds an arm64 kernel and runs arm64 guests; every published runtime image carries both architectures. On macOS the `hluk` binary needs the hypervisor entitlement: `codesign -f -s - --entitlements dev/macos-entitlements.plist target/release/hluk` (`cargo run` and `cargo test` do it for you, `install.sh` signs the one it installs, and an unsigned `hluk` prints a command that signs it). Hypervisor.framework allows one VM per process, so the sandboxes of one process take turns: run them from separate processes to run them side by side. A guest waiting on a timer while another sandbox runs sees its deadline pass.
 
 Guest runtimes include **Python**, **Node.js**, **.NET** (JIT and AOT), **Bash**, **Go**, **Rust**, **C**, **PowerShell**, **QuickJS** and **Wasmtime** (WebAssembly modules and components under WASI). The quickjs, node, python, dotnet-jit and wasmtime images also take guest function calls (a handler defined once, called many times with JSON in and out) and make host function calls to functions you provide, like [hyperlight-js](https://github.com/hyperlight-dev/hyperlight-js) and [hyperlight-wasm](https://github.com/hyperlight-dev/hyperlight-wasm); see [`docs/calls.md`](docs/calls.md). Two are Python variants with a BusyBox shell: **python-shell** (Python + a shell; a general base other images build on) and **agent** (python-shell plus preloaded data-science packages like numpy, pandas, scipy, scikit-learn, which are commonly used for agent code-executors). Any Python guest with `--net` can also `pip install` packages on demand from inside the guest (see [`examples/agent/pip_install.py`](examples/agent/pip_install.py)). See [support tiers](docs/guest-support-tiers.md) for the guarantee behind each; `just list-runtimes` prints the current set.
 

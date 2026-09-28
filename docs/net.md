@@ -22,11 +22,11 @@ Python/Node app               hostnet.rs
 1. The guest calls `socket()`, `connect()`, `send()`, etc. through the standard POSIX socket API.
 2. Unikraft's socket layer dispatches to **hostsock** — a kernel driver registered for `AF_INET` and `AF_INET6`.
 3. hostsock serialises the call into `hl_param` structs and makes a synchronous host call (`hl_hcall_int` for integer results, `hl_hcall_vecbytes` for variable-length data).
-4. The host's **hostnet** module looks up the virtual fd in a `SocketTable`, checks policy, and makes the matching [`rustix`](https://docs.rs/rustix) call — `rustix::net::connect`, `rustix::net::sendto`, `rustix::event::poll`, … — on the real OS socket.  rustix is a safe wrapper over the POSIX/WinSock socket API, so the host side is the same code on Linux and Windows.
+4. The host's **hostnet** module looks up the virtual fd in a `SocketTable`, checks policy, and makes the matching [`rustix`](https://docs.rs/rustix) call — `rustix::net::connect`, `rustix::net::sendto`, `rustix::event::poll`, … — on the real OS socket.  rustix is a safe wrapper over the POSIX/WinSock socket API, so the host side is the same code on Linux, Windows and macOS.
 
 ### Host portability
 
-The host side is the same code on Linux and Windows.  The guest is a Linux-ABI unikernel, so the host always speaks Linux numbers to it: errno values, `POLL*` bits and `SOL_*`/`SO_*` option numbers are translated at the boundary (`src/errno.rs`, `src/hostnet.rs`), and socket options are served from an allow-list of the int-valued options runtimes use (unknown ones return `-ENOPROTOOPT`).
+The host side is the same code on Linux, Windows and macOS.  The guest is a Linux-ABI unikernel, so the host always speaks Linux numbers to it: errno values, `POLL*` bits and `SOL_*`/`SO_*` option numbers are translated at the boundary (`src/errno.rs`, `src/hostnet.rs`), and socket options are served from an allow-list of the int-valued options runtimes use (unknown ones return `-ENOPROTOOPT`).
 
 ### Blocking model and intra-guest networking
 

@@ -32,4 +32,4 @@ host Yield                                      3       0.001        0.3        
 
 From the library, `AppSandbox::profile()` gives the report (`report()`) and a way to start over after a warm-up (`reset()`). Off, the profiler costs one atomic load per entry and host function.
 
-The profile is host-side: it tells guest time from host time, and counts exits, but not what the guest spent its time on. For that, Unikraft's tracepoints (`UK_TRACEPOINT`, `CONFIG_LIBUKDEBUG_TRACEPOINTS`) or sampling the guest with `perf kvm --guest` against `kernel/.build/elfloader_hyperlight-x86_64.dbg` are the tools.
+The profile is host-side: it tells guest time from host time, and counts exits, but not what the guest spent its time on. For that, Unikraft's tracepoints (`UK_TRACEPOINT`, `CONFIG_LIBUKDEBUG_TRACEPOINTS`) or sampling the guest with `perf kvm --guest` against `kernel/.build/elfloader_hyperlight-<arch>.dbg` are the tools.
