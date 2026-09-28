@@ -10,10 +10,12 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <!-- Pin ILCompiler to latest 9.0.x to avoid PrivateSdkAssemblies error
-       with the SDK-bundled version. -->
+       with the SDK-bundled version: the compiler for the machine building
+       (linux-x64, linux-arm64) and the runtime for the guest (-r). -->
   <ItemGroup>
     <PackageReference Include="Microsoft.DotNet.ILCompiler" Version="9.0.*" />
-    <PackageReference Include="runtime.linux-x64.Microsoft.DotNet.ILCompiler" Version="9.0.*" />
-    <PackageReference Include="runtime.linux-musl-x64.Microsoft.DotNet.ILCompiler" Version="9.0.*" />
+    <PackageReference Include="runtime.$(NETCoreSdkPortableRuntimeIdentifier).Microsoft.DotNet.ILCompiler" Version="9.0.*" />
+    <PackageReference Include="runtime.$(RuntimeIdentifier).Microsoft.DotNet.ILCompiler" Version="9.0.*"
+                      Condition="'$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != '$(NETCoreSdkPortableRuntimeIdentifier)'" />
   </ItemGroup>
 </Project>

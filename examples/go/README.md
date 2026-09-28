@@ -8,7 +8,7 @@ CGO_ENABLED=0 go build -buildmode=pie -ldflags='-s -w' -o hello hello.go
 
 The binary must be position-independent (`-buildmode=pie`) for the elfloader.  `CGO_ENABLED=0` produces a pure Go binary.  `-ldflags='-s -w'` strips debug info to reduce size.
 
-**Note:** Go PIE binaries on glibc hosts set the program interpreter to `/lib64/ld-linux-x86-64.so.2`.  The Go rootfs includes a compatibility symlink that maps this to musl's linker.
+**Note:** Go PIE binaries on glibc hosts set the program interpreter to glibc's (`/lib64/ld-linux-x86-64.so.2`, or `/lib/ld-linux-aarch64.so.1` on arm64).  The Go rootfs includes a compatibility symlink that maps it to musl's linker.
 
 Run it by mounting the directory containing the binary:
 

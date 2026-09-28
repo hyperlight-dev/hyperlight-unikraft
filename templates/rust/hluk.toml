@@ -12,7 +12,8 @@ image = "{{image}}"
 
 [build]
 # .cargo/config.toml makes this a static PIE, which the guest's ELF loader
-# needs.
+# needs.  It builds for the host, so on Linux; arm64 needs Rust 1.99 or
+# later, the first to link a static PIE there.
 command = "cargo build --release"
 
 [run]
