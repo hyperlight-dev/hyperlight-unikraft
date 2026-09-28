@@ -98,6 +98,10 @@ all = true                          #   every destination (AllowAll)
 ports = [8080, "9000-9010"]         # ports the guest may listen on: a port, "LOW-HIGH" or "all"
 ```
 
+### The build command
+
+The guest is Linux on the host's CPU, so what `[build]` compiles must be a Linux binary for the host's architecture. Toolchains default to the host's CPU, so a command only names the OS: `GOOS=linux` (the `go` template). `dotnet-aot` publishes in Alpine's .NET SDK image with Docker, for a musl toolchain on the host's CPU, so it builds on Linux and on macOS with Docker Desktop. On macOS, `c` needs a Linux cross compiler (`CC="zig cc -target aarch64-linux-musl"` works), and `rust` cannot build for the guest there yet; the interpreted templates, `wasmtime` and the `http-*` ones build anywhere. On Windows `hluk build` runs the command with `cmd`, so `c`, `go`, `rust` and `dotnet-aot` (sh syntax, Linux toolchains) build in WSL or on Linux.
+
 ### Memory
 
 A guest's memory is `scratch_mb` when the manifest sets it. Otherwise it is the size the runtime's image is tested and benchmarked with, which `hluk` carries as a table (the justfile's `scratch_*`): c, rust and quickjs 64 MiB, go 128, bash, python, python-shell, dotnet-aot and wasmtime 256, node 512, dotnet-jit 768, powershell 1024, agent 1536. The runtime is read from the image's name when `[rootfs] image` is a published one (`…/agent:initrd-v0.14.1`), and from the driver found in the rootfs otherwise (a Dockerfile rootfs `FROM` the python-shell base carries `hl_pywarmdriver`, so it gets python-shell's 256); an image with no driver `hluk` knows gets 256. `hluk run` without `--scratch-mb` does the same by driver, and so does a `SandboxBuilder` that never called `scratch_mb`; `default_scratch_mb`, `runtime_scratch_mb` and `RUNTIME_SCRATCH_MB` are the library's. The rootfs is unpacked into that memory, so a rootfs that packages have grown past it fails to unpack: `hluk build` and `hluk run` say so, with a size to set, whenever the rootfs takes more than half of the memory it would get.

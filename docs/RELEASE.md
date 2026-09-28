@@ -13,27 +13,27 @@ User-facing changes are recorded in [`CHANGELOG.md`](../CHANGELOG.md) (Keep a Ch
 ## Cutting a release
 
 1. In [`CHANGELOG.md`](../CHANGELOG.md), rename the top `## [Prerelease] - Unreleased` heading to the version being cut (`## [v<version>]`), confirm it captures what shipped, and add a fresh empty `## [Prerelease] - Unreleased` above it for the next cycle. (`just changelog-notes v<version>` prints exactly what the release notes will be.)
-2. If the host side of the guest contract changed since the last release (a host function's meaning, the I/O stack sizes, the layout, the guest MSRs, or the hyperlight-host dependency), bump `SNAPSHOT_CONTRACT` in [`build.rs`](../build.rs) so saved snapshots are refused rather than misread. A kernel change rolls the snapshot key by itself, and a release that changes neither keeps every saved snapshot loadable.
+2. If the host side of the guest contract changed since the last release (a host function's meaning, the I/O stack sizes, the layout, the guest MSRs (system registers on arm64), or the hyperlight-host dependency), bump `SNAPSHOT_CONTRACT` in [`build.rs`](../build.rs) so saved snapshots are refused rather than misread. A kernel change rolls the snapshot key by itself, and a release that changes neither keeps every saved snapshot loadable.
 3. Bump `version` in `Cargo.toml` on `main` (semver, e.g. `0.2.0`), commit, and push (the `CHANGELOG.md` edit can ride in the same commit).
 4. Actions → **Create release** → **Run workflow**. It:
    - validates the version and that the tag doesn't exist,
-   - builds `hluk` for Linux and Windows (x86_64),
-   - creates tag `v<version>` and a GitHub Release whose notes are the matching `CHANGELOG.md` section plus GitHub's auto-generated PR list (via `just changelog-notes v<version>`; the run fails if that section is missing), with both binaries attached (`hluk-v<version>-x86_64-*.tar.gz`/`.zip`),
+   - builds `hluk` for Linux (x86_64, arm64), macOS (Apple silicon, signed with the hypervisor entitlement) and Windows (x86_64), each on a native runner,
+   - creates tag `v<version>` and a GitHub Release whose notes are the matching `CHANGELOG.md` section plus GitHub's auto-generated PR list (via `just changelog-notes v<version>`; the run fails if that section is missing), with the binaries attached (`hluk-v<version>-<target>.tar.gz`/`.zip`) and a `SHA256SUMS` over them; the release stays a draft until the last of these is attached,
    - triggers `publish-images.yml` for that tag.
 
 Nothing is pushed to crates.io as part of this — that is deliberate.
 
-`install.sh` at the repository root fetches the Linux tarball of the latest release (or `HLUK_VERSION`); when a release carries a `SHA256SUMS` asset listing it, the download is checked against it.
+`install.sh` (Linux, macOS) and `install.ps1` (Windows) at the repository root fetch the binary for the host from the latest release (or `HLUK_VERSION`); when a release carries a `SHA256SUMS`, the download must be listed in it and match; only a release from before `SHA256SUMS` existed installs unchecked.
 
 ## What's published
 
-- **GitHub Release**: `hluk` binaries for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, plus release notes extracted from the matching [`CHANGELOG.md`](../CHANGELOG.md) section.
+- **GitHub Release**: `hluk` binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`, their `SHA256SUMS`, and release notes extracted from the matching [`CHANGELOG.md`](../CHANGELOG.md) section.
 - **GHCR** (`ghcr.io/<owner>/<repo>/…`):
-  - `<runtime>` — one package per runtime (`python`, `node`, `agent`, `python-shell`, `bash`, `c`, `go`, `rust`, `dotnet-aot`, `dotnet-jit`, `powershell`, `quickjs`, `wasmtime`), with two tags:
+  - `<runtime>` — one package per runtime (`python`, `node`, `agent`, `python-shell`, `bash`, `c`, `go`, `rust`, `dotnet-aot`, `dotnet-jit`, `powershell`, `quickjs`, `wasmtime`), with two tags, each a multi-platform index (linux/amd64 and linux/arm64):
     - `:latest` (+ `:v<version>`) — the rootfs filesystem image; build a custom guest `FROM <registry>/<runtime>`.
     - `:initrd` (+ `:initrd-v<version>`) — the runnable CPIO; `just pull-rootfs <runtime> <registry>` fetches it into `build-elfloader/` to `hluk run` — no local build.
-  - `busybox` — the shared BusyBox base at `:latest` (bash/agent/python-shell build on it),
-  - `kernel` — the Unikraft elfloader kernel at `/kernel`,
+  - `busybox` — the shared BusyBox base at `:latest` (bash/agent/python-shell build on it), for both platforms,
+  - `kernel` — the Unikraft elfloader kernel at `/kernel`, the x86_64 or arm64 one per platform,
   - `hello-urunc` — a urunc-runnable OCI image (see `demos/urunc/`).
 
 ## crates.io

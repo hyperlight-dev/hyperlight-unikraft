@@ -109,7 +109,7 @@ A mount table holds at most 32 mounts and 3.5 KiB of entries, the kernel's bound
 
 All host filesystem access is sandboxed by [`cap-std`](https://docs.rs/cap-std) (capability-based filesystem access):
 
-- **Path traversal (`../`)**: blocked.  On Linux 5.6+, `openat2` with `RESOLVE_BENEATH` is kernel-enforced.  On Windows, cap-std uses component-by-component resolution that rejects escapes.
+- **Path traversal (`../`)**: blocked.  On Linux 5.6+, `openat2` with `RESOLVE_BENEATH` is kernel-enforced.  On Windows and macOS, cap-std uses component-by-component resolution that rejects escapes.
 - **Symlink escapes**: blocked.  `RESOLVE_NO_MAGICLINKS` prevents `/proc/self/fd/N`-style escapes on Linux.  Absolute symlink targets are rejected on all platforms.
 - **No ambient filesystem access**: the guest can only reach files inside the mounted host directory.
 - **chmod**: the guest can change permissions on files in the host mount (same as virtio-fs / 9pfs).  Use `:ro` mounts to prevent this.

@@ -4,6 +4,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Added
+
+- arm64 guests: `hluk` runs on arm64 hosts, macOS on Apple silicon (Hypervisor.framework) and Linux arm64 (KVM), with an arm64 kernel, `kernel/elfloader_hyperlight-arm64`, embedded in place of the x86_64 one on an arm64 host. `just build-kernel` and `just verify-kernel` build and check both (the arm64 one cross-compiled). Every runtime runs on it, warm snapshots included; Rust programs need Rust 1.99 or later, the first to link a static PIE for arm64, and are built on Linux.
+- `HLUK_ROOTFS_PLATFORM=linux/arm64 just build-rootfs <runtime>` builds an arm64 rootfs on an x86_64 host (into `build-elfloader/<runtime>-rootfs-arm64.cpio`). Every runtime image builds for either architecture; powershell on arm64 is Microsoft's glibc build, since there is no musl one.
+- Published images are multi-platform (linux/amd64 and linux/arm64): each architecture is built on a native runner and the tags joined into one index (`just publish ... <arch>`, `just publish-index`). The kernel image carries both kernels.
+- Releases carry `hluk` for Linux arm64 and macOS (Apple silicon) too, and a `SHA256SUMS`. `install.sh` installs them (and signs the macOS binary for Hypervisor.framework); `install.ps1` installs on Windows: `irm https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.ps1 | iex`.
+- The `go`, `dotnet-aot` and `http-dotnet` templates build for the host's CPU, whatever it is (they name only the OS, Linux), and `hluk build`'s Docker builds name the host's platform. `dotnet-aot` now publishes in Alpine's .NET SDK image (Docker), a musl toolchain: linked by a glibc one, an arm64 binary did not load in the guest. `hluk run` says so when a mounted program is a macOS or Windows binary, or one for another architecture.
+- CI builds, lints and unit-tests on macOS and Linux arm64. A new `arm64` workflow builds the arm64 images and test binaries and runs the integration tests on hyperlight-dev's self-hosted arm64 runners (Linux/KVM and macOS/Hypervisor.framework): on `main`, on demand, and on pull requests labelled `ci/arm64`. The Linux runner, a small VM with nested virtualization, runs only the suites with small guests; macOS runs them all.
+- `GetRandomBytes` host function: the arm64 kernel seeds its CSPRNG from the host, at boot and on every restore, since Apple's cores have no random-number instructions.
+- On macOS, `cargo run` and `cargo test` sign binaries with the hypervisor entitlement (`dev/macos-sign-and-run.sh`), and an unsigned `hluk` says how to sign itself. Tests run one at a time there (`RUST_TEST_THREADS` overrides it): Hypervisor.framework runs one sandbox of a process at a time.
+
+- `/dev/maps` (`LIBUKVMEM_DEVFS_MAPS`, both kernels) lists the address space in `/proc/self/maps` format. The powershell image links `/proc/self/maps` to it: glibc reads it to find the main thread's stack, and PowerShell's glibc build on arm64 does not start without it.
+
+### Changed
+
+- Snapshots saved by an earlier release are refused (the kernel changed); save them again.
+- The `c` template's `[build]` command takes `CC`, e.g. a Linux cross compiler on macOS.
+- Projects made by an earlier `hluk` pin amd64 (`GOARCH=amd64` or `-r linux-musl-x64` in `[build]`, or in an http-dotnet `Dockerfile`); drop it to build them on arm64.
+
+### Fixed
+
+- An entry-point program that slept before anything else happened was reported deadlocked: the boot's first idle dropped its timer.
+- Generic Unikraft arm64 bugs that kept Linux binaries from running, each reproduced and fixed on QEMU/KVM: `execve` started the program at a stale address with stale registers and FP state, system calls ran with interrupts masked (so any that blocked crashed), `struct stat` and `struct epoll_event` had the x86_64 layout, `uname` reported `arm64` rather than `aarch64`, the build failed without SMP or with `signalfd`, and `chmod`, `chown` and symlinks failed with ENOSYS (the `*at` system calls arm64 has in their place were missing, so pip could not install a package). A jump into a non-executable page raises SIGSEGV instead of crashing the kernel (arm64 took instruction faults for reads). An SVE or SME instruction raises SIGILL, as on Linux, instead of SIGFPE or a kernel crash, so Node.js (whose OpenSSL probes for SVE at startup) runs on CPUs with SVE and on Apple M4.
+- `hluk pull` takes the image for the host's architecture from an index, and refuses a single image built for another one.
+- A signal the CPU raises (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP) carries the `si_code` and `si_addr` Linux would report (the faulting address or instruction where Linux gives one); it looked like a `kill(2)` from the process itself. Runtimes read these to turn a null dereference into an exception. Both architectures.
+- macOS: sockets are close-on-exec and don't raise SIGPIPE, host errors reach the guest as Linux errno values, a datagram socket can be disconnected and connected again, and a refused connect completes.
+
 ## [v0.16.0]
 
 ### Added

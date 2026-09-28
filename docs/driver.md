@@ -15,7 +15,7 @@ The whole contract is one character device, `/dev/hlcall`, and six operations on
 | `ioctl(HLCALL_IOC_HOSTCALL)` | Call one of the embedder's functions (`SandboxBuilder::host_function`) by name and get its reply. The kernel forwards it as the host function `HostCall(name, args)`. Only while a call is in flight. |
 | `write()` | An `int32_t` status for the call being served, optionally followed by its result, which the kernel reports with the entry's `Yield`. Written when the call failed or has a result. Refused when no call is in flight. |
 
-The ioctl numbers, `_IOR('H', 1, uint64_t)`, `_IOWR('H', 2, struct hlcall_env)` and `_IOWR('H', 3, struct hlcall_hostcall)`, are built with the standard macros, so the argument's size is part of the number and a layout mismatch between the two sides reads as `ENOTTY`.  The kernel's `plat/hyperlight/include/hyperlight-x86/step.h` is the source of truth; `hl_driver.h` mirrors it.
+The ioctl numbers, `_IOR('H', 1, uint64_t)`, `_IOWR('H', 2, struct hlcall_env)` and `_IOWR('H', 3, struct hlcall_hostcall)`, are built with the standard macros, so the argument's size is part of the number and a layout mismatch between the two sides reads as `ENOTTY`.  The kernel's `plat/hyperlight/include/hyperlight/step.h` is the source of truth; `hl_driver.h` mirrors it.
 
 ## From boot to a call
 

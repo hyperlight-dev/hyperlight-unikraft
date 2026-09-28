@@ -3,3 +3,5 @@
 # the whole point of the demo, so tell typos it is expected.
 [default.extend-words]
 reqeusts = "reqeusts"
+# Arm's Scalable Matrix Extension.
+SME = "SME"
