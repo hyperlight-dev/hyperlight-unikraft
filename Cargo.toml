@@ -42,8 +42,11 @@ tracing = "0.1"
 # Host I/O.  Filesystem: cap-std's `Dir` is the capability that keeps
 # guest paths inside the mount on every host OS.  Networking: the guest
 # speaks POSIX sockets one syscall per host call, and rustix is the safe,
-# cross-platform (Linux, Windows) wrapper over exactly that API.
+# cross-platform (Linux, Windows, macOS) wrapper over exactly that API.
 cap-std = "4"
+# Entropy for the guest's CSPRNG (GetRandomBytes); already in the tree
+# through hyperlight-host.
+getrandom = "0.4"
 rustix = { version = "1", features = ["net", "event"] }
 
 # Optional — CLI only.

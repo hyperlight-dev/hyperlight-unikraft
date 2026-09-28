@@ -25,6 +25,9 @@
 //! the elfloader never hit it because it never returns from `main`.  See the
 //! fixture README.
 
+// The fixture is an x86_64 kernel; an arm64 host cannot run it.
+#![cfg(target_arch = "x86_64")]
+
 use std::path::PathBuf;
 
 use hyperlight_unikraft::SandboxBuilder;

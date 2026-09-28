@@ -18,8 +18,15 @@ use sha2::{Digest, Sha256};
 const SNAPSHOT_CONTRACT: u32 = 2;
 
 /// The embedded kernel, whose code and host-call protocol a snapshot
-/// carries in its memory.
-const KERNEL: &str = "kernel/elfloader_hyperlight-x86_64";
+/// carries in its memory: one per architecture, named as Unikraft names
+/// it (`elfloader_hyperlight-<arch>`).
+fn kernel() -> String {
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        _ => "x86_64",
+    };
+    format!("kernel/elfloader_hyperlight-{arch}")
+}
 
 /// The `hluk init` templates: one directory each, every file in it copied
 /// into a new project.  Embedded so a project can be started offline (only
@@ -27,9 +34,10 @@ const KERNEL: &str = "kernel/elfloader_hyperlight-x86_64";
 const TEMPLATES: &str = "templates";
 
 fn main() {
-    println!("cargo:rerun-if-changed={KERNEL}");
+    let path = kernel();
+    println!("cargo:rerun-if-changed={path}");
     println!("cargo:rerun-if-changed=build.rs");
-    let kernel = std::fs::read(KERNEL).expect("the embedded kernel is in the tree");
+    let kernel = std::fs::read(&path).expect("the embedded kernel is in the tree");
     let hash: String = Sha256::digest(&kernel)
         .iter()
         .take(8)
