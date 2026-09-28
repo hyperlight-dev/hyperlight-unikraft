@@ -4,10 +4,12 @@
 # for the bash, agent and python-shell rootfs.  Building it here once — rather
 # than repeating the ~40-line build in each of those Dockerfiles — keeps the
 # BusyBox version, config and applet set in a single place.  Consumers do:
-#     COPY --from=hluk-busybox /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
-#     COPY --from=hluk-busybox /busybox-root/ /
+#     ARG BUSYBOX=hluk-busybox
+#     FROM ${BUSYBOX} AS busybox
+#     COPY --from=busybox /busybox-root/ /
 # so this image must be built first (see `just build-busybox`, invoked by
 # `just build-rootfs` for those runtimes and by `just build-all-rootfs`).
+# An arm64 build is tagged hluk-busybox-arm64 and passed in as BUSYBOX.
 FROM alpine:3.20
 
 RUN apk add --no-cache gcc musl-dev make perl linux-headers
@@ -71,3 +73,8 @@ RUN mkdir -p /busybox-root/bin /busybox-root/usr/bin \
 # Minimal /etc for the shell.
 RUN printf 'root:x:0:0:root:/root:/bin/sh\n' > /busybox-root/etc/passwd && \
     printf 'root:x:0:\n' > /busybox-root/etc/group
+
+# BusyBox is dynamically linked, so the tree carries musl's loader, which is
+# named for the architecture (x86_64, aarch64).
+RUN mkdir -p /busybox-root/lib && \
+    cp /lib/ld-musl-$(uname -m).so.1 /busybox-root/lib/

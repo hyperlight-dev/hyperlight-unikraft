@@ -30,7 +30,7 @@
  * host's current environment (see hl_env.h for the refresh built on it),
  * and a call to one of the embedder's functions.
  * The numbers and the struct are the kernel's ABI, defined in
- * plat/hyperlight/include/hyperlight-x86/step.h.
+ * plat/hyperlight/include/hyperlight/step.h.
  *
  * Include hl_fc.h (for hl_dispatch_fn_t) transitively via this header.
  */

@@ -13,11 +13,14 @@ RUN gcc -O2 -Wall -Wextra -Wno-unused-parameter \
         -static-pie -fPIE \
         -o /hl_nodedriver /src/drivers/node/hl_nodedriver.c
 
+# musl's dynamic linker is named for the architecture (x86_64, aarch64)
+RUN mkdir -p /musl && cp /lib/ld-musl-$(uname -m).so.1 /musl/
+
 # Minimal rootfs: Node binary + musl + driver
 FROM scratch
 
 # musl dynamic linker + libs
-COPY --from=build /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
+COPY --from=build /musl/ /lib/
 COPY --from=build /usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1
 COPY --from=build /usr/lib/libstdc++.so.6 /usr/lib/libstdc++.so.6
 
