@@ -257,24 +257,29 @@ fn dotnet_jit_thread_runs_between_calls() {
         .scratch_mb(768)
         .boot()
         .unwrap();
-    let t = Instant::now();
     sandbox
         .run(concat!(
             "var t = new System.Threading.Thread(() => { for (int i = 1; i <= 5; i++) { System.Threading.Thread.Sleep(300); Console.WriteLine($\"tick {i}\"); Console.Out.Flush(); } });\n",
             "t.Start(); Console.WriteLine(\"started\"); Console.Out.Flush();\n",
         ))
         .unwrap();
+    // Judged by output, not the clock: a slow host may take longer to JIT
+    // the call than the thread takes to finish.
+    let out = sandbox.drain_output();
+    assert!(out.contains("started"), "{out:?}");
     assert!(
-        t.elapsed() < Duration::from_millis(800),
-        "the call waited for the thread"
+        !out.contains("tick 5"),
+        "the call waited for the thread: {out:?}"
     );
-    assert!(sandbox.drain_output().contains("started"));
-    while t.elapsed() < Duration::from_millis(2200) {
+    let mut out = String::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !out.contains("tick 5") && Instant::now() < deadline {
         sandbox.step(Duration::from_millis(500)).unwrap();
+        out.push_str(&sandbox.drain_output());
     }
     assert!(
-        sandbox.drain_output().contains("tick 5"),
-        "thread did not run while parked"
+        out.contains("tick 5"),
+        "thread did not run while parked: {out:?}"
     );
     sandbox
         .run("Console.WriteLine(\"again\"); Console.Out.Flush();")

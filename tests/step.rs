@@ -581,7 +581,9 @@ fn python_restored_clones_draw_different_random_bytes() {
 #[test]
 fn python_checkpoint_resumes_mid_call() {
     let mut sandbox = boot_python();
-    sandbox.submit(tick_script(3, 30)).expect("submit");
+    // Five ticks: however long the restore takes, its resume entry runs at
+    // most one overdue tick, which leaves the restored guest waits to park on.
+    sandbox.submit(tick_script(5, 30)).expect("submit");
     sandbox.drain_output();
 
     // Run until the first tick has printed, then stop at that boundary.
@@ -594,7 +596,7 @@ fn python_checkpoint_resumes_mid_call() {
     let (tail, _, done) = drive(&mut sandbox, |_| false);
     assert!(done);
     assert!(
-        tail.contains("tick 1") && tail.contains("tick 2") && tail.contains("done"),
+        tail.contains("tick 1") && tail.contains("tick 4") && tail.contains("done"),
         "{tail:?}"
     );
 
@@ -615,7 +617,7 @@ fn python_checkpoint_resumes_mid_call() {
         "restored guest restarted: {rest:?}"
     );
     assert!(
-        rest.contains("tick 1") && rest.contains("tick 2") && rest.contains("done"),
+        rest.contains("tick 1") && rest.contains("tick 4") && rest.contains("done"),
         "{rest:?}"
     );
     restored.run("print('again')").expect("run after restore");

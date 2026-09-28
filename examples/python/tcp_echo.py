@@ -1,6 +1,6 @@
 """TCP echo — runs a server and client inside the guest.
 
-A background thread starts a TCP echo server on 127.0.0.1:9999.
+A background thread serves TCP echo on a free port of 127.0.0.1.
 The main thread connects, sends a message, reads the echo, and
 verifies the content.
 
@@ -13,15 +13,18 @@ yield to the other thread.
 import socket
 import threading
 
-PORT = 9999
 PAYLOAD = b"Hello from guest!"
+
+# Bound and listening before the thread starts, on a port the host picks,
+# so the client never races the server or meets another program's port.
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.bind(("127.0.0.1", 0))
+srv.listen(1)
+PORT = srv.getsockname()[1]
 
 
 def echo_server():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", PORT))
-        srv.listen(1)
+    with srv:
         conn, _addr = srv.accept()
         with conn:
             data = b""
@@ -35,10 +38,6 @@ def echo_server():
 
 t = threading.Thread(target=echo_server, daemon=True)
 t.start()
-
-# Give the server thread a chance to call listen() before we connect.
-import time
-time.sleep(0.1)
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.connect(("127.0.0.1", PORT))

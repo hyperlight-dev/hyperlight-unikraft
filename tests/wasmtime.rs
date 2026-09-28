@@ -274,19 +274,29 @@ fn wasmtime_runs_a_wasi_0_3_command() {
         .mount(Mount::ro(require_bins("wasmtime"), BIN_MOUNT))
         .boot()
         .unwrap();
-    sandbox
-        .run(Exec::Guest(format!("{BIN_MOUNT}/hello-p3.wasm world")))
-        .unwrap();
-    let output = sandbox.drain_output();
-    assert!(output.contains("Hello, world, from WASI 0.3!"), "{output}");
-    // Two 20 ms sleeps side by side take one tick, not two.
-    let ms: u64 = output
-        .split("concurrently in ")
-        .nth(1)
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("{output}"));
-    assert!((20..40).contains(&ms), "{output}");
+    // Two 200 ms sleeps side by side take one wait, not two.  The margin
+    // absorbs a loaded host's late wakeups (macOS runners have added over
+    // 100 ms), and the program still gets three tries.
+    let mut outputs = Vec::new();
+    for _ in 0..3 {
+        sandbox
+            .run(Exec::Guest(format!("{BIN_MOUNT}/hello-p3.wasm world")))
+            .unwrap();
+        let output = sandbox.drain_output();
+        assert!(output.contains("Hello, world, from WASI 0.3!"), "{output}");
+        let ms: u64 = output
+            .split("concurrently in ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(ms >= 200, "{output}");
+        if ms < 400 {
+            return;
+        }
+        outputs.push(output);
+    }
+    panic!("the sleeps never ran side by side: {outputs:?}");
 }
 
 /// A WASI 0.3 library (`examples/wasmtime/calculator`): a plain export and

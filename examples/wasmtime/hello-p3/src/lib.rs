@@ -22,11 +22,11 @@ impl wasip3::exports::cli::run::Guest for Hello {
         let (written, ()) = futures::join!(async { stdout::write_via_stream(rx).await }, async {
             tx.write_all(format!("Hello, {who}, from WASI 0.3!\n").into_bytes())
                 .await;
-            // Two sleeps at once: the run takes one tick of 20 ms, not two.
+            // Two sleeps at once: the run takes one 200 ms wait, not two.
             let start = monotonic_clock::now();
             futures::join!(
-                monotonic_clock::wait_for(20_000_000),
-                monotonic_clock::wait_for(20_000_000)
+                monotonic_clock::wait_for(200_000_000),
+                monotonic_clock::wait_for(200_000_000)
             );
             let ms = (monotonic_clock::now() - start) / 1_000_000;
             tx.write_all(format!("slept twice concurrently in {ms} ms\n").into_bytes())
