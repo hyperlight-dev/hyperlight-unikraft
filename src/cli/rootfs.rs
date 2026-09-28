@@ -394,8 +394,15 @@ pub fn build_dockerfile(
     fs::create_dir_all(output.parent().unwrap()).map_err(|e| e.to_string())?;
 
     eprintln!("building {} as {tag}", dockerfile.display());
+    // For the host's CPU, which the guest runs on, whatever platform
+    // Docker would default to.
+    let platform = if cfg!(target_arch = "aarch64") {
+        "linux/arm64"
+    } else {
+        "linux/amd64"
+    };
     let status = Command::new("docker")
-        .args(["build", "-t", &tag, "-f"])
+        .args(["build", "--platform", platform, "-t", &tag, "-f"])
         .arg(&dockerfile)
         .arg(&manifest.dir)
         .status()

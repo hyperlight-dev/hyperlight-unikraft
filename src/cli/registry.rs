@@ -229,10 +229,26 @@ pub struct Layer {
 #[derive(Deserialize, Debug)]
 struct ImageManifest {
     #[serde(default)]
+    config: Option<Layer>,
+    #[serde(default)]
     layers: Vec<Layer>,
     #[serde(default)]
     manifests: Vec<IndexEntry>,
 }
+
+/// The one field of an image config the pull reads.
+#[derive(Deserialize, Debug)]
+struct ImageConfig {
+    #[serde(default)]
+    architecture: String,
+}
+
+/// The guest's architecture, in OCI's names: the host's, since a guest runs
+/// on the host CPU.
+#[cfg(target_arch = "x86_64")]
+const GUEST_ARCH: &str = "amd64";
+#[cfg(target_arch = "aarch64")]
+const GUEST_ARCH: &str = "arm64";
 
 #[derive(Deserialize, Debug)]
 struct IndexEntry {
@@ -351,14 +367,28 @@ impl Client {
     }
 
     /// The layers of `reference`'s image, following an index to the
-    /// linux/amd64 manifest, and the manifest's digest when the registry
-    /// reports one.
+    /// linux/[`GUEST_ARCH`] manifest, and the manifest's digest when the
+    /// registry reports one.
     pub fn manifest(
         &mut self,
         reference: &Reference,
     ) -> Result<(Option<String>, Vec<Layer>), String> {
         let (digest, manifest) = self.fetch_manifest(reference, &reference.reference)?;
         if manifest.manifests.is_empty() {
+            // A single image says its platform in its config: refuse one for
+            // another architecture here rather than fail to run its binaries.
+            if let Some(config) = &manifest.config {
+                // A config that can't be read or isn't an image's says
+                // nothing about the platform: only a known mismatch refuses.
+                let arch = self.config_arch(reference, config).unwrap_or_default();
+                if !arch.is_empty() && arch != GUEST_ARCH {
+                    return Err(format!(
+                        "{reference} is a linux/{arch} image; this hluk runs linux/{GUEST_ARCH} \
+                         guests. Build one for linux/{GUEST_ARCH} (`just build-rootfs <runtime>` \
+                         in a checkout)"
+                    ));
+                }
+            }
             return Ok((digest, manifest.layers));
         }
         // An index: only the platform the guest kernel is built for will do.
@@ -368,11 +398,29 @@ impl Client {
             .find(|m| {
                 m.platform
                     .as_ref()
-                    .is_some_and(|p| p.architecture == "amd64" && p.os == "linux")
+                    .is_some_and(|p| p.architecture == GUEST_ARCH && p.os == "linux")
             })
-            .ok_or_else(|| format!("{reference}: the image index has no linux/amd64 manifest"))?;
+            .ok_or_else(|| {
+                format!("{reference}: the image index has no linux/{GUEST_ARCH} manifest")
+            })?;
         let (_, manifest) = self.fetch_manifest(reference, &entry.digest)?;
         Ok((Some(entry.digest.clone()), manifest.layers))
+    }
+
+    /// The architecture an image config names (empty if it names none).
+    fn config_arch(&mut self, reference: &Reference, config: &Layer) -> Result<String, String> {
+        let url = reference.blob_url(&config.digest);
+        let mut response = self.get(&url, "application/octet-stream")?;
+        if response.status() != StatusCode::OK {
+            return Err(format!("GET {url}: HTTP {}", response.status()));
+        }
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("{url}: {e}"))?;
+        let config: ImageConfig =
+            serde_json::from_str(&body).map_err(|e| format!("{url}: not an image config: {e}"))?;
+        Ok(config.architecture)
     }
 
     fn fetch_manifest(
