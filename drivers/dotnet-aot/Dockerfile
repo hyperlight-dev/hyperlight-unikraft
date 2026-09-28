@@ -21,19 +21,23 @@ RUN gcc -O2 -Wall -Wextra -Wno-unused-parameter \
         -static-pie -fPIE \
         -o /hl_dotnetaotdriver /src/drivers/hl_execdriver.c
 
-# Compat symlinks: glibc library names → musl (in /lib so musl finds them)
-# AOT binaries cross-compiled on glibc hosts reference ld-linux-x86-64.so.2
-# and libc.so.6 even when targeting linux-musl-x64.
-RUN ln -s /lib/ld-musl-x86_64.so.1 /lib/ld-linux-x86-64.so.2 && \
-    ln -s /lib/ld-musl-x86_64.so.1 /lib/libc.so.6
-
-RUN rm -rf /tmp/* /tmp/.[!.]*
+# Rootfs staged under /rootfs: the musl linker, also under the glibc
+# library names (in /lib so musl finds them), all named for the
+# architecture.  AOT binaries cross-compiled on glibc hosts reference
+# ld-linux-<arch>.so and libc.so.6 even when targeting linux-musl-<arch>.
+RUN set -eu; \
+    musl=/lib/ld-musl-$(uname -m).so.1; \
+    case $(uname -m) in \
+        x86_64)  glibc_ldso=ld-linux-x86-64.so.2 ;; \
+        aarch64) glibc_ldso=ld-linux-aarch64.so.1 ;; \
+        *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /rootfs/lib /rootfs/usr/local/bin; \
+    mkdir -p /rootfs/tmp; \
+    cp $musl /rootfs/lib/; \
+    cp $musl /rootfs/lib/$glibc_ldso; \
+    cp $musl /rootfs/lib/libc.so.6; \
+    cp /hl_dotnetaotdriver /rootfs/usr/local/bin/hl_dotnetaotdriver
 
 FROM scratch
-COPY --from=build-driver /tmp /tmp
-# musl dynamic linker
-COPY --from=build-driver /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
-# glibc compat symlinks (AOT cross-compilation on glibc hosts)
-COPY --from=build-driver /lib/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2
-COPY --from=build-driver /lib/libc.so.6 /lib/libc.so.6
-COPY --from=build-driver /hl_dotnetaotdriver /usr/local/bin/hl_dotnetaotdriver
+COPY --from=build-driver /rootfs/ /
