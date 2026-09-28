@@ -82,85 +82,106 @@ build *flags:
 # ── Kernel ───────────────────────────────────────────────────────
 
 kernel_dir    := root_dir / "kernel"
-kernel_bin    := kernel_dir / "elfloader_hyperlight-x86_64"
 kernel_build  := kernel_dir / ".build"
+
+# The architectures the embedded kernel is built for, one binary each
+# (kernel/elfloader_hyperlight-<arch>): hluk embeds the one for its host.
+kernel_arches := "x86_64 arm64"
 
 # Native test-fixture kernel (a C main() compiled into the kernel — no
 # elfloader/initrd), used by tests/native_kernel.rs.
 native_kernel_dir := root_dir / "tests" / "fixtures" / "native-kernel"
 native_kernel_bin := native_kernel_dir / "helloworld-native_hyperlight-x86_64"
 
-# Build the Unikraft elfloader kernel from submodule sources.
+# Build the Unikraft elfloader kernel from submodule sources, for one
+# architecture (x86_64, arm64) or, by default, all of them.
 # Uses Docker for reproducible builds — the same binary on every machine.
 # Requires: Docker, and the kernel submodules (git submodule update --init).
 [unix]
-build-kernel:
+build-kernel arch="all":
     #!/usr/bin/env bash
     set -euo pipefail
-
-    if [ ! -f "{{kernel_dir}}/unikraft/Makefile" ]; then
-        echo "error: kernel submodules not initialised" >&2
-        echo "run: git submodule update --init --recursive" >&2
-        exit 1
-    fi
-
-    echo "==> Building kernel builder image..."
-    docker build -q -t hluk-kernel-builder \
-        -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/"
-
-    echo "==> Building kernel inside Docker (reproducible toolchain)..."
-    docker run --rm \
-        -v "{{kernel_dir}}:/kernel" \
-        -v "{{root_dir}}/defconfig-elfloader:/defconfig-elfloader:ro" \
-        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-        hluk-kernel-builder bash -c '
-            set -euo pipefail
-            rm -rf .build
-            mkdir -p .build app-elfloader/workdir/libs
-            ln -sfn /kernel/unikraft app-elfloader/workdir/unikraft
-            ln -sfn /kernel/libs/libelf app-elfloader/workdir/libs/libelf
-            ln -sfn /kernel/.build app-elfloader/workdir/build
-            cp /defconfig-elfloader app-elfloader/.config
-            cd app-elfloader
-            yes "" 2>/dev/null | make WITH_LWIP=n olddefconfig || true
-            make WITH_LWIP=n -j$(nproc)
-            cd ..
-            cp .build/elfloader_hyperlight-x86_64 elfloader_hyperlight-x86_64
-            chown "$HOST_UID:$HOST_GID" elfloader_hyperlight-x86_64
-            chown -R "$HOST_UID:$HOST_GID" .build
-            rm -f app-elfloader/.config app-elfloader/.config.old
-            rm -f app-elfloader/workdir/unikraft app-elfloader/workdir/libs/libelf app-elfloader/workdir/build
-            rmdir app-elfloader/workdir/libs app-elfloader/workdir 2>/dev/null || true
-        '
-
-    echo "==> Kernel built: {{kernel_bin}}"
-    echo "    sha256: $(sha256sum "{{kernel_bin}}" | cut -d' ' -f1)"
+    arches="{{ if arch == "all" { kernel_arches } else { arch } }}"
+    for a in $arches; do
+        echo "==> Building the $a kernel inside Docker (reproducible toolchain)..."
+        just _kernel-docker "$a"
+        cp "{{kernel_build}}/elfloader_hyperlight-$a" "{{kernel_dir}}/elfloader_hyperlight-$a"
+        echo "==> Kernel built: {{kernel_dir}}/elfloader_hyperlight-$a"
+        echo "    sha256: $(sha256sum "{{kernel_dir}}/elfloader_hyperlight-$a" | cut -d' ' -f1)"
+    done
 
 [windows]
-build-kernel:
-    @Write-Error "build-kernel needs Docker on Linux. Build there (just build-kernel) and commit kernel/elfloader_hyperlight-x86_64."; exit 1
+build-kernel arch="all":
+    @Write-Error "build-kernel needs Docker on Linux. Build there (just build-kernel) and commit kernel/elfloader_hyperlight-*."; exit 1
 
-# Verify the committed kernel binary matches a fresh build.
-# Returns exit 0 if they match, exit 1 if they differ.
+# Verify the committed kernel binaries match a fresh build (one
+# architecture, or by default all of them).
+# Returns exit 0 if they match, exit 1 if any differ.
 [unix]
-verify-kernel:
+verify-kernel arch="all":
     #!/usr/bin/env bash
     set -euo pipefail
-    committed="$(sha256sum "{{kernel_bin}}" | cut -d' ' -f1)"
+    arches="{{ if arch == "all" { kernel_arches } else { arch } }}"
+    if [ ! -f "{{kernel_dir}}/unikraft/Makefile" ]; then
+        echo "error: kernel submodules not initialised" >&2
+        echo "run: git submodule update --init --recursive" >&2
+        exit 1
+    fi
+    rc=0
+    for a in $arches; do
+        committed="$(sha256sum "{{kernel_dir}}/elfloader_hyperlight-$a" | cut -d' ' -f1)"
+        just _kernel-docker "$a" > /dev/null 2>&1
+        fresh="$(sha256sum "{{kernel_build}}/elfloader_hyperlight-$a" | cut -d' ' -f1)"
+        if [ "$committed" = "$fresh" ]; then
+            echo "✓ $a kernel binary matches source (sha256: $committed)"
+        else
+            echo "✗ $a kernel binary does NOT match source" >&2
+            echo "  committed: $committed" >&2
+            echo "  fresh:     $fresh" >&2
+            echo "  Run 'just build-kernel $a' to rebuild." >&2
+            rc=1
+        fi
+    done
+    exit $rc
+
+[windows]
+verify-kernel arch="all":
+    @Write-Error "verify-kernel needs Docker on Linux; run it there."; exit 1
+
+# Build the elfloader kernel for one architecture into kernel/.build, in the
+# builder image, at fixed container paths so the binary is deterministic.
+# arm64 is cross-compiled, with defconfig-elfloader.arm64 on top of the
+# shared defconfig.
+[private]
+[unix]
+_kernel-docker arch:
+    #!/usr/bin/env bash
+    set -euo pipefail
 
     if [ ! -f "{{kernel_dir}}/unikraft/Makefile" ]; then
         echo "error: kernel submodules not initialised" >&2
         echo "run: git submodule update --init --recursive" >&2
         exit 1
     fi
+    # The builder is amd64 everywhere: the committed binaries are built
+    # there, and verify-kernel must reproduce them on an arm64 host too.
+    case "{{arch}}" in
+        x86_64) cross=""; overlay=() ;;
+        arm64)  cross="CROSS_COMPILE=aarch64-linux-gnu-"
+                overlay=(-v "{{root_dir}}/defconfig-elfloader.arm64:/defconfig-overlay:ro") ;;
+        *) echo "error: unknown kernel architecture '{{arch}}' (want: {{kernel_arches}})" >&2
+           exit 1 ;;
+    esac
 
-    docker build -q -t hluk-kernel-builder \
-        -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/"
+    docker build -q --platform linux/amd64 -t hluk-kernel-builder \
+        -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/" > /dev/null
 
-    docker run --rm \
+    docker run --rm --platform linux/amd64 \
         -v "{{kernel_dir}}:/kernel" \
         -v "{{root_dir}}/defconfig-elfloader:/defconfig-elfloader:ro" \
+        ${overlay[@]+"${overlay[@]}"} \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        -e CROSS="$cross" \
         hluk-kernel-builder bash -c '
             set -euo pipefail
             rm -rf .build
@@ -168,31 +189,16 @@ verify-kernel:
             ln -sfn /kernel/unikraft app-elfloader/workdir/unikraft
             ln -sfn /kernel/libs/libelf app-elfloader/workdir/libs/libelf
             ln -sfn /kernel/.build app-elfloader/workdir/build
-            cp /defconfig-elfloader app-elfloader/.config
+            { cat /defconfig-elfloader; [ ! -f /defconfig-overlay ] || cat /defconfig-overlay; } > app-elfloader/.config
             cd app-elfloader
-            yes "" 2>/dev/null | make WITH_LWIP=n olddefconfig > /dev/null 2>&1 || true
-            make WITH_LWIP=n -j$(nproc) > /dev/null 2>&1
+            yes "" 2>/dev/null | make $CROSS WITH_LWIP=n olddefconfig || true
+            make $CROSS WITH_LWIP=n -j$(nproc)
             cd ..
             chown -R "$HOST_UID:$HOST_GID" .build
             rm -f app-elfloader/.config app-elfloader/.config.old
             rm -f app-elfloader/workdir/unikraft app-elfloader/workdir/libs/libelf app-elfloader/workdir/build
             rmdir app-elfloader/workdir/libs app-elfloader/workdir 2>/dev/null || true
         '
-
-    fresh="$(sha256sum "{{kernel_build}}/elfloader_hyperlight-x86_64" | cut -d' ' -f1)"
-    if [ "$committed" = "$fresh" ]; then
-        echo "✓ Kernel binary matches source (sha256: $committed)"
-    else
-        echo "✗ Kernel binary does NOT match source" >&2
-        echo "  committed: $committed" >&2
-        echo "  fresh:     $fresh" >&2
-        echo "  Run 'just build-kernel' to rebuild." >&2
-        exit 1
-    fi
-
-[windows]
-verify-kernel:
-    @Write-Error "verify-kernel needs Docker on Linux; run it there."; exit 1
 
 # Build the native test-fixture kernel from source, reproducibly, in the same
 # Docker toolchain as the elfloader kernel.  Sources live in the fixture dir;
@@ -209,11 +215,11 @@ build-native-kernel:
     fi
 
     echo "==> Building kernel builder image..."
-    docker build -q -t hluk-kernel-builder \
+    docker build -q --platform linux/amd64 -t hluk-kernel-builder \
         -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/"
 
     echo "==> Building native kernel inside Docker (reproducible toolchain)..."
-    docker run --rm \
+    docker run --rm --platform linux/amd64 \
         -v "{{kernel_dir}}:/kernel" \
         -v "{{native_kernel_dir}}:/napp" \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
@@ -249,10 +255,10 @@ verify-native-kernel:
         exit 1
     fi
 
-    docker build -q -t hluk-kernel-builder \
+    docker build -q --platform linux/amd64 -t hluk-kernel-builder \
         -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/"
 
-    docker run --rm \
+    docker run --rm --platform linux/amd64 \
         -v "{{kernel_dir}}:/kernel" \
         -v "{{native_kernel_dir}}:/napp" \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
@@ -300,11 +306,21 @@ clean-kernel:
 # build-rootfs for those runtimes; run directly to refresh it.
 [unix]
 build-busybox:
-    docker build -t hluk-busybox -f "{{drivers_dir}}/busybox.Dockerfile" "{{root_dir}}/"
+    docker build {{ if rootfs_platform == "" { "" } else { "--platform " + rootfs_platform } }} \
+        -t hluk-busybox{{rootfs_suffix}} -f "{{drivers_dir}}/busybox.Dockerfile" "{{root_dir}}/"
 
 [windows]
 build-busybox:
     @Write-Error "build-busybox needs Docker on Linux."; exit 1
+
+# The platform rootfs images are built for: Docker's default (the host's)
+# unless set, e.g. HLUK_ROOTFS_PLATFORM=linux/arm64 to build arm64 images on
+# an x86_64 host (needs QEMU binfmt handlers).  Such a build is kept apart from the
+# host's: image hluk-<runtime>-rootfs-arm64, build-elfloader/<runtime>-rootfs-arm64.cpio.
+# Images built FROM a driver's (examples/, demos/) take the same suffix through
+# ARG ROOTFS_SUFFIX; rebuild-rootfs builds for the host.
+rootfs_platform := env("HLUK_ROOTFS_PLATFORM", "")
+rootfs_suffix   := if rootfs_platform == "" { "" } else { "-" + file_name(rootfs_platform) }
 
 # Build a rootfs CPIO from a driver Dockerfile.
 #
@@ -333,16 +349,21 @@ build-rootfs runtime dockerfile="":
             exit 1
         fi
     fi
-    image="hluk-{{runtime}}-rootfs"
-    output="{{build_dir}}/{{runtime}}-rootfs.cpio"
+    image="hluk-{{runtime}}-rootfs{{rootfs_suffix}}"
+    output="{{build_dir}}/{{runtime}}-rootfs{{rootfs_suffix}}.cpio"
     mkdir -p "{{build_dir}}"
     # Dependency: build the shared BusyBox base image first if this
-    # Dockerfile pulls from it (COPY --from=hluk-busybox).
-    if grep -q 'from=hluk-busybox' "$df"; then
+    # Dockerfile pulls from it (ARG BUSYBOX=hluk-busybox), for the same
+    # platform: the build names it through that argument.
+    if grep -q 'ARG BUSYBOX=hluk-busybox' "$df"; then
         just build-busybox
     fi
     echo "==> Building image $image from $df"
-    docker build -t "$image" -f "$df" "{{root_dir}}/"
+    platform="{{rootfs_platform}}"
+    docker build ${platform:+--platform "$platform"} \
+        --build-arg BUSYBOX=hluk-busybox{{rootfs_suffix}} \
+        --build-arg ROOTFS_SUFFIX={{rootfs_suffix}} \
+        -t "$image" -f "$df" "{{root_dir}}/"
     just _export-cpio "{{runtime}}" "$image"
 
 [windows]
@@ -356,12 +377,14 @@ build-rootfs runtime dockerfile="":
 _export-cpio runtime image:
     #!/usr/bin/env bash
     set -euo pipefail
-    output="{{build_dir}}/{{runtime}}-rootfs.cpio"
+    output="{{build_dir}}/{{runtime}}-rootfs{{rootfs_suffix}}.cpio"
     mkdir -p "{{build_dir}}"
     echo "==> Exporting {{image}} to $output (newc CPIO)"
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir"' EXIT
-    cid=$(docker create --entrypoint=/ "{{image}}" 2>/dev/null || docker create "{{image}}")
+    platform="{{rootfs_platform}}"
+    cid=$(docker create ${platform:+--platform "$platform"} --entrypoint=/ "{{image}}" 2>/dev/null \
+        || docker create ${platform:+--platform "$platform"} "{{image}}")
     docker export "$cid" | tar -C "$tmpdir" -xf -
     docker rm "$cid" > /dev/null
     # docker export replaces /etc/hosts, /etc/resolv.conf with empty
@@ -441,42 +464,78 @@ changelog-notes version:
 # Same scheme for busybox (:latest is its base; no initrd — it's build-only),
 # and the kernel / urunc "hello" images.  publish-images.yml logs in and passes
 # the version; run locally after `docker login`.  Linux-only (Docker builds).
+#
+# Runtimes and busybox are multi-platform: each architecture is built
+# natively and pushed under arch-suffixed tags (`publish ... arm64` pushes
+# :latest-arm64, :initrd-arm64, …), then `publish-index` joins them into one
+# image index per tag, from which hluk and Docker pick the host's.
 
-# Tag a local image into <target>:latest (+ :<version> when given) and push.
+# Tag a local image into <target>:latest (+ :<version> when given) and push,
+# each tag suffixed with -<arch> when given.
 [private]
 [unix]
-_push local target version="":
+_push local target version="" arch="":
     #!/usr/bin/env bash
     set -euo pipefail
-    docker tag "{{local}}:latest" "{{target}}:latest"
-    docker push "{{target}}:latest"
+    sfx="{{ if arch == "" { "" } else { "-" + arch } }}"
+    docker tag "{{local}}:latest" "{{target}}:latest$sfx"
+    docker push "{{target}}:latest$sfx"
     if [ -n "{{version}}" ]; then
-        docker tag "{{local}}:latest" "{{target}}:{{version}}"
-        docker push "{{target}}:{{version}}"
+        docker tag "{{local}}:latest" "{{target}}:{{version}}$sfx"
+        docker push "{{target}}:{{version}}$sfx"
     fi
+
+# Join the per-architecture tags `publish <runtime> ... <arch>` pushed into one
+# multi-platform index per tag: <registry>/<runtime>:latest, :initrd (and the
+# versioned ones).  Every architecture must have been published: a missing
+# -<arch> tag is an error, not a platform left out.
+[unix]
+publish-index runtime registry version="" arches="amd64 arm64":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repo="{{registry}}/{{runtime}}"
+    tags=(latest)
+    [ "{{runtime}}" = busybox ] || tags+=(initrd)
+    if [ -n "{{version}}" ]; then
+        tags+=("{{version}}")
+        [ "{{runtime}}" = busybox ] || tags+=("initrd-{{version}}")
+    fi
+    for tag in "${tags[@]}"; do
+        sources=()
+        for a in {{arches}}; do
+            docker buildx imagetools inspect "$repo:$tag-$a" > /dev/null 2>&1 \
+                || { echo "error: $repo:$tag-$a is not published" >&2; exit 1; }
+            sources+=("$repo:$tag-$a")
+        done
+        docker buildx imagetools create -t "$repo:$tag" "${sources[@]}"
+    done
 
 # Build a runtime's rootfs and publish it as one package, two tags:
 # <registry>/<runtime>:latest (filesystem base, to build FROM) and
-# <registry>/<runtime>:initrd (the runnable CPIO, for pull-rootfs).
+# <registry>/<runtime>:initrd (the runnable CPIO, for pull-rootfs).  With an
+# arch (amd64, arm64), for the host's architecture under -<arch> tags, which
+# publish-index joins.
 [unix]
-publish runtime registry version="":
+publish runtime registry version="" arch="":
     #!/usr/bin/env bash
     set -euo pipefail
     just build-rootfs "{{runtime}}"
     repo="{{registry}}/{{runtime}}"
+    sfx="{{ if arch == "" { "" } else { "-" + arch } }}"
     # :latest (+ :<version>) — the rootfs filesystem image, to build FROM.
-    just _push "hluk-{{runtime}}-rootfs" "$repo" "{{version}}"
+    just _push "hluk-{{runtime}}-rootfs{{rootfs_suffix}}" "$repo" "{{version}}" "{{arch}}"
     # :initrd (+ :initrd-<version>) — the runnable CPIO wrapped in a scratch
     # image.  build-elfloader is in .dockerignore, so wrap from a temp context.
     tmpctx=$(mktemp -d); trap 'rm -rf "$tmpctx"' EXIT
-    cp "{{build_dir}}/{{runtime}}-rootfs.cpio" "$tmpctx/initrd.cpio"
+    cp "{{build_dir}}/{{runtime}}-rootfs{{rootfs_suffix}}.cpio" "$tmpctx/initrd.cpio"
+    platform="{{rootfs_platform}}"
     printf 'FROM scratch\nCOPY initrd.cpio /initrd.cpio\n' \
-        | docker build -q -f - -t "hluk-{{runtime}}-initrd" "$tmpctx"
-    docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd"
-    docker push "$repo:initrd"
+        | docker build -q ${platform:+--platform "$platform"} -f - -t "hluk-{{runtime}}-initrd" "$tmpctx"
+    docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd$sfx"
+    docker push "$repo:initrd$sfx"
     if [ -n "{{version}}" ]; then
-        docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd-{{version}}"
-        docker push "$repo:initrd-{{version}}"
+        docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd-{{version}}$sfx"
+        docker push "$repo:initrd-{{version}}$sfx"
     fi
 
 # Publish the shared BusyBox base as <registry>/busybox:latest.  busybox has no
@@ -484,18 +543,26 @@ publish runtime registry version="":
 # userland bash/agent/python-shell build on.  Kept separate from `publish` (which
 # is for runtimes), alongside publish-kernel / publish-urunc.
 [unix]
-publish-busybox registry version="":
+publish-busybox registry version="" arch="":
     just build-busybox
-    just _push hluk-busybox "{{registry}}/busybox" "{{version}}"
+    just _push hluk-busybox{{rootfs_suffix}} "{{registry}}/busybox" "{{version}}" "{{arch}}"
 
-# Publish the committed kernel as <registry>/kernel (scratch image at /kernel).
+# Publish the committed kernels as <registry>/kernel (scratch image at
+# /kernel), one image index for linux/amd64 and linux/arm64.  Nothing runs in
+# the build, so buildx builds both platforms on any host.
 [unix]
 publish-kernel registry version="":
     #!/usr/bin/env bash
     set -euo pipefail
-    printf 'FROM scratch\nCOPY kernel/elfloader_hyperlight-x86_64 /kernel\n' \
-        | docker build -f - -t hluk-kernel "{{root_dir}}/"
-    just _push hluk-kernel "{{registry}}/kernel" "{{version}}"
+    tags=(-t "{{registry}}/kernel:latest")
+    [ -z "{{version}}" ] || tags+=(-t "{{registry}}/kernel:{{version}}")
+    # The context names each kernel as buildx names its platform.
+    tmpctx=$(mktemp -d); trap 'rm -rf "$tmpctx"' EXIT
+    cp "{{kernel_dir}}/elfloader_hyperlight-x86_64" "$tmpctx/kernel-amd64"
+    cp "{{kernel_dir}}/elfloader_hyperlight-arm64" "$tmpctx/kernel-arm64"
+    printf '%s\n' 'FROM scratch' 'ARG TARGETARCH' 'COPY kernel-${TARGETARCH} /kernel' \
+        | docker buildx build --platform linux/amd64,linux/arm64 \
+            -f - "${tags[@]}" --push "$tmpctx"
 
 # Publish the urunc "hello" OCI image (see demos/urunc).
 [unix]
@@ -682,7 +749,7 @@ build-test-bins:
     done
     echo "==> Go"
     for src in hello env_vars counter; do
-        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildmode=pie -ldflags='-s -w' \
+        CGO_ENABLED=0 GOOS=linux go build -buildmode=pie -ldflags='-s -w' \
             -o "$bins/go/$src" "{{examples_dir}}/go/$src.go"
     done
     echo "==> WebAssembly"
@@ -703,11 +770,22 @@ build-test-bins:
     cp "{{examples_dir}}/wasmtime/calculator/target/wasm32-wasip2/release/calculator.wasm" \
         "$bins/wasmtime/calculator.wasm"
     echo "==> .NET AOT"
-    for proj in hello env_vars caps; do
-        dotnet publish "{{examples_dir}}/dotnet-aot/$proj" -c Release -r linux-musl-x64 -v q --nologo \
-            -o "$bins/dotnet-aot"
-    done
-    rm -f "$bins/dotnet-aot"/*.dbg
+    # In Alpine's SDK image, for a musl toolchain: linked on a glibc host,
+    # an arm64 binary takes gcc's atomics helpers from glibc's libgcc, which
+    # call __getauxval, a symbol musl lacks, and fails to load in the guest.
+    docker run --rm -v "{{root_dir}}:/src" -w /src -e HOME=/tmp \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        mcr.microsoft.com/dotnet/sdk:9.0-alpine sh -c '
+            set -eu
+            apk add --no-cache clang lld build-base zlib-dev >/dev/null
+            for proj in hello env_vars caps; do
+                dotnet publish examples/dotnet-aot/$proj -c Release -v q --nologo \
+                    -o build-elfloader/bins/dotnet-aot
+            done
+            rm -f build-elfloader/bins/dotnet-aot/*.dbg
+            chown -R "$HOST_UID:$HOST_GID" build-elfloader/bins/dotnet-aot \
+                examples/dotnet-aot/*/bin examples/dotnet-aot/*/obj'
+
     echo "==> Done:"
     find "$bins" -type f | sort
 
