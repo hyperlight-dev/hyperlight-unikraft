@@ -112,16 +112,25 @@ use abi::*;
 type Res<T> = Result<T, i32>;
 
 /// Flags for new and accepted sockets.  Close-on-exec keeps guest
-/// sockets out of any child the host spawns; Windows has no such flag.
+/// sockets out of any child the host spawns; Windows has no such flag,
+/// and macOS none at creation (see [`apple_socket_setup`]).
 fn socket_flags() -> SocketFlags {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_vendor = "apple"))]
     {
         SocketFlags::empty()
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_vendor = "apple")))]
     {
         SocketFlags::CLOEXEC
     }
+}
+
+/// macOS has neither `SOCK_CLOEXEC` nor `MSG_NOSIGNAL`: set close-on-exec
+/// and no-SIGPIPE on each new or accepted socket instead.
+#[cfg(target_vendor = "apple")]
+fn apple_socket_setup(sock: &OwnedFd) -> Res<()> {
+    rustix::io::fcntl_setfd(sock, rustix::io::FdFlags::CLOEXEC).map_err(from_rustix)?;
+    sockopt::set_socket_nosigpipe(sock, true).map_err(from_rustix)
 }
 
 /// The DNS message in a send to port 53: the datagram itself on UDP; on
@@ -160,6 +169,17 @@ struct SockMeta {
     udp: bool,
     /// Where a `send` on it goes, once the guest connected it.
     peer: Option<SocketAddr>,
+    /// `listen` succeeded on it: `SO_ACCEPTCONN`, which macOS has but
+    /// rustix does not expose there.
+    listening: bool,
+    /// What a datagram socket is made again from on macOS, which can
+    /// neither dissolve its association nor connect it a second time (see
+    /// [`SocketTable::renew`]): its family and protocol (`None` for an
+    /// accepted socket), and the address the guest bound it to.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    origin: Option<(AddressFamily, Option<Protocol>)>,
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    bound: Option<SocketAddr>,
 }
 
 /// Guest fd → host socket.  Dropping the fd closes the socket.
@@ -202,14 +222,28 @@ impl SocketTable {
         }
     }
 
-    fn insert(&mut self, sock: OwnedFd, udp: bool) -> Res<i32> {
+    fn insert(
+        &mut self,
+        sock: OwnedFd,
+        udp: bool,
+        origin: Option<(AddressFamily, Option<Protocol>)>,
+    ) -> Res<i32> {
         if self.sockets.len() >= MAX_SOCKETS {
             return Err(errno::EMFILE);
         }
         let fd = self.next_fd;
         self.next_fd = self.next_fd.wrapping_add(1);
         self.sockets.insert(fd, Arc::new(sock));
-        self.meta.insert(fd, SockMeta { udp, peer: None });
+        self.meta.insert(
+            fd,
+            SockMeta {
+                udp,
+                peer: None,
+                listening: false,
+                origin,
+                bound: None,
+            },
+        );
         Ok(fd)
     }
 
@@ -229,6 +263,87 @@ impl SocketTable {
         }
     }
 
+    fn set_listening(&mut self, fd: i32) {
+        if let Some(m) = self.meta.get_mut(&fd) {
+            m.listening = true;
+        }
+    }
+
+    fn set_bound(&mut self, fd: i32, addr: SocketAddr) {
+        if let Some(m) = self.meta.get_mut(&fd) {
+            m.bound = Some(addr);
+        }
+    }
+
+    /// A fresh datagram socket like `fd`'s, with the options the guest can
+    /// set: what [`renew`](Self::renew) and [`reconnect`](Self::reconnect)
+    /// put in its place.
+    #[cfg(target_vendor = "apple")]
+    fn fresh_dgram(&self, fd: i32) -> Res<(OwnedFd, AddressFamily)> {
+        let Some((af, proto)) = self.meta(fd)?.origin else {
+            return Err(errno::EOPNOTSUPP);
+        };
+        let sock =
+            net::socket_with(af, SocketType::DGRAM, socket_flags(), proto).map_err(from_rustix)?;
+        apple_socket_setup(&sock)?;
+        rustix::io::ioctl_fionbio(&sock, true).map_err(from_rustix)?;
+        copy_dgram_options(self.get(fd)?, &sock, af);
+        Ok((sock, af))
+    }
+
+    /// Dissolve a datagram socket's association on macOS, which refuses
+    /// `connect(AF_UNSPEC)`: a fresh socket takes its place, bound where the
+    /// guest bound the old one (as on Linux, a port the kernel picked is
+    /// dropped).  Datagrams still queued are lost.
+    #[cfg(target_vendor = "apple")]
+    fn renew(&mut self, fd: i32) -> Res<()> {
+        let bound = self.meta(fd)?.bound;
+        let (sock, _) = self.fresh_dgram(fd)?;
+        // Replacing the old socket closes it, which frees the port for the
+        // new one: binding first would fail with EADDRINUSE.
+        self.sockets.insert(fd, Arc::new(sock));
+        self.clear_peer(fd);
+        if let Some(addr) = bound {
+            net::bind(self.get(fd)?, &addr).map_err(from_rustix)?;
+        }
+        Ok(())
+    }
+
+    /// Connect a connected datagram socket to a new peer on macOS, which
+    /// answers a second `connect` with `EISCONN`.  A fresh socket on the
+    /// same local address is connected while the old one still holds it
+    /// (both share it through SO_REUSEPORT meanwhile), and replaces it only
+    /// if that worked.  As on Linux, the source address and port stay, and
+    /// a connect that fails leaves the old association.  Datagrams still
+    /// queued on the old socket are lost.
+    #[cfg(target_vendor = "apple")]
+    fn reconnect(&mut self, fd: i32, addr: SocketAddr) -> Res<()> {
+        // Already this peer: nothing to do (and a second socket with the
+        // same four-tuple would be refused).
+        if self.meta(fd)?.peer == Some(addr) {
+            return Ok(());
+        }
+        let local = net::getsockname(self.get(fd)?).map_err(from_rustix)?;
+        let local = SocketAddr::try_from(local).map_err(|_| errno::EAFNOSUPPORT)?;
+        let (sock, _) = self.fresh_dgram(fd)?;
+        let old = self.get(fd)?;
+        let reuse = sockopt::socket_reuseport(old).unwrap_or(false);
+        sockopt::set_socket_reuseport(old, true).map_err(from_rustix)?;
+        let r = sockopt::set_socket_reuseport(&sock, true)
+            .and_then(|()| net::bind(&sock, &local))
+            .and_then(|()| net::connect(&sock, &addr))
+            .map_err(from_rustix);
+        if let Err(e) = r {
+            let _ = sockopt::set_socket_reuseport(old, reuse);
+            return Err(e);
+        }
+        let _ = sockopt::set_socket_reuseport(&sock, reuse);
+        // Replacing the old socket closes it.
+        self.sockets.insert(fd, Arc::new(sock));
+        self.set_peer(fd, addr);
+        Ok(())
+    }
+
     fn get(&self, fd: i32) -> Res<&OwnedFd> {
         self.sockets
             .get(&fd)
@@ -241,6 +356,54 @@ impl SocketTable {
         self.want_writable.remove(&fd);
         self.meta.remove(&fd);
         self.sockets.remove(&fd).ok_or(errno::EBADF)
+    }
+}
+
+/// Give `new` the options of `old` that the guest can set on a datagram
+/// socket (see [`Net::setsockopt`]), before [`SocketTable::renew`] or
+/// [`SocketTable::reconnect`] binds it: SO_REUSEADDR/SO_REUSEPORT decide
+/// whether that bind succeeds.  An option the socket's family lacks fails
+/// to read and is skipped.
+#[cfg(target_vendor = "apple")]
+fn copy_dgram_options(old: &OwnedFd, new: &OwnedFd, af: AddressFamily) {
+    if let Ok(v) = sockopt::socket_reuseaddr(old) {
+        let _ = sockopt::set_socket_reuseaddr(new, v);
+    }
+    if let Ok(v) = sockopt::socket_reuseport(old) {
+        let _ = sockopt::set_socket_reuseport(new, v);
+    }
+    if let Ok(v) = sockopt::socket_broadcast(old) {
+        let _ = sockopt::set_socket_broadcast(new, v);
+    }
+    if let Ok(v) = sockopt::socket_send_buffer_size(old) {
+        let _ = sockopt::set_socket_send_buffer_size(new, v);
+    }
+    if let Ok(v) = sockopt::socket_recv_buffer_size(old) {
+        let _ = sockopt::set_socket_recv_buffer_size(new, v);
+    }
+    if af == AddressFamily::INET6 {
+        if let Ok(v) = sockopt::ipv6_v6only(old) {
+            let _ = sockopt::set_ipv6_v6only(new, v);
+        }
+        if let Ok(v) = sockopt::ipv6_unicast_hops(old) {
+            let _ = sockopt::set_ipv6_unicast_hops(new, Some(v));
+        }
+        if let Ok(v) = sockopt::ipv6_multicast_loop(old) {
+            let _ = sockopt::set_ipv6_multicast_loop(new, v);
+        }
+    } else {
+        if let Ok(v) = sockopt::ip_ttl(old) {
+            let _ = sockopt::set_ip_ttl(new, v);
+        }
+        if let Ok(v) = sockopt::ip_tos(old) {
+            let _ = sockopt::set_ip_tos(new, v);
+        }
+        if let Ok(v) = sockopt::ip_multicast_ttl(old) {
+            let _ = sockopt::set_ip_multicast_ttl(new, v);
+        }
+        if let Ok(v) = sockopt::ip_multicast_loop(old) {
+            let _ = sockopt::set_ip_multicast_loop(new, v);
+        }
     }
 }
 
@@ -334,6 +497,8 @@ impl Net {
             Err(_) => return Err(errno::EINVAL),
         };
         let sock = net::socket_with(af, ty, socket_flags(), proto).map_err(from_rustix)?;
+        #[cfg(target_vendor = "apple")]
+        apple_socket_setup(&sock)?;
         rustix::io::ioctl_fionbio(&sock, true).map_err(from_rustix)?;
         // Linux AF_INET6 sockets are dual-stack by default; Windows's are
         // v6-only.  Give the guest the Linux default (it can still opt in).
@@ -341,28 +506,37 @@ impl Net {
         if af == AddressFamily::INET6 {
             let _ = sockopt::set_ipv6_v6only(&sock, false);
         }
-        self.table().insert(sock, ty == SocketType::DGRAM)
+        self.table()
+            .insert(sock, ty == SocketType::DGRAM, Some((af, proto)))
     }
 
     fn bind(&self, fd: i32, addr: SocketAddr) -> Res<()> {
         self.allow_bind(&addr)?;
-        net::bind(self.table().get(fd)?, &addr).map_err(from_rustix)
+        let mut tbl = self.table();
+        net::bind(tbl.get(fd)?, &addr).map_err(from_rustix)?;
+        tbl.set_bound(fd, addr);
+        Ok(())
     }
 
     fn listen(&self, fd: i32, backlog: i32) -> Res<()> {
-        net::listen(self.table().get(fd)?, backlog).map_err(from_rustix)
+        let mut tbl = self.table();
+        net::listen(tbl.get(fd)?, backlog).map_err(from_rustix)?;
+        tbl.set_listening(fd);
+        Ok(())
     }
 
     fn accept(&self, fd: i32) -> Res<(i32, Option<SocketAddr>)> {
         let mut tbl = self.table();
         let (conn, peer) =
             net::acceptfrom_with(tbl.get(fd)?, socket_flags()).map_err(from_rustix)?;
+        #[cfg(target_vendor = "apple")]
+        apple_socket_setup(&conn)?;
         rustix::io::ioctl_fionbio(&conn, true).map_err(from_rustix)?;
         let peer = peer.and_then(|a| SocketAddr::try_from(a).ok());
         // No peer is recorded: only a socket the guest itself aimed at port
         // 53 carries its DNS questions, and a remote client may pick any
         // source port, 53 included.
-        Ok((tbl.insert(conn, false)?, peer))
+        Ok((tbl.insert(conn, false, None)?, peer))
     }
 
     /// Starts the handshake and returns at once: `EINPROGRESS` while it
@@ -387,6 +561,12 @@ impl Net {
             {
                 return Err(errno::EISCONN);
             }
+        }
+        // Linux lets a datagram socket be connected again, to a new peer;
+        // macOS answers EISCONN, so a fresh socket takes the new peer.
+        #[cfg(target_vendor = "apple")]
+        if meta.udp && meta.peer.is_some() {
+            return tbl.reconnect(fd, addr);
         }
         let r = match net::connect(tbl.get(fd)?, &addr) {
             Ok(()) => Ok(()),
@@ -414,8 +594,11 @@ impl Net {
             if sockopt::socket_type(sock) != Ok(SocketType::DGRAM) {
                 return Err(errno::EOPNOTSUPP);
             }
+            #[cfg(not(target_vendor = "apple"))]
             net::connect_unspec(sock).map_err(from_rustix)?;
         }
+        #[cfg(target_vendor = "apple")]
+        tbl.renew(fd)?;
         tbl.clear_peer(fd);
         Ok(())
     }
@@ -451,6 +634,14 @@ impl Net {
             return Err(errno::EACCES);
         }
         let mut tbl = self.table();
+        // macOS refuses sendto() on a connected socket (EISCONN) even to its
+        // own peer, which Linux accepts.
+        #[cfg(target_vendor = "apple")]
+        if udp && tbl.meta(fd)?.peer == Some(addr) {
+            let r = net::send(tbl.get(fd)?, data, send_flags()).map_err(from_rustix);
+            tbl.note_send(fd, &r);
+            return r;
+        }
         let r = net::sendto(tbl.get(fd)?, data, send_flags(), &addr).map_err(from_rustix);
         tbl.note_send(fd, &r);
         r
@@ -518,6 +709,7 @@ impl Net {
     /// Anything else is `ENOPROTOOPT`.
     fn getsockopt(&self, fd: i32, level: i32, name: i32) -> Res<i32> {
         let tbl = self.table();
+        let listening = tbl.meta(fd)?.listening;
         let fd = tbl.get(fd)?;
         let as_i32 = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
         let secs = |d: Duration| i32::try_from(d.as_secs()).unwrap_or(i32::MAX);
@@ -538,7 +730,7 @@ impl Net {
             (SOL_SOCKET, SO_RCVBUF) => sockopt::socket_recv_buffer_size(fd).map(as_i32),
             (SOL_SOCKET, SO_KEEPALIVE) => sockopt::socket_keepalive(fd).map(i32::from),
             (SOL_SOCKET, SO_OOBINLINE) => sockopt::socket_oobinline(fd).map(i32::from),
-            (SOL_SOCKET, SO_ACCEPTCONN) => sockopt::socket_acceptconn(fd).map(i32::from),
+            (SOL_SOCKET, SO_ACCEPTCONN) => Ok(i32::from(listening)),
             #[cfg(not(windows))]
             (SOL_SOCKET, SO_REUSEPORT) => sockopt::socket_reuseport(fd).map(i32::from),
             #[cfg(target_os = "linux")]
@@ -842,6 +1034,13 @@ fn linux_revents(f: PollFlags) -> i16 {
         #[cfg(windows)]
         {
             r |= POLLIN;
+        }
+        // macOS reports a refused connect as HUP alone, where Linux adds OUT
+        // (as it does for any stream socket not connected): a guest waits
+        // for POLLOUT to see a connect through, then reads its error.
+        #[cfg(target_vendor = "apple")]
+        {
+            r |= POLLOUT;
         }
     }
     if f.contains(PollFlags::NVAL) {
@@ -1421,17 +1620,53 @@ mod tests {
         assert_eq!(net.disconnect(tcp(&net)), Err(errno::EOPNOTSUPP));
     }
 
+    /// A datagram socket bound to a port keeps it across a reconnect and a
+    /// disconnect, as on Linux (macOS replaces the host socket for both).
+    #[test]
+    fn datagram_rebind_keeps_bound_port() {
+        let net = open_net();
+        let port = std::net::UdpSocket::bind(loopback(0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let s = udp(&net);
+        net.setsockopt(s, SOL_SOCKET, SO_REUSEADDR, 1).unwrap();
+        net.bind(s, loopback(port)).unwrap();
+        net.connect(s, loopback(9)).unwrap();
+        net.connect(s, loopback(10)).unwrap();
+        net.connect(s, loopback(10)).unwrap();
+        assert_eq!(net.peer_addr(s).unwrap().port(), 10);
+        assert_eq!(net.local_addr(s).unwrap().port(), port);
+        // Windows takes SO_REUSEADDR without setting it (see `setsockopt`).
+        #[cfg(not(windows))]
+        assert_ne!(net.getsockopt(s, SOL_SOCKET, SO_REUSEADDR).unwrap(), 0);
+        net.disconnect(s).unwrap();
+        assert_eq!(net.local_addr(s).unwrap().port(), port);
+        net.connect(s, loopback(11)).unwrap();
+        assert_eq!(net.local_addr(s).unwrap().port(), port);
+
+        // A reconnect that fails (an IPv6 peer for an IPv4 socket) leaves
+        // the socket connected where it was.
+        let v6 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 9);
+        assert!(net.connect(s, v6).is_err());
+        assert_eq!(net.peer_addr(s).unwrap().port(), 11);
+        assert_eq!(net.local_addr(s).unwrap().port(), port);
+        net.send(s, b"still connected").unwrap();
+    }
+
     #[test]
     fn connection_refused_is_linux_errno() {
         let net = open_net();
-        // Bound but not listening: a SYN is answered with RST.
+        // Bound but not listening: a SYN is answered with RST.  macOS drops
+        // it instead, so there the port is freed and nothing holds it.
         let closed = tcp(&net);
         net.bind(closed, loopback(0)).unwrap();
+        let addr = net.local_addr(closed).unwrap();
+        #[cfg(target_vendor = "apple")]
+        net.close(closed).unwrap();
         let c = tcp(&net);
-        assert_eq!(
-            connect_blocking(&net, c, net.local_addr(closed).unwrap()),
-            Err(errno::ECONNREFUSED)
-        );
+        assert_eq!(connect_blocking(&net, c, addr), Err(errno::ECONNREFUSED));
         // The fd survives a failed connect so the guest can close it.
         net.close(c).unwrap();
     }
