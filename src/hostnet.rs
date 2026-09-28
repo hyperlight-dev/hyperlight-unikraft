@@ -373,26 +373,33 @@ impl Net {
     /// embedder's thread for as long as the peer took: up to the OS's SYN
     /// retry timeout, about two minutes on Linux.
     fn connect(&self, fd: i32, addr: SocketAddr) -> Res<()> {
-        let udp = self.table().meta(fd)?.udp;
-        self.allow_outbound(&addr, udp)?;
+        let meta = self.table().meta(fd)?;
+        self.allow_outbound(&addr, meta.udp)?;
         let mut tbl = self.table();
-        // Later sends on this socket go to `addr`: for a UDP socket aimed
-        // at port 53 they are DNS questions, checked by name in `send`.
-        tbl.set_peer(fd, addr);
-        let fd = tbl.get(fd)?;
-        // Linux answers a second connect on a connected stream socket
-        // with EISCONN; say so here, since nothing calls connect(2) again
-        // on the host socket to make the OS observe the established state.
-        if sockopt::socket_type(fd) == Ok(SocketType::STREAM)
-            && net::getpeername(fd).is_ok_and(|p| p.is_some())
         {
-            return Err(errno::EISCONN);
+            let sock = tbl.get(fd)?;
+            // Linux answers a second connect on a connected stream socket
+            // with EISCONN; say so here, since nothing calls connect(2)
+            // again on the host socket to make the OS observe the
+            // established state.
+            if sockopt::socket_type(sock) == Ok(SocketType::STREAM)
+                && net::getpeername(sock).is_ok_and(|p| p.is_some())
+            {
+                return Err(errno::EISCONN);
+            }
         }
-        match net::connect(fd, &addr) {
+        let r = match net::connect(tbl.get(fd)?, &addr) {
             Ok(()) => Ok(()),
             Err(Errno::INPROGRESS) | Err(Errno::WOULDBLOCK) => Err(errno::EINPROGRESS),
             Err(e) => Err(from_rustix(e)),
+        };
+        // Later sends on this socket go to `addr`: for a UDP socket aimed
+        // at port 53 they are DNS questions, checked by name in `send`.  A
+        // connect that failed leaves the socket's association as it was.
+        if r.is_ok() || r == Err(errno::EINPROGRESS) {
+            tbl.set_peer(fd, addr);
         }
+        r
     }
 
     /// `connect(2)` with `AF_UNSPEC`: dissolve a datagram socket's
