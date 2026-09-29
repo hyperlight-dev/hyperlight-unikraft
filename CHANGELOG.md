@@ -4,6 +4,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+## [v0.17.0]
+
 ### Added
 
 - arm64 guests: `hluk` runs on arm64 hosts, macOS on Apple silicon (Hypervisor.framework) and Linux arm64 (KVM), with an arm64 kernel, `kernel/elfloader_hyperlight-arm64`, embedded in place of the x86_64 one on an arm64 host. `just build-kernel` and `just verify-kernel` build and check both (the arm64 one cross-compiled). Every runtime runs on it, warm snapshots included; Rust programs need Rust 1.99 or later, the first to link a static PIE for arm64, and are built on Linux.
@@ -19,7 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Snapshots saved by an earlier release are refused (the kernel changed); save them again.
+- Snapshots saved by an earlier release are refused (the kernel and the host functions changed); save them again.
 - The `c` template's `[build]` command takes `CC`, e.g. a Linux cross compiler on macOS.
 - Projects made by an earlier `hluk` pin amd64 (`GOARCH=amd64` or `-r linux-musl-x64` in `[build]`, or in an http-dotnet `Dockerfile`); drop it to build them on arm64.
 
