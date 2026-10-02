@@ -321,6 +321,7 @@ fn templates_lists_every_tier_one_runtime_first() {
         "bash-repl",
         "python-shell",
         "dotnet",
+        "java",
         "go",
         "rust",
         "c",
