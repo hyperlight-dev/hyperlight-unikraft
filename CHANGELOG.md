@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The `java` runtime (tier 2): Java 25 on a jlinked runtime, with Java source run by JShell in the guest's JVM, so statements, expressions and declarations mix and stay for the next call, and a call that only declares a `main` (a compact source file, or a class) runs it. It serves guest function calls (a static method, its input converted to a record, collection or simple value, a future awaited) and makes host function calls through `hyperlight.Host.call`; `System.getenv()` sees the host's variables, and `System.exit()` ends the call with its status; the next call starts a fresh JVM while the guest has the memory for one (two restarts at 512 MiB: the kernel keeps an exited process's memory), and fails without crashing when it doesn't. The image is 84 MiB and runs in 512 MiB; a CDS archive of the classes the dispatcher loads while it warms up comes with it. `hluk init --template java` starts a project.
 
+### Fixed
+
+- A condition variable broadcast, or several signals, woke one waiter and left the others asleep in programs linked with musl, which most images use (node, dotnet-jit, java, quickjs, bash, and programs built on Alpine): the kernel refused `FUTEX_REQUEUE`, which musl's condition variables use to hand each woken waiter's successor to the mutex. It showed as rare, timing-dependent hangs, such as Java's `HttpClient` stalling on its first request on Windows hosts. `FUTEX_CMP_REQUEUE` also woke a waiter when asked to wake none, looped when requeuing onto the same futex, and crashed the kernel when a requeued waiter timed out. All four are generic Unikraft fixes, each reproduced and verified on QEMU/KVM.
+
 ## [v0.17.0]
 
 ### Added
