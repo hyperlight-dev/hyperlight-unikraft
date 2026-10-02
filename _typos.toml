@@ -5,3 +5,8 @@
 reqeusts = "reqeusts"
 # Arm's Scalable Matrix Extension.
 SME = "SME"
+
+# Terminal recordings store typed commands a few characters per event, and
+# demo-magic is vendored as published.
+[files]
+extend-exclude = ["site/casts/*.cast", "site/record/demo-magic.sh"]
