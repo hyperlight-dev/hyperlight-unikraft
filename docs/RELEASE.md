@@ -29,7 +29,7 @@ Nothing is pushed to crates.io as part of this — that is deliberate.
 
 - **GitHub Release**: `hluk` binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`, their `SHA256SUMS`, and release notes extracted from the matching [`CHANGELOG.md`](../CHANGELOG.md) section.
 - **GHCR** (`ghcr.io/<owner>/<repo>/…`):
-  - `<runtime>` — one package per runtime (`python`, `node`, `agent`, `python-shell`, `bash`, `c`, `go`, `rust`, `dotnet-aot`, `dotnet-jit`, `powershell`, `quickjs`, `wasmtime`), with two tags, each a multi-platform index (linux/amd64 and linux/arm64):
+  - `<runtime>` — one package per runtime (`python`, `node`, `agent`, `python-shell`, `bash`, `c`, `go`, `rust`, `dotnet-aot`, `dotnet-jit`, `java`, `powershell`, `quickjs`, `wasmtime`), with two tags, each a multi-platform index (linux/amd64 and linux/arm64):
     - `:latest` (+ `:v<version>`) — the rootfs filesystem image; build a custom guest `FROM <registry>/<runtime>`.
     - `:initrd` (+ `:initrd-v<version>`) — the runnable CPIO; `just pull-rootfs <runtime> <registry>` fetches it into `build-elfloader/` to `hluk run` — no local build.
   - `busybox` — the shared BusyBox base at `:latest` (bash/agent/python-shell build on it), for both platforms,

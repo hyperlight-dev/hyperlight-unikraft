@@ -39,7 +39,7 @@ A tier 2 runtime boots, runs guest code, and has integration tests covering the 
 - **Integration tests** covering inline and/or file execution, a snapshot round-trip, and the applicable capability surface — filesystem, networking, concurrency, stdin, environment variables — for the capabilities that apply to the runtime. (A shell runtime has no networking or threads; the Python-based runtimes inherit the tier-1 Python suite.) Failures block release.
 - **Example script** in `examples/<runtime>/`.
 
-**Current tier 2 runtimes:** Node.js, .NET (JIT and AOT), Bash (BusyBox), Agent, Python-Shell
+**Current tier 2 runtimes:** Node.js, .NET (JIT and AOT), Java, Bash (BusyBox), Agent, Python-Shell
 
 ## Tier 3 — Builds and smoke-tested
 
