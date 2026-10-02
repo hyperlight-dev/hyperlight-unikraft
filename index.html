@@ -1,24 +1,234 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>hyperlight-unikraft benchmarks</title>
-  <style>body { font-family: sans-serif; max-width: 40em; margin: 2em auto; }</style>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hyperlight-unikraft</title>
+  <meta name="description" content="Run Python, Node.js, .NET, Go, Rust and more inside Hyperlight micro-VMs on a Unikraft kernel. Default-deny host access, snapshot restore in milliseconds.">
+  <meta property="og:title" content="hyperlight-unikraft">
+  <meta property="og:description" content="Ordinary Linux programs, each in its own micro-VM. Snapshot restore in milliseconds.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400..900;1,400..900&family=JetBrains+Mono:wght@400;600&display=swap">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.17.0/dist/bundle/asciinema-player.css">
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <h1>hyperlight-unikraft benchmarks</h1>
-  <p>Per-commit results from CI on <code>main</code>, one page per host OS and guest runtime.</p>
-  <h2>Linux</h2>
-  <ul>
-    <li><a href="dev/bench/linux/python/">python</a></li>
-    <li><a href="dev/bench/linux/python-shell/">python-shell</a></li>
-    <li><a href="dev/bench/linux/agent/">agent</a></li>
-  </ul>
-  <h2>Windows</h2>
-  <ul>
-    <li><a href="dev/bench/windows/python/">python</a></li>
-    <li><a href="dev/bench/windows/python-shell/">python-shell</a></li>
-    <li><a href="dev/bench/windows/agent/">agent</a></li>
-  </ul>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <a class="wordmark" href="./" aria-label="hyperlight-unikraft home">
+      <span class="flex" aria-hidden="true">ᕦ(ò_óˇ)ᕤ</span>
+      hyperlight-unikraft
+    </a>
+    <nav aria-label="Sections">
+      <a href="#startup">Startup</a>
+      <a href="#density">Density</a>
+      <a href="#languages">Languages</a>
+      <a href="#extend">Extend</a>
+      <a href="#embed">Embed</a>
+      <a href="https://github.com/hyperlight-dev/hyperlight-unikraft">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="hero-copy">
+        <h1>Ordinary Linux programs, each in&nbsp;its own micro&#8209;VM.</h1>
+        <p class="lede">hyperlight-unikraft runs Python, Node.js, .NET, Go, Rust and more on a <a href="https://unikraft.org">Unikraft</a> kernel inside <a href="https://github.com/hyperlight-dev/hyperlight">Hyperlight</a>. The guest reaches nothing on the host unless you allow it, and a warmed guest comes back from a snapshot in milliseconds.</p>
+
+        <div class="install" data-tabs>
+          <div class="tablist" role="tablist" aria-label="Install">
+            <button role="tab" aria-selected="true" aria-controls="install-unix" id="tab-unix">Linux, macOS</button>
+            <button role="tab" aria-selected="false" aria-controls="install-win" id="tab-win" tabindex="-1">Windows</button>
+            <button role="tab" aria-selected="false" aria-controls="install-cargo" id="tab-cargo" tabindex="-1">Cargo</button>
+          </div>
+          <div class="cmd" role="tabpanel" id="install-unix" aria-labelledby="tab-unix">
+            <code>curl -fsSL https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.sh | sh</code>
+            <button class="copy" type="button">Copy</button>
+          </div>
+          <div class="cmd" role="tabpanel" id="install-win" aria-labelledby="tab-win" hidden>
+            <code>irm https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.ps1 | iex</code>
+            <button class="copy" type="button">Copy</button>
+          </div>
+          <div class="cmd" role="tabpanel" id="install-cargo" aria-labelledby="tab-cargo" hidden>
+            <code>cargo install hyperlight-unikraft</code>
+            <button class="copy" type="button">Copy</button>
+          </div>
+        </div>
+        <p class="then">Then <code>hluk init hello --template python</code>, <code>cd hello</code>, <code>hluk run</code>. The CLI is <code>hluk</code>, pronounced "hulk".</p>
+      </div>
+
+      <figure class="term hero-term">
+        <div class="term-bar"><span>hluk init, then two runs of a Python project</span></div>
+        <div class="player" data-cast="casts/hero.cast"></div>
+        <figcaption>Recorded with hluk 0.17.0 on Linux/KVM. The first run boots the guest and saves a snapshot of it; the second restores the snapshot.</figcaption>
+      </figure>
+    </section>
+
+    <section id="startup" class="startup" aria-labelledby="startup-title">
+      <div class="section-head">
+        <h2 id="startup-title">Boot once. Restore in milliseconds.</h2>
+        <p>Booting a guest and starting CPython takes a couple of hundred milliseconds. Restoring a snapshot of the booted guest takes under ten, and a guest already in memory resets in about one. The bars play ten times slower than real time.</p>
+      </div>
+
+      <p class="sr-only" data-bind="race-summary"></p>
+      <div class="race" aria-hidden="true">
+        <div class="lane" data-lane="cold" data-metric="cold/hello">
+          <div class="lane-label"><span class="lane-name">Cold boot</span><span class="lane-note">kernel, rootfs, CPython, your script</span></div>
+          <div class="track"><div class="fill"></div></div>
+          <span class="lane-value">–</span>
+        </div>
+        <div class="lane" data-lane="snap" data-metric="cold-snap/hello">
+          <div class="lane-label"><span class="lane-name">From a snapshot</span><span class="lane-note">load it from disk, restore, run</span></div>
+          <div class="track"><div class="fill"></div></div>
+          <span class="lane-value">–</span>
+        </div>
+        <div class="lane" data-lane="reset" data-metric="restore-cost/hello">
+          <div class="lane-label"><span class="lane-name">Reset between calls</span><span class="lane-note">restore a guest already in memory</span></div>
+          <div class="track"><div class="fill"></div></div>
+          <span class="lane-value">–</span>
+        </div>
+      </div>
+      <div class="race-foot">
+        <p class="provenance" data-bind="ci-provenance">Loading the latest results from CI…</p>
+        <button class="replay" type="button">Play again</button>
+      </div>
+    </section>
+
+    <section id="density" class="density" aria-labelledby="density-title">
+      <div class="section-head">
+        <h2 id="density-title">A thousand Python sandboxes in under 3 GiB</h2>
+        <p>Guests restored from one snapshot share it, so each sandbox adds only the memory it changes. One <code>hluk</code> process ran 1,000 Python micro-VMs at once, each running a script in a loop, and peaked at 2.7 GiB of private memory: about 2.8 MiB per sandbox.</p>
+      </div>
+      <div class="density-grid">
+        <div class="cells" role="img" aria-label="1,000 squares, one per running Python sandbox"></div>
+        <dl class="density-facts">
+          <div><dt>1,000</dt><dd>Python micro-VMs running at once, in one process</dd></div>
+          <div><dt>2.8 MiB</dt><dd>private host memory per sandbox, 2.7 GiB for all of them at the peak</dd></div>
+          <div><dt>74 MiB</dt><dd>the one snapshot all of them start from</dd></div>
+        </dl>
+      </div>
+      <p class="provenance">Measured with <code>hluk bench parallel --vms 1000</code> (hluk 0.17.0) on Linux/KVM, an 8-vCPU Xeon Platinum 8370C. Peak <code>RssAnon</code> of the process; <code>site/tools/density.sh</code> repeats it.</p>
+    </section>
+
+    <section id="languages" class="languages" aria-labelledby="languages-title">
+      <div class="section-head">
+        <h2 id="languages-title">One command for every runtime</h2>
+        <p><code>hluk init</code> starts a project from a template and pulls the runtime's image. Interpreted languages run as scripts; compiled ones are built on the host by <code>hluk build</code> and mounted into the guest.</p>
+      </div>
+
+      <div class="lang-layout">
+        <div class="lang-picker" role="tablist" aria-label="Templates" aria-orientation="vertical"></div>
+        <div class="lang-panel" id="lang-panel" role="tabpanel">
+          <p class="lang-desc"></p>
+          <div class="cmd small"><code></code><button class="copy" type="button">Copy</button></div>
+          <div class="files"></div>
+        </div>
+      </div>
+
+      <figure class="term">
+        <div class="term-bar"><span>Six projects, each restoring its warm snapshot</span></div>
+        <div class="player" data-cast="casts/languages.cast"></div>
+      </figure>
+    </section>
+
+    <section id="extend" class="extend" aria-labelledby="extend-title">
+      <div class="section-head">
+        <h2 id="extend-title">Add packages with a Dockerfile</h2>
+        <p>Every runtime image is published as a base to build <code>FROM</code>. Install packages in a normal Linux stage, copy them onto the rootfs, and <code>hluk build</code> exports the result as the guest's filesystem. The <code>http-python</code>, <code>http-node</code> and <code>http-dotnet</code> templates follow this pattern.</p>
+      </div>
+      <div class="files" data-template-files="http-python"></div>
+      <figure class="term">
+        <div class="term-bar"><span>Build a Flask image and serve from the guest</span></div>
+        <div class="player" data-cast="casts/dockerfile.cast"></div>
+      </figure>
+    </section>
+
+    <section id="deny" class="deny" aria-labelledby="deny-title">
+      <div class="section-head">
+        <h2 id="deny-title">The guest gets what the manifest grants</h2>
+        <p>A guest starts with no host files, no network and no listening ports. Each capability is a line in <code>hluk.toml</code> or a flag to <code>hluk run</code>.</p>
+      </div>
+      <div class="deny-grid">
+        <pre class="code"><code><span class="c"># hluk.toml</span>
+[run]
+script = "main.py"
+mounts = ["./data:/mnt/data:ro"]
+
+[run.net]
+allow = ["pypi.org", "files.pythonhosted.org"]
+ports = [8080]</code></pre>
+        <dl class="caps">
+          <div><dt>Files</dt><dd><code>mounts</code> preopens a host directory, read-only with <code>:ro</code>. Nothing else on the host filesystem is visible. <a href="https://github.com/hyperlight-dev/hyperlight-unikraft/blob/main/docs/fs.md">fs.md</a></dd></div>
+          <div><dt>Network</dt><dd>No <code>[run.net]</code> table means no sockets. <code>allow</code> or <code>block</code> lists name hosts or addresses. <a href="https://github.com/hyperlight-dev/hyperlight-unikraft/blob/main/docs/net.md">net.md</a></dd></div>
+          <div><dt>Listening</dt><dd><code>ports</code> lists what the guest may listen on. A guest socket is a host socket at the address the guest binds, so <code>0.0.0.0</code> listens on every host interface.</dd></div>
+          <div><dt>Isolation</dt><dd>Each sandbox is a hardware-virtualized VM with its own kernel. A compromised interpreter is still inside the VM.</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <section id="embed" class="embed" aria-labelledby="embed-title">
+      <div class="section-head">
+        <h2 id="embed-title">Embed it as a Rust library</h2>
+        <p><code>hluk</code> is one consumer of the <a href="https://crates.io/crates/hyperlight-unikraft">hyperlight-unikraft</a> crate. Your service can boot a guest, load code once, call it with JSON as often as you like, and give it host functions you choose. The quickjs, node, python, dotnet-jit and wasmtime images take these calls.</p>
+      </div>
+      <div class="embed-grid">
+        <pre class="code"><code><span class="k">use</span> hyperlight_unikraft::SandboxBuilder;
+<span class="k">use</span> serde_json::json;
+
+<span class="k">let mut</span> sandbox = SandboxBuilder::from_initrd(<span class="s">"quickjs-rootfs.cpio"</span>)
+    .host_function(<span class="s">"db.lookup"</span>, |args| {
+        <span class="k">let</span> [id]: [u32; 1] =
+            serde_json::from_str(args).map_err(|e| e.to_string())?;
+        Ok(json!({ <span class="s">"id"</span>: id, <span class="s">"name"</span>: <span class="s">"Ada"</span> }).to_string())
+    })
+    .boot()?;
+
+<span class="c">// Load the code once...</span>
+sandbox.run(<span class="s">r#"
+    import { lookup } from "host:db";
+    globalThis.greet = (e) => ({ message: `Hello, ${lookup(e.id).name}` });
+"#</span>)?;
+
+<span class="c">// ...then call it as often as you like.</span>
+<span class="k">let</span> out = sandbox.call(<span class="s">"greet"</span>, <span class="s">r#"{"id": 7}"#</span>)?;
+assert_eq!(out, <span class="s">r#"{"message":"Hello, Ada"}"#</span>);</code></pre>
+        <figure class="term">
+          <div class="term-bar"><span>A guest function call from the CLI</span></div>
+          <div class="player" data-cast="casts/calls.cast"></div>
+          <figcaption>More in <a href="https://github.com/hyperlight-dev/hyperlight-unikraft/blob/main/docs/calls.md">docs/calls.md</a>.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="platforms" class="platforms" aria-labelledby="platforms-title">
+      <h2 id="platforms-title">Runs where Hyperlight runs</h2>
+      <table class="platform-table">
+        <thead><tr><th scope="col">Host</th><th scope="col">Hypervisor</th><th scope="col">Guests</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Linux</th><td>KVM, or MSHV with <code>--features mshv</code></td><td>x86_64, arm64</td></tr>
+          <tr><th scope="row">Windows</th><td>Windows Hypervisor Platform</td><td>x86_64</td></tr>
+          <tr><th scope="row">macOS on Apple silicon</th><td>Hypervisor.framework</td><td>arm64</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>hyperlight-unikraft is part of <a href="https://github.com/hyperlight-dev/hyperlight">Hyperlight</a>, a <a href="https://cncf.io">Cloud Native Computing Foundation</a> sandbox project. Licensed under Apache 2.0.</p>
+    <ul>
+      <li><a href="https://github.com/hyperlight-dev/hyperlight-unikraft">Source</a></li>
+      <li><a href="https://github.com/hyperlight-dev/hyperlight-unikraft/tree/main/docs">Documentation</a></li>
+      <li><a href="https://github.com/hyperlight-dev/hyperlight-unikraft/releases">Releases</a></li>
+      <li><a href="https://hackmd.io/blCrncfOSEuqSbRVT9KYkg">Community meeting, Mondays 09:00 Pacific</a></li>
+      <li><a href="https://www.cncf.io/membership-faq/#how-do-i-join-cncfs-slack">#hyperlight on CNCF Slack</a></li>
+    </ul>
+    <p class="histories">Benchmark history from CI, per commit: Linux <a href="dev/bench/linux/python/">python</a>, <a href="dev/bench/linux/python-shell/">python-shell</a>, <a href="dev/bench/linux/agent/">agent</a>; Windows <a href="dev/bench/windows/python/">python</a>, <a href="dev/bench/windows/python-shell/">python-shell</a>, <a href="dev/bench/windows/agent/">agent</a>.</p>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.17.0/dist/bundle/asciinema-player.min.js"></script>
+  <script src="app.js" type="module"></script>
 </body>
 </html>

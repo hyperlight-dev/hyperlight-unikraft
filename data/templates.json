@@ -1,0 +1,328 @@
+[
+ {
+  "name": "agent",
+  "runtime": "agent",
+  "tier": 2,
+  "description": "Python 3.12 with numpy, pandas, scipy, scikit-learn and friends preloaded -- an agent code executor",
+  "build": false,
+  "files": [
+   {
+    "path": "main.py",
+    "text": "import time\n\nt = time.perf_counter()\nimport numpy as np\nimport pandas as pd\nimport sklearn\ntook = time.perf_counter() - t\n\ndf = pd.DataFrame({\"x\": np.arange(6), \"y\": np.arange(6) ** 2})\nprint(f\"Hello from hello!\")\nprint(f\"numpy {np.__version__}, pandas {pd.__version__}, scikit-learn {sklearn.__version__} \"\n      f\"imported in {took * 1000:.1f} ms (already loaded in the warm snapshot)\")\nprint(df.describe().loc[[\"mean\", \"std\", \"max\"]])\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/agent:initrd-vX.Y.Z\"\n\n[run]\nscript = \"main.py\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "bash",
+  "runtime": "bash",
+  "tier": 2,
+  "description": "A shell script on BusyBox (hush)",
+  "build": false,
+  "files": [
+   {
+    "path": "main.sh",
+    "text": "# BusyBox runs in NOMMU mode here (the kernel has vfork, not fork): every\n# applet is its own process, and a pipe or a $(...) substitution between\n# processes is not supported yet -- so one command per line, and shell\n# builtins (echo, printf, read, test, arithmetic) wherever possible.\necho \"Hello from hello!\"\nprintf 'Running on '\nuname -srm\necho \"inside a Hyperlight micro-VM\"\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/bash:initrd-vX.Y.Z\"\n\n[run]\nscript = \"main.sh\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "bash-repl",
+  "runtime": "bash",
+  "tier": 2,
+  "description": "An interactive shell on BusyBox (hush): type commands, the guest runs them",
+  "build": false,
+  "files": [
+   {
+    "path": "repl.sh",
+    "text": "# The whole guest session: read a line, run it, print a prompt, until stdin\n# closes. `eval` runs each line in this shell, so `cd` and variables persist\n# from one command to the next.\necho \"hello: a shell inside a Hyperlight micro-VM. Ctrl-D to leave.\"\nwhile true; do\n    printf '%s' \"${PS1:-# }\"\n    if ! IFS= read -r cmd; then\n        # End of input.  A last line with no newline has still filled cmd:\n        # run it, and stop here rather than read past the end.\n        [ -n \"$cmd\" ] && eval \"$cmd\"\n        break\n    fi\n    eval \"$cmd\"\ndone\necho\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/bash:initrd-vX.Y.Z\"\n\n[run]\nscript = \"repl.sh\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "c",
+  "runtime": "c",
+  "tier": 3,
+  "description": "A C program, built on the host as a static PIE binary and run through the exec driver",
+  "build": true,
+  "files": [
+   {
+    "path": "main.c",
+    "text": "#include <stdio.h>\n#include <sys/utsname.h>\n\nint main(void)\n{\n\tstruct utsname u;\n\tuname(&u);\n\tprintf(\"Hello from hello!\\n\");\n\tprintf(\"C on %s %s, inside a Hyperlight micro-VM\\n\", u.sysname, u.machine);\n\treturn 0;\n}\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/c:initrd-vX.Y.Z\"\n\n[build]\ncommand = \"mkdir -p bin && ${CC:-gcc} -O2 -Wall -static-pie -fPIE -o bin/app main.c\"\n\n[run]\nmounts = [\"./bin:/mnt/app:ro\"]\nexec = \"/mnt/app/app\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "dotnet",
+  "runtime": "dotnet-jit",
+  "tier": 2,
+  "description": "C# top-level statements, compiled inside the guest by Roslyn (.NET 9 JIT)",
+  "build": false,
+  "files": [
+   {
+    "path": "Program.cs",
+    "text": "// Top-level statements: this file is compiled inside the guest by Roslyn.\nConsole.WriteLine(\"Hello from hello!\");\nConsole.WriteLine($\".NET {Environment.Version} on {System.Runtime.InteropServices.RuntimeInformation.OSDescription}, \" +\n                  \"inside a Hyperlight micro-VM\");\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/dotnet-jit:initrd-vX.Y.Z\"\n\n[run]\nscript = \"Program.cs\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "dotnet-aot",
+  "runtime": "dotnet-aot",
+  "tier": 2,
+  "description": "A .NET 9 Native AOT program, published on the host and run through the exec driver",
+  "build": true,
+  "files": [
+   {
+    "path": "Program.cs",
+    "text": "Console.WriteLine(\"Hello from hello!\");\nConsole.WriteLine($\".NET {Environment.Version} (Native AOT) on \" +\n                  $\"{System.Runtime.InteropServices.RuntimeInformation.OSDescription}, inside a Hyperlight micro-VM\");\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/dotnet-aot:initrd-vX.Y.Z\"\n\n[build]\ncommand = \"\"\"docker run --rm -v \"$PWD:/src\" -w /src -e HOME=/tmp \\\n  -e HOST_UID=\"$(id -u)\" -e HOST_GID=\"$(id -g)\" \\\n  mcr.microsoft.com/dotnet/sdk:9.0-alpine sh -c '\\\n    apk add --no-cache clang lld build-base zlib-dev >/dev/null && \\\n    dotnet publish -c Release -v q --nologo -o bin && rm -f bin/*.dbg && \\\n    chown -R \"$HOST_UID:$HOST_GID\" bin obj'\"\"\"\n\n[run]\nmounts = [\"./bin:/mnt/app:ro\"]\nexec = \"/mnt/app/App\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "go",
+  "runtime": "go",
+  "tier": 3,
+  "description": "A Go program, built on the host as a PIE binary and run through the exec driver",
+  "build": true,
+  "files": [
+   {
+    "path": "main.go",
+    "text": "package main\n\nimport (\n\t\"fmt\"\n\t\"runtime\"\n)\n\nfunc main() {\n\tfmt.Println(\"Hello from hello!\")\n\tfmt.Printf(\"Go %s on %s/%s, inside a Hyperlight micro-VM\\n\", runtime.Version(), runtime.GOOS, runtime.GOARCH)\n}\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/go:initrd-vX.Y.Z\"\n\n[build]\ncommand = \"CGO_ENABLED=0 GOOS=linux go build -buildmode=pie -ldflags='-s -w' -o bin/app .\"\n\n[run]\nmounts = [\"./bin:/mnt/app:ro\"]\nexec = \"/mnt/app/app\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "http-dotnet",
+  "runtime": "dotnet-aot",
+  "tier": 2,
+  "description": "An ASP.NET Core (Kestrel) HTTP server, published in Docker onto the dotnet-aot rootfs",
+  "build": true,
+  "files": [
+   {
+    "path": "Program.cs",
+    "text": "// A Kestrel server inside a Hyperlight micro-VM.\n//\n// Binds 0.0.0.0:8080; the manifest's [run.net] enables networking and\n// allows the port, so the host reaches it at http://127.0.0.1:8080.\nvar builder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions());\nbuilder.WebHost.UseKestrelCore();\n\nvar app = builder.Build();\napp.Urls.Add(\"http://0.0.0.0:8080\");\n\napp.Run(async context =>\n{\n    await context.Response.WriteAsync(\"Hello from hello on Kestrel, inside a Hyperlight micro-VM!\\n\");\n});\n\nConsole.WriteLine(\"Listening on http://127.0.0.1:8080\");\nawait app.RunAsync();\n"
+   },
+   {
+    "path": "Dockerfile",
+    "text": "# The guest rootfs for hello: the app, published self-contained and\n# trimmed for linux-musl by the .NET SDK, on the published dotnet-aot base\n# (exec driver, musl linker, glibc compat symlinks). `hluk build` builds it\n# for the host's CPU and exports it as .hluk/rootfs.cpio; `hluk run` boots it.\nFROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS build\nWORKDIR /src\nCOPY Program.cs App.csproj ./\nRUN dotnet publish -c Release --os linux-musl --self-contained \\\n    -p:PublishTrimmed=true \\\n    -p:InvariantGlobalization=true \\\n    -o /out\n\nFROM ghcr.io/hyperlight-dev/hyperlight-unikraft/dotnet-aot:vX.Y.Z\nCOPY --from=build /out/ /app/\n# The C++ runtime the CoreCLR host needs.\nCOPY --from=build /usr/lib/libstdc++.so.6 /usr/lib/libstdc++.so.6\nCOPY --from=build /usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\ndockerfile = \"Dockerfile\"\n\n[run]\nexec = \"/app/App\"\nwarm = true\n\n[run.net]\nall = true\nports = [8080]\n"
+   }
+  ]
+ },
+ {
+  "name": "http-node",
+  "runtime": "node",
+  "tier": 2,
+  "description": "An Express HTTP server on a rootfs you extend with npm packages (Dockerfile)",
+  "build": true,
+  "files": [
+   {
+    "path": "server.js",
+    "text": "// An Express server inside a Hyperlight micro-VM.\n//\n// The guest binds 0.0.0.0:8080; hluk backs guest sockets with host sockets,\n// so the listener is reachable from the host at http://127.0.0.1:8080. The\n// manifest's [run.net] enables networking and allows the port.\nconst express = require('express');\nconst app = express();\n\napp.get('/', (req, res) => {\n  res.type('text/plain').send('Hello from hello on Express, inside a Hyperlight micro-VM!\\n');\n});\n\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', app: 'hello', isolation: 'hyperlight-micro-vm' });\n});\n\napp.listen(8080, '0.0.0.0', () => {\n  console.log('Listening on http://127.0.0.1:8080');\n});\n"
+   },
+   {
+    "path": "Dockerfile",
+    "text": "# The guest rootfs for hello: the published node base plus the packages\n# package.json names. `hluk build` builds it and exports it as\n# .hluk/rootfs.cpio; `hluk run` boots it.\n#\n# The guest runs the script with cwd = /, so require() resolves from\n# /node_modules (Node's search walks up from the module's directory).\nFROM node:22-alpine AS deps\nWORKDIR /nm\nCOPY package.json .\nRUN npm install --omit=dev --no-audit --no-fund\n\nFROM ghcr.io/hyperlight-dev/hyperlight-unikraft/node:vX.Y.Z\nCOPY --from=deps /nm/node_modules /node_modules\n"
+   },
+   {
+    "path": "package.json",
+    "text": "{\n  \"name\": \"hello\",\n  \"private\": true,\n  \"dependencies\": {\n    \"express\": \"^4\"\n  }\n}\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\ndockerfile = \"Dockerfile\"\n\n[run]\nscript = \"server.js\"\nwarm = true\nwarm_exec = \"require('express')\"\n\n[run.net]\nall = true\nports = [8080]\n"
+   }
+  ]
+ },
+ {
+  "name": "http-python",
+  "runtime": "python-shell",
+  "tier": 2,
+  "description": "A Flask HTTP server on a rootfs you extend with pip packages (Dockerfile)",
+  "build": true,
+  "files": [
+   {
+    "path": "server.py",
+    "text": "\"\"\"A Flask server inside a Hyperlight micro-VM.\n\nThe guest binds 0.0.0.0:8080; hluk backs guest sockets with host sockets,\nso the listener is reachable from the host at http://127.0.0.1:8080. The\nmanifest's [run.net] enables networking and allows the port.\n\"\"\"\nfrom flask import Flask, jsonify\n\napp = Flask(__name__)\n\n\n@app.get(\"/\")\ndef index():\n    return \"Hello from hello on Flask, inside a Hyperlight micro-VM!\\n\"\n\n\n@app.get(\"/health\")\ndef health():\n    return jsonify(status=\"ok\", app=\"hello\", isolation=\"hyperlight-micro-vm\")\n\n\nif __name__ == \"__main__\":\n    print(\"Listening on http://127.0.0.1:8080\", flush=True)\n    app.run(host=\"0.0.0.0\", port=8080, threaded=True)\n"
+   },
+   {
+    "path": "Dockerfile",
+    "text": "# The guest rootfs for hello: the published python-shell base plus the\n# packages in requirements.txt. `hluk build` builds it and exports it as\n# .hluk/rootfs.cpio; `hluk run` boots it.\nFROM ghcr.io/hyperlight-dev/hyperlight-unikraft/python-shell:vX.Y.Z AS base\n\n# pip runs in a real Linux stage, then the packages are copied into the\n# rootfs, which is FROM scratch and has no shell to run pip in.\nFROM python:3.12-slim-bookworm AS installer\nCOPY --from=base / /rootfs/\nCOPY requirements.txt /tmp/requirements.txt\nRUN pip install --no-cache-dir -r /tmp/requirements.txt \\\n        --target /rootfs/usr/local/lib/python3.12/site-packages\n\nFROM scratch\nCOPY --from=installer /rootfs/ /\n"
+   },
+   {
+    "path": "requirements.txt",
+    "text": "flask\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\ndockerfile = \"Dockerfile\"\n\n[run]\nscript = \"server.py\"\nwarm = true\nwarm_exec = \"import flask\"\n\n[run.net]\nall = true\nports = [8080]\n"
+   }
+  ]
+ },
+ {
+  "name": "java",
+  "runtime": "java",
+  "tier": 2,
+  "description": "Java 25 source, run by JShell inside the guest (compact source files, classes, snippets)",
+  "build": false,
+  "files": [
+   {
+    "path": "Main.java",
+    "text": "// A compact source file (Java 25): the guest runs its main, as `java Main.java` would.\n// A static method declared here can also be called from an embedder with\n// AppSandbox::call(\"greet\", json) once this file has run.\nrecord Event(String name) {}\n\nrecord Greeting(String greeting) {}\n\nGreeting greet(Event event) {\n    return new Greeting(\"Hello, \" + event.name() + \"!\");\n}\n\nvoid main() {\n    IO.println(\"Hello from hello!\");\n    IO.println(greet(new Event(\"Java \" + Runtime.version().feature())).greeting() + \" Running inside a Hyperlight micro-VM.\");\n}\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/java:initrd-vX.Y.Z\"\n\n[run]\nscript = \"Main.java\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "node",
+  "runtime": "node",
+  "tier": 2,
+  "description": "A Node.js 22 script",
+  "build": false,
+  "files": [
+   {
+    "path": "main.js",
+    "text": "console.log(`Hello from hello!`);\nconsole.log(`Node.js ${process.version} on ${process.platform}/${process.arch}, inside a Hyperlight micro-VM`);\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/node:initrd-vX.Y.Z\"\n\n[run]\nscript = \"main.js\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "powershell",
+  "runtime": "powershell",
+  "tier": 3,
+  "description": "A PowerShell 7 script",
+  "build": false,
+  "files": [
+   {
+    "path": "main.ps1",
+    "text": "# Module loading is limited in the unikernel rootfs, so write with\n# [Console] rather than Write-Host.\n[Console]::WriteLine(\"Hello from hello!\")\n[Console]::WriteLine(\"PowerShell $($PSVersionTable.PSVersion), inside a Hyperlight micro-VM\")\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/powershell:initrd-vX.Y.Z\"\n\n[run]\nscript = \"main.ps1\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "python",
+  "runtime": "python",
+  "tier": 1,
+  "description": "A Python 3.12 script",
+  "build": false,
+  "files": [
+   {
+    "path": "main.py",
+    "text": "import platform\nimport sys\n\nprint(f\"Hello from hello!\")\nprint(f\"Python {sys.version_info.major}.{sys.version_info.minor} on {platform.system()} \"\n      f\"({platform.machine()}), inside a Hyperlight micro-VM\")\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/python:initrd-vX.Y.Z\"\n\n[run]\nscript = \"main.py\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "python-shell",
+  "runtime": "python-shell",
+  "tier": 2,
+  "description": "A Python 3.12 script with a BusyBox shell to run commands through subprocess",
+  "build": false,
+  "files": [
+   {
+    "path": "main.py",
+    "text": "import subprocess\nimport sys\n\nprint(f\"Hello from hello!\")\nprint(f\"Python {sys.version_info.major}.{sys.version_info.minor}, inside a Hyperlight micro-VM\")\n\n# /bin/sh is BusyBox's hush. It runs in NOMMU mode here (vfork, not fork),\n# so give it one command at a time: no pipes or $(...) between processes.\nfor cmd in [\"uname -srm\", \"which python3 sh\"]:\n    result = subprocess.run([\"/bin/sh\", \"-c\", cmd], capture_output=True, text=True)\n    print(f\"$ {cmd}\")\n    print(result.stdout, end=\"\")\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/python-shell:initrd-vX.Y.Z\"\n\n[run]\nscript = \"main.py\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "quickjs",
+  "runtime": "quickjs",
+  "tier": 3,
+  "description": "A JavaScript script or ES module on QuickJS, small and fast to start",
+  "build": false,
+  "files": [
+   {
+    "path": "main.js",
+    "text": "// A script: what it declares stays for the next call, so a handler defined\n// here (or in warm_exec, to have it in the snapshot) can be called many\n// times from an embedder with AppSandbox::call(\"handler\", json).\nfunction handler(event) {\n  return { greeting: `Hello, ${event.name}!` };\n}\n\nconsole.log(`Hello from hello!`);\nconsole.log(JSON.stringify(handler({ name: \"QuickJS on Hyperlight\" })));\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/quickjs:initrd-vX.Y.Z\"\n\n[run]\nscript = \"main.js\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "rust",
+  "runtime": "rust",
+  "tier": 3,
+  "description": "A Rust program, built on the host as a static PIE binary and run through the exec driver",
+  "build": true,
+  "files": [
+   {
+    "path": "src/main.rs",
+    "text": "fn main() {\n    println!(\"Hello from hello!\");\n    println!(\n        \"Rust on {}/{}, inside a Hyperlight micro-VM\",\n        std::env::consts::OS,\n        std::env::consts::ARCH\n    );\n}\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/rust:initrd-vX.Y.Z\"\n\n[build]\ncommand = \"cargo build --release\"\n\n[run]\nmounts = [\"./target/release:/mnt/app:ro\"]\nexec = \"/mnt/app/app\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
+  "name": "wasmtime",
+  "runtime": "wasmtime",
+  "tier": 3,
+  "description": "A Rust program compiled to a WASI 0.2 component on the host, run by Wasmtime in the guest",
+  "build": true,
+  "files": [
+   {
+    "path": "src/main.rs",
+    "text": "fn main() {\n    let args: Vec<String> = std::env::args().skip(1).collect();\n    println!(\"Hello from hello!\");\n    println!(\"A WASI component run by Wasmtime inside a Hyperlight micro-VM; args: {args:?}\");\n}\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/wasmtime:initrd-vX.Y.Z\"\n\n[build]\ncommand = \"cargo build --release\"\n\n[run]\nmounts = [\"./target/wasm32-wasip2/release:/mnt/app:ro\"]\nguest_exec = \"/mnt/app/app.wasm\"\nwarm = true\n"
+   }
+  ]
+ }
+]
