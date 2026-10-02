@@ -1,0 +1,4 @@
+[template]
+description = "Java 25 source, run by JShell inside the guest (compact source files, classes, snippets)"
+runtime = "java"
+tier = 2

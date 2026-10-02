@@ -8,6 +8,7 @@ An appliance whose **entire workload lives in the initrd** and runs with **no ho
 | Node | `hl_nodedriver` | `/entrypoint.js` |
 | Bash | `hl_bashdriver` | `/entrypoint.sh` |
 | .NET (JIT) | `hl_dotnetdriver` | `/entrypoint.cs` |
+| Java | `hl_javadriver` | `/entrypoint.java` |
 | PowerShell | `hl_pwshdriver` | `/entrypoint.ps1` |
 | C / Rust / Go / .NET AOT | `hl_execdriver` | `/entrypoint` (an executable) |
 
