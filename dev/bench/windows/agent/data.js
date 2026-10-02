@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790984482390,
+  "lastUpdate": 1790985563779,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "agent benchmarks": [
@@ -2807,6 +2807,190 @@ window.BENCHMARK_DATA = {
           {
             "name": "rss/stdlib",
             "value": 28,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "3df47f64f99229e3cebef07b22ba948c69e1398c",
+          "message": "site: stop narrow phones from scrolling sideways\n\nAt 375px the template picker made the page 4px wider than the screen,\nand at 320px the platform table did, by 11px. The template grid's one\ncolumn can now shrink below its content, and below 340px the table\nbreaks \"Hypervisor.framework\" rather than widening the page.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-10-02T23:41:32Z",
+          "tree_id": "07515b9b26e279dec1882c4b82f82d6b214986af",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/3df47f64f99229e3cebef07b22ba948c69e1398c"
+        },
+        "date": 1790985561196,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 10809.417,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 10853.028,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 10788.046,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 11130.742,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 100.084,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 74.221,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 95.606,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 143.471,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 18.91,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 6.76,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 13.808,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 39.428,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 59.228,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 58.86,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 61.115,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 63.614,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.892,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.363,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 3.584,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 11.404,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 29.072,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 10.008,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 19.109,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 77.801,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 822.5,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 822.5,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 822.5,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 822.5,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 22,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 20,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 24,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 27,
             "unit": "MB"
           }
         ]
