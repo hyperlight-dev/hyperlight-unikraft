@@ -475,33 +475,43 @@ changelog-notes version:
 # natively and pushed under arch-suffixed tags (`publish ... arm64` pushes
 # :latest-arm64, :initrd-arm64, …), then `publish-index` joins them into one
 # image index per tag, from which hluk and Docker pick the host's.
+#
+# `stable` says whether :latest and :initrd move: a release's publish
+# (true) moves them, the dev channel's (false, version `dev-<sha7>`) pushes
+# only :dev-<sha7> and :initrd-dev-<sha7>, which that commit's dev build of
+# hluk pulls.
 
-# Tag a local image into <target>:latest (+ :<version> when given) and push,
-# each tag suffixed with -<arch> when given.
+# Tag a local image into <target>:latest (when stable) and :<version> (when
+# given) and push, each tag suffixed with -<arch> when given.
 [private]
 [unix]
-_push local target version="" arch="":
+_push local target version="" arch="" stable="true":
     #!/usr/bin/env bash
     set -euo pipefail
     sfx="{{ if arch == "" { "" } else { "-" + arch } }}"
-    docker tag "{{local}}:latest" "{{target}}:latest$sfx"
-    docker push "{{target}}:latest$sfx"
+    if [ "{{stable}}" = true ]; then
+        docker tag "{{local}}:latest" "{{target}}:latest$sfx"
+        docker push "{{target}}:latest$sfx"
+    fi
     if [ -n "{{version}}" ]; then
         docker tag "{{local}}:latest" "{{target}}:{{version}}$sfx"
         docker push "{{target}}:{{version}}$sfx"
     fi
 
 # Join the per-architecture tags `publish <runtime> ... <arch>` pushed into one
-# multi-platform index per tag: <registry>/<runtime>:latest, :initrd (and the
-# versioned ones).  Every architecture must have been published: a missing
-# -<arch> tag is an error, not a platform left out.
+# multi-platform index per tag: <registry>/<runtime>:latest, :initrd (when
+# stable) and the versioned ones.  Every architecture must have been
+# published: a missing -<arch> tag is an error, not a platform left out.
 [unix]
-publish-index runtime registry version="" arches="amd64 arm64":
+publish-index runtime registry version="" arches="amd64 arm64" stable="true":
     #!/usr/bin/env bash
     set -euo pipefail
     repo="{{registry}}/{{runtime}}"
-    tags=(latest)
-    [ "{{runtime}}" = busybox ] || tags+=(initrd)
+    tags=()
+    if [ "{{stable}}" = true ]; then
+        tags+=(latest)
+        [ "{{runtime}}" = busybox ] || tags+=(initrd)
+    fi
     if [ -n "{{version}}" ]; then
         tags+=("{{version}}")
         [ "{{runtime}}" = busybox ] || tags+=("initrd-{{version}}")
@@ -518,18 +528,19 @@ publish-index runtime registry version="" arches="amd64 arm64":
 
 # Build a runtime's rootfs and publish it as one package, two tags:
 # <registry>/<runtime>:latest (filesystem base, to build FROM) and
-# <registry>/<runtime>:initrd (the runnable CPIO, for pull-rootfs).  With an
-# arch (amd64, arm64), for the host's architecture under -<arch> tags, which
-# publish-index joins.
+# <registry>/<runtime>:initrd (the runnable CPIO, for pull-rootfs), each
+# also under the version when given; with stable=false only the versioned
+# ones.  With an arch (amd64, arm64), for the host's architecture under
+# -<arch> tags, which publish-index joins.
 [unix]
-publish runtime registry version="" arch="":
+publish runtime registry version="" arch="" stable="true":
     #!/usr/bin/env bash
     set -euo pipefail
     just build-rootfs "{{runtime}}"
     repo="{{registry}}/{{runtime}}"
     sfx="{{ if arch == "" { "" } else { "-" + arch } }}"
     # :latest (+ :<version>) — the rootfs filesystem image, to build FROM.
-    just _push "hluk-{{runtime}}-rootfs{{rootfs_suffix}}" "$repo" "{{version}}" "{{arch}}"
+    just _push "hluk-{{runtime}}-rootfs{{rootfs_suffix}}" "$repo" "{{version}}" "{{arch}}" "{{stable}}"
     # :initrd (+ :initrd-<version>) — the runnable CPIO wrapped in a scratch
     # image.  build-elfloader is in .dockerignore, so wrap from a temp context.
     tmpctx=$(mktemp -d); trap 'rm -rf "$tmpctx"' EXIT
@@ -537,8 +548,10 @@ publish runtime registry version="" arch="":
     platform="{{rootfs_platform}}"
     printf 'FROM scratch\nCOPY initrd.cpio /initrd.cpio\n' \
         | docker build -q ${platform:+--platform "$platform"} -f - -t "hluk-{{runtime}}-initrd" "$tmpctx"
-    docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd$sfx"
-    docker push "$repo:initrd$sfx"
+    if [ "{{stable}}" = true ]; then
+        docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd$sfx"
+        docker push "$repo:initrd$sfx"
+    fi
     if [ -n "{{version}}" ]; then
         docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd-{{version}}$sfx"
         docker push "$repo:initrd-{{version}}$sfx"
@@ -549,19 +562,21 @@ publish runtime registry version="" arch="":
 # userland bash/agent/python-shell build on.  Kept separate from `publish` (which
 # is for runtimes), alongside publish-kernel / publish-urunc.
 [unix]
-publish-busybox registry version="" arch="":
+publish-busybox registry version="" arch="" stable="true":
     just build-busybox
-    just _push hluk-busybox{{rootfs_suffix}} "{{registry}}/busybox" "{{version}}" "{{arch}}"
+    just _push hluk-busybox{{rootfs_suffix}} "{{registry}}/busybox" "{{version}}" "{{arch}}" "{{stable}}"
 
 # Publish the committed kernels as <registry>/kernel (scratch image at
 # /kernel), one image index for linux/amd64 and linux/arm64.  Nothing runs in
 # the build, so buildx builds both platforms on any host.
 [unix]
-publish-kernel registry version="":
+publish-kernel registry version="" stable="true":
     #!/usr/bin/env bash
     set -euo pipefail
-    tags=(-t "{{registry}}/kernel:latest")
+    tags=()
+    [ "{{stable}}" != true ] || tags+=(-t "{{registry}}/kernel:latest")
     [ -z "{{version}}" ] || tags+=(-t "{{registry}}/kernel:{{version}}")
+    [ ${#tags[@]} -gt 0 ] || { echo "error: no tag to publish the kernel under" >&2; exit 1; }
     # The context names each kernel as buildx names its platform.
     tmpctx=$(mktemp -d); trap 'rm -rf "$tmpctx"' EXIT
     cp "{{kernel_dir}}/elfloader_hyperlight-x86_64" "$tmpctx/kernel-amd64"
@@ -572,11 +587,11 @@ publish-kernel registry version="":
 
 # Publish the urunc "hello" OCI image (see demos/urunc).
 [unix]
-publish-urunc registry version="":
+publish-urunc registry version="" stable="true":
     #!/usr/bin/env bash
     set -euo pipefail
     ( cd "{{root_dir}}/demos/urunc" && just stage && docker build -f Containerfile -t hluk-hello-urunc . )
-    just _push hluk-hello-urunc "{{registry}}/hello-urunc" "{{version}}"
+    just _push hluk-hello-urunc "{{registry}}/hello-urunc" "{{version}}" "" "{{stable}}"
 
 # Clean rebuild of a rootfs — pulls fresh base images, no Docker cache.
 # Also nukes stale snapshots. Use when base images or drivers change.

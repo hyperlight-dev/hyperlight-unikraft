@@ -7,6 +7,9 @@
 # Plus busybox (:latest is its base), kernel, and the urunc "hello" image.
 #
 # On a git tag push the version is added too (:<version> and :initrd-<version>).
+# The dev channel (dev.yml) calls it with version `dev-<sha7>` and stable
+# false: it pushes only that commit's :dev-<sha7> and :initrd-dev-<sha7>, and
+# leaves :latest and :initrd to releases.
 # Every tag is a multi-platform index (linux/amd64, linux/arm64): each
 # architecture is built natively on its own runner and pushed under -<arch>
 # tags, then joined.  The tag/push logic lives in the justfile (`just
@@ -17,15 +20,31 @@ on:
   workflow_dispatch:
   push:
     tags: ['v*']
+  workflow_call:
+    inputs:
+      version:
+        description: The version tag to publish under (`dev-<sha7>` for the dev channel)
+        type: string
+        required: true
+      stable:
+        description: Whether :latest and :initrd move too
+        type: boolean
+        default: false
 
+# Called (the dev channel), one run per version: dev builds of different
+# commits push different tags and run side by side; a re-run of one waits.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ inputs.version != '' && format('publish-images-{0}', inputs.version) || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: ${{ inputs.version == '' }}
 
 env:
   IMAGE_BASE: ghcr.io/${{ github.repository }}
-  # v<version> on a tag push, empty otherwise (only :latest then).
-  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+  # The caller's version; v<version> on a tag push; empty otherwise (only
+  # :latest then).
+  VERSION: ${{ inputs.version || (github.ref_type == 'tag' && github.ref_name) || '' }}
+  # Called: as the caller says; otherwise a release or a manual run, which
+  # move :latest and :initrd.
+  STABLE: ${{ inputs.version == '' && 'true' || (inputs.stable && 'true' || 'false') }}
 
 jobs:
   # One package per runtime: :latest (filesystem base) + :initrd (cpio),
@@ -42,13 +61,16 @@ jobs:
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit the caller publishes (dev.yml: the one main's CI passed).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
       - name: Install cpio
         run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends cpio
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Build and publish rootfs
-        run: just publish ${{ matrix.runtime }} "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}" ${{ matrix.arch }}
+        run: just publish ${{ matrix.runtime }} "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}" ${{ matrix.arch }} "${{ env.STABLE }}"
 
   # Join each runtime's per-architecture tags into multi-platform ones, only
   # once every architecture published: an older run's -<arch> tag would
@@ -66,11 +88,14 @@ jobs:
         runtime: [python, node, agent, python-shell, bash, c, go, rust, dotnet-aot, dotnet-jit, java, powershell, quickjs, wasmtime]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit the caller publishes (dev.yml: the one main's CI passed).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Publish the multi-platform tags
-        run: just publish-index ${{ matrix.runtime }} "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}"
+        run: just publish-index ${{ matrix.runtime }} "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}" "amd64 arm64" "${{ env.STABLE }}"
 
   # The shared BusyBox base (base-only — no driver, not a runnable guest).
   publish-busybox:
@@ -84,11 +109,14 @@ jobs:
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit the caller publishes (dev.yml: the one main's CI passed).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Build and publish busybox base
-        run: just publish-busybox "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}" ${{ matrix.arch }}
+        run: just publish-busybox "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}" ${{ matrix.arch }} "${{ env.STABLE }}"
 
   index-busybox:
     needs: publish-busybox
@@ -98,11 +126,14 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit the caller publishes (dev.yml: the one main's CI passed).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Publish the multi-platform tags
-        run: just publish-index busybox "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}"
+        run: just publish-index busybox "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}" "amd64 arm64" "${{ env.STABLE }}"
 
   publish-kernel:
     runs-on: ubuntu-latest
@@ -111,6 +142,9 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit the caller publishes (dev.yml: the one main's CI passed).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -119,7 +153,7 @@ jobs:
       - name: Set up a multi-platform builder
         run: docker buildx create --use
       - name: Publish kernel image
-        run: just publish-kernel "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}"
+        run: just publish-kernel "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}" "${{ env.STABLE }}"
 
   publish-urunc:
     runs-on: ubuntu-latest
@@ -128,8 +162,11 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit the caller publishes (dev.yml: the one main's CI passed).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Build and publish urunc image
-        run: just publish-urunc "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}"
+        run: just publish-urunc "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}" "${{ env.STABLE }}"
