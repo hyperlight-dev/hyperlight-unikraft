@@ -734,7 +734,7 @@ example-java: (run "java" (examples_dir / "java" / "Hello.java"))
 # mounts into the guest, into build-elfloader/bins/<runtime>/.  Linux
 # ELF output, so like build-rootfs this runs on Linux; copy
 # build-elfloader/bins/ to other hosts.  Needs gcc/g++, rustc, go and
-# the .NET SDK.
+# Docker: the musl C programs and .NET AOT are built in Alpine images.
 [unix]
 build-test-bins:
     #!/usr/bin/env bash
@@ -747,6 +747,16 @@ build-test-bins:
         gcc -O2 -Wall -static-pie -fPIE -o "$bins/c/$src" "{{examples_dir}}/c/$src.c"
     done
     g++ -O2 -Wall -static-pie -fPIE -o "$bins/c/hello_cpp" "{{examples_dir}}/c/hello_cpp.cpp"
+    # With musl, in Alpine: its condition variables hand waiters over with
+    # FUTEX_REQUEUE, which glibc's do not use.
+    docker run --rm -v "{{examples_dir}}/c:/c:ro" -v "$bins/c:/out" \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" alpine:3.20 sh -c '
+            set -eu
+            apk add --no-cache gcc musl-dev linux-headers >/dev/null
+            for src in condvar futex_requeue; do
+                gcc -O2 -Wall -static-pie -fPIE -pthread -o /out/$src /c/$src.c
+                chown "$HOST_UID:$HOST_GID" /out/$src
+            done'
     echo "==> Rust"
     for src in hello env_vars; do
         rustc -C opt-level=2 -C target-feature=+crt-static -C relocation-model=pie \

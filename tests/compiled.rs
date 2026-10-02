@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{BIN_MOUNT, require_bins, require_rootfs, temp_dir};
+use common::{BIN_MOUNT, require_bin, require_bins, require_rootfs, temp_dir};
 use hyperlight_unikraft::{Mount, SandboxBuilder};
 
 /// Environment handed to the `env_vars` examples.
@@ -89,6 +89,43 @@ fn c_hello() {
         output.contains("Hello from C on Hyperlight"),
         "expected C hello output, got: {output:?}"
     );
+}
+
+/// Waiters released together by a broadcast all wake: musl's condition
+/// variables hand each one's successor to the mutex with FUTEX_REQUEUE,
+/// which the kernel once refused, leaving all but one asleep.
+#[test]
+fn c_condvar_broadcast_wakes_every_waiter() {
+    let (status, output) = run_c_check("condvar");
+    assert!(
+        status.is_ok() && output.contains("every waiter woke, 50 rounds"),
+        "expected every waiter to wake, got {status:?}: {output}"
+    );
+}
+
+/// FUTEX_REQUEUE and FUTEX_CMP_REQUEUE as Linux defines them: a requeue
+/// wakes only as many as asked, moves the next ones, returns when the
+/// target is the source, and a requeued waiter that times out says so.
+#[test]
+fn c_futex_requeue_matches_linux() {
+    let (status, output) = run_c_check("futex_requeue");
+    assert!(
+        status.is_ok() && output.contains("futex requeue: all checks pass"),
+        "expected every futex check to pass, got {status:?}: {output}"
+    );
+}
+
+/// Run a C check program, keeping its output when it fails: the output
+/// says which check did.
+fn run_c_check(name: &str) -> (hyperlight_unikraft::Result<()>, String) {
+    let mounts = vec![Mount::rw(require_bin("c", name), BIN_MOUNT)];
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("c"))
+        .scratch_mb(64)
+        .mounts(mounts)
+        .boot()
+        .unwrap();
+    let status = sandbox.run(format!("{BIN_MOUNT}/{name}"));
+    (status, sandbox.drain_output())
 }
 
 /// A program that exits non-zero fails the call, as it would fail a
