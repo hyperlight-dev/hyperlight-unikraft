@@ -20,6 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/
 #    Windows (PowerShell)
 irm https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.ps1 | iex
 #    or, with a Rust toolchain: cargo install hyperlight-unikraft
+#    main's latest build that passed CI: HLUK_VERSION=dev in front of either
 
 # 2. Start a project from a template; the matching rootfs is pulled from GHCR
 hluk init hello --template python          # or plain `hluk init` to be asked

@@ -3,6 +3,7 @@
 #   irm https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.ps1 | iex
 #
 #   $env:HLUK_VERSION = 'v0.14.1'   a release instead of the latest
+#   $env:HLUK_VERSION = 'dev'       the dev build: main's latest push that passed CI
 #   $env:HLUK_INSTALL_DIR = 'DIR'   where hluk.exe goes (default %LOCALAPPDATA%\hluk\bin)
 #
 # Linux and macOS use install.sh.  hluk runs guests on the Windows Hypervisor
@@ -27,7 +28,8 @@ if (-not $version) {
     $version = (Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$repo/releases/latest").tag_name
     if (-not $version) { throw "cannot find the latest release of $repo" }
 }
-if (-not $version.StartsWith('v')) { $version = "v$version" }
+# A release is v<version>; the dev channel is the `dev` pre-release.
+if (-not $version.StartsWith('v') -and $version -ne 'dev') { $version = "v$version" }
 
 $asset = "hluk-$version-$target.zip"
 $base = "https://github.com/$repo/releases/download/$version"
@@ -48,6 +50,9 @@ try {
     } catch {
         $resp = $_.Exception.Response
         if (-not $resp -or [int]$resp.StatusCode -ne 404) { throw }
+        # The dev pre-release always has one; it is missing only while a
+        # newer build replaces the assets.
+        if ($version -eq 'dev') { throw "the dev release is being replaced; try again in a few minutes" }
     }
     if ($sums -is [byte[]]) { $sums = [System.Text.Encoding]::UTF8.GetString($sums) }
     $line = if ($sums) { $sums -split "`n" | Where-Object { $_ -match " $([regex]::Escape($asset))\s*$" } | Select-Object -First 1 }

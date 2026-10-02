@@ -4,6 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.sh | sh
 #
 #   HLUK_VERSION=v0.14.1   a release instead of the latest
+#   HLUK_VERSION=dev       the dev build: main's latest push that passed CI
 #   HLUK_INSTALL_DIR=DIR   where the binary goes (default ~/.local/bin)
 #
 # Releases carry binaries for Linux (x86_64, arm64), macOS (Apple silicon)
@@ -39,7 +40,8 @@ if [ -z "$VERSION" ]; then
         | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
     [ -n "$VERSION" ] || { echo "cannot find the latest release of $REPO" >&2; exit 1; }
 fi
-case "$VERSION" in v*) ;; *) VERSION=v$VERSION ;; esac
+# A release is v<version>; the dev channel is the `dev` pre-release.
+case "$VERSION" in v* | dev) ;; *) VERSION=v$VERSION ;; esac
 
 asset="hluk-$VERSION-$target.tar.gz"
 url="https://github.com/$REPO/releases/download/$VERSION/$asset"
@@ -55,7 +57,12 @@ code=$(curl -sSL -w '%{http_code}' -o "$tmp/SHA256SUMS" \
     echo "cannot fetch SHA256SUMS" >&2; exit 1; }
 case $code in
     200) ;;
-    404) rm -f "$tmp/SHA256SUMS" ;;
+    404)
+        # The dev pre-release always has one; it is missing only while a
+        # newer build replaces the assets.
+        [ "$VERSION" != dev ] || {
+            echo "the dev release is being replaced; try again in a few minutes" >&2; exit 1; }
+        rm -f "$tmp/SHA256SUMS" ;;
     *) echo "cannot fetch SHA256SUMS (HTTP $code)" >&2; exit 1 ;;
 esac
 if [ -f "$tmp/SHA256SUMS" ]; then
