@@ -1,0 +1,60 @@
+name: Site
+
+# Publishes site/ to the root of the gh-pages branch, which GitHub Pages
+# serves. dev/bench/ on that branch belongs to the CI benchmark job and is
+# left as it is; the page reads it for the startup numbers.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "templates/**"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: site
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push to gh-pages
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build
+        run: python3 site/tools/build.py "$RUNNER_TEMP/site"
+
+      - name: Publish to gh-pages
+        run: |
+          set -euo pipefail
+          git fetch origin gh-pages
+          git worktree add --detach "$RUNNER_TEMP/pages" FETCH_HEAD
+          cd "$RUNNER_TEMP/pages"
+          # Set for the rebase below as well as the commit: a rebase rewrites
+          # the commit, and hosted runners have no identity to fall back on.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Everything at the root is the site's except dev/.
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name dev -exec rm -rf {} +
+          cp -r "$RUNNER_TEMP/site/." .
+          touch .nojekyll
+          git add -A
+          if git diff --cached --quiet; then
+            echo "gh-pages already has this site"
+            exit 0
+          fi
+          git commit -q -m "site: publish ${GITHUB_SHA::7}"
+          # The benchmark job pushes to gh-pages too; it only touches dev/,
+          # so a rebase onto its push never conflicts.
+          for attempt in 1 2 3; do
+            git push origin HEAD:gh-pages && exit 0
+            git fetch origin gh-pages
+            git rebase FETCH_HEAD
+          done
+          exit 1

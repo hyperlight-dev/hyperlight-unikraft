@@ -938,6 +938,29 @@ ci:
 check-license-headers:
     ./dev/check-license-headers.sh
 
+# Build the GitHub Pages site (site/) into target/site, with the benchmark
+# history from the gh-pages branch beside it so the startup numbers load.
+[unix]
+site-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git fetch -q origin gh-pages
+    rm -rf target/site-bench
+    mkdir -p target/site-bench
+    git archive FETCH_HEAD dev/bench | tar -x -C target/site-bench
+    python3 site/tools/build.py target/site --bench-from target/site-bench/dev/bench
+
+# Preview the site at http://localhost:8000.
+[unix]
+site-serve: site-build
+    python3 -m http.server -d target/site 8000
+
+# Re-record the site's terminal demos into site/casts/: all, or the scenes
+# named (hero, languages, dockerfile, calls). Uses the hluk on PATH.
+[unix]
+site-record *scenes:
+    site/record/record.sh {{scenes}}
+
 # Run benchmarks for a runtime across all workloads and modes.
 #
 # Usage:
