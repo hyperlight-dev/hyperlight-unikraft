@@ -20,7 +20,7 @@ from pathlib import Path
 SITE = Path(__file__).resolve().parent.parent
 REPO = SITE.parent
 # What is copied: everything else under site/ is tooling.
-PUBLISHED = ["index.html", "style.css", "app.js", "favicon.svg", "casts"]
+PUBLISHED = ["index.html", "style.css", "app.js", "hyperlight-logo.png", "casts"]
 # The file a template's project is about, in the order to look for it.
 MAIN_FILES = ["main.py", "main.js", "server.py", "server.js", "Program.cs", "main.go",
               "src/main.rs", "main.c", "main.sh", "repl.sh", "main.ps1", "Main.java"]

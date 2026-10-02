@@ -4,7 +4,8 @@ The source of <https://hyperlight-dev.github.io/hyperlight-unikraft>. It is stat
 
 | Path | What it is |
 |---|---|
-| `index.html`, `style.css`, `app.js`, `favicon.svg` | The page |
+| `index.html`, `style.css`, `app.js` | The page |
+| `hyperlight-logo.png` | The Hyperlight logo (header and favicon), the same file as hyperlight.org's |
 | `casts/*.cast` | Terminal recordings (asciinema v2), played by [asciinema-player](https://github.com/asciinema/asciinema-player) |
 | `record/` | The [demo-magic](https://github.com/paxtonhare/demo-magic) scenes behind the recordings, and `record.sh` |
 | `tools/build.py` | Copies the page and writes `data/templates.json` from `templates/` |

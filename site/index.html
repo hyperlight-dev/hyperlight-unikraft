@@ -7,7 +7,7 @@
   <meta name="description" content="Run Python, Node.js, .NET, Go, Rust and more inside Hyperlight micro-VMs on a Unikraft kernel. Default-deny host access, snapshot restore in milliseconds.">
   <meta property="og:title" content="hyperlight-unikraft">
   <meta property="og:description" content="Ordinary Linux programs, each in its own micro-VM. Snapshot restore in milliseconds.">
-  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="hyperlight-logo.png" type="image/png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400..900;1,400..900&family=JetBrains+Mono:wght@400;600&display=swap">
@@ -18,10 +18,15 @@
   <a class="skip" href="#main">Skip to content</a>
 
   <header class="site-header">
-    <a class="wordmark" href="./" aria-label="hyperlight-unikraft home">
-      <span class="flex" aria-hidden="true">ᕦ(ò_óˇ)ᕤ</span>
-      hyperlight-unikraft
-    </a>
+    <div class="site-header-inner">
+    <div class="brand">
+      <a class="parent" href="https://hyperlight.org">
+        <img src="hyperlight-logo.png" alt="" width="32" height="32">
+        Hyperlight
+      </a>
+      <span class="sep" aria-hidden="true">/</span>
+      <a class="wordmark" href="./">hyperlight-unikraft</a>
+    </div>
     <nav aria-label="Sections">
       <a href="#startup">Startup</a>
       <a href="#density">Density</a>
@@ -30,6 +35,7 @@
       <a href="#embed">Embed</a>
       <a href="https://github.com/hyperlight-dev/hyperlight-unikraft">GitHub</a>
     </nav>
+    </div>
   </header>
 
   <main id="main">
