@@ -1,21 +1,27 @@
-/* Tokens. Light is the default; dark is its own set of steps, not an
-   inversion, and the chart pair is validated against each surface. */
+/* Tokens: the palette of hyperlight.org (Starlight's defaults: blue-gray
+   neutrals at hue 224, a blue accent). Light is the default; dark is its
+   own set of steps, not an inversion. */
 :root {
-  --bg: #eef1f4;
-  --surface: #f6f8fa;
-  --ink: #15202c;
-  --ink-2: #3f4c5a;
-  --muted: #56626f;
-  --rule: #cfd6de;
-  --link: #8a5300;
-  --term: #1b2633;
-  --term-ink: #d9e1e9;
-  --term-dim: #8e9cab;
-  --hluk: #c2770e;
-  --code-key: #336b9e;
-  --cold: #7b8794;
-  --focus: #3f7cb3;
-  --code-bg: #e3e8ed;
+  --bg: #ffffff;
+  --surface: #f6f7f9;
+  --ink: #17181c;
+  --ink-2: #353841;
+  --muted: #555962;
+  --rule: #c1c3c8;
+  --link: #3d50f5;
+  --accent: #3d50f5;
+  --code-key: #0f1c8a;
+  --cold: #888c96;
+  --focus: #3d50f5;
+  --code-bg: #edeef3;
+  --term: #17181c;
+  --term-ink: #edeef3;
+  --term-dim: #9a9ea8;
+  --term-rule: #353841;
+  --term-hover: #23262f;
+  --term-link: #b2c7ff;
+  --nav-bg: #f6f7f9;
+  --hairline: #edeef3;
 
   --font: "Schibsted Grotesk", system-ui, sans-serif;
   --mono: "JetBrains Mono", ui-monospace, monospace;
@@ -26,36 +32,44 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #121a23;
-    --surface: #141c25;
-    --ink: #e4e9ee;
-    --ink-2: #b6c0ca;
-    --muted: #8d99a6;
-    --rule: #2b3744;
-    --link: #e6a64a;
-    --term: #0c121a;
-    --hluk: #c98418;
-    --code-key: #4f8dd0;
-    --cold: #66727f;
-    --focus: #6aa3dc;
-    --code-bg: #1c2631;
+    --bg: #17181c;
+    --surface: #23262f;
+    --ink: #edeef3;
+    --ink-2: #c1c3c8;
+    --muted: #8d919a;
+    --rule: #353841;
+    --link: #b2c7ff;
+    --accent: #3369ff;
+    --code-key: #b2c7ff;
+    --cold: #656872;
+    --focus: #b2c7ff;
+    --code-bg: #23262f;
+    --term: #23262f;
+    --term-rule: #353841;
+    --term-hover: #2c303b;
+    --nav-bg: #23262f;
+    --hairline: #17181c;
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
-  --bg: #121a23;
-  --surface: #141c25;
-  --ink: #e4e9ee;
-  --ink-2: #b6c0ca;
-  --muted: #8d99a6;
-  --rule: #2b3744;
-  --link: #e6a64a;
-  --term: #0c121a;
-  --hluk: #c98418;
-  --code-key: #4f8dd0;
-  --cold: #66727f;
-  --focus: #6aa3dc;
-  --code-bg: #1c2631;
+  --bg: #17181c;
+  --surface: #23262f;
+  --ink: #edeef3;
+  --ink-2: #c1c3c8;
+  --muted: #8d919a;
+  --rule: #353841;
+  --link: #b2c7ff;
+  --accent: #3369ff;
+  --code-key: #b2c7ff;
+  --cold: #656872;
+  --focus: #b2c7ff;
+  --code-bg: #23262f;
+  --term: #23262f;
+  --term-rule: #353841;
+  --term-hover: #2c303b;
+  --nav-bg: #23262f;
+  --hairline: #17181c;
   color-scheme: dark;
 }
 
@@ -87,27 +101,37 @@ p { margin: 0; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .skip:focus { left: var(--gutter); top: 0.5rem; background: var(--surface); padding: 0.4rem 0.8rem; z-index: 10; }
 
-/* Header */
+/* Header: the nav bar of hyperlight.org (Starlight's), so moving between
+   the two sites feels like one. */
 .site-header {
+  background: var(--nav-bg);
+  border-bottom: 1px solid var(--hairline);
+}
+.site-header-inner {
   max-width: var(--wrap);
   margin: 0 auto;
-  padding: 1.1rem var(--gutter);
+  padding: 0.85rem var(--gutter);
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem 1.5rem;
 }
-.wordmark {
+.brand { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.brand a { text-decoration: none; }
+.brand .parent {
   display: inline-flex;
   align-items: center;
-  gap: 0.55rem;
-  color: var(--ink);
-  text-decoration: none;
-  font-weight: 750;
+  gap: 0.5rem;
+  color: var(--link);
+  font-size: 1.35rem;
+  font-weight: 700;
   letter-spacing: -0.01em;
 }
-.wordmark .flex { color: var(--link); font-weight: 600; white-space: nowrap; }
+.brand img { width: 2rem; height: 2rem; }
+.brand .sep { color: var(--muted); font-size: 1.2rem; }
+.wordmark { color: var(--ink); font-weight: 700; }
+.brand a:hover { text-decoration: underline; }
 .site-header nav { display: flex; flex-wrap: wrap; gap: 0.2rem 1.2rem; font-size: 0.95rem; }
 .site-header nav a { color: var(--ink-2); text-decoration: none; }
 .site-header nav a:hover { color: var(--ink); text-decoration: underline; }
@@ -149,7 +173,7 @@ h1 {
   padding: 0.3rem 0.6rem;
   cursor: pointer;
 }
-.tablist button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--hluk); }
+.tablist button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
 
 .cmd {
   display: flex;
@@ -175,11 +199,11 @@ h1 {
   background: none;
   color: var(--term-ink);
   border: 0;
-  border-left: 1px solid #2f3d4c;
+  border-left: 1px solid var(--term-rule);
   padding: 0 1rem;
   cursor: pointer;
 }
-.copy:hover { background: #253242; }
+.copy:hover { background: var(--term-hover); }
 /* .cmd clips its overflow, so the ring goes inside the button. */
 .copy:focus-visible { outline-offset: -3px; }
 
@@ -198,54 +222,54 @@ h1 {
   padding: 0.55rem 0.9rem;
   color: var(--term-dim);
   font-size: 0.8rem;
-  border-bottom: 1px solid #263342;
+  border-bottom: 1px solid var(--term-rule);
 }
 .term-bar::before {
   content: "";
   width: 0.6rem;
   height: 0.6rem;
   border-radius: 50%;
-  background: var(--hluk);
-  box-shadow: 1rem 0 0 #3a4858, 2rem 0 0 #3a4858;
+  background: var(--accent);
+  box-shadow: 1rem 0 0 var(--term-rule), 2rem 0 0 var(--term-rule);
   margin-right: 2.2rem;
 }
 .term figcaption {
   padding: 0.7rem 0.9rem 0.85rem;
   color: var(--term-dim);
   font-size: 0.82rem;
-  border-top: 1px solid #263342;
+  border-top: 1px solid var(--term-rule);
 }
-.term figcaption a { color: #e6a64a; }
+.term figcaption a { color: var(--term-link); }
 .player { min-height: 12rem; }
 .player .ap-wrapper { background: var(--term); }
 .player .ap-player { border-radius: 0; }
 .player-fallback { padding: 1rem; color: var(--term-dim); font-size: 0.9rem; }
-.player-fallback a { color: #e6a64a; }
+.player-fallback a { color: var(--term-link); }
 
 .asciinema-player-theme-hluk {
-  --term-color-foreground: #d9e1e9;
-  --term-color-background: #1b2633;
-  --term-color-0: #1b2633;
+  --term-color-foreground: #edeef3;
+  --term-color-background: #17181c;
+  --term-color-0: #17181c;
   --term-color-1: #e5776b;
   --term-color-2: #8fc28a;
   --term-color-3: #e6a64a;
-  --term-color-4: #6aa3dc;
+  --term-color-4: #7d9bff;
   --term-color-5: #c79be0;
   --term-color-6: #6fc4c4;
-  --term-color-7: #d9e1e9;
+  --term-color-7: #edeef3;
   --term-color-8: #7f8d9c;
   --term-color-9: #f08a7e;
   --term-color-10: #a5d6a0;
   --term-color-11: #f0bd6a;
-  --term-color-12: #8bb9e6;
+  --term-color-12: #b2c7ff;
   --term-color-13: #d7b0ec;
   --term-color-14: #8ad6d6;
   --term-color-15: #ffffff;
 }
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .asciinema-player-theme-hluk { --term-color-background: #0c121a; --term-color-0: #0c121a; }
+  :root:not([data-theme="light"]) .asciinema-player-theme-hluk { --term-color-background: #23262f; --term-color-0: #23262f; }
 }
-:root[data-theme="dark"] .asciinema-player-theme-hluk { --term-color-background: #0c121a; --term-color-0: #0c121a; }
+:root[data-theme="dark"] .asciinema-player-theme-hluk { --term-color-background: #23262f; --term-color-0: #23262f; }
 
 /* Section heads */
 .section-head { max-width: 46rem; margin-bottom: 2rem; }
@@ -295,7 +319,7 @@ h2 {
   z-index: 1;
 }
 .lane[data-lane="cold"] .fill { background: var(--cold); }
-.lane[data-lane="snap"] .fill, .lane[data-lane="reset"] .fill { background: var(--hluk); }
+.lane[data-lane="snap"] .fill, .lane[data-lane="reset"] .fill { background: var(--accent); }
 .lane.done .fill { min-width: 3px; }
 .lane-value {
   grid-area: value;
@@ -322,7 +346,7 @@ thead th { color: var(--muted); font-weight: 500; font-size: 0.86rem; }
   grid-template-columns: repeat(40, 1fr);
   gap: 2px;
 }
-.cells i { aspect-ratio: 1; background: var(--hluk); border-radius: 1px; opacity: 0.85; }
+.cells i { aspect-ratio: 1; background: var(--accent); border-radius: 1px; opacity: 0.85; }
 .density-facts { margin: 0; display: grid; gap: 1.3rem; }
 .density-facts dt { font-size: clamp(1.6rem, 3.2vw, 2.4rem); font-weight: 800; letter-spacing: -0.03em; line-height: 1; font-variant-numeric: tabular-nums; }
 .density-facts dd { margin: 0.3rem 0 0; color: var(--ink-2); }
@@ -350,7 +374,7 @@ thead th { color: var(--muted); font-weight: 500; font-size: 0.86rem; }
   .lang-picker button { border: 0; border-left: 2px solid transparent; margin-left: -1px; border-radius: 0; padding: 0.32rem 0.9rem; }
 }
 .lang-picker button small { color: var(--muted); font-size: 0.78rem; }
-.lang-picker button[aria-selected="true"] { color: var(--ink); font-weight: 700; border-color: var(--hluk); }
+.lang-picker button[aria-selected="true"] { color: var(--ink); font-weight: 700; border-color: var(--accent); }
 @media (max-width: 899px) { .lang-picker button[aria-selected="true"] { background: var(--ink); color: var(--bg); } .lang-picker button[aria-selected="true"] small { color: inherit; } }
 .lang-desc { color: var(--ink-2); margin-bottom: 1rem; max-width: 46rem; }
 .lang-desc .note { display: block; color: var(--link); font-size: 0.9rem; margin-top: 0.3rem; }
