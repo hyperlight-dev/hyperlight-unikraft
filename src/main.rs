@@ -27,7 +27,7 @@ fn elapsed_ms(t: Instant) -> f64 {
 
 /// Run Linux programs in Hyperlight micro-VMs, with Unikraft as the guest kernel.
 #[derive(Parser)]
-#[command(name = "hluk", version)]
+#[command(name = "hluk", version = cli::registry::BUILD_VERSION)]
 struct Cli {
     /// Log level for hluk diagnostics: error, warn, info, debug, trace.
     /// Off by default; pass --log-level info to see timing.

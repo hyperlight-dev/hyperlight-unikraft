@@ -24,8 +24,23 @@ use ureq::http::{Response, StatusCode};
 /// `--registry` or `HLUK_REGISTRY` says otherwise.
 pub const DEFAULT_REGISTRY: &str = "ghcr.io/hyperlight-dev/hyperlight-unikraft";
 
-/// This build's release, which names the image tags it matches.
+/// This build's release.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The images this build matches: its release's, or its own commit's when
+/// it was built for the dev channel (`HLUK_CHANNEL=dev-44ee170`: a build of
+/// `main`, pinned to the images published with it, `:initrd-dev-44ee170`).
+pub const IMAGE_VERSION: &str = match option_env!("HLUK_CHANNEL") {
+    Some(channel) => channel,
+    None => VERSION,
+};
+
+/// What `hluk --version` prints: the release, or the build a channel's
+/// workflow named (`HLUK_BUILD_VERSION`, e.g. `0.17.0+dev.44ee170`).
+pub const BUILD_VERSION: &str = match option_env!("HLUK_BUILD_VERSION") {
+    Some(build) => build,
+    None => VERSION,
+};
 
 /// The registry `init` renders into a project: the flag, else the
 /// environment, else the project's own.
@@ -43,14 +58,25 @@ pub fn registry(flag: Option<String>) -> String {
 }
 
 /// The release whose images `init` writes into a project: the flag, else
-/// `HLUK_IMAGE_VERSION`, else this build's own.  A build between releases
-/// has no published images; pointing it at the last release's works for
-/// as long as the driver protocol has not changed since.
+/// `HLUK_IMAGE_VERSION`, else this build's own ([`IMAGE_VERSION`]).  A
+/// release (`0.17.0`) or a dev build (`dev-44ee170`).  A build between releases has
+/// no published images; pointing it at the last release's works for as
+/// long as the driver protocol has not changed since.
 pub fn image_version(flag: Option<String>) -> String {
     flag.or_else(|| std::env::var("HLUK_IMAGE_VERSION").ok())
         .map(|v| v.trim().trim_start_matches('v').to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| VERSION.to_string())
+        .unwrap_or_else(|| IMAGE_VERSION.to_string())
+}
+
+/// The tag a release or a dev build is published under: `v0.17.0` for a
+/// release, a dev build's name (`dev-44ee170`) as it is.
+fn version_tag(version: &str) -> String {
+    if version.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("v{version}")
+    } else {
+        version.to_string()
+    }
 }
 
 /// The image a `--runtime` value names: a full reference as given
@@ -79,12 +105,12 @@ pub fn runtime_name(spec: &str) -> Option<&str> {
 
 /// The runnable CPIO image for `runtime` at `version`.
 pub fn initrd_image(registry: &str, runtime: &str, version: &str) -> String {
-    format!("{registry}/{runtime}:initrd-v{version}")
+    format!("{registry}/{runtime}:initrd-{}", version_tag(version))
 }
 
 /// The filesystem image for `runtime` at `version`, to build `FROM`.
 pub fn base_image(registry: &str, runtime: &str, version: &str) -> String {
-    format!("{registry}/{runtime}:v{version}")
+    format!("{registry}/{runtime}:{}", version_tag(version))
 }
 
 /// A parsed image reference: `host/repository[:tag|@digest]`.
@@ -433,12 +459,21 @@ impl Client {
         match response.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => {
+                // A dev build's images come from the dev workflow, and only
+                // the last two builds' are kept.
+                let tag = reference.reference.as_str();
+                let when = if tag.starts_with("dev-") || tag.starts_with("initrd-dev-") {
+                    "A dev build's images are published with it and kept for the last two \
+                     dev builds only: install the current one (HLUK_VERSION=dev with \
+                     install.sh or install.ps1)"
+                } else {
+                    "A release publishes it a few minutes after tagging"
+                };
                 return Err(format!(
-                    "{reference} is not published (HTTP 404). A release publishes it a few \
-                     minutes after tagging; a build of an unreleased hluk has no published \
-                     rootfs, so pin the last release's with --image-version X.Y.Z (or \
-                     HLUK_IMAGE_VERSION), or build one with `just build-rootfs <runtime>` \
-                     and point [rootfs] path at it"
+                    "{reference} is not published (HTTP 404). {when}; a build of an \
+                     unreleased hluk has no published rootfs, so pin the last release's \
+                     with --image-version X.Y.Z (or HLUK_IMAGE_VERSION), or build one with \
+                     `just build-rootfs <runtime>` and point [rootfs] path at it"
                 ));
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -666,17 +701,27 @@ mod tests {
     #[test]
     fn image_names_follow_the_release() {
         let v = image_version(None);
-        assert_eq!(v, VERSION);
+        assert_eq!(v, IMAGE_VERSION);
         assert_eq!(
-            initrd_image("ghcr.io/x/y", "python", &v),
-            format!("ghcr.io/x/y/python:initrd-v{VERSION}")
+            initrd_image("ghcr.io/x/y", "python", "0.17.0"),
+            "ghcr.io/x/y/python:initrd-v0.17.0"
         );
+        // A dev build's images are tagged with its commit.
+        assert_eq!(
+            initrd_image("ghcr.io/x/y", "python", "dev-44ee170"),
+            "ghcr.io/x/y/python:initrd-dev-44ee170"
+        );
+        assert_eq!(
+            base_image("ghcr.io/x/y", "node", "dev-44ee170"),
+            "ghcr.io/x/y/node:dev-44ee170"
+        );
+        assert_eq!(image_version(Some("dev-44ee170".into())), "dev-44ee170");
         assert_eq!(
             base_image("ghcr.io/x/y", "node", "0.14.1"),
             "ghcr.io/x/y/node:v0.14.1"
         );
         assert_eq!(image_version(Some("v0.14.1".into())), "0.14.1");
-        assert_eq!(image_version(Some("  ".into())), VERSION);
+        assert_eq!(image_version(Some("  ".into())), IMAGE_VERSION);
         assert_eq!(
             registry(Some("https://r.example/".into())),
             "r.example",
@@ -692,7 +737,7 @@ mod tests {
     fn a_runtime_spec_is_a_name_or_a_reference() {
         assert_eq!(
             runtime_image("python"),
-            format!("{DEFAULT_REGISTRY}/python:initrd-v{VERSION}")
+            initrd_image(DEFAULT_REGISTRY, "python", IMAGE_VERSION)
         );
         assert_eq!(
             runtime_image("ghcr.io/o/r/node:initrd-v0.14.0"),
