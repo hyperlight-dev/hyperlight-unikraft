@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790664357056,
+  "lastUpdate": 1790953925948,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python benchmarks": [
@@ -2359,6 +2359,190 @@ window.BENCHMARK_DATA = {
           {
             "name": "rss/stdlib",
             "value": 8,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": false,
+          "id": "44ee170f171ed387cbeb530775edb913bbf687aa",
+          "message": "examples, tests: check musl condition variables and futex requeues\n\nTwo C programs, built with musl in Alpine (glibc's condition variables\ndo not requeue): condvar broadcasts to four waiters fifty times and\nexpects every one to wake, and futex_requeue checks FUTEX_REQUEUE and\nFUTEX_CMP_REQUEUE against Linux's semantics, which it passes on Linux\ntoo.  Every wait has a deadline, so a kernel that loses a waiter fails\nthe test rather than hanging it, and the tests print which check failed.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-10-02T14:23:19Z",
+          "tree_id": "c75fe4aa7f972e6f548fa3f3b9fb7a0e6026d448",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/44ee170f171ed387cbeb530775edb913bbf687aa"
+        },
+        "date": 1790953925303,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 199.807,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 198.204,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 198.977,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 247.26,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 15.59,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 8.258,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 12.712,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 74.423,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 5.842,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 1.539,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 2.92,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 54.972,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 1.287,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 1.126,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 1.492,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 1.435,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.664,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.201,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 0.781,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 44.414,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 9.792,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 2.394,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 4.615,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 107.766,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 73.6,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 73.6,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 73.6,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 73.6,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 7,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 6,
             "unit": "MB"
           }
         ]
