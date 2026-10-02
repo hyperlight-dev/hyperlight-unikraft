@@ -141,7 +141,8 @@ pub struct RunArgs {
     /// and print its result: a handler the script defined, an export of the
     /// WebAssembly library --guest-exec loaded. With no workload, only the
     /// call runs (on a handler --warm-exec defined, say). The quickjs, node,
-    /// python, dotnet-jit and wasmtime images serve guest function calls.
+    /// python, dotnet-jit, java and wasmtime images serve guest function
+    /// calls.
     #[arg(long, value_name = "FUNCTION")]
     call: Option<String>,
 
