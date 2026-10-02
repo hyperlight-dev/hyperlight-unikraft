@@ -1,6 +1,6 @@
 /*
  * hl_child.h — the pipe protocol between a driver and a runtime it runs
- * as a child process (node, dotnet-jit).
+ * as a child process (node, dotnet-jit, java).
  *
  * The child owns the runtime; the driver owns /dev/hlcall.  Each call
  * the driver serves goes down the code pipe as one message:

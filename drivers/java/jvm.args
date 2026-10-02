@@ -1,0 +1,31 @@
+# The JVM's options in the guest, read by the java launcher (@argfile):
+# hl_javadriver starts the dispatcher with them, and the image build runs
+# it with them to write the CDS archive, which is only used under the
+# options it was written with.  The jar's manifest opens java.io (a
+# FileDescriptor from the pipe fds), java.lang (the host's environment
+# variables, Environment.java) and jdk.jshell (which class is a snippet's,
+# Snippets.java) to it: as --add-opens, they would turn the archive's
+# module graph off.
+#
+# Serial GC: one vCPU, so no GC threads to coordinate.
+-XX:+UseSerialGC
+# C1 only: one compiler thread and far less memory than C2.
+-XX:TieredStopAtLevel=1
+# The heap a share of the memory free when the JVM starts (the driver
+# passes it as -XX:MaxRAM), so it tracks the scratch size, and what a JVM
+# started after System.exit() has left, and an allocation that cannot be
+# served is an OutOfMemoryError, not a page fault the kernel cannot serve.  The rest
+# holds the rootfs, the JVM's own memory (metaspace, code cache, stacks)
+# and the kernel.
+-XX:MaxRAMPercentage=50
+# Perf data is a file in /tmp for jstat, which nothing reads.
+-XX:-UsePerfData
+# No SIGQUIT thread dumps or attach listener, which nothing can send.
+-Xrs
+-XX:+DisableAttachMechanism
+# The guest has no locale to take the output's encoding from.
+-Dstdout.encoding=UTF-8
+-Dstderr.encoding=UTF-8
+# The JVM raises its open-file limit to the maximum by default, which the
+# kernel already gives it, and logs that it ignored.
+-XX:-MaxFDLimit
