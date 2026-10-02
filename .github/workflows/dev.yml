@@ -1,0 +1,241 @@
+# The dev channel: each push to main whose CI passes is published as the `dev`
+# pre-release, replacing the last one.
+#   - Images: every runtime, busybox, the kernel and the urunc image, tagged
+#     with the commit (:dev-<sha7>, and :initrd-dev-<sha7> for the CPIO),
+#     multi-platform.  :latest, :initrd and the release tags are left to
+#     releases.
+#   - Binaries: hluk for the four release targets, built with
+#     HLUK_CHANNEL=dev-<sha7>, so each pulls the images of its own commit and
+#     a newer build never meets an older one's images in a cache.  Attached to
+#     the `dev` pre-release with a SHA256SUMS; `HLUK_VERSION=dev` makes
+#     install.sh and install.ps1 install them.
+#   - Cleanup: the dev images of all but this build and the one before are
+#     deleted (dev/clean-dev-images.sh), so the channel keeps only what its
+#     binaries pull.
+# The images go first: a dev binary never names images that are not there yet.
+# Builds run side by side; only moving the channel is one at a time, and a
+# build that finds the channel already at a newer commit (a CI re-run of an
+# older one) leaves it.
+name: dev
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    # A push to main that passed CI, or a manual run from main.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      build: ${{ steps.meta.outputs.build }}
+      channel: ${{ steps.meta.outputs.channel }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+      # The build is named after the last release plus this commit
+      # (0.17.0+dev.44ee170): semver build metadata, so it is not mistaken
+      # for a pre-release of a version that is already out.
+      - name: Name the build
+        id: meta
+        run: |
+          sha=$(git rev-parse HEAD)
+          version=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          # A CI re-run of an older commit, finishing after a newer one went
+          # out, stops here rather than building; the release job checks
+          # again before it moves the channel.
+          publish=true
+          git fetch -q origin "refs/tags/dev:refs/tags/dev" 2>/dev/null || true
+          current=$(git rev-parse -q --verify 'refs/tags/dev^{commit}' || true)
+          if [ -n "$current" ] && [ "$current" != "$sha" ] &&
+              git merge-base --is-ancestor "$sha" "$current"; then
+            echo "dev is at ${current:0:7}, newer than ${sha:0:7}: nothing to publish"
+            publish=false
+          fi
+          # Build metadata: the version, then the commit it was built from.
+          {
+            echo "sha=$sha"
+            echo "build=$version+dev.${sha:0:7}"
+            echo "channel=dev-${sha:0:7}"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+  images:
+    needs: meta
+    if: needs.meta.outputs.publish == 'true'
+    uses: ./.github/workflows/publish-images.yml
+    with:
+      version: ${{ needs.meta.outputs.channel }}
+      stable: false
+    permissions:
+      contents: read
+      packages: write
+
+  binaries:
+    needs: meta
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    env:
+      HLUK_CHANNEL: ${{ needs.meta.outputs.channel }}
+      HLUK_BUILD_VERSION: ${{ needs.meta.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
+
+      - name: Build hluk
+        run: cargo build --release --locked
+
+      # Hypervisor.framework requires the entitlement; install.sh signs the
+      # binary again where it installs it.
+      - name: Sign (macOS)
+        if: runner.os == 'macOS'
+        run: codesign -f -s - --entitlements dev/macos-entitlements.plist target/release/hluk
+
+      - name: Package (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: tar -C target/release -czf "hluk-dev-${{ matrix.target }}.tar.gz" hluk
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target\release\hluk.exe -DestinationPath "hluk-dev-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hluk-dev-${{ matrix.target }}
+          path: hluk-dev-${{ matrix.target }}.*
+          retention-days: 1
+          if-no-files-found: error
+
+  # One at a time: a newer build waits for the one in flight rather than
+  # leaving the channel half replaced.
+  release:
+    needs: [meta, images, binaries]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: dev-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD: ${{ needs.meta.outputs.build }}
+      CHANNEL: ${{ needs.meta.outputs.channel }}
+      SHA: ${{ needs.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
+          fetch-depth: 0
+
+      # Read under the lock: the build `dev` is at now is the one whose
+      # images the cleanup keeps, for the binaries still installed from it.
+      # A re-run of the build `dev` is at keeps the one before, which its
+      # notes name.
+      - name: Find the build it replaces
+        id: current
+        run: |
+          git fetch -q -f origin "refs/tags/dev:refs/tags/dev" 2>/dev/null || true
+          current=$(git rev-parse -q --verify 'refs/tags/dev^{commit}' || true)
+          publish=true
+          previous=${current:0:7}
+          if [ "$current" = "$SHA" ]; then
+            previous=$(gh release view dev --json body -q .body 2>/dev/null |
+              sed -n 's/^<!-- previous: \([0-9a-f]*\) -->$/\1/p')
+          elif [ -n "$current" ] && git merge-base --is-ancestor "$SHA" "$current"; then
+            echo "dev moved on to ${current:0:7}, newer than ${SHA:0:7}: nothing to publish"
+            publish=false
+          fi
+          {
+            echo "previous=$previous"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.current.outputs.publish == 'true'
+        with:
+          pattern: hluk-dev-*
+          path: assets
+          merge-multiple: true
+
+      - name: Checksums and notes
+        if: steps.current.outputs.publish == 'true'
+        env:
+          PREVIOUS: ${{ steps.current.outputs.previous }}
+          REPO: ${{ github.repository }}
+        run: |
+          (cd assets && sha256sum hluk-dev-* > ../SHA256SUMS)
+          {
+            echo "The latest build of \`main\` that passed CI: \`$BUILD\`, from $(git log -1 --format='%h %s' "$SHA")."
+            echo
+            echo "Replaced on every push to \`main\`. It pulls the images of its own commit, \`:initrd-$CHANNEL\` (\`:$CHANNEL\` to build \`FROM\`)."
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | HLUK_VERSION=dev sh"
+            echo '```'
+            echo
+            echo '```powershell'
+            echo "\$env:HLUK_VERSION = 'dev'; irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex"
+            echo '```'
+            echo
+            echo "<!-- previous: $PREVIOUS -->"
+          } > notes.md
+
+      # The binaries go up before SHA256SUMS, so an install in between fails
+      # on a checksum mismatch instead of passing an unchecked one; with the
+      # release's sums missing (each upload replaces a file in place), the
+      # installers refuse a dev install outright.
+      - name: Move the dev tag and replace the pre-release
+        if: steps.current.outputs.publish == 'true'
+        run: |
+          git tag -f dev "$SHA"
+          git push -f origin refs/tags/dev
+          if ! gh release view dev > /dev/null 2>&1; then
+            gh release create dev --prerelease --title "dev ($BUILD)" --notes-file notes.md
+          fi
+          gh release upload dev assets/* --clobber
+          gh release upload dev SHA256SUMS --clobber
+          gh release edit dev --prerelease --title "dev ($BUILD)" --notes-file notes.md
+
+      - name: Log in to GHCR
+        if: steps.current.outputs.publish == 'true'
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # The dev images of every build but this one and the one before (still
+      # installed until its users update).
+      - name: Delete older dev images
+        if: steps.current.outputs.publish == 'true'
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          KEEP: ${{ needs.meta.outputs.channel }} ${{ steps.current.outputs.previous && format('dev-{0}', steps.current.outputs.previous) || '' }}
+          NEWEST: ${{ needs.meta.outputs.sha }}
+        run: dev/clean-dev-images.sh

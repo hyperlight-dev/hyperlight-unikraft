@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - The `java` runtime (tier 2): Java 25 on a jlinked runtime, with Java source run by JShell in the guest's JVM, so statements, expressions and declarations mix and stay for the next call, and a call that only declares a `main` (a compact source file, or a class) runs it. It serves guest function calls (a static method, its input converted to a record, collection or simple value, a future awaited) and makes host function calls through `hyperlight.Host.call`; `System.getenv()` sees the host's variables, and `System.exit()` ends the call with its status; the next call starts a fresh JVM while the guest has the memory for one (two restarts at 512 MiB: the kernel keeps an exited process's memory), and fails without crashing when it doesn't. The image is 84 MiB and runs in 512 MiB; a CDS archive of the classes the dispatcher loads while it warms up comes with it. `hluk init --template java` starts a project.
+- A `dev` channel: each push to `main` whose CI passes replaces the `dev` pre-release (the `hluk` binaries and a `SHA256SUMS`) and publishes the images of that commit (`:dev-<sha7>`, `:initrd-dev-<sha7>`), so `main` can be installed and run between releases: `HLUK_VERSION=dev` with `install.sh` or `install.ps1`. A dev `hluk` pulls the images of its own commit and prints its build with `--version` (`0.17.0+dev.44ee170`); only the last two builds' images are kept. Releases and their tags are unchanged (`dev.yml`, docs/RELEASE.md).
 
 ### Fixed
 

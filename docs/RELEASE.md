@@ -7,6 +7,7 @@ Releases are driven by the `version` in the root `Cargo.toml` and cut with three
 | `release.yml` | manual (`workflow_dispatch`) | Tags the version, creates a GitHub Release (notes from the matching `CHANGELOG.md` section) with the `hluk` binaries, and triggers the GHCR publish. |
 | `publish-images.yml` | git tag `v*`, or manual | Pushes each runtime as one package (`:latest` base + `:initrd` cpio), plus busybox, the kernel, and the urunc "hello" image to GHCR. |
 | `cargo-publish.yml` | manual | Publishes the `hyperlight-unikraft` crate to crates.io. Dry-run by default. |
+| `dev.yml` | `main`'s CI passing on a push, or manual (from `main`) | Replaces the `dev` pre-release and publishes the commit's `:dev-<sha7>` images (see [Dev builds](#dev-builds)). |
 
 User-facing changes are recorded in [`CHANGELOG.md`](../CHANGELOG.md) (Keep a Changelog format): changes accumulate under `## [Prerelease] - Unreleased`, then that heading is renamed to the version at release time.
 
@@ -35,6 +36,19 @@ Nothing is pushed to crates.io as part of this — that is deliberate.
   - `busybox` — the shared BusyBox base at `:latest` (bash/agent/python-shell build on it), for both platforms,
   - `kernel` — the Unikraft elfloader kernel at `/kernel`, the x86_64 or arm64 one per platform,
   - `hello-urunc` — a urunc-runnable OCI image (see `demos/urunc/`).
+
+## Dev builds
+
+Each push to `main` whose CI passes replaces the `dev` channel, so the latest `main` can be installed and run without a release:
+
+| What | Where |
+|---|---|
+| `hluk` for the four release targets, and a `SHA256SUMS` | the `dev` pre-release; the `dev` tag moves to the commit |
+| every runtime, busybox, the kernel and the urunc image | tagged with the commit: `:dev-<sha7>`, and `:initrd-dev-<sha7>` for the CPIO, multi-platform |
+
+A dev `hluk` is built with `HLUK_CHANNEL=dev-<sha7>`, so it pulls the images of its own commit, and `hluk --version` prints its build (`0.17.0+dev.44ee170`). A newer dev build asks for newer tags, so no cache or Docker build hands it an older build's images. `HLUK_VERSION=dev` makes `install.sh` and `install.ps1` install it, and they refuse it while its `SHA256SUMS` is being replaced.
+
+The images go up before the binaries, so a dev binary never names images that are not there yet. Once the binaries are up, the dev images of every build but this one and the one before are deleted, with the untagged platform manifests only they list: the channel keeps only what its installed binaries pull. A run whose commit is older than the one `dev` already points at (a CI re-run) publishes nothing. Builds run side by side, and only the release step is serialized. GitHub keeps one pending run per group, so a run that arrives while another waits replaces it; if an older commit's run replaces a newer one, `dev` is one commit behind until the next push (or re-run the cancelled one). When two builds overlap, the newer one's cleanup can delete the older one's images while it is still joining them, and that run fails; it would have published nothing anyway. `:latest`, `:initrd` and the release tags are left to releases, and GitHub does not count a pre-release as the latest release, so a plain install still gets the last release.
 
 ## crates.io
 
