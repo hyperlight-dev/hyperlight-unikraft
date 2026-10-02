@@ -10,7 +10,7 @@
 
 Run ordinary Linux programs (e.g., Python, Node.js, .NET, Go, Rust, C, Bash) inside [Hyperlight](https://github.com/hyperlight-dev/hyperlight) micro-VMs, using a [Unikraft](https://github.com/unikraft/unikraft) unikernel as the guest kernel.
 
-hyperlight-unikraft ships as both a Rust library and a CLI. `hluk` (the CLI) boots the kernel, mounts a rootfs, runs your workload behind a **default-deny** host boundary (no filesystem or network unless you opt in), and can snapshot a warmed guest to skip startup on later runs. The same building blocks (`SandboxBuilder`, `run`, snapshot save/restore) are exposed as a library, so you can embed guest execution in your own application (`hluk` itself is a good reference consumer of it).
+hyperlight-unikraft ships as both a Rust library and a CLI. `hluk` (the CLI, pronounced "hulk") boots the kernel, mounts a rootfs, runs your workload behind a **default-deny** host boundary (no filesystem or network unless you opt in), and can snapshot a warmed guest to skip startup on later runs. The same building blocks (`SandboxBuilder`, `run`, snapshot save/restore) are exposed as a library, so you can embed guest execution in your own application (`hluk` itself is a good reference consumer of it).
 
 ## Quick start
 
