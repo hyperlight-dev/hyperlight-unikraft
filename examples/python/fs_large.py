@@ -1,9 +1,9 @@
 """Large file I/O — exercises chunked hostfs reads and writes.
 
-Writes and reads back data larger than a single transfer chunk (32 KB)
-to verify that multi-chunk I/O works end-to-end.  The host's PEB I/O
-stacks must be sized to hold at least one chunk plus FlatBuffer
-overhead; this test catches silent failures from undersized stacks.
+Writes and reads back data larger than a single transfer chunk (64 KiB)
+to verify that multi-chunk I/O works end-to-end.  The host's virtqueue
+pools must hold at least one chunk plus FlatBuffer overhead; this test
+catches silent failures from undersized pools.
 """
 
 import os
@@ -11,8 +11,8 @@ import os
 MOUNT = "/mnt/host"
 PATH = os.path.join(MOUNT, "large.bin")
 
-# 96 KB — three full 32 KB chunks.
-SIZE = 96 * 1024
+# 192 KiB — three full 64 KiB chunks.
+SIZE = 192 * 1024
 PATTERN = b"ABCDEFGHIJKLMNOP"  # 16 bytes, repeats evenly into SIZE
 data = PATTERN * (SIZE // len(PATTERN))
 assert len(data) == SIZE

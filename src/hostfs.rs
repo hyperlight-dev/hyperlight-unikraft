@@ -43,8 +43,13 @@ use crate::{HOST_CALL_MAX, Mount, errno};
 
 /// Maximum bytes per read/write host call.  The guest queries this
 /// value via `GetHostFsChunkSize` at mount time — changing it here
-/// does not require a kernel rebuild.
-pub(crate) const CHUNK: usize = 32768;
+/// does not require a kernel rebuild.  64 KiB: over the virtqueues a
+/// 64 KiB chunk reads and writes about 40% faster than a 32 KiB one,
+/// and larger ones gain little for the pool memory they cost.
+pub(crate) const CHUNK: usize = 64 * 1024;
+
+// The chunk and its 4-byte status are one host call's reply.
+const _: () = assert!(CHUNK + 4 <= HOST_CALL_MAX);
 
 /// Register all `fs_*` host functions.
 ///
