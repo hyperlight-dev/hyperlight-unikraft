@@ -933,8 +933,7 @@ fn python_stderr_apart_from_stdout() {
     let stderr = sandbox.drain_stderr();
     assert!(stderr.contains("ZeroDivisionError"), "{stderr:?}");
 
-    // Over 4 KiB of multi-byte characters: several HostPrintErr calls,
-    // each cut between characters.
+    // Multi-byte characters, well past a page: they arrive whole.
     sandbox
         .run("import sys\nsys.stderr.write('\u{20ac}' * 3000)\nsys.stderr.flush()")
         .unwrap();
@@ -949,14 +948,14 @@ fn python_stderr_apart_from_stdout() {
     assert_eq!(sandbox.drain_output(), "True True\na\nb\n");
 }
 
-/// A host without `HostPrintErr` gets standard error through `HostPrint`,
+/// A host without `HostWriteErr` gets standard error through `HostWrite`,
 /// all of it, as before the stream had its own.
 #[test]
-fn python_stderr_reaches_a_host_without_host_print_err() {
+fn python_stderr_reaches_a_host_without_host_write_err() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
-        .without_host_print_err()
+        .without_host_write_err()
         .boot()
         .unwrap();
     sandbox

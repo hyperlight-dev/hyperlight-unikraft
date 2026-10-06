@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 pub use hyperlight_host;
 
 use hyperlight_host::{
-    GuestBinary, HyperlightError, MultiUseSandbox, UninitializedSandbox, func::Registerable,
+    GuestBinary, HyperlightError, Sandbox, UninitializedSandbox, func::Registerable,
     sandbox::SandboxConfiguration, sandbox::snapshot::OciTag,
 };
 
@@ -204,8 +204,9 @@ fn dispatch_host_call(table: &HostFunctionTable, name: &str, args: &[u8]) -> Vec
         Ok(text) => (HOST_CALL_OK, text),
         Err(message) => (HOST_CALL_ERR, message),
     };
-    // A reply the guest's buffer cannot take would arrive cut short; it
-    // becomes an error the guest can report instead.
+    // A reply the guest's buffer cannot take would be refused by the
+    // kernel, and the call fail with nothing to say why; it becomes an
+    // error the guest can report instead.
     let (tag, text) = if text.len() + 1 > HOST_CALL_MAX {
         (
             HOST_CALL_ERR,
@@ -364,26 +365,165 @@ mod scratch_tests {
     }
 }
 
-/// Largest payload of one host call, in either direction.
-///
-/// The host decides this alone: it sizes the PEB I/O stacks
-/// ([`IO_STACK_SIZE`]) and the guest sizes every transfer buffer from
-/// the stack sizes it reads back out of the PEB
-/// (`hl_hcall_max_payload()` in `plat/hyperlight/hcall.c`: the smaller
-/// stack less a 4 KiB reserve for the FlatBuffer framing).  So a guest
-/// never asks for, or sends, more than this, and the host functions
-/// here only cap what they hand back (`net_recvfrom`) as a courtesy to
-/// a guest that asks for more.
-pub(crate) const HOST_CALL_MAX: usize = 64 * 1024;
+/// Guest page size, the unit the virtqueue pools are sized in.
+const PAGE_SIZE: usize = hyperlight_common::vmem::PAGE_SIZE;
 
-/// PEB I/O stack size for host-call data transfer.
-///
-/// Both the input stack (host→guest results) and output stack
-/// (guest→host calls) must hold a FlatBuffer-encoded message carrying
-/// a [`HOST_CALL_MAX`] payload plus its framing, the same 4 KiB reserve
-/// the guest subtracts.  Default Hyperlight stacks are only 16 KiB —
-/// too small for large file or network transfers.
-const IO_STACK_SIZE: usize = HOST_CALL_MAX + 4096;
+/// What the guest keeps back from each half of the G2H pool: the
+/// message header, and a 4 KiB reserve for the FlatBuffer framing
+/// (`HL_HCALL_FRAMING` in `plat/hyperlight/hcall.c`).
+const MSG_OVERHEAD: usize = hyperlight_common::transport::MsgHeader::SIZE + 4096;
+
+/// Pages in each half of the guest-to-host pool.  The guest splits the
+/// pool in two, a host call's request and its reply, and each half
+/// carries a 64 KiB payload (a file or socket transfer) plus
+/// [`MSG_OVERHEAD`].  Hyperlight's default pool (12 pages) is too small
+/// for that.
+const G2H_HALF_PAGES: usize = (64 * 1024 + MSG_OVERHEAD).div_ceil(PAGE_SIZE);
+const G2H_POOL_PAGES: usize = 2 * G2H_HALF_PAGES;
+
+/// Largest payload of one host call, in either direction: exactly what
+/// the guest computes from the pool geometry (`hl_hcall_max_payload()`
+/// in `plat/hyperlight/hcall.c`), 69,620 bytes.  The host decides it
+/// alone, through the pool sizes, and the guest sizes every transfer
+/// buffer from it.  So a guest never sends more than this, and the host
+/// functions that hand back data (`fs_*` reads and listings,
+/// `net_recvfrom`, `HostCall` results) keep their whole reply within it,
+/// data and what comes with it; the kernel refuses a larger result rather
+/// than cut it short.
+pub(crate) const HOST_CALL_MAX: usize = G2H_HALF_PAGES * PAGE_SIZE - MSG_OVERHEAD;
+
+/// Pages of the host-to-guest pool, cut into receive buffers of
+/// Hyperlight's default size.  A guest function call can be as large as
+/// a host call's whole message (the kernel sizes `/dev/hlcall` buffers,
+/// which also take host call replies, from it), so it gets as many pages
+/// as a G2H half.
+const H2G_POOL_PAGES: usize = G2H_HALF_PAGES;
+
+// Hyperlight keeps one H2G buffer spare for a call with byte parameters;
+// hluk's guest functions (`step`, `Exec`, `Call`, ...) take strings and
+// integers only, and the kernel serves no other, so every buffer is the
+// call's.
+const _: () = {
+    assert!(HOST_CALL_MAX >= 64 * 1024);
+    // The guest posts min(queue size, pool / buffer size) receive
+    // buffers: the default queue must post all of them, or a call the
+    // size of a G2H half would not fit.
+    let buffers = H2G_POOL_PAGES * PAGE_SIZE / SandboxConfiguration::DEFAULT_H2G_BUFFER_SIZE;
+    assert!(buffers <= SandboxConfiguration::DEFAULT_H2G_QUEUE_SIZE);
+    assert!(buffers * SandboxConfiguration::DEFAULT_H2G_BUFFER_SIZE >= G2H_HALF_PAGES * PAGE_SIZE);
+};
+
+/// Size the virtqueue pools for [`HOST_CALL_MAX`] transfers.  The other
+/// knobs keep Hyperlight's defaults: this guest copies every message out
+/// of the pools, so buffer sizes and queue depths change nothing it
+/// measures (see the transport notes in `docs/`).
+fn apply_transport(cfg: &mut SandboxConfiguration) {
+    cfg.set_g2h_pool_pages(G2H_POOL_PAGES);
+    cfg.set_h2g_pool_pages(H2G_POOL_PAGES);
+}
+
+/// A decoder for one stream of guest console output.  The guest sends
+/// bytes; a character split between two writes is held back until its end
+/// arrives, across drains (a program may print half of one in one step and
+/// the rest in the next), or the guest ends; bytes that are not UTF-8 read
+/// as U+FFFD.
+#[derive(Default)]
+struct GuestOutput {
+    /// The start of a character whose end is still to come.
+    partial: Vec<u8>,
+}
+
+impl GuestOutput {
+    /// Take `bytes` in; returns the text they completed.
+    fn push(&mut self, bytes: &[u8]) -> String {
+        let mut text = String::new();
+        self.join(bytes, &mut text);
+        text
+    }
+
+    /// [`push`](Self::push), for a write the caller owns: with nothing held
+    /// and bytes that are UTF-8, perhaps but for a character cut short at
+    /// the end (most writes), the text is the bytes themselves, not a copy.
+    fn push_owned(&mut self, bytes: Vec<u8>) -> String {
+        if !self.partial.is_empty() {
+            return self.push(&bytes);
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(e) if e.utf8_error().error_len().is_none() => {
+                let valid = e.utf8_error().valid_up_to();
+                let mut bytes = e.into_bytes();
+                self.partial = bytes.split_off(valid);
+                // `valid_up_to` bytes are UTF-8: this never falls back.
+                String::from_utf8(bytes).unwrap_or_default()
+            }
+            Err(e) => self.push(e.as_bytes()),
+        }
+    }
+
+    /// End the output: a character still cut short reads as U+FFFD.
+    /// Returns the text that adds.
+    fn finish(&mut self) -> String {
+        if self.partial.is_empty() {
+            return String::new();
+        }
+        self.partial.clear();
+        char::REPLACEMENT_CHARACTER.to_string()
+    }
+
+    fn join(&mut self, mut bytes: &[u8], text: &mut String) {
+        // Finish a character cut short by the last write with the few
+        // bytes it lacks; the rest is decoded where it lies.  The joined
+        // bytes can leave a new character cut short (the held one was
+        // not continued, and what follows starts another), so this goes
+        // on until nothing is held or the write is used up.
+        while let Some(&lead) = self.partial.first() {
+            if bytes.is_empty() {
+                return;
+            }
+            let width: usize = match lead {
+                0xf0.. => 4,
+                0xe0.. => 3,
+                _ => 2,
+            };
+            let take = width
+                .saturating_sub(self.partial.len())
+                .clamp(1, bytes.len());
+            self.partial.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            let joined = std::mem::take(&mut self.partial);
+            self.decode(&joined, text);
+        }
+        self.decode(bytes, text);
+    }
+
+    fn decode(&mut self, mut rest: &[u8], text: &mut String) {
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    text.push_str(s);
+                    return;
+                }
+                Err(e) => {
+                    let (valid, after) = rest.split_at(e.valid_up_to());
+                    // `valid_up_to` bytes are UTF-8: this never falls back.
+                    text.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                    match e.error_len() {
+                        Some(bad) => {
+                            text.push(char::REPLACEMENT_CHARACTER);
+                            rest = &after[bad..];
+                        }
+                        // Cut short: keep it for the next write.
+                        None => {
+                            self.partial.extend_from_slice(after);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// PEB heap size.
 ///
@@ -396,9 +536,11 @@ const HEAP_SIZE: u64 = 0x10_0000; // 1 MiB
 /// the embedded kernel's SHA-256 (its first 16 hex digits; the kernel's
 /// code and host-call protocol are in the snapshot's memory) and the host
 /// contract number kept in `build.rs` (the host functions and their
-/// meaning, the buffer sizes, the layout, the MSRs, the hyperlight-host
+/// meaning, the pool sizes, the layout, the MSRs, the hyperlight-host
 /// release).  A snapshot loads under any release with the same key, so a
-/// release that changes neither keeps every saved snapshot.
+/// release that changes neither keeps every saved snapshot.  (Hyperlight
+/// versions its own snapshot format besides, and refuses one it cannot
+/// read.)
 pub const SNAPSHOT_KEY: &str = env!("HLUK_SNAPSHOT_KEY");
 
 /// The name a snapshot is saved under in its directory: this release and
@@ -751,15 +893,15 @@ struct Guest {
 /// A guest output stream, and the host function that carries it.
 #[derive(Clone, Copy)]
 enum Stream {
-    Out,
-    Err,
+    Out = 0,
+    Err = 1,
 }
 
 impl Stream {
     fn host_function(self) -> &'static str {
         match self {
-            Stream::Out => "HostPrint",
-            Stream::Err => "HostPrintErr",
+            Stream::Out => "HostWrite",
+            Stream::Err => "HostWriteErr",
         }
     }
 }
@@ -772,8 +914,10 @@ pub struct CapturedOutput {
     /// its first bytes, up to [`SandboxBuilder::output_limit`], cut between
     /// characters.
     pub text: String,
-    /// How many bytes were left out: `text.len() + omitted` is all the
-    /// guest wrote since the last drain.
+    /// How many bytes of text were left out: `text.len() + omitted` is all
+    /// the guest wrote since the last drain, as text (UTF-8, with a byte
+    /// that is not read as U+FFFD, three bytes); a character the guest has
+    /// only begun to write is in neither until it ends.
     pub omitted: u64,
 }
 
@@ -784,7 +928,7 @@ impl CapturedOutput {
     }
 }
 
-/// What the print host functions keep of one stream until it is drained.
+/// What the write host functions keep of one stream until it is drained.
 #[derive(Default)]
 struct Capture {
     text: String,
@@ -824,7 +968,7 @@ impl Capture {
     }
 }
 
-/// The guest's output on the host: where the print host functions send it,
+/// The guest's output on the host: where the write host functions send it,
 /// and what they keep of it for the embedder ([`SandboxBuilder::output_limit`],
 /// [`SandboxBuilder::echo_output`]).
 struct Console {
@@ -836,6 +980,10 @@ struct Console {
     output: Mutex<Capture>,
     /// Standard error alone.
     stderr: Mutex<Capture>,
+    /// Each stream's decoder (standard output, standard error), so a
+    /// character one leaves cut short is not joined to the other's next
+    /// write.
+    decoders: Mutex<[GuestOutput; 2]>,
 }
 
 impl Console {
@@ -845,6 +993,60 @@ impl Console {
             echo,
             output: Mutex::default(),
             stderr: Mutex::default(),
+            decoders: Mutex::default(),
+        }
+    }
+
+    /// Take `bytes` written to `stream` in; returns the text they completed.
+    fn decode(&self, stream: Stream, bytes: Vec<u8>) -> String {
+        self.decoders.lock().unwrap()[stream as usize].push_owned(bytes)
+    }
+
+    /// Echo `text`, written to `stream`, to this process's stdout or stderr,
+    /// flushed, unless echo is off.  `print!`/`eprint!`, which a test
+    /// harness captures and which panic on a failed write, so
+    /// `hluk run | head -1` ends when its reader does.
+    fn emit(&self, stream: Stream, text: &str) {
+        if !self.echo || text.is_empty() {
+            return;
+        }
+        match stream {
+            Stream::Out => {
+                use std::io::Write;
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+            // Unbuffered: nothing to flush.
+            Stream::Err => eprint!("{text}"),
+        }
+    }
+
+    /// Keep `text`, written to `stream`, up to the limit: with the rest, and
+    /// on its own for standard error.
+    fn capture(&self, stream: Stream, text: &str) {
+        if let Stream::Err = stream {
+            self.stderr.lock().unwrap().push(text, self.limit);
+        }
+        self.output.lock().unwrap().push(text, self.limit);
+    }
+
+    /// End the output: a character either stream left cut short reads as
+    /// U+FFFD, echoed and captured like the rest.
+    fn finish(&self) {
+        for stream in [Stream::Out, Stream::Err] {
+            let text = self.decoders.lock().unwrap()[stream as usize].finish();
+            self.emit(stream, &text);
+            self.capture(stream, &text);
+        }
+    }
+
+    /// Drop a character cut short, on a restore: the bytes held may be the
+    /// discarded timeline's, and which they are is not known here, so a
+    /// character the snapshot's own timeline left cut short is dropped too
+    /// (its end, should the restored guest write it, reads as U+FFFD).
+    fn forget(&self) {
+        for decoder in self.decoders.lock().unwrap().iter_mut() {
+            decoder.partial.clear();
         }
     }
 }
@@ -871,7 +1073,7 @@ pub(crate) struct GuestConfig {
     initrd_size: u64,
     /// Host filesystem mounts.
     mounts: Vec<Mount>,
-    /// The guest's output, captured by the HostPrint and HostPrintErr
+    /// The guest's output, captured by the HostWrite and HostWriteErr
     /// callbacks.
     console: Arc<Console>,
     /// NUL-separated KEY=VALUE pairs for guest env vars.
@@ -891,9 +1093,9 @@ pub(crate) struct GuestConfig {
     result: Arc<Mutex<Option<Vec<u8>>>>,
     /// The embedder's functions, served through `HostCall`.
     host_functions: HostFunctionTable,
-    /// Whether to register `HostPrintErr`; off only to test a host
-    /// without it ([`SandboxBuilder::without_host_print_err`]).
-    host_print_err: bool,
+    /// Whether to register `HostWriteErr`; off only to test a host
+    /// without it ([`SandboxBuilder::without_host_write_err`]).
+    host_write_err: bool,
     /// What those events add up to.
     guest: Mutex<Guest>,
     /// Where this sandbox's time goes (off unless asked for).
@@ -932,7 +1134,7 @@ impl GuestConfig {
             events: Arc::new(Mutex::new(Vec::new())),
             result: Arc::new(Mutex::new(None)),
             host_functions: HostFunctionTable::default(),
-            host_print_err: true,
+            host_write_err: true,
             guest: Mutex::new(Guest::default()),
             profile: profile::Profile::new(),
             env_version: std::sync::atomic::AtomicU64::new(next_env_version()),
@@ -945,8 +1147,8 @@ impl GuestConfig {
         self
     }
 
-    fn with_host_print_err(mut self, on: bool) -> Self {
-        self.host_print_err = on;
+    fn with_host_write_err(mut self, on: bool) -> Self {
+        self.host_write_err = on;
         self
     }
 
@@ -1037,48 +1239,38 @@ impl GuestConfig {
         self.take_output().text
     }
 
-    /// The print host function for `stream`: the guest's text to the host's
-    /// stdout or stderr, flushed, unless echo is off, and captured up to the
-    /// limit — standard error both with the rest and on its own.  It uses
-    /// `print!`/`eprint!`, which a test harness captures and which panic on
-    /// a failed write, so `hluk run | head -1` ends when its reader does.
-    /// The guest is told all of its text was written, kept or not.
-    fn print_host_function(
+    /// The write host function for `stream`: the guest's bytes, decoded as
+    /// they come (see [`GuestOutput`]), to the host's stdout or stderr,
+    /// flushed, unless echo is off, and captured up to the limit — standard
+    /// error both with the rest and on its own.  Bytes, not a string: what a
+    /// program writes need not be UTF-8, and a write can end inside a
+    /// character.  It uses `print!`/`eprint!`, which a test harness captures
+    /// and which panic on a failed write, so `hluk run | head -1` ends when
+    /// its reader does.  The guest is told all of its bytes were written,
+    /// kept or not.
+    fn write_host_function(
         &self,
         stream: Stream,
-    ) -> impl Fn(String) -> hyperlight_host::Result<i32> + Send + Sync + 'static {
+    ) -> impl Fn(Vec<u8>) -> hyperlight_host::Result<i32> + Send + Sync + 'static {
         let prof = self.profile.clone();
         let console = self.console.clone();
         let name = stream.host_function();
-        move |msg: String| {
-            use std::io::Write;
+        move |bytes: Vec<u8>| {
             let _profile = prof.host(name);
-            // Captured after the write, so a failed one leaves both
-            // captures as they were.
-            match stream {
-                Stream::Out => {
-                    if console.echo {
-                        print!("{msg}");
-                        let _ = std::io::stdout().flush();
-                    }
-                }
-                Stream::Err => {
-                    // Unbuffered: nothing to flush.
-                    if console.echo {
-                        eprint!("{msg}");
-                    }
-                    console.stderr.lock().unwrap().push(&msg, console.limit);
-                }
-            }
-            console.output.lock().unwrap().push(&msg, console.limit);
-            Ok(msg.len() as i32)
+            // Captured after the echo, so a failed one (a closed pipe)
+            // leaves both captures as they were; the decoder has moved on.
+            let written = bytes.len() as i32;
+            let text = console.decode(stream, bytes);
+            console.emit(stream, &text);
+            console.capture(stream, &text);
+            Ok(written)
         }
     }
 
-    /// Register `stream`'s print host function, name and closure from the
+    /// Register `stream`'s write host function, name and closure from the
     /// one value so they cannot disagree.
-    fn register_print(&self, target: &mut impl Registerable, stream: Stream) -> Result<()> {
-        target.register_host_function(stream.host_function(), self.print_host_function(stream))?;
+    fn register_write(&self, target: &mut impl Registerable, stream: Stream) -> Result<()> {
+        target.register_host_function(stream.host_function(), self.write_host_function(stream))?;
         Ok(())
     }
 
@@ -1087,15 +1279,26 @@ impl GuestConfig {
     /// Works for both the init path (`UninitializedSandbox`) and the
     /// snapshot-restore path (`HostFunctions`).
     pub fn register(&self, target: &mut impl Registerable) -> Result<()> {
-        // Override Hyperlight's default HostPrint (which wraps output in
-        // green ANSI on stdout) — send guest output to stdout uncolored,
-        // and capture it for programmatic access.
-        self.register_print(target, Stream::Out)?;
+        // Guest console output, uncolored (Hyperlight's own HostPrint wraps
+        // it in green ANSI), and captured for programmatic access.
+        self.register_write(target, Stream::Out)?;
+
+        // Hyperlight registers a HostPrint of its own, which this kernel
+        // does not call; one that another guest or driver might is taken as
+        // standard output, so it is captured and echoed like the rest
+        // rather than printed in green past `echo_output(false)`.
+        // Through the same decoder, so it lands in order with HostWrite
+        // (and is timed as HostWrite by `--profile`).
+        let write = self.write_host_function(Stream::Out);
+        target.register_host_function(
+            "HostPrint",
+            move |msg: String| -> hyperlight_host::Result<i32> { write(msg.into_bytes()) },
+        )?;
 
         // Optional only so a test can stand in for a host without it, whose
-        // guest then sends standard error through HostPrint.
-        if self.host_print_err {
-            self.register_print(target, Stream::Err)?;
+        // guest then sends standard error through HostWrite.
+        if self.host_write_err {
+            self.register_write(target, Stream::Err)?;
         }
 
         let cmdline = self.cmdline.clone();
@@ -1252,16 +1455,18 @@ impl GuestConfig {
         )?;
 
         // ── Stdin ─────────────────────────────────────────────────
+        // Bytes, as stdin has them: a read can end inside a character, and
+        // what is piped in need not be text.
         let prof = self.profile.clone();
         target.register_host_function(
             "ReadStdin",
-            move || -> hyperlight_host::Result<String> {
+            move || -> hyperlight_host::Result<Vec<u8>> {
                 let _profile = prof.host("ReadStdin");
                 use std::io::Read;
                 let mut data = vec![0u8; 4096];
                 let n = std::io::stdin().read(&mut data).unwrap_or(0);
                 data.truncate(n);
-                Ok(String::from_utf8_lossy(&data).into_owned())
+                Ok(data)
             },
         )?;
 
@@ -1362,10 +1567,13 @@ impl GuestConfig {
         )?;
         let events = self.events.clone();
         let prof = self.profile.clone();
+        let console = self.console.clone();
         target.register_host_function(
             "Exited",
             move |status: i32| -> hyperlight_host::Result<i32> {
                 let _profile = prof.host("Exited");
+                // Nothing will finish a character the process left cut short.
+                console.finish();
                 events
                     .lock()
                     .unwrap()
@@ -1410,15 +1618,23 @@ impl GuestConfig {
     /// One VM entry: call `name`, then read what the guest said during it.
     /// The guest runs its scheduler until every thread is blocked and
     /// halts; see [`absorb`](Self::absorb) for how the events reduce.
-    fn enter<Args>(&self, sandbox: &mut MultiUseSandbox, name: &str, args: Args) -> Result<Yield>
+    fn enter<Args>(&self, sandbox: &mut Sandbox, name: &str, args: Args) -> Result<Yield>
     where
         Args: hyperlight_host::func::ParameterTuple,
     {
         // An entry starts with an empty inbox: a previous one that failed
         // in the hypervisor may have left events behind.
         self.events.lock().unwrap().clear();
-        self.profile
-            .entry(name, || sandbox.call::<()>(name, args))?;
+        if let Err(e) = self.profile.entry(name, || sandbox.call::<()>(name, args)) {
+            // A guest stopped short (an abort, a crash, a cancel) poisons
+            // the sandbox: its timeline ends here, and a character it left
+            // cut short with it.  A call refused before the guest ran (too
+            // large for H2G, say) leaves it going, and the character too.
+            if sandbox.status().is_poisoned() {
+                self.console.finish();
+            }
+            return Err(e.into());
+        }
         let yielded = self.absorb()?;
         debug!(?yielded, name, "entry");
         Ok(yielded)
@@ -1474,8 +1690,10 @@ impl GuestConfig {
     /// follows has the guest say again what still holds.
     fn forget(&self) {
         self.events.lock().unwrap().clear();
-        // A result from the timeline the restore discarded is not this one's.
+        // A result from the timeline the restore discarded is not this one's,
+        // nor is the start of a character it printed.
         *self.result.lock().unwrap() = None;
+        self.console.forget();
         *self.guest.lock().unwrap() = Guest::default();
         // The kernel's copy of the environment is the snapshot's.
         self.env_version
@@ -1708,7 +1926,7 @@ fn assemble_sandbox(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     host_functions: HostFunctionTable,
-    host_print_err: bool,
+    host_write_err: bool,
     console: Console,
 ) -> Result<(UninitializedSandbox, GuestConfig)> {
     let scratch_size = scratch_mb * 1024 * 1024;
@@ -1716,9 +1934,7 @@ fn assemble_sandbox(
     let mut cfg = SandboxConfiguration::default();
     cfg.set_scratch_size(scratch_size);
     cfg.set_heap_size(HEAP_SIZE);
-
-    cfg.set_input_data_size(IO_STACK_SIZE);
-    cfg.set_output_data_size(IO_STACK_SIZE);
+    apply_transport(&mut cfg);
 
     // Permit the guest to touch the MSRs the Unikraft kernel programs
     apply_guest_msrs(&mut cfg)?;
@@ -1783,7 +1999,7 @@ fn assemble_sandbox(
         listen_ports,
     )
     .with_host_functions(host_functions)
-    .with_host_print_err(host_print_err)
+    .with_host_write_err(host_write_err)
     .with_console(console);
 
     config.register(&mut usandbox)?;
@@ -1833,7 +2049,7 @@ pub struct SandboxBuilder {
     resolv_conf: Option<String>,
     host_functions: std::collections::BTreeMap<String, HostFunction>,
     profile: Option<bool>,
-    host_print_err: bool,
+    host_write_err: bool,
     output_limit: usize,
     echo_output: bool,
 }
@@ -1854,7 +2070,7 @@ impl SandboxBuilder {
             resolv_conf: None,
             host_functions: std::collections::BTreeMap::new(),
             profile: None,
-            host_print_err: true,
+            host_write_err: true,
             output_limit: usize::MAX,
             echo_output: true,
         }
@@ -2062,13 +2278,13 @@ impl SandboxBuilder {
         self
     }
 
-    /// Leave out the `HostPrintErr` host function, as an older or
+    /// Leave out the `HostWriteErr` host function, as an older or
     /// third-party host does: the guest's standard error then reaches
-    /// `HostPrint`.  For testing that fallback, on a fresh boot: a snapshot
-    /// saved with `HostPrintErr` will not restore without it.
+    /// `HostWrite`.  For testing that fallback, on a fresh boot: a snapshot
+    /// saved with `HostWriteErr` will not restore without it.
     #[doc(hidden)]
-    pub fn without_host_print_err(mut self) -> Self {
-        self.host_print_err = false;
+    pub fn without_host_write_err(mut self) -> Self {
+        self.host_write_err = false;
         self
     }
 
@@ -2092,7 +2308,7 @@ impl SandboxBuilder {
             resolv_conf,
             host_functions,
             profile,
-            host_print_err,
+            host_write_err,
             output_limit,
             echo_output,
         } = self;
@@ -2130,7 +2346,7 @@ impl SandboxBuilder {
                     network,
                     listen_ports,
                     host_functions,
-                    host_print_err,
+                    host_write_err,
                     Console::new(output_limit, echo_output),
                 )?;
                 if let Some(on) = profile {
@@ -2182,7 +2398,7 @@ impl SandboxBuilder {
                     network,
                     listen_ports,
                     host_functions,
-                    host_print_err,
+                    host_write_err,
                     Console::new(output_limit, echo_output),
                 )?;
                 // Before the boot: the kernel fetches the environment once
@@ -2202,8 +2418,10 @@ impl SandboxBuilder {
                 {
                     Ok(sandbox) => sandbox,
                     Err(e) => {
-                        // The guest's output is the diagnosis: all of it, or
-                        // under a limit its beginning and how much is missing.
+                        // The guest's output is the diagnosis: all of it, a
+                        // character cut short included, or under a limit its
+                        // beginning and how much is missing.
+                        cfg.console.finish();
                         let output = cfg.take_output();
                         if !output.text.is_empty() || output.truncated() {
                             tracing::error!(
@@ -2361,7 +2579,7 @@ impl From<String> for Exec {
 /// bring it back.  Dropping the sandbox tears
 /// the VM down and releases every host socket it held.
 pub struct AppSandbox {
-    sandbox: MultiUseSandbox,
+    sandbox: Sandbox,
     config: GuestConfig,
     /// The [`Yield::Exited`] the guest process ended with, once it has;
     /// every later step reports it again.
@@ -2738,7 +2956,7 @@ impl AppSandbox {
 ///
 /// Creates a default [`GuestConfig`] (the snapshot already has the guest's
 /// cmdline/initrd), registers host functions, and rebuilds a
-/// [`MultiUseSandbox`] from the snapshot.  `mounts` are the restored
+/// [`Sandbox`] from the snapshot.  `mounts` are the restored
 /// guest's: the kernel reads them through `GetMounts` on its `resume`
 /// entry and makes its mount table match.
 fn restore_snapshot(
@@ -2747,9 +2965,9 @@ fn restore_snapshot(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     host_functions: HostFunctionTable,
-    host_print_err: bool,
+    host_write_err: bool,
     console: Console,
-) -> Result<(MultiUseSandbox, GuestConfig)> {
+) -> Result<(Sandbox, GuestConfig)> {
     let config = GuestConfig::new(
         String::new(),
         DEFAULT_SCRATCH_MB * 1024 * 1024,
@@ -2760,7 +2978,7 @@ fn restore_snapshot(
         listen_ports,
     )
     .with_host_functions(host_functions)
-    .with_host_print_err(host_print_err)
+    .with_host_write_err(host_write_err)
     .with_console(console);
     let mut hf = HostFunctions::default();
     config.register(&mut hf)?;
@@ -2772,12 +2990,11 @@ fn restore_snapshot(
     // know to match (avoiding a spurious layout-override warning) and let
     // it override scratch.
     let mut sbcfg = SandboxConfiguration::default();
-    sbcfg.set_input_data_size(IO_STACK_SIZE);
-    sbcfg.set_output_data_size(IO_STACK_SIZE);
+    apply_transport(&mut sbcfg);
     sbcfg.set_heap_size(HEAP_SIZE);
     apply_guest_msrs(&mut sbcfg)?;
 
-    let sandbox = MultiUseSandbox::from_snapshot(snapshot, hf, Some(sbcfg))?;
+    let sandbox = Sandbox::from_snapshot(snapshot, hf, Some(sbcfg))?;
     Ok((sandbox, config))
 }
 
@@ -2803,6 +3020,77 @@ mod tests {
     }
 
     #[test]
+    fn guest_output_push_owned_matches_push() {
+        let writes: &[&[u8]] = &[
+            b"plain",
+            "olé".as_bytes(),
+            b"ends mid \xe2\x82",
+            b"\xac done",
+            b"\xff bad",
+            b"\xc3",
+            b"A",
+            b"\xf0\x9f",
+            b"\x98\x80!",
+            b"",
+            b"tail \xe2",
+        ];
+        let (mut a, mut b) = (GuestOutput::default(), GuestOutput::default());
+        let (mut ta, mut tb) = (String::new(), String::new());
+        for w in writes {
+            ta += &a.push(w);
+            tb += &b.push_owned(w.to_vec());
+            assert_eq!(ta, tb);
+            assert_eq!(a.partial, b.partial);
+        }
+        assert_eq!(a.finish(), b.finish());
+    }
+
+    #[test]
+    fn guest_output_joins_split_characters_and_replaces_bad_bytes() {
+        let mut out = GuestOutput::default();
+        let mut text = out.push(b"ol\xc3");
+        assert_eq!(text, "ol");
+        text += &out.push(b"\xa9 \xff!");
+        assert_eq!(text, "olé \u{fffd}!");
+        text += &out.push(b"\xe2\x82");
+        text += &out.push(b"\xac");
+        assert_eq!(text, "olé \u{fffd}!€");
+        assert!(out.partial.is_empty());
+        // Finished by the next write, even after the text so far is taken.
+        text += &out.push(b"x\xf0\x9f");
+        assert_eq!(std::mem::take(&mut text), "olé \u{fffd}!€x");
+        text += &out.push(b"\x98");
+        text += &out.push(b"\x80 ok");
+        assert_eq!(text, "\u{1f600} ok");
+        // A lead byte the next write does not continue.
+        text += &out.push(b"\xc3");
+        text += &out.push(b"A");
+        assert_eq!(text, "\u{1f600} ok\u{fffd}A");
+        assert!(out.partial.is_empty());
+
+        // A stray lead byte, then a write that starts a character of its
+        // own: the character survives, in order.
+        let mut out = GuestOutput::default();
+        let mut text = out.push(b"ol\xe9");
+        text += &out.push("€5".as_bytes());
+        text += &out.push(b"\n");
+        assert_eq!(text, "ol\u{fffd}€5\n");
+        // Ones that leave a new cut-short character behind each time.
+        let mut out = GuestOutput::default();
+        let mut text = out.push(b"\xc3");
+        text += &out.push(b"\xe2a\xf0\x9f\x98");
+        let tail = out.push(b"\x80");
+        assert_eq!(tail, "\u{1f600}");
+        text += &tail;
+        assert_eq!(text, "\u{fffd}\u{fffd}a\u{1f600}");
+        assert!(out.partial.is_empty());
+        // The guest ends with half a character: it reads as U+FFFD.
+        assert_eq!(out.push(b"!\xe2\x82"), "!");
+        assert_eq!(out.finish(), "\u{fffd}");
+        assert_eq!(out.finish(), "");
+    }
+
+    #[test]
     fn snapshot_tag_key_reads_only_a_keyed_tag() {
         assert_eq!(snapshot_tag_key("0.14.0"), None);
         assert_eq!(
@@ -2810,6 +3098,10 @@ mod tests {
             Some("kdeadbeefdeadbeef-c2")
         );
         assert_eq!(snapshot_tag_key("0.15.0-kappa-c2"), None);
+        assert_eq!(
+            snapshot_tag_key(snapshot_tag().as_ref()),
+            Some(SNAPSHOT_KEY)
+        );
         assert_eq!(describe_snapshot_tag("0.14.0"), "0.14.0");
     }
 
@@ -3157,8 +3449,6 @@ mod tests {
     /// for `fs_stat(0, "hello.txt")` and verify Hyperlight can parse it.
     #[test]
     fn flatbuffer_generic_encoder_roundtrip() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         // Construct the exact bytes the C fb_encode_generic would produce
         // for hl_hcall_vecbytes("fs_stat", [hlint(0), hlstring("hello.txt")], 2).
         //
@@ -3180,7 +3470,7 @@ mod tests {
         }
 
         // Try to parse the C-style bytes.
-        let c_parsed = FunctionCall::try_from(c_bytes.as_slice());
+        let c_parsed = decode_c_call(&c_bytes);
         assert!(
             c_parsed.is_ok(),
             "C-encoded FunctionCall should parse: {:?}",
@@ -3193,8 +3483,6 @@ mod tests {
     /// Roundtrip test for fs_write_bytes with empty VecBytes.
     #[test]
     fn flatbuffer_generic_encoder_roundtrip_write() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         let c_bytes = build_c_generic_fb(
             "fs_write_bytes",
             2, // HL_FCT_HOST
@@ -3217,7 +3505,7 @@ mod tests {
             eprintln!();
         }
 
-        let result = FunctionCall::try_from(c_bytes.as_slice());
+        let result = decode_c_call(&c_bytes);
         match &result {
             Ok(fc) => eprintln!("PARSED: name={}", fc.function_name),
             Err(e) => eprintln!("FAILED: {:?}", e),
@@ -3295,14 +3583,16 @@ mod tests {
         for param in params.iter().take(np) {
             let pvt = align2(pos);
             let ptbl = align4(pvt + PM_VT_SZ);
+            // A byte vector is an hlexternalbytes: its length, laid out
+            // like a ulong; the bytes follow the FlatBuffer.
             let (vvtsz, vtblsz) = match param {
                 CParam::Int(_) => (VW_SCALAR_VT_SZ, VW_INT_TBL_SZ),
-                CParam::ULong(_) => (VW_SCALAR_VT_SZ, VW_ULONG_TBL_SZ),
-                CParam::Str(_) | CParam::VecBytes(_) => (VW_SCALAR_VT_SZ, VW_REF_TBL_SZ),
+                CParam::ULong(_) | CParam::VecBytes(_) => (VW_SCALAR_VT_SZ, VW_ULONG_TBL_SZ),
+                CParam::Str(_) => (VW_SCALAR_VT_SZ, VW_REF_TBL_SZ),
             };
             let vvt = align2(ptbl + PM_TBL_SZ);
             let vtbl = match param {
-                CParam::ULong(_) => align8_off4(vvt + vvtsz),
+                CParam::ULong(_) | CParam::VecBytes(_) => align8_off4(vvt + vvtsz),
                 _ => align4(vvt + vvtsz),
             };
             pos = vtbl + vtblsz;
@@ -3317,19 +3607,11 @@ mod tests {
             });
         }
 
-        // Variable-length data
+        // Strings
         for (i, param) in params.iter().enumerate().take(np) {
-            match param {
-                CParam::Str(s) => {
-                    pl[i].vdata = align4(pos);
-                    pos = pl[i].vdata + 4 + align4(s.len() + 1);
-                }
-                CParam::VecBytes(v) => {
-                    pl[i].vdata = align4(pos);
-                    let dlen = if v.is_empty() { 1 } else { v.len() };
-                    pos = pl[i].vdata + 4 + align4(dlen);
-                }
-                _ => {}
+            if let CParam::Str(s) = param {
+                pl[i].vdata = align4(pos);
+                pos = pl[i].vdata + 4 + align4(s.len() + 1);
             }
         }
 
@@ -3381,10 +3663,10 @@ mod tests {
             // Parameter table
             ew32(&mut buf, layout.ptbl, (layout.ptbl - layout.pvt) as u32);
             let pv_type = match param {
-                CParam::Int(_) => 1u8,      // HL_PV_HLINT
-                CParam::ULong(_) => 4u8,    // HL_PV_HLULONG (was incorrectly 5=hlfloat!)
-                CParam::Str(_) => 7u8,      // HL_PV_HLSTRING
-                CParam::VecBytes(_) => 9u8, // HL_PV_HLVECBYTES
+                CParam::Int(_) => 1u8,       // HL_PV_HLINT
+                CParam::ULong(_) => 4u8,     // HL_PV_HLULONG (was incorrectly 5=hlfloat!)
+                CParam::Str(_) => 7u8,       // HL_PV_HLSTRING
+                CParam::VecBytes(_) => 10u8, // HL_PV_HLEXTERNALBYTES
             };
             buf[layout.ptbl + 4] = pv_type;
             ew32(
@@ -3418,15 +3700,7 @@ mod tests {
                     buf[layout.vdata + 4..layout.vdata + 4 + s.len()].copy_from_slice(s.as_bytes());
                 }
                 CParam::VecBytes(v) => {
-                    ew32(
-                        &mut buf,
-                        layout.vtbl + 4,
-                        (layout.vdata - (layout.vtbl + 4)) as u32,
-                    );
-                    ew32(&mut buf, layout.vdata, v.len() as u32);
-                    if !v.is_empty() {
-                        buf[layout.vdata + 4..layout.vdata + 4 + v.len()].copy_from_slice(v);
-                    }
+                    ew64(&mut buf, layout.vtbl + 4, v.len() as u64);
                 }
             }
         }
@@ -3435,15 +3709,85 @@ mod tests {
         ew32(&mut buf, fnpos, nlen as u32);
         buf[fnpos + 4..fnpos + 4 + nlen].copy_from_slice(name.as_bytes());
 
+        // The byte values, in parameter order
+        for param in params {
+            if let CParam::VecBytes(v) = param {
+                buf.extend_from_slice(v);
+            }
+        }
+
         buf
+    }
+
+    /// The bytes after a C-encoded FunctionCall, handed to the decoder the
+    /// way the host's transport does.
+    struct CExternals<'a>(&'a [u8]);
+
+    impl hyperlight_common::flatbuffer_wrappers::ExternalValueSource for CExternals<'_> {
+        fn take_bytes(&mut self, length: usize) -> anyhow::Result<Vec<u8>> {
+            anyhow::ensure!(length <= self.0.len(), "external bytes cut short");
+            let (value, rest) = self.0.split_at(length);
+            self.0 = rest;
+            Ok(value.to_vec())
+        }
+
+        fn take_chunks(&mut self, length: usize) -> anyhow::Result<Vec<bytes::Bytes>> {
+            Ok(vec![self.take_bytes(length)?.into()])
+        }
+
+        fn finish(&mut self) -> anyhow::Result<()> {
+            anyhow::ensure!(self.0.is_empty(), "unused external bytes");
+            Ok(())
+        }
+    }
+
+    /// Decode what the C encoder produced: the size-prefixed FlatBuffer,
+    /// then the bytes of its VecBytes parameters.
+    fn decode_c_call(
+        payload: &[u8],
+    ) -> anyhow::Result<hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall> {
+        let fb_len = 4 + u32::from_le_bytes(payload[..4].try_into()?) as usize;
+        let (control, externals) = payload.split_at(fb_len);
+        hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall::decode(
+            control,
+            &mut CExternals(externals),
+        )
+    }
+
+    /// Byte parameters travel after the FlatBuffer and come back intact,
+    /// in order, around the other parameters.
+    #[test]
+    fn flatbuffer_generic_encoder_external_bytes() {
+        use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
+
+        let payload = build_c_generic_fb(
+            "HostCall",
+            2,
+            9,
+            &[
+                CParam::VecBytes(b"first"),
+                CParam::Str("name"),
+                CParam::VecBytes(&[]),
+                CParam::VecBytes(b"second"),
+            ],
+        );
+        let call = decode_c_call(&payload).unwrap();
+        assert_eq!(call.function_name, "HostCall");
+        assert_eq!(
+            call.parameters.unwrap(),
+            vec![
+                ParameterValue::VecBytes(b"first".to_vec()),
+                ParameterValue::String("name".into()),
+                ParameterValue::VecBytes(Vec::new()),
+                ParameterValue::VecBytes(b"second".to_vec()),
+            ]
+        );
     }
 
     /// Roundtrip test for fs_read_bytes(mount_idx=0, path="test.txt", offset=0, len=32768)
     /// which uses u64 parameters.
     #[test]
     fn flatbuffer_generic_encoder_roundtrip_ulong() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         let c_bytes = build_c_generic_fb(
             "fs_read_bytes",
             2, // HL_FCT_HOST
@@ -3465,7 +3809,7 @@ mod tests {
             eprintln!();
         }
 
-        let c_parsed = FunctionCall::try_from(c_bytes.as_slice());
+        let c_parsed = decode_c_call(&c_bytes);
         assert!(
             c_parsed.is_ok(),
             "C-encoded FunctionCall should parse: {:?}",
@@ -3480,8 +3824,6 @@ mod tests {
     /// (not 5=hlfloat) and that 8-byte alignment is respected.
     #[test]
     fn c_encoder_ulong_alignment_check() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         // First, fix the discriminant and test with type=4 (the REAL HL_PV_HLULONG)
         let c_bytes = build_c_generic_fb(
             "fs_write_bytes",
@@ -3505,7 +3847,7 @@ mod tests {
             eprintln!();
         }
 
-        let result = FunctionCall::try_from(c_bytes.as_slice());
+        let result = decode_c_call(&c_bytes);
         match &result {
             Ok(fc) => eprintln!("PARSED: name={}", fc.function_name),
             Err(e) => eprintln!("FAILED: {:?}", e),

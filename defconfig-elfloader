@@ -87,7 +87,7 @@ CONFIG_LIBHOSTSOCK=y
 # can read host-provided input via sys.stdin, process.stdin, etc.
 CONFIG_LIBPOSIX_TTY_STDIN_SERIAL=y
 CONFIG_LIBPOSIX_TTY_SERIAL_EOF_FINAL=y
-# stderr is a stream of its own (HostPrintErr), and newlines reach the
+# stderr is a stream of its own (HostWriteErr), and newlines reach the
 # host as the program wrote them, not as CR-LF.  Pinned here on purpose,
 # though the kernel defaults them so for Hyperlight.
 CONFIG_LIBPOSIX_TTY_SERIAL_STDERR=y

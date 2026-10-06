@@ -49,6 +49,11 @@ use crate::net_policy::{ListenPorts, NetworkPolicy};
 
 const MAX_SOCKETS: usize = 1024;
 
+/// What `net_recvfrom`'s reply carries besides the data: its length (4
+/// bytes) and the packed source address (at most 7 + 16).  The kernel
+/// keeps the same room (`HOSTSOCK_RECV_HDR` in lib/hostsock).
+const RECVFROM_HDR: usize = 4 + 7 + 16;
+
 /// Linux ABI constants the guest speaks.
 mod abi {
     pub const AF_INET: i32 = 2;
@@ -649,9 +654,10 @@ impl Net {
 
     /// Receive up to `len` bytes plus the source address when the
     /// socket has one (datagrams).  `len` is capped at what one host
-    /// call can carry back; the guest asks for at most that anyway.
+    /// call can carry back besides the reply's length and address
+    /// ([`RECVFROM_HDR`]); the guest asks for at most that anyway.
     fn recvfrom(&self, fd: i32, len: usize) -> Res<(Vec<u8>, Option<SocketAddr>)> {
-        let mut buf = vec![0u8; len.min(HOST_CALL_MAX)];
+        let mut buf = vec![0u8; len.min(HOST_CALL_MAX - RECVFROM_HDR)];
         let tbl = self.table();
         let fd = tbl.get(fd)?;
         let (n, _, from) = match net::recvfrom(fd, &mut buf[..], RecvFlags::empty()) {

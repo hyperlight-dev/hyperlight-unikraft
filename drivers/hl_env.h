@@ -32,9 +32,9 @@
  */
 typedef void (*hl_env_cb_t)(const char *key, const char *val, void *ctx);
 
-/* The entries arrive on the same PEB stack as a call, so a call-sized
- * buffer always holds them; allocated on the first refresh, kept since
- * this runs on every call. */
+/* The host sizes calls to hold any host call reply, the entries
+ * included, so a call-sized buffer always holds them; allocated on the
+ * first refresh, kept since this runs on every call. */
 static char *g_hl_env_buf;
 
 /*

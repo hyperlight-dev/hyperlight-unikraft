@@ -130,8 +130,8 @@ fn python_call_yields_on_timers() {
     assert!(sandbox.drain_output().contains("again"));
 }
 
-/// A call is only limited by the host's I/O buffer, which the kernel reads
-/// from the PEB and the driver learns through the device: a script far
+/// A call is only limited by the host's H2G pool, whose geometry the
+/// kernel reads from scratch and the driver learns through the device: a script far
 /// larger than any guest-side constant still runs.  (The previous kernel
 /// rejected anything over 16 KiB.)
 #[test]
