@@ -67,7 +67,9 @@ open("/mnt/host/foo.txt")
 
 Each mount corresponds to a `cap_std::fs::Dir` on the host side.  The guest kernel injects a mount index into every host call so the host routes operations to the correct directory.
 
-Reads and writes are transferred in chunks: the host's preferred size (`GetHostFsChunkSize`, 32 KiB), or less if one host call cannot carry that much — the guest reads the limit out of the PEB I/O stack sizes the host chose.
+Reads and writes are transferred in chunks: the host's preferred size (`GetHostFsChunkSize`, 64 KiB), or less if one host call cannot carry that much — the guest reads the limit out of the virtqueue pool sizes the host chose.
+
+Paths travel to the host as UTF-8 strings: a name that is not UTF-8 fails with `EILSEQ`, and a host file whose name is not UTF-8 lists with U+FFFD in its place (and cannot be opened by that name). The path below the mount's root is at most 1,023 bytes; a longer one fails with `ENAMETOOLONG`.
 
 Two limits of the protocol as it stands.  A directory listing is one host call, so a directory whose names do not fit in it (about 3,000 entries) does not list: `readdir` fails with `EOVERFLOW` and the guest goes on (TODO: page `fs_list`).  `stat` carries the size and whether the entry is a file or a directory, nothing more: mode reads as `755` (`555` on a read-only file), timestamps as the epoch, and a symlink as the file it points at (TODO: carry the real mode, the times and an `lstat`).
 

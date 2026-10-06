@@ -80,7 +80,7 @@ All functions return negative `-errno` values on error.
 ## Limits
 
 - **Max sockets:** 1024 open sockets per sandbox (host-enforced).
-- **Transfer size:** 64 KiB per `recvfrom` / `write` / `sendmsg` call, the most one host call carries; a longer write returns a short count and the caller's loop continues. The guest takes the figure from the PEB I/O stack sizes the host chose.
+- **Transfer size:** 69,620 bytes per `write` / `sendmsg` call, the most one host call carries, and 69,593 per `recvfrom` (its reply also carries the source address); a longer write returns a short count and the caller's loop continues. The guest takes the figure from the virtqueue pool sizes the host chose.
 - **Protocols:** `AF_INET`/`AF_INET6` with `SOCK_STREAM`/`SOCK_DGRAM` reach the host. No raw sockets. `AF_UNIX` exists only inside the guest (`socketpair`, which asyncio's event loop needs), served by the kernel itself.
 
 ## Network policy
