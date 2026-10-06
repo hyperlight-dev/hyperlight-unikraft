@@ -34,7 +34,9 @@ cli = [
 mshv = ["hyperlight-host/mshv3"]
 
 [dependencies]
-hyperlight-common = "0.17"
+# Hyperlight v0.18.0 (virtqueue transport) is not on crates.io yet: track
+# upstream main until it is.
+hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "3ee2d4cb3cbf" }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -76,12 +78,12 @@ sha2 = { version = "0.11", optional = true }
 #   Windows — WHP, compiled in unconditionally for the target (no feature).
 #   macOS   — Hypervisor.framework via the default `hvf` feature.
 [target.'cfg(target_os = "linux")'.dependencies]
-hyperlight-host = { version = "0.17", default-features = false, features = ["kvm", "build-metadata"] }
+hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "3ee2d4cb3cbf", default-features = false, features = ["kvm", "build-metadata"] }
 
 # Non-Linux keeps hyperlight's defaults: HVF (macOS) is on, WHP (Windows) is
 # unconditional, and the Linux-only kvm/mshv3 features are inert here.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-hyperlight-host = "0.17"
+hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "3ee2d4cb3cbf" }
 
 [target.'cfg(windows)'.dependencies]
 # Private working set for the bench RSS line (already in the tree via clap).
@@ -89,3 +91,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win
 
 [dev-dependencies]
 tempfile = "3"
+# The FlatBuffer decoder's external-value source, mirrored in the tests.
+anyhow = "1"
+bytes = "1"

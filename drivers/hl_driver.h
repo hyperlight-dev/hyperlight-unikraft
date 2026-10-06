@@ -58,8 +58,8 @@
  * itself, so a layout mismatch with the kernel reads as ENOTTY. */
 
 /* The largest call a read() on the queue can return (a uint64_t).  The
- * kernel takes it from the host's PEB, so the driver never hard-codes a
- * call size. */
+ * kernel takes it from the transport geometry the host published, so the
+ * driver never hard-codes a call size. */
 #define HLCALL_IOC_MAXLEN _IOR('H', 1, uint64_t)
 
 /* The host's environment as it is now: KEY=VALUE entries separated by NUL
@@ -163,7 +163,7 @@ static inline void hl_driver_serve_calls(void)
  * call's status once the callback returns, and read there as the call's
  * result.  -1 if it exceeds the buffer (a call's size, HLCALL_IOC_MAXLEN)
  * or the buffer cannot be allocated;
- * the kernel takes at most what a host call carries (64 KiB by default),
+ * the kernel takes at most what a host call carries (69,620 bytes in hluk),
  * and refuses a larger one, which hl_driver_run then reports as a failed
  * call.
  */
