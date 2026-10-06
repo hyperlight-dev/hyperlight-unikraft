@@ -22,6 +22,52 @@ fn python_inline_code() {
     );
 }
 
+/// A line longer than one host call carries reaches the host whole, in
+/// several HostWrite calls the kernel cuts between characters (it used
+/// to drop all but the first 4 KiB).  How the host joins a character
+/// split between writes is covered by `python_non_utf8_output_...` and
+/// the `GuestOutput` unit test.
+#[test]
+fn python_long_line_is_printed_whole() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox
+        .run("import sys; sys.stdout.write('x' + 'é' * 100000 + 'end\\n'); sys.stdout.flush()")
+        .unwrap();
+    // The leading 'x' puts the 69,620-byte marks inside an 'é', so the
+    // kernel has to back the cuts off to where a character starts.
+    let output = sandbox.drain_output();
+    let line = output
+        .lines()
+        .find(|l| l.ends_with("end"))
+        .unwrap_or_default();
+    assert_eq!(line, format!("x{}end", "é".repeat(100000)));
+}
+
+/// Output that is not UTF-8, or that ends a write inside a character,
+/// is still output: the call goes on, and the text reads as it would on
+/// a terminal (it used to fail the whole call).
+#[test]
+fn python_non_utf8_output_does_not_fail_the_call() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "import sys\n\
+             out = sys.stdout.buffer\n\
+             for chunk in (b'ol\\xc3', b'\\xa9 \\xff', b'!\\n'):\n\
+             \x20   out.write(chunk); out.flush()",
+        )
+        .unwrap();
+    assert!(sandbox.drain_output().contains("olé \u{fffd}!"));
+}
+
 #[test]
 fn python_exec_file() {
     let rootfs = require_rootfs("python");
@@ -229,6 +275,39 @@ print(f'step3: STATEFUL_VAR={v}')
     );
 }
 
+/// Stdin reaches the guest as the bytes piped in: a character the host's
+/// 4 KiB reads cut in two, and bytes that are not UTF-8 (they used to
+/// arrive as U+FFFD).  (Ones the terminal layer acts on, a chunk ending
+/// in Ctrl-D or CR, are left out: that is the terminal, not the host.)
+#[test]
+fn python_stdin_is_bytes() {
+    let rootfs = require_rootfs("python");
+    let dir = temp_dir("py-stdin-bytes");
+    let script = dir.path().join("hash.py");
+    std::fs::write(
+        &script,
+        "import sys\n\
+         print('stdin', sys.stdin.buffer.read().hex())\n",
+    )
+    .unwrap();
+    // 'x' then 'é's: the 4 KiB reads end inside one; then bytes no UTF-8
+    // decoder takes.
+    let mut data = b"x".to_vec();
+    data.extend("é".repeat(5000).as_bytes());
+    data.extend([0xff, 0x00, 0xc3]);
+    let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+    // The console echoes what it reads, so the line may start with that.
+    let output = hluk_with_stdin(&rootfs, &script, &data);
+    let want = format!("stdin {hex}");
+    assert!(
+        output
+            .lines()
+            .any(|l| l.trim_end_matches('\r').ends_with(&want)),
+        "expected the {} bytes piped in, got: {output:?}",
+        data.len()
+    );
+}
+
 #[test]
 fn python_stdin_piped() {
     let rootfs = require_rootfs("python");
@@ -314,6 +393,71 @@ fn python_stdin_empty_piped() {
         stdout.contains("len=0"),
         "expected empty stdin (len=0), got: {stdout:?}",
     );
+}
+
+/// A path that is not UTF-8 fails the syscall, not the guest function
+/// call: the host cannot take it as a string, and the kernel refuses it
+/// before sending (it used to fail the whole call).
+#[test]
+fn python_non_utf8_path_fails_the_syscall_only() {
+    let rootfs = require_rootfs("python");
+    let mount_dir = temp_dir("fs-non-utf8");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .mounts(vec![Mount::rw(mount_dir.path(), "/mnt/host")])
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "import errno, os\n\
+             try:\n\
+             \x20   os.stat(b'/mnt/host/\\xff')\n\
+             except OSError as e:\n\
+             \x20   print('refused', errno.errorcode.get(e.errno))\n\
+             print('still running')",
+        )
+        .unwrap();
+    let output = sandbox.drain_output();
+    assert!(output.contains("refused EILSEQ"), "got: {output:?}");
+    assert!(output.contains("still running"), "got: {output:?}");
+}
+
+/// A path too long for the kernel's hostfs buffers fails with
+/// ENAMETOOLONG; it used to be cut short, and the syscall act on another
+/// host directory.  Linux only: the host directories it makes, about
+/// 1,100 bytes deep in the temporary directory, are past the path limits
+/// of macOS (1,024 bytes) and Windows.
+#[cfg(target_os = "linux")]
+#[test]
+fn python_long_host_path_is_refused() {
+    let rootfs = require_rootfs("python");
+    let mount_dir = temp_dir("fs-long-path");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .mounts(vec![Mount::rw(mount_dir.path(), "/mnt/host")])
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "import errno, os\n\
+             path = '/mnt/host'\n\
+             try:\n\
+             \x20   for i in range(6):\n\
+             \x20       path += '/' + str(i) * 200\n\
+             \x20       os.mkdir(path)\n\
+             except OSError as e:\n\
+             \x20   print('refused at', i, errno.errorcode.get(e.errno))",
+        )
+        .unwrap();
+    // 200-byte names: five make 1,004 bytes below the mount (1,005 with
+    // the NUL), which fits; six make 1,205, which does not.
+    assert!(sandbox.drain_output().contains("refused at 5 ENAMETOOLONG"),);
+    // Nothing was made under a name cut short.
+    let mut deepest = mount_dir.path().to_path_buf();
+    for i in 0..5 {
+        deepest.push(i.to_string().repeat(200));
+    }
+    assert_eq!(std::fs::read_dir(&deepest).unwrap().count(), 0);
 }
 
 #[test]
