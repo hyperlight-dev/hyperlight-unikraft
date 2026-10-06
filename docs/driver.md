@@ -9,7 +9,7 @@ The whole contract is one character device, `/dev/hlcall`, and six operations on
 | Operation | Meaning |
 |---|---|
 | `open()` | The driver is here.  The kernel tells the host `DriverReady`; a call that arrives before any open is refused with `CallRejected`, which is what an image without a driver produces. |
-| `ioctl(HLCALL_IOC_MAXLEN)` | How large a call can be, a `uint64_t` the kernel knows from the host's PEB.  The driver allocates its read buffer from it, once. |
+| `ioctl(HLCALL_IOC_MAXLEN)` | How large a call can be, a `uint64_t` the kernel knows from the transport geometry the host published.  The driver allocates its read buffer from it, once. |
 | `read()` | Blocks until the host issues a call, then returns it whole: the FunctionCall FlatBuffer as the host encoded it.  Reading again completes the previous call. |
 | `ioctl(HLCALL_IOC_GETENV)` | The variables the embedder set (`--env`, `set_env_vars`) as they are now, `KEY=VALUE` entries separated by NUL, into a buffer the driver provides.  Asked at the top of every call; the kernel answers from its own copy unless the embedder changed the variables since (each call carries the host's version of them), so an unchanged environment costs no host call. |
 | `ioctl(HLCALL_IOC_HOSTCALL)` | Call one of the embedder's functions (`SandboxBuilder::host_function`) by name and get its reply. The kernel forwards it as the host function `HostCall(name, args)`. Only while a call is in flight. |
@@ -30,7 +30,7 @@ sequenceDiagram
     D->>K: open(/dev/hlcall)
     K-->>H: DriverReady
     D->>K: ioctl(MAXLEN)
-    K-->>D: 64 KiB
+    K-->>D: 73,716 bytes
     Note over D: Py_Initialize()
     D->>K: read()
     Note over D: parked, nothing left to run
@@ -58,7 +58,7 @@ A call can block.  `run("time.sleep(2)")` puts the driver thread to sleep, and t
 
 `Exec` carries source: `run("print(6*7)")` arrives as `Exec` with that string as its one parameter, and the callback runs it in the runtime (an `Exec::File` is read on the host and sent the same way).  `GuestExec` carries a command line for a program already in the image: `run(Exec::Guest("/app/server --port 8080"))` arrives as `GuestExec` with that line, the callback runs the file with that argv, and an empty line runs the image's conventional entrypoint, `/entrypoint.py` in the python image.  [`hl_fc.h`](../drivers/hl_fc.h) reads the name and the parameters out of the FlatBuffer.  One call at a time: the host finishes one before it issues the next.
 
-`Call` carries a function name and an input. `call("greet", r#"{"name":"World"}"#)` asks the driver to run the guest's `greet` and send back its result with `hl_set_result()`. A driver opts in with `hl_driver_serve_calls()`. Without it, `hl_driver_run` fails a `Call` itself, so a callback written for `Exec` never runs a function name as code. A result is at most 64 KiB; the kernel refuses a larger one and the call fails. [calls.md](calls.md) covers what each image does with a call.
+`Call` carries a function name and an input. `call("greet", r#"{"name":"World"}"#)` asks the driver to run the guest's `greet` and send back its result with `hl_set_result()`. A driver opts in with `hl_driver_serve_calls()`. Without it, `hl_driver_run` fails a `Call` itself, so a callback written for `Exec` never runs a function name as code. A result is at most 69,620 bytes, what one host call carries; the kernel refuses a larger one and the call fails. [calls.md](calls.md) covers what each image does with a call.
 
 ## Host functions
 
@@ -68,7 +68,7 @@ Call it from the thread serving the call. The node, dotnet-jit and java runtimes
 
 ## The environment
 
-`hluk run --env GREETING="it's me"` reaches the guest as the entry `GREETING=it's me` from `HLCALL_IOC_GETENV`.  Only the embedder's variables travel this way; what the image's runtime sets for itself stays, unless the embedder sets the same key, which then wins.  Together they must fit one host call, 64 KiB by default, since the kernel fetches them with one.  [`hl_env.h`](../drivers/hl_env.h) does `setenv()` for the C side and hands each variable to the runtime: Python sets `os.environ["GREETING"]` through the C API, and bash, whose shell is a separate process fed with source, gets `export GREETING='it'\''s me'` in front of the call, quoted so the shell takes the value as it is.  A variable the embedder removed stays set in the guest.
+`hluk run --env GREETING="it's me"` reaches the guest as the entry `GREETING=it's me` from `HLCALL_IOC_GETENV`.  Only the embedder's variables travel this way; what the image's runtime sets for itself stays, unless the embedder sets the same key, which then wins.  Together, with a separator after each, they must fit one host call: under 69,620 bytes, since the kernel fetches them with one.  [`hl_env.h`](../drivers/hl_env.h) does `setenv()` for the C side and hands each variable to the runtime: Python sets `os.environ["GREETING"]` through the C API, and bash, whose shell is a separate process fed with source, gets `export GREETING='it'\''s me'` in front of the call, quoted so the shell takes the value as it is.  A variable the embedder removed stays set in the guest.
 
 ## Snapshots
 

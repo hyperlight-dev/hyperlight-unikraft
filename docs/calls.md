@@ -78,7 +78,7 @@ The CLI registers no host functions, so a host function call fails there. Use th
 
 - **Host function calls are synchronous.** The guest waits while your function runs on the thread driving the sandbox. In Python, only the thread running the code or guest function can make a host function call; others get a `RuntimeError`.
 - **Snapshots.** Functions belong to the sandbox, not the guest. A restored guest calls the functions of the builder that restored it, so different hosts can serve the same snapshot with different functions. One catch: a quickjs `host:` module is built the first time it is imported, so a snapshot taken after `import ... from "host:db"` keeps that module's exports.
-- **Limits.** A host function call's name and arguments together, and its reply, are at most 64 KiB, as is a guest function's result. The empty name is reserved: it lists the registered functions.
+- **Limits.** A host function call's name and arguments together, and its reply, are at most 69,620 bytes (the 64 KiB the transport's pool is sized for, plus what rounding the pool up to whole pages leaves over), as is a guest function's result. The empty name is reserved: it lists the registered functions.
 
 ### WebAssembly imports
 
@@ -157,3 +157,17 @@ Wasmtime 49 marks its 0.3 support as experimental, so treat it as such. Build a 
 ## How it works
 
 A guest function call is a `Call(function, input)` that the kernel queues on `/dev/hlcall`, like `Exec`. The driver writes the result after the status, and the kernel reports both with the entry's final `Yield`, so a call that returns within one entry costs a single VM exit. Host function calls all travel as one kernel host function, `HostCall(name, args)`, which the library dispatches by name, so adding one needs no kernel change. [driver.md](driver.md) has the device protocol, and [execution.md](execution.md) has the host side.
+
+### Transport
+
+The kernel and the host talk over Hyperlight's two virtqueues (VIRTIO packed rings in scratch memory). A host function call is one chain on the guest-to-host queue: the request, then a buffer for the reply. A guest function call arrives in 4 KiB buffers the kernel keeps posted on the host-to-guest queue, and its result goes back on the guest-to-host one. The kernel copies every message out of the pools, so it never holds a pool buffer past the call that used it.
+
+Hyperlight leaves the sizes to the host. hluk sets only the pool sizes (`apply_transport` in `src/lib.rs`): each half of the guest-to-host pool, request and reply, holds a 64 KiB payload plus framing, and the host-to-guest pool as much. Buffer sizes and queue depths keep Hyperlight's defaults. Measured on KVM with Python:
+
+| Knob | Effect |
+|---|---|
+| Payload per host call (hostfs chunk) | 32 → 64 KiB: reads and writes about 40% faster. 256 KiB: about 15% more, for 0.8 MiB more pool per sandbox. 1 MiB: no further gain. |
+| Host-to-guest buffer size (4, 16 or 72 KiB) | No measurable change, even for a 60 KB guest function call. |
+| Queue depths | Guest-to-host: one chain (a request and its reply buffer) at a time, so any depth of 2 or more serves; the kernel refuses less at boot. Host-to-guest: the kernel posts one buffer per descriptor, so the depth caps the largest guest function call; the default (32) posts the whole pool. |
+
+Against the PEB I/O stacks of Hyperlight 0.17, with the same 64 KiB chunks, hostfs reads and writes are about 25% faster; against v0.17 as released (32 KiB chunks), about 55% (reads) and 50% (writes). Guest function calls take the same time (47 µs for a small one). A small host function call takes about 1 µs more.
