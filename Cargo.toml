@@ -35,8 +35,9 @@ mshv = ["hyperlight-host/mshv3"]
 
 [dependencies]
 # Hyperlight v0.18.0 (virtqueue transport) is not on crates.io yet: track
-# upstream main until it is.
-hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "3ee2d4cb3cbf" }
+# upstream main until it is, minus 3ef1a362 (sparse snapshot blobs), whose
+# effect on Windows cold starts is being measured.
+hyperlight-common = { git = "https://github.com/danbugs/hyperlight", rev = "b8ec4b9f02d6" }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -78,12 +79,12 @@ sha2 = { version = "0.11", optional = true }
 #   Windows — WHP, compiled in unconditionally for the target (no feature).
 #   macOS   — Hypervisor.framework via the default `hvf` feature.
 [target.'cfg(target_os = "linux")'.dependencies]
-hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "3ee2d4cb3cbf", default-features = false, features = ["kvm", "build-metadata"] }
+hyperlight-host = { git = "https://github.com/danbugs/hyperlight", rev = "b8ec4b9f02d6", default-features = false, features = ["kvm", "build-metadata"] }
 
 # Non-Linux keeps hyperlight's defaults: HVF (macOS) is on, WHP (Windows) is
 # unconditional, and the Linux-only kvm/mshv3 features are inert here.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "3ee2d4cb3cbf" }
+hyperlight-host = { git = "https://github.com/danbugs/hyperlight", rev = "b8ec4b9f02d6" }
 
 [target.'cfg(windows)'.dependencies]
 # Private working set for the bench RSS line (already in the tree via clap).
