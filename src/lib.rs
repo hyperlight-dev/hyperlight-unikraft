@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 pub use hyperlight_host;
 
 use hyperlight_host::{
-    GuestBinary, HyperlightError, MultiUseSandbox, UninitializedSandbox, func::Registerable,
+    GuestBinary, HyperlightError, Sandbox, UninitializedSandbox, func::Registerable,
     sandbox::SandboxConfiguration, sandbox::snapshot::OciTag,
 };
 
@@ -204,8 +204,9 @@ fn dispatch_host_call(table: &HostFunctionTable, name: &str, args: &[u8]) -> Vec
         Ok(text) => (HOST_CALL_OK, text),
         Err(message) => (HOST_CALL_ERR, message),
     };
-    // A reply the guest's buffer cannot take would arrive cut short; it
-    // becomes an error the guest can report instead.
+    // A reply the guest's buffer cannot take would be refused by the
+    // kernel, and the call fail with nothing to say why; it becomes an
+    // error the guest can report instead.
     let (tag, text) = if text.len() + 1 > HOST_CALL_MAX {
         (
             HOST_CALL_ERR,
@@ -364,26 +365,147 @@ mod scratch_tests {
     }
 }
 
-/// Largest payload of one host call, in either direction.
-///
-/// The host decides this alone: it sizes the PEB I/O stacks
-/// ([`IO_STACK_SIZE`]) and the guest sizes every transfer buffer from
-/// the stack sizes it reads back out of the PEB
-/// (`hl_hcall_max_payload()` in `plat/hyperlight/hcall.c`: the smaller
-/// stack less a 4 KiB reserve for the FlatBuffer framing).  So a guest
-/// never asks for, or sends, more than this, and the host functions
-/// here only cap what they hand back (`net_recvfrom`) as a courtesy to
-/// a guest that asks for more.
-pub(crate) const HOST_CALL_MAX: usize = 64 * 1024;
+/// Guest page size, the unit the virtqueue pools are sized in.
+const PAGE_SIZE: usize = hyperlight_common::vmem::PAGE_SIZE;
 
-/// PEB I/O stack size for host-call data transfer.
-///
-/// Both the input stack (host→guest results) and output stack
-/// (guest→host calls) must hold a FlatBuffer-encoded message carrying
-/// a [`HOST_CALL_MAX`] payload plus its framing, the same 4 KiB reserve
-/// the guest subtracts.  Default Hyperlight stacks are only 16 KiB —
-/// too small for large file or network transfers.
-const IO_STACK_SIZE: usize = HOST_CALL_MAX + 4096;
+/// What the guest keeps back from each half of the G2H pool: the
+/// message header, and a 4 KiB reserve for the FlatBuffer framing
+/// (`HL_HCALL_FRAMING` in `plat/hyperlight/hcall.c`).
+const MSG_OVERHEAD: usize = hyperlight_common::transport::MsgHeader::SIZE + 4096;
+
+/// Pages in each half of the guest-to-host pool.  The guest splits the
+/// pool in two, a host call's request and its reply, and each half
+/// carries a 64 KiB payload (a file or socket transfer) plus
+/// [`MSG_OVERHEAD`].  Hyperlight's default pool (12 pages) is too small
+/// for that.
+const G2H_HALF_PAGES: usize = (64 * 1024 + MSG_OVERHEAD).div_ceil(PAGE_SIZE);
+const G2H_POOL_PAGES: usize = 2 * G2H_HALF_PAGES;
+
+/// Largest payload of one host call, in either direction: exactly what
+/// the guest computes from the pool geometry (`hl_hcall_max_payload()`
+/// in `plat/hyperlight/hcall.c`), 69,620 bytes.  The host decides it
+/// alone, through the pool sizes, and the guest sizes every transfer
+/// buffer from it.  So a guest never sends more than this, and the host
+/// functions that hand back data (`fs_*` reads and listings,
+/// `net_recvfrom`, `HostCall` results) cap it here; the kernel refuses a
+/// larger result rather than cut it short.
+pub(crate) const HOST_CALL_MAX: usize = G2H_HALF_PAGES * PAGE_SIZE - MSG_OVERHEAD;
+
+/// Pages of the host-to-guest pool, cut into receive buffers of
+/// Hyperlight's default size.  A guest function call can be as large as
+/// a host call's whole message (the kernel sizes `/dev/hlcall` buffers,
+/// which also take host call replies, from it), so it gets as many pages
+/// as a G2H half.
+const H2G_POOL_PAGES: usize = G2H_HALF_PAGES;
+
+// Hyperlight keeps one H2G buffer spare for a call with byte parameters;
+// hluk's guest functions (`step`, `Exec`, `Call`, ...) take strings and
+// integers only, and the kernel serves no other, so every buffer is the
+// call's.
+const _: () = {
+    assert!(HOST_CALL_MAX >= 64 * 1024);
+    // The guest posts min(queue size, pool / buffer size) receive
+    // buffers: the default queue must post all of them, or a call the
+    // size of a G2H half would not fit.
+    let buffers = H2G_POOL_PAGES * PAGE_SIZE / SandboxConfiguration::DEFAULT_H2G_BUFFER_SIZE;
+    assert!(buffers <= SandboxConfiguration::DEFAULT_H2G_QUEUE_SIZE);
+    assert!(buffers * SandboxConfiguration::DEFAULT_H2G_BUFFER_SIZE >= G2H_HALF_PAGES * PAGE_SIZE);
+};
+
+/// Size the virtqueue pools for [`HOST_CALL_MAX`] transfers.  The other
+/// knobs keep Hyperlight's defaults: this guest copies every message out
+/// of the pools, so buffer sizes and queue depths change nothing it
+/// measures (see the transport notes in `docs/`).
+fn apply_transport(cfg: &mut SandboxConfiguration) {
+    cfg.set_g2h_pool_pages(G2H_POOL_PAGES);
+    cfg.set_h2g_pool_pages(H2G_POOL_PAGES);
+}
+
+/// Guest console output, decoded for [`GuestConfig::drain_output`].  The
+/// guest sends bytes; a character split between two writes is held back
+/// until its end arrives, across drains (a program may print half of one
+/// in one step and the rest in the next), or the process exits; bytes
+/// that are not UTF-8 read as U+FFFD.
+#[derive(Default)]
+struct GuestOutput {
+    text: String,
+    /// The start of a character whose end is still to come.
+    partial: Vec<u8>,
+}
+
+impl GuestOutput {
+    /// Take `bytes` in; returns the text they completed.
+    fn push(&mut self, bytes: &[u8]) -> String {
+        let start = self.text.len();
+        self.join(bytes);
+        self.text[start..].to_string()
+    }
+
+    /// End the output: a character still cut short reads as U+FFFD.
+    /// Returns the text that added.
+    fn finish(&mut self) -> String {
+        if self.partial.is_empty() {
+            return String::new();
+        }
+        self.partial.clear();
+        self.text.push(char::REPLACEMENT_CHARACTER);
+        char::REPLACEMENT_CHARACTER.to_string()
+    }
+
+    fn join(&mut self, mut bytes: &[u8]) {
+        // Finish a character cut short by the last write with the few
+        // bytes it lacks; the rest is decoded where it lies.  The joined
+        // bytes can leave a new character cut short (the held one was
+        // not continued, and what follows starts another), so this goes
+        // on until nothing is held or the write is used up.
+        while let Some(&lead) = self.partial.first() {
+            if bytes.is_empty() {
+                return;
+            }
+            let width: usize = match lead {
+                0xf0.. => 4,
+                0xe0.. => 3,
+                _ => 2,
+            };
+            let take = width
+                .saturating_sub(self.partial.len())
+                .clamp(1, bytes.len());
+            self.partial.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            let joined = std::mem::take(&mut self.partial);
+            self.decode(&joined);
+        }
+        self.decode(bytes);
+    }
+
+    fn decode(&mut self, mut rest: &[u8]) {
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    self.text.push_str(s);
+                    return;
+                }
+                Err(e) => {
+                    let (valid, after) = rest.split_at(e.valid_up_to());
+                    // `valid_up_to` bytes are UTF-8: this never falls back.
+                    self.text
+                        .push_str(std::str::from_utf8(valid).unwrap_or_default());
+                    match e.error_len() {
+                        Some(bad) => {
+                            self.text.push(char::REPLACEMENT_CHARACTER);
+                            rest = &after[bad..];
+                        }
+                        // Cut short: keep it for the next write.
+                        None => {
+                            self.partial.extend_from_slice(after);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// PEB heap size.
 ///
@@ -396,9 +518,11 @@ const HEAP_SIZE: u64 = 0x10_0000; // 1 MiB
 /// the embedded kernel's SHA-256 (its first 16 hex digits; the kernel's
 /// code and host-call protocol are in the snapshot's memory) and the host
 /// contract number kept in `build.rs` (the host functions and their
-/// meaning, the buffer sizes, the layout, the MSRs, the hyperlight-host
+/// meaning, the pool sizes, the layout, the MSRs, the hyperlight-host
 /// release).  A snapshot loads under any release with the same key, so a
-/// release that changes neither keeps every saved snapshot.
+/// release that changes neither keeps every saved snapshot.  (Hyperlight
+/// versions its own snapshot format besides, and refuses one it cannot
+/// read.)
 pub const SNAPSHOT_KEY: &str = env!("HLUK_SNAPSHOT_KEY");
 
 /// The name a snapshot is saved under in its directory: this release and
@@ -763,8 +887,8 @@ pub(crate) struct GuestConfig {
     initrd_size: u64,
     /// Host filesystem mounts.
     mounts: Vec<Mount>,
-    /// Captured guest stdout — accumulated by the HostPrint callback.
-    output: Arc<Mutex<String>>,
+    /// Captured guest stdout — accumulated by the HostWrite callback.
+    output: Arc<Mutex<GuestOutput>>,
     /// NUL-separated KEY=VALUE pairs for guest env vars.
     env_str: Arc<Mutex<String>>,
     /// The guest's `/etc/resolv.conf`, written by the kernel at boot and on
@@ -813,7 +937,7 @@ impl GuestConfig {
             initrd_base,
             initrd_size,
             mounts,
-            output: Arc::new(Mutex::new(String::new())),
+            output: Arc::new(Mutex::new(GuestOutput::default())),
             env_str: Arc::new(Mutex::new(String::new())),
             resolv_conf: Arc::new(Mutex::new(String::new())),
             net,
@@ -896,7 +1020,7 @@ impl GuestConfig {
 
     /// Drain captured guest output, clearing the buffer.
     pub fn drain_output(&self) -> String {
-        self.output.lock().unwrap().split_off(0)
+        std::mem::take(&mut self.output.lock().unwrap().text)
     }
 
     /// Register host functions on any [`Registerable`] target.
@@ -904,21 +1028,24 @@ impl GuestConfig {
     /// Works for both the init path (`UninitializedSandbox`) and the
     /// snapshot-restore path (`HostFunctions`).
     pub fn register(&self, target: &mut impl Registerable) -> Result<()> {
-        // Override Hyperlight's default HostPrint (which wraps output in
-        // green ANSI on stdout) — send guest output to stdout uncolored,
-        // and capture it for programmatic access.
+        // Guest console output, as bytes: what a program writes need not be
+        // UTF-8, and a write can end inside a character.  Decoded as it
+        // comes (see `GuestOutput`), printed uncolored (Hyperlight's own
+        // HostPrint wraps it in green ANSI) with `print!`, which a test
+        // harness captures, and kept for programmatic access.
         let output = self.output.clone();
         let prof = self.profile.clone();
         target.register_host_function(
-            "HostPrint",
-            move |msg: String| -> hyperlight_host::Result<i32> {
-                let _profile = prof.host("HostPrint");
+            "HostWrite",
+            move |bytes: Vec<u8>| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("HostWrite");
                 use std::io::Write;
-                let len = msg.len() as i32;
-                print!("{msg}");
+                // Printed once the lock is dropped: stdout may block, or
+                // fail, and neither may hold up or poison `drain_output`.
+                let text = output.lock().unwrap().push(&bytes);
+                print!("{text}");
                 let _ = std::io::stdout().flush();
-                output.lock().unwrap().push_str(&msg);
-                Ok(len)
+                Ok(bytes.len() as i32)
             },
         )?;
 
@@ -1076,16 +1203,18 @@ impl GuestConfig {
         )?;
 
         // ── Stdin ─────────────────────────────────────────────────
+        // Bytes, as stdin has them: a read can end inside a character, and
+        // what is piped in need not be text.
         let prof = self.profile.clone();
         target.register_host_function(
             "ReadStdin",
-            move || -> hyperlight_host::Result<String> {
+            move || -> hyperlight_host::Result<Vec<u8>> {
                 let _profile = prof.host("ReadStdin");
                 use std::io::Read;
                 let mut data = vec![0u8; 4096];
                 let n = std::io::stdin().read(&mut data).unwrap_or(0);
                 data.truncate(n);
-                Ok(String::from_utf8_lossy(&data).into_owned())
+                Ok(data)
             },
         )?;
 
@@ -1186,10 +1315,16 @@ impl GuestConfig {
         )?;
         let events = self.events.clone();
         let prof = self.profile.clone();
+        let output = self.output.clone();
         target.register_host_function(
             "Exited",
             move |status: i32| -> hyperlight_host::Result<i32> {
                 let _profile = prof.host("Exited");
+                // Nothing will finish a character the process left cut short.
+                let text = output.lock().unwrap().finish();
+                print!("{text}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
                 events
                     .lock()
                     .unwrap()
@@ -1234,7 +1369,7 @@ impl GuestConfig {
     /// One VM entry: call `name`, then read what the guest said during it.
     /// The guest runs its scheduler until every thread is blocked and
     /// halts; see [`absorb`](Self::absorb) for how the events reduce.
-    fn enter<Args>(&self, sandbox: &mut MultiUseSandbox, name: &str, args: Args) -> Result<Yield>
+    fn enter<Args>(&self, sandbox: &mut Sandbox, name: &str, args: Args) -> Result<Yield>
     where
         Args: hyperlight_host::func::ParameterTuple,
     {
@@ -1298,8 +1433,10 @@ impl GuestConfig {
     /// follows has the guest say again what still holds.
     fn forget(&self) {
         self.events.lock().unwrap().clear();
-        // A result from the timeline the restore discarded is not this one's.
+        // A result from the timeline the restore discarded is not this one's,
+        // nor is the start of a character it printed.
         *self.result.lock().unwrap() = None;
+        self.output.lock().unwrap().partial.clear();
         *self.guest.lock().unwrap() = Guest::default();
         // The kernel's copy of the environment is the snapshot's.
         self.env_version
@@ -1538,9 +1675,7 @@ fn assemble_sandbox(
     let mut cfg = SandboxConfiguration::default();
     cfg.set_scratch_size(scratch_size);
     cfg.set_heap_size(HEAP_SIZE);
-
-    cfg.set_input_data_size(IO_STACK_SIZE);
-    cfg.set_output_data_size(IO_STACK_SIZE);
+    apply_transport(&mut cfg);
 
     // Permit the guest to touch the MSRs the Unikraft kernel programs
     apply_guest_msrs(&mut cfg)?;
@@ -1952,7 +2087,11 @@ impl SandboxBuilder {
                 {
                     Ok(sandbox) => sandbox,
                     Err(e) => {
-                        // The guest's last words are the diagnosis.
+                        // The guest's last words are the diagnosis, all of
+                        // them: a character cut short included.
+                        let tail = cfg.output.lock().unwrap().finish();
+                        print!("{tail}");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
                         let output = cfg.drain_output();
                         if !output.is_empty() {
                             tracing::error!(%output, "guest console output before the boot failure");
@@ -2106,7 +2245,7 @@ impl From<String> for Exec {
 /// bring it back.  Dropping the sandbox tears
 /// the VM down and releases every host socket it held.
 pub struct AppSandbox {
-    sandbox: MultiUseSandbox,
+    sandbox: Sandbox,
     config: GuestConfig,
     /// The [`Yield::Exited`] the guest process ended with, once it has;
     /// every later step reports it again.
@@ -2462,7 +2601,7 @@ impl AppSandbox {
 ///
 /// Creates a default [`GuestConfig`] (the snapshot already has the guest's
 /// cmdline/initrd), registers host functions, and rebuilds a
-/// [`MultiUseSandbox`] from the snapshot.  `mounts` are the restored
+/// [`Sandbox`] from the snapshot.  `mounts` are the restored
 /// guest's: the kernel reads them through `GetMounts` on its `resume`
 /// entry and makes its mount table match.
 fn restore_snapshot(
@@ -2471,7 +2610,7 @@ fn restore_snapshot(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     host_functions: HostFunctionTable,
-) -> Result<(MultiUseSandbox, GuestConfig)> {
+) -> Result<(Sandbox, GuestConfig)> {
     let config = GuestConfig::new(
         String::new(),
         DEFAULT_SCRATCH_MB * 1024 * 1024,
@@ -2492,12 +2631,11 @@ fn restore_snapshot(
     // know to match (avoiding a spurious layout-override warning) and let
     // it override scratch.
     let mut sbcfg = SandboxConfiguration::default();
-    sbcfg.set_input_data_size(IO_STACK_SIZE);
-    sbcfg.set_output_data_size(IO_STACK_SIZE);
+    apply_transport(&mut sbcfg);
     sbcfg.set_heap_size(HEAP_SIZE);
     apply_guest_msrs(&mut sbcfg)?;
 
-    let sandbox = MultiUseSandbox::from_snapshot(snapshot, hf, Some(sbcfg))?;
+    let sandbox = Sandbox::from_snapshot(snapshot, hf, Some(sbcfg))?;
     Ok((sandbox, config))
 }
 
@@ -2523,6 +2661,50 @@ mod tests {
     }
 
     #[test]
+    fn guest_output_joins_split_characters_and_replaces_bad_bytes() {
+        let mut out = GuestOutput::default();
+        out.push(b"ol\xc3");
+        assert_eq!(out.text, "ol");
+        out.push(b"\xa9 \xff!");
+        assert_eq!(out.text, "olé \u{fffd}!");
+        out.push(b"\xe2\x82");
+        out.push(b"\xac");
+        assert_eq!(out.text, "olé \u{fffd}!€");
+        assert!(out.partial.is_empty());
+        // Finished by the next write, even after the text so far is taken.
+        out.push(b"x\xf0\x9f");
+        assert_eq!(std::mem::take(&mut out.text), "olé \u{fffd}!€x");
+        out.push(b"\x98");
+        out.push(b"\x80 ok");
+        assert_eq!(out.text, "\u{1f600} ok");
+        // A lead byte the next write does not continue.
+        out.push(b"\xc3");
+        out.push(b"A");
+        assert_eq!(out.text, "\u{1f600} ok\u{fffd}A");
+        assert!(out.partial.is_empty());
+
+        // A stray lead byte, then a write that starts a character of its
+        // own: the character survives, in order.
+        let mut out = GuestOutput::default();
+        out.push(b"ol\xe9");
+        out.push("€5".as_bytes());
+        out.push(b"\n");
+        assert_eq!(out.text, "ol\u{fffd}€5\n");
+        // Ones that leave a new cut-short character behind each time.
+        let mut out = GuestOutput::default();
+        out.push(b"\xc3");
+        out.push(b"\xe2a\xf0\x9f\x98");
+        assert_eq!(out.push(b"\x80"), "\u{1f600}");
+        assert_eq!(out.text, "\u{fffd}\u{fffd}a\u{1f600}");
+        assert!(out.partial.is_empty());
+        // The process ends with half a character: it reads as U+FFFD.
+        assert_eq!(out.push(b"!\xe2\x82"), "!");
+        assert_eq!(out.finish(), "\u{fffd}");
+        assert_eq!(out.finish(), "");
+        assert!(out.text.ends_with("!\u{fffd}"));
+    }
+
+    #[test]
     fn snapshot_tag_key_reads_only_a_keyed_tag() {
         assert_eq!(snapshot_tag_key("0.14.0"), None);
         assert_eq!(
@@ -2530,6 +2712,10 @@ mod tests {
             Some("kdeadbeefdeadbeef-c2")
         );
         assert_eq!(snapshot_tag_key("0.15.0-kappa-c2"), None);
+        assert_eq!(
+            snapshot_tag_key(snapshot_tag().as_ref()),
+            Some(SNAPSHOT_KEY)
+        );
         assert_eq!(describe_snapshot_tag("0.14.0"), "0.14.0");
     }
 
@@ -2817,8 +3003,6 @@ mod tests {
     /// for `fs_stat(0, "hello.txt")` and verify Hyperlight can parse it.
     #[test]
     fn flatbuffer_generic_encoder_roundtrip() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         // Construct the exact bytes the C fb_encode_generic would produce
         // for hl_hcall_vecbytes("fs_stat", [hlint(0), hlstring("hello.txt")], 2).
         //
@@ -2840,7 +3024,7 @@ mod tests {
         }
 
         // Try to parse the C-style bytes.
-        let c_parsed = FunctionCall::try_from(c_bytes.as_slice());
+        let c_parsed = decode_c_call(&c_bytes);
         assert!(
             c_parsed.is_ok(),
             "C-encoded FunctionCall should parse: {:?}",
@@ -2853,8 +3037,6 @@ mod tests {
     /// Roundtrip test for fs_write_bytes with empty VecBytes.
     #[test]
     fn flatbuffer_generic_encoder_roundtrip_write() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         let c_bytes = build_c_generic_fb(
             "fs_write_bytes",
             2, // HL_FCT_HOST
@@ -2877,7 +3059,7 @@ mod tests {
             eprintln!();
         }
 
-        let result = FunctionCall::try_from(c_bytes.as_slice());
+        let result = decode_c_call(&c_bytes);
         match &result {
             Ok(fc) => eprintln!("PARSED: name={}", fc.function_name),
             Err(e) => eprintln!("FAILED: {:?}", e),
@@ -2955,14 +3137,16 @@ mod tests {
         for param in params.iter().take(np) {
             let pvt = align2(pos);
             let ptbl = align4(pvt + PM_VT_SZ);
+            // A byte vector is an hlexternalbytes: its length, laid out
+            // like a ulong; the bytes follow the FlatBuffer.
             let (vvtsz, vtblsz) = match param {
                 CParam::Int(_) => (VW_SCALAR_VT_SZ, VW_INT_TBL_SZ),
-                CParam::ULong(_) => (VW_SCALAR_VT_SZ, VW_ULONG_TBL_SZ),
-                CParam::Str(_) | CParam::VecBytes(_) => (VW_SCALAR_VT_SZ, VW_REF_TBL_SZ),
+                CParam::ULong(_) | CParam::VecBytes(_) => (VW_SCALAR_VT_SZ, VW_ULONG_TBL_SZ),
+                CParam::Str(_) => (VW_SCALAR_VT_SZ, VW_REF_TBL_SZ),
             };
             let vvt = align2(ptbl + PM_TBL_SZ);
             let vtbl = match param {
-                CParam::ULong(_) => align8_off4(vvt + vvtsz),
+                CParam::ULong(_) | CParam::VecBytes(_) => align8_off4(vvt + vvtsz),
                 _ => align4(vvt + vvtsz),
             };
             pos = vtbl + vtblsz;
@@ -2977,19 +3161,11 @@ mod tests {
             });
         }
 
-        // Variable-length data
+        // Strings
         for (i, param) in params.iter().enumerate().take(np) {
-            match param {
-                CParam::Str(s) => {
-                    pl[i].vdata = align4(pos);
-                    pos = pl[i].vdata + 4 + align4(s.len() + 1);
-                }
-                CParam::VecBytes(v) => {
-                    pl[i].vdata = align4(pos);
-                    let dlen = if v.is_empty() { 1 } else { v.len() };
-                    pos = pl[i].vdata + 4 + align4(dlen);
-                }
-                _ => {}
+            if let CParam::Str(s) = param {
+                pl[i].vdata = align4(pos);
+                pos = pl[i].vdata + 4 + align4(s.len() + 1);
             }
         }
 
@@ -3041,10 +3217,10 @@ mod tests {
             // Parameter table
             ew32(&mut buf, layout.ptbl, (layout.ptbl - layout.pvt) as u32);
             let pv_type = match param {
-                CParam::Int(_) => 1u8,      // HL_PV_HLINT
-                CParam::ULong(_) => 4u8,    // HL_PV_HLULONG (was incorrectly 5=hlfloat!)
-                CParam::Str(_) => 7u8,      // HL_PV_HLSTRING
-                CParam::VecBytes(_) => 9u8, // HL_PV_HLVECBYTES
+                CParam::Int(_) => 1u8,       // HL_PV_HLINT
+                CParam::ULong(_) => 4u8,     // HL_PV_HLULONG (was incorrectly 5=hlfloat!)
+                CParam::Str(_) => 7u8,       // HL_PV_HLSTRING
+                CParam::VecBytes(_) => 10u8, // HL_PV_HLEXTERNALBYTES
             };
             buf[layout.ptbl + 4] = pv_type;
             ew32(
@@ -3078,15 +3254,7 @@ mod tests {
                     buf[layout.vdata + 4..layout.vdata + 4 + s.len()].copy_from_slice(s.as_bytes());
                 }
                 CParam::VecBytes(v) => {
-                    ew32(
-                        &mut buf,
-                        layout.vtbl + 4,
-                        (layout.vdata - (layout.vtbl + 4)) as u32,
-                    );
-                    ew32(&mut buf, layout.vdata, v.len() as u32);
-                    if !v.is_empty() {
-                        buf[layout.vdata + 4..layout.vdata + 4 + v.len()].copy_from_slice(v);
-                    }
+                    ew64(&mut buf, layout.vtbl + 4, v.len() as u64);
                 }
             }
         }
@@ -3095,15 +3263,85 @@ mod tests {
         ew32(&mut buf, fnpos, nlen as u32);
         buf[fnpos + 4..fnpos + 4 + nlen].copy_from_slice(name.as_bytes());
 
+        // The byte values, in parameter order
+        for param in params {
+            if let CParam::VecBytes(v) = param {
+                buf.extend_from_slice(v);
+            }
+        }
+
         buf
+    }
+
+    /// The bytes after a C-encoded FunctionCall, handed to the decoder the
+    /// way the host's transport does.
+    struct CExternals<'a>(&'a [u8]);
+
+    impl hyperlight_common::flatbuffer_wrappers::ExternalValueSource for CExternals<'_> {
+        fn take_bytes(&mut self, length: usize) -> anyhow::Result<Vec<u8>> {
+            anyhow::ensure!(length <= self.0.len(), "external bytes cut short");
+            let (value, rest) = self.0.split_at(length);
+            self.0 = rest;
+            Ok(value.to_vec())
+        }
+
+        fn take_chunks(&mut self, length: usize) -> anyhow::Result<Vec<bytes::Bytes>> {
+            Ok(vec![self.take_bytes(length)?.into()])
+        }
+
+        fn finish(&mut self) -> anyhow::Result<()> {
+            anyhow::ensure!(self.0.is_empty(), "unused external bytes");
+            Ok(())
+        }
+    }
+
+    /// Decode what the C encoder produced: the size-prefixed FlatBuffer,
+    /// then the bytes of its VecBytes parameters.
+    fn decode_c_call(
+        payload: &[u8],
+    ) -> anyhow::Result<hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall> {
+        let fb_len = 4 + u32::from_le_bytes(payload[..4].try_into()?) as usize;
+        let (control, externals) = payload.split_at(fb_len);
+        hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall::decode(
+            control,
+            &mut CExternals(externals),
+        )
+    }
+
+    /// Byte parameters travel after the FlatBuffer and come back intact,
+    /// in order, around the other parameters.
+    #[test]
+    fn flatbuffer_generic_encoder_external_bytes() {
+        use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
+
+        let payload = build_c_generic_fb(
+            "HostCall",
+            2,
+            9,
+            &[
+                CParam::VecBytes(b"first"),
+                CParam::Str("name"),
+                CParam::VecBytes(&[]),
+                CParam::VecBytes(b"second"),
+            ],
+        );
+        let call = decode_c_call(&payload).unwrap();
+        assert_eq!(call.function_name, "HostCall");
+        assert_eq!(
+            call.parameters.unwrap(),
+            vec![
+                ParameterValue::VecBytes(b"first".to_vec()),
+                ParameterValue::String("name".into()),
+                ParameterValue::VecBytes(Vec::new()),
+                ParameterValue::VecBytes(b"second".to_vec()),
+            ]
+        );
     }
 
     /// Roundtrip test for fs_read_bytes(mount_idx=0, path="test.txt", offset=0, len=32768)
     /// which uses u64 parameters.
     #[test]
     fn flatbuffer_generic_encoder_roundtrip_ulong() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         let c_bytes = build_c_generic_fb(
             "fs_read_bytes",
             2, // HL_FCT_HOST
@@ -3125,7 +3363,7 @@ mod tests {
             eprintln!();
         }
 
-        let c_parsed = FunctionCall::try_from(c_bytes.as_slice());
+        let c_parsed = decode_c_call(&c_bytes);
         assert!(
             c_parsed.is_ok(),
             "C-encoded FunctionCall should parse: {:?}",
@@ -3140,8 +3378,6 @@ mod tests {
     /// (not 5=hlfloat) and that 8-byte alignment is respected.
     #[test]
     fn c_encoder_ulong_alignment_check() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         // First, fix the discriminant and test with type=4 (the REAL HL_PV_HLULONG)
         let c_bytes = build_c_generic_fb(
             "fs_write_bytes",
@@ -3165,7 +3401,7 @@ mod tests {
             eprintln!();
         }
 
-        let result = FunctionCall::try_from(c_bytes.as_slice());
+        let result = decode_c_call(&c_bytes);
         match &result {
             Ok(fc) => eprintln!("PARSED: name={}", fc.function_name),
             Err(e) => eprintln!("FAILED: {:?}", e),

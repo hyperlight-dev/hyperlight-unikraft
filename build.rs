@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 /// The host side of the guest contract: the host functions and their
-/// meaning, the I/O stack sizes, the heap and scratch layout, the guest
-/// MSR list, and the hyperlight-host release that reads a snapshot.  Bump
-/// it when any of those changes in a way a snapshot would notice; a
+/// meaning, the virtqueue pool sizes, the heap and scratch layout, the
+/// guest MSR list, and the hyperlight-host release that reads a snapshot.
+/// Bump it when any of those changes in a way a snapshot would notice; a
 /// kernel change rolls the key by itself.
-const SNAPSHOT_CONTRACT: u32 = 3;
+const SNAPSHOT_CONTRACT: u32 = 4;
 
 /// The embedded kernel, whose code and host-call protocol a snapshot
 /// carries in its memory: one per architecture, named as Unikraft names

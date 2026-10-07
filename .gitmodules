@@ -1,7 +1,9 @@
 [submodule "kernel/unikraft"]
 	path = kernel/unikraft
-	url = https://github.com/unikraft/unikraft.git
-	branch = plat-hyperlight-v2
+	# The fork until plat-hyperlight-v2-virtio (the virtqueue transport,
+	# Hyperlight 0.18) merges into plat-hyperlight-v2.
+	url = https://github.com/danbugs/unikraft.git
+	branch = plat-hyperlight-v2-virtio
 [submodule "kernel/app-elfloader"]
 	path = kernel/app-elfloader
 	# The fork until unikraft/app-elfloader#105 (arm64 AT_HWCAP) merges.

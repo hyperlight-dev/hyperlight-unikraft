@@ -14,7 +14,7 @@ User-facing changes are recorded in [`CHANGELOG.md`](../CHANGELOG.md) (Keep a Ch
 ## Cutting a release
 
 1. In [`CHANGELOG.md`](../CHANGELOG.md), rename the top `## [Prerelease] - Unreleased` heading to the version being cut (`## [v<version>]`), confirm it captures what shipped, and add a fresh empty `## [Prerelease] - Unreleased` above it for the next cycle. (`just changelog-notes v<version>` prints exactly what the release notes will be.)
-2. If the host side of the guest contract changed since the last release (a host function's meaning, the I/O stack sizes, the layout, the guest MSRs (system registers on arm64), or the hyperlight-host dependency), bump `SNAPSHOT_CONTRACT` in [`build.rs`](../build.rs) so saved snapshots are refused rather than misread. A kernel change rolls the snapshot key by itself, and a release that changes neither keeps every saved snapshot loadable.
+2. If the host side of the guest contract changed since the last release (a host function's meaning, the virtqueue pool sizes, the layout, the guest MSRs (system registers on arm64), or the hyperlight-host dependency), bump `SNAPSHOT_CONTRACT` in [`build.rs`](../build.rs) so saved snapshots are refused rather than misread. A kernel change rolls the snapshot key by itself, and a release that changes neither keeps every saved snapshot loadable.
 3. Bump `version` in `Cargo.toml` on `main` (semver, e.g. `0.2.0`), commit, and push (the `CHANGELOG.md` edit can ride in the same commit).
 4. Actions → **Create release** → **Run workflow**. It:
    - validates the version and that the tag doesn't exist,
