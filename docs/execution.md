@@ -20,15 +20,21 @@ sequenceDiagram
 
 Guest memory persists across the halt: parked threads, scheduler queues, the application heap.  A snapshot taken at any boundary resumes exactly there.  The guest never spins waiting for the host; an idle guest costs nothing.
 
-The guest reports to the host through named host functions. Each is a VM exit, so an entry makes as few as it can: a call's start and return ride on the entry's final `Yield`, and a guest function call that returns in one entry costs that one exit.
+An entry ends with a `Yield`, which the guest returns as the guest function's result, so an entry that needs nothing from the host costs one VM exit, the halt: a call's start and return ride on the `Yield`. Anything else the guest reports goes through a named host function, a VM exit each.
 
 | Host function | Meaning |
 |---|---|
-| `Yield(ns, flags, status, result)` | Every thread is blocked; the next timer fires in `ns` (0: none). `flags` says what the entry saw of the call in flight: taken and still running, or returned, with its `status` (0: success) and `result` (empty: none). |
+| `Yield(ns, flags, status, result)` | Every thread is blocked; the next timer fires in `ns` (0: none). Returned as the entry's result, a `Vec<u8>`: `ns` (u64), `flags` and `status` (i32), little-endian, then `result`. Sent as this host function only at boot complete. |
 | `DriverReady()` | A runtime driver opened `/dev/hlcall`: named calls are served. |
 | `CallStarted()` / `CallDone(status, result)` | The same news on its own, for an entry that ends without a `Yield` (the process exiting). |
 | `CallRejected()` | A named call had no reader: it never ran. |
 | `Exited(status)` | The guest process ended; the kernel is shutting down. |
+
+| `Yield` flag | Meaning |
+|---|---|
+| 1 | The reader took the call in flight. |
+| 2 | The call returned: `status` (0: success) and `result` (empty: none). Set with 1 when it started in this entry. |
+| 4 | A driver serves named calls. Set on the first entry after a restore. |
 
 One more host function, `HostCall(name, args)`, runs the embedder's function of that name for a driver and returns its reply ([calls.md](calls.md)).  The host folds the reports into one [`Yield`](../src/lib.rs) per entry: `Blocked { until }`, `CallDone`, `CallFailed { status }`, or `Exited { status }`.  A `Blocked` with no timer and no host socket that could wake the guest, while a call's return or a program's exit is still owed, is a deadlock: `step`, `run` and `join` return `Error::Deadlocked` rather than wait forever.
 
@@ -194,4 +200,4 @@ sequenceDiagram
 
 A snapshot loads under any build with the same *snapshot key*, `SNAPSHOT_KEY` (`hluk snapshot key`): the embedded kernel's hash and a host contract number, the two things a snapshot depends on.  A release that changes neither keeps every saved snapshot; one that does refuses them with `Error::SnapshotRelease`, which names the release that saved the snapshot and says to save it again.
 
-On `resume` the guest puts itself right for the new host: its hostfs mounts are made to match what the host serves (see [fs.md](fs.md)), sockets are opened and bound again, connections whose peers died with the old host read as closed, the CSPRNG is reseeded (see [random.md](random.md)) and the wall clock re-anchored (see [clock.md](clock.md)). It asks the host for the mounts, the wall clock and the resolver configuration in one host call, `GetResumeState`, which answers what `GetMounts`, `GetWallClockNs` and `GetResolvConf` answer on their own.  The embedder supplies what lives on its side: the mounts, the listen ports, and any environment.  `restore(snap)` does the same in place, on an existing `AppSandbox`.
+On `resume` the guest puts itself right for the new host: its hostfs mounts are made to match what the host serves (see [fs.md](fs.md)), sockets are opened and bound again, connections whose peers died with the old host read as closed, the CSPRNG is reseeded (see [random.md](random.md)) and the wall clock re-anchored (see [clock.md](clock.md)). The host sends what this takes with the `resume` entry: the mounts, the wall clock, the resolver configuration and the environment (unless it is too large, when the first call fetches it). A kernel that gets none asks with `GetResumeState`, which answers what `GetMounts`, `GetWallClockNs` and `GetResolvConf` answer on their own.  The embedder supplies what lives on its side: the mounts, the listen ports, and any environment.  `restore(snap)` does the same in place, on an existing `AppSandbox`.
