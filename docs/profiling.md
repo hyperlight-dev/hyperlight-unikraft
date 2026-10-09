@@ -9,21 +9,21 @@ hluk run --cold --profile --initrd build-elfloader/quickjs-rootfs.cpio examples/
 
 ```
 hluk profile (host side)                    count    total ms    mean µs     max µs    exits
-entry Exec                                      1       0.205      205.4      205.4      2.0
-  guest                                         1       0.205      204.9      204.9
-  host functions                                1       0.001        0.6        0.6
-entry Call                                      1       0.096       95.8       95.8      1.0
-  guest                                         1       0.095       95.5       95.5
-  host functions                                1       0.000        0.3        0.3
-boot: evolve (cold boot)                        1      42.215    42214.8    42214.8
-host GetTscHz                                   1      20.070    20070.0    20070.0
-host Yield                                      3       0.001        0.3        0.3
+entry Exec                                      1       0.146      145.7      145.7      1.0
+  guest                                         1       0.146      145.6      145.6
+  host functions                                1       0.000        0.1        0.1
+entry Call                                      1       0.050       50.0       50.0      0.0
+  guest                                         1       0.050       50.0       50.0
+  host functions                                1       0.000        0.0        0.0
+boot: evolve (cold boot)                        1      38.899    38898.5    38898.5
+host GetTscHz                                   1      20.069    20068.8    20068.8
+host Yield                                      1       0.004        4.2        4.2
 ...
 ```
 
 | Row | What it measures |
 |---|---|
-| `entry NAME` | One VM entry (`step`, `resume`, `Exec`, `Call`, …), wall time. `exits` is the mean number of host function calls it made, one VM exit each. |
+| `entry NAME` | One VM entry (`step`, `resume`, `Exec`, `Call`, …), wall time. `exits` is the mean number of host function calls it made, one VM exit each, besides the halt that ends it. |
 | `guest` | The entry's time outside host functions: the guest running, plus the VM exits and entries themselves. |
 | `host functions` | The entry's time inside host functions. |
 | `host NAME` | Each host function hluk registers, across all entries. |

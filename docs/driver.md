@@ -72,7 +72,7 @@ Call it from the thread serving the call. The node, dotnet-jit and java runtimes
 
 ## Snapshots
 
-A snapshot taken while the driver is parked in `read()` is a warm image: restored, it continues from that read, and the kernel announces `DriverReady` again so the new host knows a driver is there.  A call that was in flight completes on a later step.
+A snapshot taken while the driver is parked in `read()` is a warm image: restored, it continues from that read, and the kernel's first `Yield` says a driver is ready, so the new host knows it is there.  A call that was in flight completes on a later step.
 
 ## Where the runtime lives
 

@@ -89,3 +89,9 @@ windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win
 
 [dev-dependencies]
 tempfile = "3"
+
+# Do not merge: the resident scratch reset experiment (hyperlight
+# resident-scratch-reset-v0.17, on 0.17.0).
+[patch.crates-io]
+hyperlight-host = { git = "https://github.com/danbugs/hyperlight", rev = "79418815" }
+hyperlight-common = { git = "https://github.com/danbugs/hyperlight", rev = "79418815" }
