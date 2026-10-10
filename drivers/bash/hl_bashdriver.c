@@ -11,11 +11,6 @@
  * run as separate processes via vfork+execve.  NOFORK applets
  * (echo, mkdir, touch, etc.) still run in-process for speed.
  *
- * Limitation: pipes (|) and output redirects from external commands
- * (cmd > file) crash the kernel because vfork shares the parent's
- * stack with the child.  A kernel fix (separate child stack) is needed.
- * Use temp files from builtins or awk single-pass for chaining.
- *
  * Flow:
  *   boot (evolve):
  *     main() → hl_driver_init(): open /dev/hlcall
