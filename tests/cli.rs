@@ -48,6 +48,29 @@ fn cli_env_flag() {
     );
 }
 
+/// `hluk run` writes the guest's standard error to its own stderr, not
+/// into its stdout.
+#[test]
+fn cli_stderr_apart_from_stdout() {
+    let rootfs = require_rootfs("python");
+    let bin = env!("CARGO_BIN_EXE_hluk");
+    let output = std::process::Command::new(bin)
+        .args([
+            "run",
+            "--initrd",
+            rootfs.to_str().unwrap(),
+            "--scratch-mb",
+            "256",
+            "--exec",
+            "import sys; print('to stdout'); print('to stderr', file=sys.stderr)",
+        ])
+        .output()
+        .expect("failed to run hluk");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "to stdout\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "to stderr\n");
+}
+
 /// `--call` runs the workload, then calls a function it defined and
 /// prints the result; with no workload, only the call runs, and a failed
 /// call fails the run.
@@ -72,7 +95,7 @@ fn cli_call_flag() {
     let output = run(&["--call", "handler"]);
     assert!(!output.status.success(), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("no global function handler"),
+        String::from_utf8_lossy(&output.stderr).contains("no global function handler"),
         "{output:?}"
     );
 }

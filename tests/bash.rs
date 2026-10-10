@@ -209,7 +209,7 @@ fn bash_exit_ends_the_call() {
     sandbox
         .run("echo leaving; exit 0; echo not reached")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "leaving\r\n");
+    assert_eq!(sandbox.drain_output(), "leaving\n");
     assert!(
         sandbox.run("exit 3").is_err(),
         "exit 3 did not fail the call"

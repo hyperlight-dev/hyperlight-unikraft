@@ -301,7 +301,7 @@ fn dotnet_jit_environment_exit_ends_the_call() {
     sandbox
         .run("Console.WriteLine(\"leaving\"); Environment.Exit(0); Console.WriteLine(\"not reached\");")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "leaving\r\n");
+    assert_eq!(sandbox.drain_output(), "leaving\n");
     sandbox.run("Console.WriteLine(\"still here\");").unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 
@@ -431,7 +431,7 @@ fn dotnet_jit_calls_host_functions() {
              try { Host.Call(\"math.fail\"); } catch (HostException e) { Console.WriteLine($\"caught {e.Message}\"); }",
         )
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "5\r\nAda\r\ncaught no can do\r\n");
+    assert_eq!(sandbox.drain_output(), "5\nAda\ncaught no can do\n");
     sandbox
         .run("public static class H { public static double Total(double[] v) => Host.Call<double>(\"math.add\", v.Cast<object>().ToArray()); }")
         .unwrap();

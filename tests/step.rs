@@ -419,11 +419,11 @@ fn python_threads_do_not_extend_the_call() {
         t.elapsed() < Duration::from_millis(400),
         "call waited for the thread"
     );
-    assert_eq!(sandbox.drain_output(), "main done\r\n");
+    assert_eq!(sandbox.drain_output(), "main done\n");
     while t.elapsed() < Duration::from_millis(1200) {
         sandbox.step(Duration::from_millis(500)).expect("step");
     }
-    assert_eq!(sandbox.drain_output(), "thread done\r\n");
+    assert_eq!(sandbox.drain_output(), "thread done\n");
 }
 
 /// A module-level thread pool keeps idle non-daemon workers alive.  The
@@ -439,11 +439,11 @@ fn python_thread_pool_does_not_hold_the_call() {
             "print('result', ex.submit(lambda: 21 * 2).result(), flush=True)\n",
         ))
         .expect("run");
-    assert_eq!(sandbox.drain_output(), "result 42\r\n");
+    assert_eq!(sandbox.drain_output(), "result 42\n");
     sandbox
         .run("print('again', ex.submit(lambda: 1).result(), flush=True)")
         .expect("run");
-    assert_eq!(sandbox.drain_output(), "again 1\r\n");
+    assert_eq!(sandbox.drain_output(), "again 1\n");
 }
 
 /// A Python thread a call leaves behind keeps running between calls: the

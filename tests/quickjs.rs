@@ -46,7 +46,7 @@ fn quickjs_state_is_kept_across_calls() {
     }
     assert_eq!(
         sandbox.drain_output(),
-        "{\"greeting\":\"Hello, a\"} 1\r\n{\"greeting\":\"Hello, b\"} 2\r\n"
+        "{\"greeting\":\"Hello, a\"} 1\n{\"greeting\":\"Hello, b\"} 2\n"
     );
 }
 
@@ -64,7 +64,7 @@ fn quickjs_modules_timers_and_promises() {
              console.log('module');",
         )
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "module\r\njob\r\ntimer\r\n");
+    assert_eq!(sandbox.drain_output(), "module\njob\ntimer\n");
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn quickjs_calls_host_functions() {
              try { fail() } catch (e) { console.log('caught', e.message) }",
         )
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "5 js\r\ncaught no can do\r\n");
+    assert_eq!(sandbox.drain_output(), "5 js\ncaught no can do\n");
     // A name that is not UTF-8 (a lone surrogate), or the empty one the
     // protocol reserves, throws in JavaScript; the guest serves on.
     sandbox
@@ -210,7 +210,7 @@ fn quickjs_calls_host_functions() {
              }",
         )
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "threw\r\nthrew\r\n");
+    assert_eq!(sandbox.drain_output(), "threw\nthrew\n");
     // A long host error arrives whole.
     sandbox
         .run("try { host.call('math.verbose') } catch (e) { console.log(e.message.length) }")

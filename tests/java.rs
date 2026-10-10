@@ -38,7 +38,7 @@ fn java_inline_code() {
     sandbox
         .run("System.out.println(\"hluk-java-ok \" + 6 * 7);")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "hluk-java-ok 42\r\n");
+    assert_eq!(sandbox.drain_output(), "hluk-java-ok 42\n");
 }
 
 /// A compact source file: the guest runs its main, as `java Hello.java`
@@ -50,7 +50,7 @@ fn java_exec_file() {
         sandbox.run(example("Hello.java")).unwrap();
         assert_eq!(
             sandbox.drain_output(),
-            "Hello from Java 25 on Hyperlight!\r\n"
+            "Hello from Java 25 on Hyperlight!\n"
         );
     }
 }
@@ -67,7 +67,7 @@ fn java_runs_a_declared_main() {
              }",
         )
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "main ran, args=0\r\n");
+    assert_eq!(sandbox.drain_output(), "main ran, args=0\n");
     // A file runs its own main, not another overload an earlier call left.
     sandbox
         .run("void main() { System.out.println(\"A\"); }")
@@ -78,17 +78,17 @@ fn java_runs_a_declared_main() {
     sandbox
         .run("void main() { System.out.println(\"A\"); }")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "A\r\nB\r\nA\r\n");
+    assert_eq!(sandbox.drain_output(), "A\nB\nA\n");
     // With both in one file, main(String[]) is the one Java runs.
     sandbox
         .run("void main(String[] a) { System.out.println(\"args\"); }\nvoid main() { System.out.println(\"noargs\"); }")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "args\r\n");
+    assert_eq!(sandbox.drain_output(), "args\n");
     // Java 25 takes main(String[]) over main(), static or not.
     sandbox
         .run("class Rank { static void main() { System.out.println(\"static\"); } void main(String[] a) { System.out.println(\"instance args\"); } }")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "instance args\r\n");
+    assert_eq!(sandbox.drain_output(), "instance args\n");
     // The same file run again runs its main again, unchanged as it is.
     sandbox
         .run(
@@ -97,18 +97,18 @@ fn java_runs_a_declared_main() {
              }",
         )
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "main ran, args=0\r\n");
+    assert_eq!(sandbox.drain_output(), "main ran, args=0\n");
     sandbox
         .run(
             "void main() { System.out.println(\"not run\"); }\nSystem.out.println(\"statements\");",
         )
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "statements\r\n");
+    assert_eq!(sandbox.drain_output(), "statements\n");
     // An instance main, made with the class's no-argument constructor.
     sandbox
         .run("class Inst { String who = \"instance\"; void main() { System.out.println(who + \" main\"); } }")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "instance main\r\n");
+    assert_eq!(sandbox.drain_output(), "instance main\n");
     // Not with a private constructor, which Java 25's launcher refuses.
     assert!(
         sandbox
@@ -135,7 +135,7 @@ fn java_compact_source_file_shapes() {
              String greet() { return \"hi\"; }",
         )
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "hi 42\r\n");
+    assert_eq!(sandbox.drain_output(), "hi 42\n");
     sandbox.run("String greet() { return \"bye\"; }").unwrap();
     assert_eq!(sandbox.drain_output(), "");
 
@@ -143,7 +143,7 @@ fn java_compact_source_file_shapes() {
     sandbox
         .run("// App.java\n/* copied from a project */\npackage com.example.app;\n\npublic class Pkg { public static void main(String[] a) { System.out.println(\"packaged\"); } }")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "packaged\r\n");
+    assert_eq!(sandbox.drain_output(), "packaged\n");
 
     // Not a package name Java takes: rejected, as `java` would.
     assert!(sandbox
@@ -156,7 +156,7 @@ fn java_compact_source_file_shapes() {
     sandbox
         .run("package \u{3c0}.\u{3bb};\nclass Uni { public static void main(String[] a) { System.out.println(\"unicode\"); } }")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "unicode\r\n");
+    assert_eq!(sandbox.drain_output(), "unicode\n");
 
     // `void main(` in a comment or a string is not a main: a library
     // waiting on a declaration loads, as it would without them.
@@ -170,11 +170,11 @@ fn java_compact_source_file_shapes() {
     sandbox
         .run(format!("{header}package a.b;\nclass Hdr {{ public static void main(String[] a) {{ System.out.println(\"header\"); }} }}"))
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "header\r\n");
+    assert_eq!(sandbox.drain_output(), "header\n");
     sandbox
         .run(format!("{header}System.out.println(\"no package\");"))
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "no package\r\n");
+    assert_eq!(sandbox.drain_output(), "no package\n");
 
     // A main that cannot run fails the call, as `java Main.java` would not
     // compile: a class waiting on a missing type, and a main calling a
@@ -230,7 +230,7 @@ fn java_failures_keep_the_runtime() {
     );
     assert!(out.contains("a Deque cannot hold null"), "{out}");
     sandbox.run("System.out.println(kept);").unwrap();
-    assert_eq!(sandbox.drain_output(), "42\r\n");
+    assert_eq!(sandbox.drain_output(), "42\n");
 }
 
 /// Variables, methods and classes a call declares are there for the next.
@@ -242,7 +242,7 @@ fn java_state_is_kept_across_calls() {
         .unwrap();
     sandbox.run("System.out.println(greet(\"a\"));").unwrap();
     sandbox.run("System.out.println(greet(\"b\"));").unwrap();
-    assert_eq!(sandbox.drain_output(), "Hello, a #1\r\nHello, b #2\r\n");
+    assert_eq!(sandbox.drain_output(), "Hello, a #1\nHello, b #2\n");
 }
 
 /// A compile error and an uncaught exception each fail the call with
@@ -287,7 +287,7 @@ fn java_snapshot_round_trip() {
     sandbox
         .run("System.out.println(\"restored \" + (kept + 1));")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "restored 42\r\n");
+    assert_eq!(sandbox.drain_output(), "restored 42\n");
 }
 
 #[test]
@@ -320,13 +320,13 @@ fn java_env_vars() {
     sandbox.run(example("EnvVars.java")).unwrap();
     assert_eq!(
         sandbox.drain_output(),
-        "MY_VAR=hello_world\r\nDEBUG=1\r\nGREETING=hi there\r\n"
+        "MY_VAR=hello_world\nDEBUG=1\nGREETING=hi there\n"
     );
     sandbox.set_env_vars(&[("DEBUG", "2")]);
     sandbox
         .run("System.out.println(System.getenv(\"DEBUG\"));")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "2\r\n");
+    assert_eq!(sandbox.drain_output(), "2\n");
 }
 
 #[test]
@@ -414,7 +414,7 @@ fn java_an_interrupt_does_not_carry_over() {
     sandbox
         .run("Thread.sleep(10); System.out.println(\"slept\");")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "slept\r\n");
+    assert_eq!(sandbox.drain_output(), "slept\n");
 }
 
 /// Each JVM after `System.exit()` takes memory the kernel does not give
@@ -507,7 +507,7 @@ fn java_old_values_are_freed() {
     sandbox
         .run("System.out.println(data.length >> 20);")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "40\r\n");
+    assert_eq!(sandbox.drain_output(), "40\n");
     // Nor is a value rendered as text, which would run its toString().
     sandbox
         .run("record Loud(int x) { public String toString() { System.out.println(\"toString ran\"); return \"L\"; } }\nvar l = new Loud(1);\nnew Loud(2);")
@@ -560,7 +560,7 @@ fn java_redeclaring_a_variable_leaves_running_code_its_value() {
     sandbox
         .run("var hits = new java.util.concurrent.atomic.AtomicInteger(100);\ngo.countDown(); done.await(); System.out.println(\"new hits \" + hits.get());")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "old hits 1\r\nnew hits 100\r\n");
+    assert_eq!(sandbox.drain_output(), "old hits 1\nnew hits 100\n");
 }
 
 /// What a thread the code started throws is printed, as Java does.
@@ -587,7 +587,7 @@ fn java_a_thread_left_running_does_not_block_the_next_call() {
         )
         .unwrap();
     sandbox.run("System.out.println(\"next\");").unwrap();
-    assert_eq!(sandbox.drain_output(), "left running\r\nnext\r\n");
+    assert_eq!(sandbox.drain_output(), "left running\nnext\n");
 }
 
 /// `System.exit()` ends the JVM, which is the runtime: the call ends with
@@ -599,9 +599,9 @@ fn java_system_exit_ends_the_call() {
     sandbox
         .run("int kept = 1;\nSystem.out.println(\"leaving\"); System.exit(0); System.out.println(\"not reached\");")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "leaving\r\n");
+    assert_eq!(sandbox.drain_output(), "leaving\n");
     sandbox.run("System.out.println(\"still here\");").unwrap();
-    assert_eq!(sandbox.drain_output(), "still here\r\n");
+    assert_eq!(sandbox.drain_output(), "still here\n");
     assert!(
         sandbox.run("System.out.println(kept);").is_err(),
         "the fresh JVM had the old one's state"
@@ -792,7 +792,7 @@ fn java_restart_ignores_host_launcher_variables() {
     sandbox
         .run("System.out.println(System.getenv(\"MY_VAR\") + \" \" + System.getenv(\"LD_LIBRARY_PATH\"));")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "seen /nowhere\r\n");
+    assert_eq!(sandbox.drain_output(), "seen /nowhere\n");
 }
 
 /// The embedder's functions through `Host.call`; a host error is a
@@ -816,7 +816,7 @@ fn java_calls_host_functions() {
     sandbox
         .run("System.out.println(Host.call(String.class, \"big\").length());")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "40000\r\n");
+    assert_eq!(sandbox.drain_output(), "40000\n");
     sandbox
         .run(
             "System.out.println(Host.call(int.class, \"math.add\", 2, 3));\n\
@@ -826,10 +826,7 @@ fn java_calls_host_functions() {
              try { Host.call(\"math.fail\"); } catch (HostException e) { System.out.println(\"caught \" + e.getMessage()); }",
         )
         .unwrap();
-    assert_eq!(
-        sandbox.drain_output(),
-        "5\r\nAda\r\n8\r\ncaught no can do\r\n"
-    );
+    assert_eq!(sandbox.drain_output(), "5\nAda\n8\ncaught no can do\n");
     sandbox
         .run("double sum(double[] v) { return Host.call(double.class, \"math.add\", Arrays.stream(v).boxed().toArray()); }")
         .unwrap();

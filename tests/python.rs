@@ -558,7 +558,7 @@ fn python_sys_exit_ends_the_call() {
     sandbox
         .run("import sys\nprint('leaving')\nsys.exit(0)\nprint('not reached')")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "leaving\r\n");
+    assert_eq!(sandbox.drain_output(), "leaving\n");
     assert!(
         sandbox.run("import sys\nsys.exit(3)").is_err(),
         "a non-zero exit code did not fail the call"
@@ -597,7 +597,7 @@ fn python_sys_exit_then_snapshot_restore() {
         .boot()
         .unwrap();
     restored.run("print('kept =', kept)").unwrap();
-    assert_eq!(restored.drain_output(), "kept = yes\r\n");
+    assert_eq!(restored.drain_output(), "kept = yes\n");
 }
 
 /// A mounted directory too large to list in one host call fails that one
@@ -761,7 +761,7 @@ fn python_calls_host_functions() {
         .unwrap();
     assert_eq!(
         sandbox.drain_output(),
-        "5 6 None\r\ncaught no can do\r\nthrew ValueError\r\nthrew UnicodeEncodeError\r\n"
+        "5 6 None\ncaught no can do\nthrew ValueError\nthrew UnicodeEncodeError\n"
     );
     // A handler can call the host too.
     sandbox
@@ -889,4 +889,47 @@ fn python_rootfs_reads_after_restore() {
     assert_eq!(run(&mut sandbox), "rootfs-ok True True");
     let mut fresh = SandboxBuilder::from_snapshot(snapshot).boot().unwrap();
     assert_eq!(run(&mut fresh), "rootfs-ok True True");
+}
+
+/// One write larger than a host call carries arrives whole: the kernel
+/// sends it in pieces (it used to keep the first 4 KiB and report the
+/// rest written), cut between characters, never inside one.
+#[test]
+fn python_large_write_arrives_whole() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox
+        .run("import sys\nsys.stdout.write('x' * 100000)\nsys.stdout.flush()")
+        .unwrap();
+    assert_eq!(sandbox.drain_output(), "x".repeat(100_000));
+
+    // Three bytes a character: 4096 falls inside one.
+    sandbox
+        .run("import sys\nsys.stdout.write('\u{20ac}' * 3000)\nsys.stdout.flush()")
+        .unwrap();
+    assert_eq!(sandbox.drain_output(), "\u{20ac}".repeat(3000));
+}
+
+/// Standard error is a stream of its own: `drain_stderr` has it alone,
+/// `drain_output` both, in the order written, and newlines arrive as the
+/// program wrote them.
+#[test]
+fn python_stderr_apart_from_stdout() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox
+        .run("import sys\nprint('out')\nprint('err', file=sys.stderr)\nprint('out again')")
+        .unwrap();
+    assert_eq!(sandbox.drain_stderr(), "err\n");
+    assert_eq!(sandbox.drain_output(), "out\nerr\nout again\n");
+
+    assert!(sandbox.run("1 / 0").is_err());
+    let stderr = sandbox.drain_stderr();
+    assert!(stderr.contains("ZeroDivisionError"), "{stderr:?}");
 }

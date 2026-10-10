@@ -236,7 +236,7 @@ fn node_unref_interval_runs_between_calls() {
         t.elapsed() < Duration::from_millis(500),
         "the unref'd interval held the call"
     );
-    assert_eq!(sandbox.drain_output(), "started\r\n");
+    assert_eq!(sandbox.drain_output(), "started\n");
     while t.elapsed() < Duration::from_millis(1300) {
         sandbox.step(Duration::from_millis(500)).unwrap();
     }
@@ -266,7 +266,7 @@ fn node_exit_ends_the_call() {
     sandbox
         .run("globalThis.kept = 'yes'; console.log('leaving'); process.exit(0); console.log('not reached')")
         .unwrap();
-    assert_eq!(sandbox.drain_output(), "leaving\r\n");
+    assert_eq!(sandbox.drain_output(), "leaving\n");
     assert!(
         sandbox.run("process.exit(3)").is_err(),
         "process.exit(3) did not fail the call"
@@ -393,11 +393,11 @@ fn node_calls_host_functions() {
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
-        output.starts_with("5 40000\r\ncaught no can do\r\n"),
+        output.starts_with("5 40000\ncaught no can do\n"),
         "{output}"
     );
     assert!(output.contains("no host function"), "{output}");
-    assert!(output.ends_with("threw\r\nthrew\r\n"), "{output}");
+    assert!(output.ends_with("threw\nthrew\n"), "{output}");
     sandbox
         .run("function total(event) { return host.call('math.add', ...event.values) }")
         .unwrap();
