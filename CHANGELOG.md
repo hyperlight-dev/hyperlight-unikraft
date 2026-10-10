@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A program's write of more than 4 KiB at once reached the host cut to its first 4 KiB, while the program was told all of it was written: `print("x" * 10000)` printed 4,096 bytes. The kernel sends such a write in calls of 4 KiB, cut between UTF-8 characters, never inside one.
 - Standard error reached the host as standard output: the kernel opened fd 2 as a copy of fd 1. It is a stream of its own now, through the new host function `HostPrintErr`: `hluk run` writes it to its own stderr, and `AppSandbox::drain_stderr` takes it apart from standard output (`drain_output` still has both, in the order written). The kernel's own messages go there too, out of the program's standard output.
 - Every newline a guest printed reached the host as CR-LF (`\r\n`), from a workaround for serial consoles that need a carriage return. The host gets the bytes the program wrote.
+- A pipe, a `$(...)` substitution or a redirect of an external command crashed the guest in the bash image on x86_64, and so did a pipe in Python's `subprocess.run(..., shell=True)`: a vfork child returned to userland on the kernel's TLS rather than its parent's, and musl, reading its thread pointer in the system calls the child made before `execve` (`open`, `dup2`, `close`), read kernel memory as its own. The child now runs on its parent's TLS until `execve`, as it runs on its parent's stack; arm64 had the same code and gets the same fix.
 
 ### Changed
 
