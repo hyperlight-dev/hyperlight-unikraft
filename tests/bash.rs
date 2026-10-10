@@ -197,6 +197,30 @@ fn bash_env_vars() {
     );
 }
 
+/// Pipes, `$(...)` substitutions and redirects of external commands work:
+/// the shell's vfork child ran on the kernel's TLS rather than the shell's,
+/// and crashed the guest when it made a system call before its `execve`.
+#[test]
+fn bash_pipes_and_substitutions() {
+    let rootfs = require_rootfs("bash");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox.run("echo hello | tr a-z A-Z").unwrap();
+    assert_eq!(sandbox.drain_output(), "HELLO\n");
+    sandbox.run(r#"x=$(echo hi); echo "got $x""#).unwrap();
+    assert_eq!(sandbox.drain_output(), "got hi\n");
+    sandbox
+        .run("/bin/echo to-file > /tmp/f; cat /tmp/f")
+        .unwrap();
+    assert_eq!(sandbox.drain_output(), "to-file\n");
+    sandbox
+        .run(r#"printf 'b\na\nb\n' | sort | uniq -c | wc -l"#)
+        .unwrap();
+    assert_eq!(sandbox.drain_output().trim(), "2");
+}
+
 /// `exit` ends the shell, which is the runtime: the call ends with that
 /// status, and the next call starts a fresh shell.
 #[test]
