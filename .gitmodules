@@ -1,8 +1,9 @@
 [submodule "kernel/unikraft"]
 	path = kernel/unikraft
-	# The fork until its guest output fixes merge into plat-hyperlight-v2.
+	# The fork until its fixes (guest output, vfork TLS) merge into
+	# plat-hyperlight-v2.
 	url = https://github.com/sozercan/unikraft.git
-	branch = hluk-console-output
+	branch = hluk-fixes
 [submodule "kernel/app-elfloader"]
 	path = kernel/app-elfloader
 	# The fork until unikraft/app-elfloader#105 (arm64 AT_HWCAP) merges.
