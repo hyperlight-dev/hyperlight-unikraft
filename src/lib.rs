@@ -763,8 +763,12 @@ pub(crate) struct GuestConfig {
     initrd_size: u64,
     /// Host filesystem mounts.
     mounts: Vec<Mount>,
-    /// Captured guest stdout — accumulated by the HostPrint callback.
+    /// Captured guest output, standard output and standard error in the
+    /// order written — accumulated by the HostPrint and HostPrintErr
+    /// callbacks.
     output: Arc<Mutex<String>>,
+    /// Captured guest standard error alone — accumulated by HostPrintErr.
+    stderr: Arc<Mutex<String>>,
     /// NUL-separated KEY=VALUE pairs for guest env vars.
     env_str: Arc<Mutex<String>>,
     /// The guest's `/etc/resolv.conf`, written by the kernel at boot and on
@@ -814,6 +818,7 @@ impl GuestConfig {
             initrd_size,
             mounts,
             output: Arc::new(Mutex::new(String::new())),
+            stderr: Arc::new(Mutex::new(String::new())),
             env_str: Arc::new(Mutex::new(String::new())),
             resolv_conf: Arc::new(Mutex::new(String::new())),
             net,
@@ -899,6 +904,11 @@ impl GuestConfig {
         self.output.lock().unwrap().split_off(0)
     }
 
+    /// Drain captured guest standard error, clearing that buffer.
+    pub fn drain_stderr(&self) -> String {
+        self.stderr.lock().unwrap().split_off(0)
+    }
+
     /// Register host functions on any [`Registerable`] target.
     ///
     /// Works for both the init path (`UninitializedSandbox`) and the
@@ -918,6 +928,25 @@ impl GuestConfig {
                 print!("{msg}");
                 let _ = std::io::stdout().flush();
                 output.lock().unwrap().push_str(&msg);
+                Ok(len)
+            },
+        )?;
+
+        // The guest's standard error (and its kernel's messages): to
+        // stderr, captured with the rest and on its own.
+        let output = self.output.clone();
+        let stderr = self.stderr.clone();
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "HostPrintErr",
+            move |msg: String| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("HostPrintErr");
+                use std::io::Write;
+                let len = msg.len() as i32;
+                eprint!("{msg}");
+                let _ = std::io::stderr().flush();
+                output.lock().unwrap().push_str(&msg);
+                stderr.lock().unwrap().push_str(&msg);
                 Ok(len)
             },
         )?;
@@ -2432,9 +2461,17 @@ impl AppSandbox {
         self.config.has_driver()
     }
 
-    /// Take the guest output captured so far.
+    /// Take the guest output captured so far: standard output and
+    /// standard error, in the order the guest wrote them.
     pub fn drain_output(&self) -> String {
         self.config.drain_output()
+    }
+
+    /// Take the guest standard error captured so far, apart from standard
+    /// output.  [`drain_output`](Self::drain_output) has it too, in place,
+    /// and each drains its own buffer.
+    pub fn drain_stderr(&self) -> String {
+        self.config.drain_stderr()
     }
 
     /// This sandbox's profile ([`SandboxBuilder::profile`]): print its
