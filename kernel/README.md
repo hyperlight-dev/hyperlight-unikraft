@@ -19,7 +19,7 @@ The kernel is built from three git submodules pinned under `kernel/`:
 
 | Submodule | Source | Branch |
 |-----------|--------|--------|
-| `unikraft` | [unikraft/unikraft](https://github.com/unikraft/unikraft) | `plat-hyperlight-v2` |
+| `unikraft` | [sozercan/unikraft](https://github.com/sozercan/unikraft), `plat-hyperlight-v2` of [unikraft/unikraft](https://github.com/unikraft/unikraft) plus the guest output fixes (stderr apart, writes over 4 KiB whole, newlines as written), until they merge | `hluk-console-output` |
 | `app-elfloader` | [danbugs/app-elfloader](https://github.com/danbugs/app-elfloader), `staging` plus the arm64 `AT_HWCAP` fix, until [unikraft/app-elfloader#105](https://github.com/unikraft/app-elfloader/pull/105) merges | `arm64-at-hwcap` |
 | `libs/libelf` | [unikraft/lib-libelf](https://github.com/unikraft/lib-libelf) | `staging` |
 
