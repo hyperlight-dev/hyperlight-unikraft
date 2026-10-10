@@ -18,6 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `hluk init NAME --template go` wrote a `go.mod` that Go refused when the name was `go`, `toolchain` or a standard-library package such as `fmt`: the module path is now `example.com/NAME`.
 - A condition variable broadcast, or several signals, woke one waiter and left the others asleep in programs linked with musl, which most images use (node, dotnet-jit, java, quickjs, bash, and programs built on Alpine): the kernel refused `FUTEX_REQUEUE`, which musl's condition variables use to hand each woken waiter's successor to the mutex. It showed as rare, timing-dependent hangs, such as Java's `HttpClient` stalling on its first request on Windows hosts. `FUTEX_CMP_REQUEUE` also woke a waiter when asked to wake none, looped when requeuing onto the same futex, and crashed the kernel when a requeued waiter timed out. All four are generic Unikraft fixes, each reproduced and verified on QEMU/KVM.
+- A program's write of more than 4 KiB at once reached the host cut to its first 4 KiB, while the program was told all of it was written: `print("x" * 10000)` printed 4,096 bytes. The kernel sends such a write in calls of 4 KiB, cut between UTF-8 characters, never inside one.
+- Standard error reached the host as standard output: the kernel opened fd 2 as a copy of fd 1. It is a stream of its own now, through the new host function `HostPrintErr`: `hluk run` writes it to its own stderr, and `AppSandbox::drain_stderr` takes it apart from standard output (`drain_output` still has both, in the order written). The kernel's own messages go there too, out of the program's standard output.
+- Every newline a guest printed reached the host as CR-LF (`\r\n`), from a workaround for serial consoles that need a carriage return. The host gets the bytes the program wrote.
+
+### Changed
+
+- Snapshots saved by an earlier release are refused (the kernel and the host functions changed); save them again.
 
 ## [v0.17.0]
 
