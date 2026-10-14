@@ -4,7 +4,7 @@
 #     with the commit (:dev-<sha7>, and :initrd-dev-<sha7> for the CPIO),
 #     multi-platform.  :latest, :initrd and the release tags are left to
 #     releases.
-#   - Binaries: hluk for the four release targets, built with
+#   - Binaries: hluk for the four release targets (static on Linux), built with
 #     HLUK_CHANNEL=dev-<sha7>, so each pulls the images of its own commit and
 #     a newer build never meets an older one's images in a cache.  Attached to
 #     the `dev` pre-release with a SHA256SUMS; `HLUK_VERSION=dev` makes
@@ -93,9 +93,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             runner: macos-latest
@@ -109,23 +109,36 @@ jobs:
         with:
           ref: ${{ needs.meta.outputs.sha }}
 
+      # Static on Linux (release.yml says why); the musl target is not
+      # installed by default.
+      - name: musl toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+          # The pinned toolchain first: `target add` installing it by itself
+          # is deprecated in rustup.
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+
+      # Named explicitly on every runner, so the binary is under
+      # target/<target>/release everywhere.
       - name: Build hluk
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       # Hypervisor.framework requires the entitlement; install.sh signs the
       # binary again where it installs it.
       - name: Sign (macOS)
         if: runner.os == 'macOS'
-        run: codesign -f -s - --entitlements dev/macos-entitlements.plist target/release/hluk
+        run: codesign -f -s - --entitlements dev/macos-entitlements.plist target/${{ matrix.target }}/release/hluk
 
       - name: Package (Linux, macOS)
         if: runner.os != 'Windows'
-        run: tar -C target/release -czf "hluk-dev-${{ matrix.target }}.tar.gz" hluk
+        run: tar -C target/${{ matrix.target }}/release -czf "hluk-dev-${{ matrix.target }}.tar.gz" hluk
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target\release\hluk.exe -DestinationPath "hluk-dev-${{ matrix.target }}.zip"
+        run: Compress-Archive -Path target\${{ matrix.target }}\release\hluk.exe -DestinationPath "hluk-dev-${{ matrix.target }}.zip"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
