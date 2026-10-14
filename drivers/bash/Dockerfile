@@ -6,11 +6,6 @@
 # vfork()+execve() instead of fork() (the Unikraft kernel has no fork); all
 # applets (cat, grep, sed, awk, sort, ls, find, …) run as separate processes.
 # (NOMMU disables ash; hush is the active shell.)
-#
-# Limitation: pipes (|) and output redirects from external commands
-# (cmd > file) crash because Unikraft's vfork shares the parent's stack with
-# the child — a kernel fix (separate child stack) is needed.  Use awk
-# single-pass or shell builtins to work around.
 
 # The BusyBox base, per platform (hluk-busybox-arm64 for arm64); a stage
 # because COPY --from cannot expand a build arg.

@@ -1425,7 +1425,7 @@ conformance runtime *modules:
         # One module per line to avoid output truncation
         mapfile -t test_modules < <("$hluk" snapshot run "$snap_dir" --net --exec \
             "import os; d='/usr/local/lib/python3.12/test'; [print(f[:-3]) for f in sorted(os.listdir(d)) if f.startswith('test_') and f.endswith('.py')]" \
-            2>/dev/null | tr -d '\r' | grep "^test_" || true)
+            2>/dev/null | grep "^test_" || true)
     fi
 
     if [ "${#test_modules[@]}" -eq 0 ]; then
@@ -1463,7 +1463,7 @@ conformance runtime *modules:
             --net --exec "$inline" 2>/dev/null || echo "RESULT $mod status=CRASH tests=0 fail=0 error=0 skip=0 time=0")
 
         # Extract the RESULT line
-        result_line=$(echo "$output" | tr -d '\r' | grep "^RESULT " | tail -1)
+        result_line=$(echo "$output" | grep "^RESULT " | tail -1)
 
         if [ -z "$result_line" ]; then
             result_line="RESULT $mod status=CRASH tests=0 fail=0 error=0 skip=0 time=0"

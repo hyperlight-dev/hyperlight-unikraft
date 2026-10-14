@@ -41,7 +41,7 @@ RUN gcc -O2 -Wall -Wextra -Wno-unused-parameter \
         $(python3-config --ldflags --embed)
 
 # No-op lsb_release stub — pip's distro detection execs this; without
-# a valid ELF binary Unikraft's execve crashes (no graceful failure).
+# it the exec fails with EINVAL rather than ENOENT.
 COPY drivers/lsb_release_stub.c /src/drivers/lsb_release_stub.c
 RUN gcc -O2 -pie -fPIE -o /usr/bin/lsb_release /src/drivers/lsb_release_stub.c
 

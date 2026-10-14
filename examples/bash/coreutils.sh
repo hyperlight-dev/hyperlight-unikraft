@@ -1,8 +1,7 @@
 # Coreutils demo — real cat, grep, sed, sort, awk, ls, etc.
 #
 # With NOMMU mode, BusyBox hush uses vfork()+execve() to run all
-# applets as separate processes; each command here reads from a file
-# and writes to stdout.
+# applets as separate processes, pipes between them included.
 
 mkdir -p /tmp/demo
 
@@ -59,9 +58,9 @@ echo "=== sort -r ==="
 sort -r /tmp/demo/users.txt
 echo ""
 
-# ── uniq -c (awk does it in one pass) ────────────────────────────
+# ── uniq -c (a pipeline) ─────────────────────────────────────────
 echo "=== uniq -c by role ==="
-awk -F: '{ c[$2]++ } END { for (r in c) printf "  %d %s\n", c[r], r }' /tmp/demo/users.txt
+cut -d: -f2 /tmp/demo/users.txt | sort | uniq -c
 echo ""
 
 # ── sed ──────────────────────────────────────────────────────────

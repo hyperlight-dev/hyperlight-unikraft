@@ -42,15 +42,16 @@ Unikraft supports `vfork()+execve()`, which runtimes use to spawn child processe
 2. **`execve()`** — loads a new ELF binary (must be PIE) into the address space via the elfloader's binfmt handler.  The child gets a new stack and begins executing the new program.
 3. The parent resumes and can read the child's stdout/stderr.
 
+After `execve()` the parent and its children run side by side, on one vCPU, cooperatively: a shell pipeline (`a | b`) works in the images with BusyBox `/bin/sh` (bash, python-shell, agent), and so does `os.popen()` in the Python ones among them (the python image has no `/bin/sh`).
+
 This is evidenced by the `examples/python/subprocess_demo.py` example, which spawns Python child processes for computation, stdin/stdout piping, module execution, and error handling.
 
 ### What does NOT work
 
 - **`os.fork()`** — returns `ENOTSUP`.  `clone()` without `CLONE_VM` is rejected.  This means:
   - `multiprocessing.Process` (uses `fork` start method on Linux)
-  - `os.popen()`
   - Any library that calls `fork()` directly
-- **Parallel children** — `vfork()` suspends the parent, so children run sequentially.
+- **Parallel children before `execve()`** — `vfork()` suspends the parent until the child calls `execve()` or `_exit()`.
 
 ## Examples
 

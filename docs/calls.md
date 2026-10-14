@@ -30,7 +30,7 @@ assert_eq!(out, r#"{"message":"Hello, Ada"}"#);
 
 ## Guest function calls
 
-`AppSandbox::call(function, input)` calls the guest function and waits for its result, which comes back as a string. Anything the function prints goes to `drain_output()`, as it does for `run`.
+`AppSandbox::call(function, input)` calls the guest function and waits for its result, which comes back as a string. Anything the function prints goes to `drain_output()`, as it does for `run`; its standard error also goes to `drain_stderr()` on its own, which `drain_output()` clears, so take it first.
 
 | Image | `function` is | `input` | Result |
 |---|---|---|---|

@@ -75,8 +75,8 @@ int main(int argc, char **argv)
 	 * MPL_IGNORE_SYSTEM_FONTS: the unikernel has no system fonts
 	 * (no /usr/share/fonts, no fc-list).  Without this flag,
 	 * matplotlib.font_manager runs subprocess fc-list during
-	 * import, which crashes the unikernel.  Matplotlib's bundled
-	 * fonts (DejaVu, etc.) still work.
+	 * import, a failed exec that only costs time.  Matplotlib's
+	 * bundled fonts (DejaVu, etc.) still work.
 	 */
 	PyRun_SimpleString(
 		"import warnings\n"
