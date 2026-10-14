@@ -28,7 +28,7 @@ use tracing::info;
 
 use hyperlight_unikraft::{
     Error, Exec, Mount, RUNTIME_SCRATCH_MB, SNAPSHOT_KEY, SandboxBuilder, default_scratch_mb,
-    runtime_scratch_mb,
+    driver_entry, is_runtime_driver, runtime_scratch_mb,
 };
 
 use crate::{
@@ -855,7 +855,9 @@ pub fn run(args: RunArgs) -> CliResult<()> {
     } else {
         parse_net_policy(false, &[], &[], &args.ports)?.1
     };
-    let mut env: Vec<(String, String)> = manifest
+    // The project's environment is part of its guest, warm snapshot
+    // included; the command line's is this run's alone.
+    let manifest_env: Vec<(String, String)> = manifest
         .as_ref()
         .map(|m| {
             m.run
@@ -865,6 +867,7 @@ pub fn run(args: RunArgs) -> CliResult<()> {
                 .collect()
         })
         .unwrap_or_default();
+    let mut env = manifest_env.clone();
     env.extend(
         parse_envs(&args.envs)?
             .into_iter()
@@ -923,11 +926,37 @@ pub fn run(args: RunArgs) -> CliResult<()> {
 
     // A warm run restores the cached snapshot of exactly this guest, when
     // there is one, and saves one otherwise.
+    // A runtime driver takes the environment per call, so a run's own can
+    // reach it after the warm snapshot is saved.  A guest without one (an
+    // entry-point program) reads it once, at boot, and so does a
+    // warm_exec, which runs before the save: those boot with all of it,
+    // and the snapshot is keyed by it.
+    let driver = warm
+        && match &entry {
+            // The program, not its arguments, and one of the runtime
+            // drivers by name: any other program may read its environment
+            // only as it starts.
+            Some(e) => e
+                .split_whitespace()
+                .next()
+                .and_then(|program| program.rsplit('/').next())
+                .is_some_and(is_runtime_driver),
+            // Every published runtime image, named bare, has one: spare
+            // the scan.  A full reference may name anyone's image.
+            None if args.runtime.as_deref().is_some_and(|r| !r.contains('/')) => true,
+            None => rootfs.as_deref().and_then(driver_entry).is_some(),
+        };
+    let env_after_save = driver && warm_exec.is_none();
+    let boot_env = if env_after_save { &manifest_env } else { &env };
     let warm_key = match (warm, &rootfs, scratch_mb) {
         (false, _, _) => None,
-        (true, Some(path), Some(mb)) => {
-            Some(stamp(path, mb, entry.as_deref(), warm_exec.as_deref())?)
-        }
+        (true, Some(path), Some(mb)) => Some(stamp(
+            path,
+            mb,
+            entry.as_deref(),
+            warm_exec.as_deref(),
+            boot_env,
+        )?),
         (true, _, _) => {
             return Err("--warm needs a rootfs: a project, --runtime or --initrd".into());
         }
@@ -978,7 +1007,11 @@ pub fn run(args: RunArgs) -> CliResult<()> {
     if let Some(listen) = listen {
         builder = builder.listen_ports(listen);
     }
-    for (key, value) in env {
+    // A guest booted to be saved as the warm snapshot is everyone's: what
+    // it starts with (a Python's sys.path, from PYTHONPATH) is kept in
+    // it.  This run's own variables reach a driver after the save instead.
+    let saving_warm = warm_key.is_some() && !restored;
+    for (key, value) in if saving_warm { boot_env } else { &env } {
         builder = builder.env(key, value);
     }
     if let Some(rc) = resolv {
@@ -1047,6 +1080,10 @@ pub fn run(args: RunArgs) -> CliResult<()> {
             }
         }
     }
+    if saving_warm && env_after_save {
+        let vars: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        sandbox.set_env_vars(&vars);
+    }
 
     drive(
         &mut sandbox,
@@ -1097,7 +1134,9 @@ fn project_rootfs(manifest: &Manifest) -> CliResult<PathBuf> {
 
 /// What a warm snapshot depends on: the build's snapshot key, the rootfs
 /// file (by path, size and mtime), the guest's memory and entry point, and
-/// the code run before the snapshot.  Mounts, network policy and
+/// the code run before the snapshot, and the environment the guest boots
+/// with: the project's `[run] env`, or all of it for a driverless image or
+/// a run with `warm_exec`.  Mounts, the network policy and the rest of the
 /// environment are supplied on restore, so they can change without one.
 /// The text names the cache slot and is stored in it.
 fn stamp(
@@ -1105,6 +1144,7 @@ fn stamp(
     scratch_mb: usize,
     entry: Option<&str>,
     warm_exec: Option<&str>,
+    env: &[(String, String)],
 ) -> CliResult<String> {
     let canonical = rootfs
         .canonicalize()
@@ -1116,13 +1156,20 @@ fn stamp(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Ok(format!(
-        "key={SNAPSHOT_KEY}\nrootfs={}\nsize={}\nmtime={mtime}\nscratch_mb={scratch_mb}\nentry={}\nwarm_exec={}\n",
+    let mut stamp = format!(
+        "key={SNAPSHOT_KEY}\nrootfs={}\nsize={}\nmtime={mtime}\nscratch_mb={scratch_mb}\nentry={}\nwarm_exec={:?}\n",
         canonical.display(),
         meta.len(),
         entry.unwrap_or(""),
+        // Debug-quoted, as env below: its lines are code, not stamp lines.
         warm_exec.unwrap_or("")
-    ))
+    );
+    // Debug-quoted: a value may hold a newline.  A guest that boots with no
+    // environment adds no lines.
+    for (k, v) in env {
+        stamp.push_str(&format!("env={k:?}={v:?}\n"));
+    }
+    Ok(stamp)
 }
 
 // ── cache ────────────────────────────────────────────────────────
@@ -1259,13 +1306,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rootfs = dir.path().join("r.cpio");
         fs::write(&rootfs, b"070701").unwrap();
-        let a = stamp(&rootfs, 256, None, None).unwrap();
-        assert_eq!(a, stamp(&rootfs, 256, None, None).unwrap());
-        assert_ne!(a, stamp(&rootfs, 512, None, None).unwrap());
-        assert_ne!(a, stamp(&rootfs, 256, Some("/bin/app"), None).unwrap());
-        assert_ne!(a, stamp(&rootfs, 256, None, Some("import flask")).unwrap());
+        let a = stamp(&rootfs, 256, None, None, &[]).unwrap();
+        assert_eq!(a, stamp(&rootfs, 256, None, None, &[]).unwrap());
+        assert_ne!(a, stamp(&rootfs, 512, None, None, &[]).unwrap());
+        assert_ne!(a, stamp(&rootfs, 256, Some("/bin/app"), None, &[]).unwrap());
+        assert_ne!(
+            a,
+            stamp(&rootfs, 256, None, Some("import flask"), &[]).unwrap()
+        );
+        let env = [("PYTHONPATH".to_string(), "/app".to_string())];
+        assert_ne!(a, stamp(&rootfs, 256, None, None, &env).unwrap());
         fs::write(&rootfs, b"0707010").unwrap();
-        assert_ne!(a, stamp(&rootfs, 256, None, None).unwrap());
+        assert_ne!(a, stamp(&rootfs, 256, None, None, &[]).unwrap());
         assert!(a.contains(SNAPSHOT_KEY));
     }
 

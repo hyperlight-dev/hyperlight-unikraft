@@ -324,6 +324,13 @@ pub fn default_scratch_mb(initrd: &Path) -> usize {
         .unwrap_or(DEFAULT_SCRATCH_MB)
 }
 
+/// Whether `name` is the file name of one of the runtime drivers
+/// (`hl_pydriver`, …), each of which takes the host's environment again
+/// before every call.
+pub fn is_runtime_driver(name: &str) -> bool {
+    DRIVER_RUNTIME.iter().any(|(d, _)| *d == name)
+}
+
 /// [`default_scratch_mb`] from the driver's file name.
 fn driver_scratch_mb(driver: &str) -> Option<usize> {
     DRIVER_RUNTIME
@@ -354,6 +361,8 @@ mod scratch_tests {
             "the shared Python driver resolves to the smaller image"
         );
         assert_eq!(driver_scratch_mb("hl_execdriver"), None);
+        assert!(is_runtime_driver("hl_pywarmdriver"));
+        assert!(!is_runtime_driver("hl_server"));
     }
 
     #[test]
@@ -1759,6 +1768,13 @@ impl GuestConfig {
 /// point so callers don't need to set one manually.
 fn find_cpio_entry(path: &Path) -> Option<String> {
     scan_cpio(path).entry
+}
+
+/// The runtime driver a rootfs CPIO carries (`/usr/local/bin/hl_pydriver`,
+/// …), the guest's entry point when none is named; `None` for an image
+/// that runs a program of its own.
+pub fn driver_entry(initrd: &Path) -> Option<String> {
+    find_cpio_entry(initrd)
 }
 
 /// What a single pass over a CPIO archive found.

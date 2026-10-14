@@ -219,10 +219,16 @@ pub fn find_snapshot(stamp: &str) -> Result<Option<PathBuf>, String> {
     Ok(stamped.then_some(slot))
 }
 
+/// The warm snapshots kept of one guest that differ in their environment
+/// alone (see `prune_superseded`).
+const ENV_VARIANTS_KEPT: usize = 4;
+
 /// Remove the snapshots taken from an earlier version of `stamp`'s rootfs
 /// file (same path, different size or mtime: it was rebuilt), other than
 /// `keep`.  Snapshots of the same file under other settings (memory,
-/// entry, `warm_exec`) are other guests and stay.  Returns how many went.
+/// entry, `warm_exec`) are other guests and stay; of those that differ in
+/// their environment alone, the newest [`ENV_VARIANTS_KEPT`] do.  Returns
+/// how many went.
 pub fn prune_superseded(stamp: &str, keep: &Path) -> Result<usize, String> {
     let Some(rootfs) = stamp_field(stamp, "rootfs") else {
         return Ok(0);
@@ -231,14 +237,33 @@ pub fn prune_superseded(stamp: &str, keep: &Path) -> Result<usize, String> {
         stamp_field(other, "size") == stamp_field(stamp, "size")
             && stamp_field(other, "mtime") == stamp_field(stamp, "mtime")
     };
+    // Snapshots keyed by an environment (see `stamp`) differ in it alone:
+    // keep the newest few, so runs alternating between a few values all
+    // stay warm, but each new value a run passes does not add one for good.
+    fn without_env(s: &str) -> Vec<&str> {
+        s.lines().filter(|l| !l.starts_with("env=")).collect()
+    }
     let mut pruned = 0;
+    let mut variants = Vec::new();
     for entry in list_snapshots()? {
-        if entry.dir != keep
-            && stamp_field(&entry.stamp, "rootfs") == Some(rootfs)
-            && !same_file(&entry.stamp)
-        {
+        if entry.dir == keep || stamp_field(&entry.stamp, "rootfs") != Some(rootfs) {
+            continue;
+        }
+        if !same_file(&entry.stamp) {
             fs::remove_dir_all(&entry.dir)
                 .map_err(|e| format!("cannot remove {}: {e}", entry.dir.display()))?;
+            pruned += 1;
+        } else if without_env(&entry.stamp) == without_env(stamp) {
+            let saved = fs::metadata(&entry.dir).and_then(|m| m.modified()).ok();
+            variants.push((saved, entry.dir));
+        }
+    }
+    // Newest first; past the few kept (ours is one of them), they go.
+    variants.sort_by_key(|v| std::cmp::Reverse(v.0));
+    // Best effort: a concurrent run may have pruned one first, or (on
+    // Windows) have one open; the next save tries again.
+    for (_, dir) in variants.into_iter().skip(ENV_VARIANTS_KEPT - 1) {
+        if fs::remove_dir_all(&dir).is_ok() {
             pruned += 1;
         }
     }
@@ -267,13 +292,17 @@ impl SnapshotEntry {
         for key in ["rootfs", "scratch_mb", "entry", "warm_exec"] {
             if let Some(value) = stamp_field(&self.stamp, key)
                 && !value.is_empty()
+                && value != "\"\""
             {
                 if !out.is_empty() {
                     out.push(' ');
                 }
                 out.push_str(key);
                 out.push('=');
-                if value.contains(' ') {
+                if key == "warm_exec" {
+                    // Debug-quoted in the stamp already
+                    out.push_str(value);
+                } else if value.contains(' ') {
                     out.push_str(&format!("{value:?}"));
                 } else {
                     out.push_str(value);
@@ -489,7 +518,7 @@ mod tests {
     fn a_stamp_describes_itself() {
         let entry = SnapshotEntry {
             dir: PathBuf::from("/c/s/ab"),
-            stamp: "key=k\nrootfs=/p/r.cpio\nsize=1\nmtime=2\nscratch_mb=768\nentry=\nwarm_exec=import flask, pandas\n".into(),
+            stamp: "key=k\nrootfs=/p/r.cpio\nsize=1\nmtime=2\nscratch_mb=768\nentry=\nwarm_exec=\"import flask, pandas\"\n".into(),
             bytes: 0,
         };
         assert_eq!(
@@ -498,6 +527,11 @@ mod tests {
         );
         assert_eq!(stamp_field(&entry.stamp, "scratch_mb"), Some("768"));
         assert_eq!(stamp_field(&entry.stamp, "entry"), Some(""));
+        let bare = SnapshotEntry {
+            stamp: "key=k\nrootfs=/p/r.cpio\nscratch_mb=768\nentry=\nwarm_exec=\"\"\n".into(),
+            ..entry
+        };
+        assert_eq!(bare.describe(), "rootfs=/p/r.cpio scratch_mb=768");
         assert_eq!(stamp_field(&entry.stamp, "nope"), None);
     }
 
