@@ -19,9 +19,13 @@ REPO=hyperlight-dev/hyperlight-unikraft
 VERSION=${HLUK_VERSION:-}
 DIR=${HLUK_INSTALL_DIR:-$HOME/.local/bin}
 
+# On Linux the release binary is static (musl), so it runs regardless of
+# the host's glibc; releases up to v0.17.0 carry a glibc build instead,
+# which needs glibc 2.39 or newer.
+fallback=
 case "$(uname -s)-$(uname -m)" in
-    Linux-x86_64) target=x86_64-unknown-linux-gnu ;;
-    Linux-aarch64 | Linux-arm64) target=aarch64-unknown-linux-gnu ;;
+    Linux-x86_64) target=x86_64-unknown-linux-musl; fallback=x86_64-unknown-linux-gnu ;;
+    Linux-aarch64 | Linux-arm64) target=aarch64-unknown-linux-musl; fallback=aarch64-unknown-linux-gnu ;;
     Darwin-arm64) target=aarch64-apple-darwin ;;
     MINGW* | MSYS* | CYGWIN*)
         echo "on Windows, install with PowerShell:" >&2
@@ -48,8 +52,19 @@ url="https://github.com/$REPO/releases/download/$VERSION/$asset"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# Only a missing asset (404) falls back to the glibc build of an earlier
+# release; any other failure stops the install.
 echo "downloading $url"
-curl -fsSL "$url" -o "$tmp/$asset"
+code=$(curl -sSL -w '%{http_code}' -o "$tmp/$asset" "$url") || {
+    echo "cannot download $asset" >&2; exit 1; }
+if [ "$code" = 404 ] && [ -n "$fallback" ]; then
+    asset="hluk-$VERSION-$fallback.tar.gz"
+    url="https://github.com/$REPO/releases/download/$VERSION/$asset"
+    echo "no static build in $VERSION; downloading $url"
+    code=$(curl -sSL -w '%{http_code}' -o "$tmp/$asset" "$url") || {
+        echo "cannot download $asset" >&2; exit 1; }
+fi
+[ "$code" = 200 ] || { echo "cannot download $asset (HTTP $code)" >&2; exit 1; }
 # Verify against the release's checksum file when it has one.  Only its
 # absence (404) skips the check; any other failure stops the install.
 code=$(curl -sSL -w '%{http_code}' -o "$tmp/SHA256SUMS" \
