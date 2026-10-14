@@ -2,7 +2,7 @@
 #
 # Build:  just build-rootfs http-flask examples/http-server/flask/Dockerfile
 # Run:    hluk run --initrd build-elfloader/http-flask-rootfs.cpio \
-#             --scratch-mb 256 --net --port 8080 examples/http-server/flask/server.py
+#             --scratch-mb 256 --port 8080 examples/http-server/flask/server.py
 # -arm64 when `just build-rootfs` builds for another platform
 # (HLUK_ROOTFS_PLATFORM), so the base is that platform's image too.
 ARG ROOTFS_SUFFIX=

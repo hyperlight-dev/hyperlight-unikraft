@@ -2,8 +2,8 @@
 
 The guest binds 0.0.0.0:8080; because hluk backs guest sockets with host
 sockets, the listener is reachable from the host at http://127.0.0.1:8080.
-Run with `--net --port 8080` so the socket layer is registered and the guest
-is allowed to bind that port.
+Run with `--port 8080`, which lets the guest bind that port; it needs no
+`--net`, since it only answers requests.
 """
 from flask import Flask, jsonify
 

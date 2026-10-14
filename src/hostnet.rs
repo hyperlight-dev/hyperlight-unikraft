@@ -1725,6 +1725,31 @@ mod tests {
         assert_eq!(net.sendto(u, b"x", loopback(80)), Err(errno::EACCES));
     }
 
+    /// What listen ports alone give a guest (GuestConfig::new): it serves
+    /// connections from outside and opens none of its own, not even to
+    /// its own listener or a resolver.
+    #[test]
+    fn empty_allow_list_serves_but_reaches_nothing() {
+        let net = Net::new(
+            NetworkPolicy::AllowList(AllowList::empty()),
+            Some(ListenPorts::all()),
+        );
+        let srv = tcp(&net);
+        net.bind(srv, loopback(0)).unwrap();
+        net.listen(srv, 4).unwrap();
+        let addr = net.local_addr(srv).unwrap();
+
+        let _outside = std::net::TcpStream::connect(addr).unwrap();
+        assert_ne!(wait(&net, srv, POLLIN) & POLLIN, 0);
+        net.accept(srv).unwrap();
+
+        let cli = tcp(&net);
+        assert_eq!(net.connect(cli, addr), Err(errno::EACCES));
+        let u = udp(&net);
+        let resolver: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        assert_eq!(net.sendto(u, b"x", resolver), Err(errno::EACCES));
+    }
+
     #[test]
     fn listen_ports_gate_bind() {
         let net = Net::new(

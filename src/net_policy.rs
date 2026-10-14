@@ -293,6 +293,16 @@ impl AllowList {
         })
     }
 
+    /// An allow list that lists nothing: no destination is reachable.
+    pub fn empty() -> Self {
+        Self {
+            allowed_ips: HashSet::new(),
+            hostnames: Vec::new(),
+            learned_ips: Arc::new(Mutex::new(HashSet::new())),
+            resolvers: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
     /// Also treat `ips` as DNS resolvers the guest may ask: the nameservers
     /// of the `resolv.conf` it was given (see `resolv_conf_nameservers`).
     pub fn exempt_resolvers(&self, ips: impl IntoIterator<Item = IpAddr>) {

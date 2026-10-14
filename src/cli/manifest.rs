@@ -106,7 +106,7 @@ pub struct Run {
 }
 
 /// Networking, off unless this table is present.  At most one of `all`,
-/// `allow` and `block`; `ports` needs one of them.
+/// `allow` and `block`; with none of them, `ports` only serve.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Net {
@@ -236,12 +236,6 @@ impl Manifest {
             if policies > 1 {
                 return Err("[run.net] sets more than one of all, allow and block".into());
             }
-            if policies == 0 && !net.ports.is_empty() {
-                return Err(
-                    "[run.net] ports need networking: set all = true, allow = [...] or block = [...]"
-                        .into(),
-                );
-            }
             for port in &net.ports {
                 port.to_spec()?;
             }
@@ -328,6 +322,20 @@ impl Manifest {
         parse_net_policy(net.all, &net.allow, &net.block, &ports)
     }
 
+    /// The ports of `[run.net]` alone: unlike [`network`](Self::network),
+    /// it resolves none of the policy's names.
+    pub fn listen_ports(&self) -> Result<Option<ListenPorts>, String> {
+        let Some(net) = &self.run.net else {
+            return Ok(None);
+        };
+        let ports = net
+            .ports
+            .iter()
+            .map(Port::to_spec)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(parse_net_policy(false, &[], &[], &ports)?.1)
+    }
+
     /// Whether `hluk build` has anything to do for this project.
     pub fn needs_build(&self) -> bool {
         self.build.is_some() || self.rootfs.dockerfile.is_some()
@@ -357,6 +365,25 @@ mod tests {
         [run]
         script = "main.py"
     "#;
+
+    /// Ports alone serve without reaching out (see GuestConfig::new); and
+    /// reading them resolves none of the policy's names, which a run whose
+    /// own flags replace the policy must not fail on.
+    #[test]
+    fn ports_stand_alone_and_resolve_nothing() {
+        let ports_only = Manifest::parse(
+            "manifest_version = 1\n[app]\nname = \"d\"\n[rootfs]\npath = \"r\"\n[run]\n[run.net]\nports = [80]\n",
+        )
+        .unwrap();
+        let (policy, listen) = ports_only.network().unwrap();
+        assert!(policy.is_none() && listen.unwrap().allows(80));
+        let unresolvable = Manifest::parse(
+            "manifest_version = 1\n[app]\nname = \"d\"\n[rootfs]\npath = \"r\"\n[run]\n[run.net]\nallow = [\"no-such-host.invalid\"]\nports = [80]\n",
+        )
+        .unwrap();
+        assert!(unresolvable.network().is_err());
+        assert!(unresolvable.listen_ports().unwrap().unwrap().allows(80));
+    }
 
     fn with_dir(text: &str) -> Manifest {
         let mut m = Manifest::parse(text).unwrap();
@@ -473,10 +500,6 @@ mod tests {
             (
                 "manifest_version = 1\n[app]\nname = \"d\"\n[rootfs]\npath = \"r\"\n[run]\nscript = \"a\"\nexec = \"b\"\n",
                 "more than one of script, exec and guest_exec",
-            ),
-            (
-                "manifest_version = 1\n[app]\nname = \"d\"\n[rootfs]\npath = \"r\"\n[run]\n[run.net]\nports = [80]\n",
-                "ports need networking",
             ),
             (
                 "manifest_version = 1\n[app]\nname = \"d\"\n[rootfs]\npath = \"r\"\n[run]\n[run.net]\nall = true\nallow = [\"x\"]\n",

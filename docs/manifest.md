@@ -1,6 +1,6 @@
 # Projects and the manifest
 
-A project is a directory with a `hluk.toml` in it. `hluk init` writes one from a template, `hluk run` (with no `--initrd`) runs what it describes, `hluk build` compiles it or builds its rootfs, and `hluk pull` refreshes the rootfs it names. The manifest is `hluk run`'s flags written down: every key is a flag, a flag given on the command line wins (`--mount` and `--env` add to the manifest's; any network flag replaces its `[run.net]` table as a whole), and a guest can be run with no manifest at all, from a CPIO (`hluk run --initrd rootfs.cpio main.py`) or a published image by name (`hluk run --runtime python main.py`, pulled into the cache when missing).
+A project is a directory with a `hluk.toml` in it. `hluk init` writes one from a template, `hluk run` (with no `--initrd`) runs what it describes, `hluk build` compiles it or builds its rootfs, and `hluk pull` refreshes the rootfs it names. The manifest is `hluk run`'s flags written down: every key is a flag, a flag given on the command line wins (`--mount` and `--env` add to the manifest's; `--net`, `--net-allow` and `--net-block` replace its `[run.net]` policy and `--port` its ports, each leaving the other), and a guest can be run with no manifest at all, from a CPIO (`hluk run --initrd rootfs.cpio main.py`) or a published image by name (`hluk run --runtime python main.py`, pulled into the cache when missing).
 
 ## The workflow
 
@@ -91,7 +91,8 @@ warm = true                         # snapshot the booted guest; restore it on l
 warm_exec = "import flask"          # run by the driver before that snapshot, so what it loads is in it
 # resolv_conf = "resolv.conf"       # installed as the guest's /etc/resolv.conf
 
-[run.net]                           # omit the table for no networking at all; then at most one of:
+[run.net]                           # omit the table for no networking at all; then at most one of
+                                    # (none: serve on the ports below, reach nothing):
 all = true                          #   every destination (AllowAll)
 # allow = ["pypi.org"]              #   an allow list (hosts or addresses)
 # block = ["169.254.169.254"]       #   a block list

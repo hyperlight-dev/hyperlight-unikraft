@@ -1,6 +1,6 @@
 // Minimal ASP.NET Core Kestrel HTTP server for Hyperlight.
 //
-// Binds 0.0.0.0:8080; run under hluk with `--net --port 8080` so the host can
+// Binds 0.0.0.0:8080; run under hluk with `--port 8080` so the host can
 // reach it at http://127.0.0.1:8080.
 var builder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions());
 builder.WebHost.UseKestrelCore();

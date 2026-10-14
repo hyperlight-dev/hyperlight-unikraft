@@ -1119,7 +1119,14 @@ impl GuestConfig {
     ) -> Self {
         // Networking is opt-in: no policy, no host sockets and nothing for
         // the inter-step wait to watch (the `net_*` functions still exist,
-        // refusing; see `register`).
+        // refusing; see `register`).  Ports to listen on are an opt-in of
+        // their own, for inbound only: the guest may serve on them but
+        // reach nothing, as under an allow list that lists nothing.
+        let network = network.or_else(|| {
+            listen_ports
+                .as_ref()
+                .map(|_| NetworkPolicy::AllowList(AllowList::empty()))
+        });
         let net = network.map(|policy| Arc::new(hostnet::Net::new(policy, listen_ports)));
         Self {
             cmdline,
@@ -2171,7 +2178,9 @@ impl SandboxBuilder {
         self
     }
 
-    /// Ports the guest may bind for inbound connections (requires a network policy).
+    /// Ports the guest may bind for inbound connections.  Without a
+    /// [`network`](Self::network) policy the guest can only serve on them:
+    /// it may open no connection of its own.
     pub fn listen_ports(mut self, ports: ListenPorts) -> Self {
         self.listen_ports = Some(ports);
         self
@@ -3103,6 +3112,16 @@ mod tests {
             Some(SNAPSHOT_KEY)
         );
         assert_eq!(describe_snapshot_tag("0.14.0"), "0.14.0");
+    }
+
+    /// Listen ports alone opt into networking, inbound only (see
+    /// hostnet's empty_allow_list_serves_but_reaches_nothing); neither
+    /// leaves it off.
+    #[test]
+    fn listen_ports_alone_enable_networking() {
+        let config = |ports| GuestConfig::new(String::new(), 0, 0, 0, Vec::new(), None, ports);
+        assert!(config(None).net.is_none());
+        assert!(config(Some(ListenPorts::from_ports([8080]))).net.is_some());
     }
 
     #[test]

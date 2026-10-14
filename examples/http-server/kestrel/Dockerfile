@@ -7,7 +7,7 @@
 #
 # Build:  just build-rootfs http-kestrel examples/http-server/kestrel/Dockerfile
 # Run:    hluk run --initrd build-elfloader/http-kestrel-rootfs.cpio \
-#             --scratch-mb 128 --net --port 8080 --exec /app/KestrelHyperlight
+#             --scratch-mb 128 --port 8080 --exec /app/KestrelHyperlight
 # -arm64 when `just build-rootfs` builds for another platform
 # (HLUK_ROOTFS_PLATFORM), so the base is that platform's image too.
 ARG ROOTFS_SUFFIX=

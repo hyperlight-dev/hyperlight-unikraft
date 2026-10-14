@@ -417,16 +417,8 @@ fn parse_net_policy(
     } else {
         None
     };
-    // Listen ports are meaningless without networking: `hostnet` is only
-    // registered when a policy is present, so `--port` on its own would be a
-    // silent no-op (the guest gets no networking at all).  Reject it up front
-    // rather than let the user believe the guest can bind.
-    if !ports.is_empty() && policy.is_none() {
-        return Err(
-            "--port requires networking to be enabled; pass --net (or --net-allow/--net-block) too"
-                .to_string(),
-        );
-    }
+    // `--port` on its own serves without reaching out: the library gives
+    // listen ports with no policy an allow list that lists nothing.
     let listen = if ports.is_empty() {
         None
     } else if ports.contains(&PortSpec::All) {
@@ -1256,10 +1248,11 @@ mod tests {
     }
 
     #[test]
-    fn net_policy_port_without_net_is_rejected() {
-        // --port alone would be a silent no-op (hostnet is only registered
-        // when a policy is present), so it must be an error, not accepted.
-        let err = parse_net_policy(false, &[], &[], &[PortSpec::One(8080)]).unwrap_err();
-        assert!(err.contains("--port requires networking"), "got: {err}");
+    fn net_policy_port_without_net_grants_no_outbound() {
+        // --port alone names no policy: the library then lets the guest
+        // serve on the port and reach nothing (see GuestConfig::new).
+        let (policy, listen) = parse_net_policy(false, &[], &[], &[PortSpec::One(8080)]).unwrap();
+        assert!(policy.is_none());
+        assert!(listen.unwrap().allows(8080));
     }
 }

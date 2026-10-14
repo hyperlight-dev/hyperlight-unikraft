@@ -32,6 +32,6 @@ hluk snapshot run ../../.snapshots/go --mount ./:/mnt/bin --exec /mnt/bin/hello
 
 ```bash
 hluk run --initrd ../../build-elfloader/go-rootfs.cpio --scratch-mb 256 \
-         --mount ./:/mnt/bin --net --port 8080 --entry "/mnt/bin/counter -port 8080"
+         --mount ./:/mnt/bin --port 8080 --entry "/mnt/bin/counter -port 8080"
 curl http://127.0.0.1:8080/    # count: 1
 ```

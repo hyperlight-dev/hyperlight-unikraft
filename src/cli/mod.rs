@@ -177,8 +177,10 @@ pub struct RunArgs {
     net_block: Vec<String>,
 
     /// Ports the guest may bind to for inbound connections: a port, a
-    /// range LOW-HIGH, or `all` (repeatable). Without this flag, bind()
-    /// is rejected (outbound-only).
+    /// range LOW-HIGH, or `all` (repeatable); replaces a project's ports.
+    /// Without this flag or a project's ports, bind() is rejected
+    /// (outbound-only). Without --net, --net-allow, --net-block or a
+    /// project's policy, the guest serves on them but may connect nowhere.
     #[arg(long = "port", value_name = "PORT|LOW-HIGH|all")]
     ports: Vec<PortSpec>,
 
@@ -832,16 +834,26 @@ pub fn run(args: RunArgs) -> CliResult<()> {
         None => Vec::new(),
     };
     mounts.extend(parse_mounts(&args.mounts)?);
-    let net_given = args.net
-        || !args.net_allow.is_empty()
-        || !args.net_block.is_empty()
-        || !args.ports.is_empty();
-    let (policy, listen) = if net_given {
-        parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?
-    } else if let Some(m) = &manifest {
-        m.network()?
+    // What the guest may reach and the ports it may serve on are settled
+    // apart: the command line's outbound flags replace the project's
+    // policy, and its --port the project's ports.
+    // The project's policy is read only if it is used: reading it resolves
+    // its names, which an overriding run must not fail on.
+    let policy_given = args.net || !args.net_allow.is_empty() || !args.net_block.is_empty();
+    let (policy, manifest_listen) = match &manifest {
+        Some(m) if !policy_given => m.network()?,
+        Some(m) if args.ports.is_empty() => (None, m.listen_ports()?),
+        _ => (None, None),
+    };
+    let policy = if policy_given {
+        parse_net_policy(args.net, &args.net_allow, &args.net_block, &[])?.0
     } else {
-        (None, None)
+        policy
+    };
+    let listen = if args.ports.is_empty() {
+        manifest_listen
+    } else {
+        parse_net_policy(false, &[], &[], &args.ports)?.1
     };
     let mut env: Vec<(String, String)> = manifest
         .as_ref()
