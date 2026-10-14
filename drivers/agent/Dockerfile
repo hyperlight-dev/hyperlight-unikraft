@@ -116,6 +116,10 @@ RUN set -eu; \
     stage /etc/ld.so.cache /etc/ld.so.cache; \
     # /tmp needed for guest filesystem writes (ramfs, in-memory)
     mkdir -p /rootfs/tmp; \
+    # The runtime marker: this image shares hl_pywarmdriver with
+    # python-shell, so without it hluk sizes it (and images built FROM it)
+    # by that driver, too small to unpack into.
+    printf 'agent\n' > /rootfs/etc/hluk-runtime; \
     # Pre-warm driver + lsb_release stub (must be in /bin — guest PATH is /bin)
     stage /hl_pywarmdriver /usr/local/bin/hl_pywarmdriver; \
     stage /usr/bin/lsb_release /bin/lsb_release

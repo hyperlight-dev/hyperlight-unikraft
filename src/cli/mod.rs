@@ -884,7 +884,7 @@ pub fn run(args: RunArgs) -> CliResult<()> {
 
     // Memory: the flag, the manifest's, else the size the runtime image is
     // tested with, by name for --runtime and a published image, by the
-    // driver in the rootfs otherwise.  A kernel with no rootfs takes the
+    // rootfs's runtime marker or driver otherwise.  A kernel with no rootfs takes the
     // library's default.
     let scratch_mb = args.scratch_mb.or_else(|| {
         let path = rootfs.as_deref()?;

@@ -271,7 +271,8 @@ impl Manifest {
     /// The guest's memory: the manifest's `scratch_mb`; else the size the
     /// runtime image is tested with, by the image's name
     /// (`…/agent:initrd-v0.14.1` is `agent`) when the rootfs is a published
-    /// image, else by the driver found in `rootfs`.
+    /// image, else by the runtime `rootfs` names in `etc/hluk-runtime`,
+    /// else by the driver found in it.
     pub fn scratch_mb(&self, rootfs: &Path) -> usize {
         if let Some(mb) = self.run.scratch_mb {
             return mb;
