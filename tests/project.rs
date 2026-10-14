@@ -390,6 +390,7 @@ fn the_python_shell_template_runs_shell_commands() {
     let t = text(&out);
     assert!(t.contains("Hello from pysh!"), "got: {t}");
     assert!(t.contains("/bin/sh"), "`which sh` did not run: {t}");
+    assert!(t.contains("PIPES WORK"), "the pipe did not run: {t}");
 }
 
 #[test]

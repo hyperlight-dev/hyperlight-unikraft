@@ -6,11 +6,11 @@ A **native** Unikraft image for the Hyperlight platform: `helloworld.c`'s `main(
 
 ## Two platform fixes that make native kernels work
 
-Both are on the `plat-hyperlight-cleanup` branch of `unikraft` (the pinned submodule):
+Both are on `unikraft/unikraft`'s `plat-hyperlight-v2` (the pinned `kernel/unikraft` submodule):
 
 1. **`select LIBPOSIX_ENVIRON`** in `plat/hyperlight/Config.uk`. `dispatch.c` injects the `HL_*` pointers into the process environment with `putenv`/`setenv` (from `lib/posix-environ`). The elfloader pulled that in transitively; a native app doesn't, so the platform must declare it — else the kernel fails to link with `undefined reference to putenv`.
 
-2. **Term-pointer fix** in `plat/hyperlight/dispatch.c`. A native app *returns* from `main()`, running the kernel's shutdown path (`uk_pm_shutdown` → term functions → `hyperlight_shutdown`, a clean port-108 halt). This exposed a latent bug: `hyperlight_dispatch_inject_host_env` was registered as `uk_late_initcall(fn, 0x1)`, but that macro's second argument is a **term-function pointer**, not a priority (`0x0` = "no term function"). The `0x1` was a bogus term pointer the shutdown term loop called → `rip: 0x1` crash. The elfloader never hit it (it runs on *dispatch* and never returns from `main`). Fixed to `0x0`.
+2. **Term-pointer fix** in `plat/hyperlight/dispatch.c`. A native app *returns* from `main()`, running the kernel's shutdown path (`uk_pm_shutdown` → term functions → `hyperlight_shutdown`, a clean port-108 halt). This exposed a latent bug: the host-environment initcall (now `hyperlight_dispatch_env_init`) was registered as `uk_late_initcall(fn, 0x1)`, but that macro's second argument is a **term-function pointer**, not a priority (`0x0` = "no term function"). The `0x1` was a bogus term pointer the shutdown term loop called → `rip: 0x1` crash. The elfloader never hit it (it runs on *dispatch* and never returns from `main`). Fixed to `0x0`.
 
 ## Build
 
@@ -25,7 +25,7 @@ The build invokes `make -C kernel/unikraft A=<app>` directly (no per-app `Makefi
 
 ## Files
 
-- `helloworld.c` — the native app (`main()` prints a greeting)
+- `helloworld.c` — the native app (`main()` prints a greeting, and a line to stderr)
 - `Makefile.uk` — Unikraft app build rules (registers `helloworld.c`)
 - `defconfig` — native Hyperlight config (paging + vmem + posix-environ, no elfloader app)
 - `helloworld-native_hyperlight-x86_64` — the prebuilt kernel the test loads

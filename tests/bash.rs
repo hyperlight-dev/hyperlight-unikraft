@@ -109,6 +109,10 @@ fn bash_coreutils() {
         "missing awk section: {output:?}"
     );
     assert!(
+        output.contains("2 admin") && output.contains("1 editor"),
+        "uniq -c pipeline didn't count roles: {output:?}"
+    );
+    assert!(
         output.contains("=== ls ==="),
         "missing ls section: {output:?}"
     );
@@ -219,6 +223,42 @@ fn bash_pipes_and_substitutions() {
         .run(r#"printf 'b\na\nb\n' | sort | uniq -c | wc -l"#)
         .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "2");
+    // An exec'd program inherits fd 2 as the shell's own stderr file.
+    sandbox.run("ls /nope; true").unwrap();
+    assert!(sandbox.drain_stderr().contains("No such file"));
+    sandbox.drain_output();
+    // fd 2 is a file of its own: redirects still move it.
+    sandbox.run("ls /nope 2>&1 | wc -l").unwrap();
+    assert_eq!(sandbox.drain_output().trim(), "1");
+    sandbox.run("ls /nope 2>/dev/null; echo rc=$?").unwrap();
+    assert_eq!(sandbox.drain_stderr(), "");
+    assert_eq!(sandbox.drain_output(), "rc=1\n");
+    sandbox.run("echo to-err >&2").unwrap();
+    assert_eq!(sandbox.drain_stderr(), "to-err\n");
+    // A command that fails to execute: its vfork child exits without an
+    // execve, and must not free the shell's stack on its way out.
+    sandbox.run("nope; sleep 0.1; echo after").unwrap();
+    // The kernel's messages about it are on stderr, without the NUL
+    // bytes they had.
+    let stderr = sandbox.drain_stderr();
+    assert!(
+        stderr.contains("Unable to load") && !stderr.contains('\0'),
+        "{stderr:?}"
+    );
+    assert!(sandbox.drain_output().ends_with("after\n"));
+    // Its kernel message outgrows the kernel's 191-byte line: with an
+    // odd-length prefix the byte limit falls inside an 'é', and the cut
+    // must back off to a whole character, or the host aborts the call.
+    sandbox
+        .run("p=/xy; i=0; while [ $i -lt 100 ]; do p=${p}\u{e9}; i=$((i+1)); done; $p; echo after")
+        .unwrap();
+    // The cut message ends its line: the next kernel message starts one.
+    let stderr = sandbox.drain_stderr();
+    assert!(
+        stderr.contains("\u{e9}\n[") && stderr.ends_with('\n'),
+        "{stderr:?}"
+    );
+    assert!(sandbox.drain_output().ends_with("after\n"));
 }
 
 /// `exit` ends the shell, which is the runtime: the call ends with that

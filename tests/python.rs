@@ -932,4 +932,38 @@ fn python_stderr_apart_from_stdout() {
     assert!(sandbox.run("1 / 0").is_err());
     let stderr = sandbox.drain_stderr();
     assert!(stderr.contains("ZeroDivisionError"), "{stderr:?}");
+
+    // Over 4 KiB of multi-byte characters: several HostPrintErr calls,
+    // each cut between characters.
+    sandbox
+        .run("import sys\nsys.stderr.write('\u{20ac}' * 3000)\nsys.stderr.flush()")
+        .unwrap();
+    assert_eq!(sandbox.drain_stderr(), "\u{20ac}".repeat(3000));
+
+    // fd 2 is a file of its own, still a terminal; /dev/stdout keeps
+    // newlines as written too.
+    sandbox.drain_output();
+    sandbox
+        .run("import os\nprint(os.fstat(1).st_ino != os.fstat(2).st_ino, os.isatty(2))\nf = open('/dev/stdout', 'w')\nf.write('a\\nb\\n')\nf.close()")
+        .unwrap();
+    assert_eq!(sandbox.drain_output(), "True True\na\nb\n");
+}
+
+/// A host without `HostPrintErr` gets standard error through `HostPrint`,
+/// all of it, as before the stream had its own.
+#[test]
+fn python_stderr_reaches_a_host_without_host_print_err() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .without_host_print_err()
+        .boot()
+        .unwrap();
+    sandbox
+        .run("import sys\nprint('out')\nprint('err', file=sys.stderr)\nsys.stderr.write('e' * 10000 + '\\n')\nsys.stderr.flush()\nprint('out again')")
+        .unwrap();
+    assert_eq!(
+        sandbox.drain_output(),
+        format!("out\nerr\n{}\nout again\n", "e".repeat(10000))
+    );
 }

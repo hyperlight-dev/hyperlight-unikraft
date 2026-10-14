@@ -124,3 +124,42 @@ fn python_shell_snapshot_round_trip() {
         "expected hello.py to work after python-shell snapshot restore, got: {output:?}",
     );
 }
+
+/// A pipe and a `$(...)` through `subprocess.run(..., shell=True)`: hush
+/// starts each process with vfork, whose child runs on its parent's TLS.
+#[test]
+fn python_shell_subprocess_pipe() {
+    let rootfs = require_rootfs("python-shell");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            r#"
+import subprocess
+r = subprocess.run('echo hello | tr a-z A-Z; echo "n=$(echo abc | wc -c)"', shell=True, capture_output=True, text=True)
+print(repr(r.stdout), r.returncode)
+"#,
+        )
+        .unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("'HELLO\\nn=4\\n' 0"),
+        "expected the pipe and substitution to run, got: {output:?}",
+    );
+
+    // A program that fails to execute, then a blocking call: the vfork
+    // child that failed must not have freed the parent's stack.
+    sandbox
+        .run("import subprocess, time\ntry:\n    subprocess.run(['/nope/x'])\nexcept OSError:\n    print('oserror')\ntime.sleep(0.2)\nprint('after')")
+        .unwrap();
+    assert!(sandbox.drain_output().ends_with("oserror\nafter\n"));
+
+    // From a thread, whose stack its caller made: the child's program
+    // still gets a stack of its own.
+    sandbox
+        .run("import subprocess, threading\nr = []\nt = threading.Thread(target=lambda: r.append(subprocess.run(['echo', 'from-thread'], capture_output=True, text=True).stdout))\nt.start()\nt.join()\nprint(repr(r))")
+        .unwrap();
+    assert!(sandbox.drain_output().ends_with("['from-thread\\n']\n"));
+}

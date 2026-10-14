@@ -5,5 +5,6 @@ int main(void)
 {
 	uk_pr_warn("native-kernel-boot-marker\n");
 	printf("Hello, World from a NATIVE mini kernel!\n");
+	fprintf(stderr, "native-kernel-stderr\n");
 	return 0;
 }
