@@ -88,9 +88,10 @@ CONFIG_LIBHOSTSOCK=y
 CONFIG_LIBPOSIX_TTY_STDIN_SERIAL=y
 CONFIG_LIBPOSIX_TTY_SERIAL_EOF_FINAL=y
 # stderr is a stream of its own (HostPrintErr), and newlines reach the
-# host as the program wrote them, not as CR-LF.
+# host as the program wrote them, not as CR-LF.  Pinned here on purpose,
+# though the kernel defaults them so for Hyperlight.
 CONFIG_LIBPOSIX_TTY_SERIAL_STDERR=y
-# CONFIG_LIBPOSIX_TTY_SERIAL_ONLCR is not set
+# CONFIG_LIBUKCONSOLE_ONLCR is not set
 # Disable compile-date embedding for reproducible builds — same source
 # always produces the same binary.
 CONFIG_LIBUKLIBID_INFO_COMPILEDATE=n
