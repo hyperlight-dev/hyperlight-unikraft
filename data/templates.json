@@ -25,7 +25,7 @@
   "files": [
    {
     "path": "main.sh",
-    "text": "# BusyBox runs in NOMMU mode here (the kernel has vfork, not fork): every\n# applet is its own process, and a pipe or a $(...) substitution between\n# processes is not supported yet -- so one command per line, and shell\n# builtins (echo, printf, read, test, arithmetic) wherever possible.\necho \"Hello from hello!\"\nprintf 'Running on '\nuname -srm\necho \"inside a Hyperlight micro-VM\"\n"
+    "text": "# BusyBox runs in NOMMU mode here (the kernel has vfork, not fork): every\n# applet is its own process, started with vfork + execve, so pipes and\n# $(...) substitutions work, and shell builtins (echo, printf, read, test,\n# arithmetic) save a process wherever they do the job.\necho \"Hello from hello!\"\nprintf 'Running on '\nuname -srm\necho \"inside a Hyperlight micro-VM\"\n"
    },
    {
     "path": "hluk.toml",
@@ -266,7 +266,7 @@
   "files": [
    {
     "path": "main.py",
-    "text": "import subprocess\nimport sys\n\nprint(f\"Hello from hello!\")\nprint(f\"Python {sys.version_info.major}.{sys.version_info.minor}, inside a Hyperlight micro-VM\")\n\n# /bin/sh is BusyBox's hush. It runs in NOMMU mode here (vfork, not fork),\n# so give it one command at a time: no pipes or $(...) between processes.\nfor cmd in [\"uname -srm\", \"which python3 sh\"]:\n    result = subprocess.run([\"/bin/sh\", \"-c\", cmd], capture_output=True, text=True)\n    print(f\"$ {cmd}\")\n    print(result.stdout, end=\"\")\n"
+    "text": "import subprocess\nimport sys\n\nprint(f\"Hello from hello!\")\nprint(f\"Python {sys.version_info.major}.{sys.version_info.minor}, inside a Hyperlight micro-VM\")\n\n# /bin/sh is BusyBox's hush. It runs in NOMMU mode here (vfork + execve,\n# not fork), and pipes and $(...) work.\nfor cmd in [\"uname -srm\", \"which python3 sh\", \"echo pipes work | tr a-z A-Z\"]:\n    result = subprocess.run([\"/bin/sh\", \"-c\", cmd], capture_output=True, text=True)\n    print(f\"$ {cmd}\")\n    print(result.stdout, end=\"\")\n"
    },
    {
     "path": "hluk.toml",
