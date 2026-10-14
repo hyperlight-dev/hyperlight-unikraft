@@ -774,7 +774,7 @@ dependencies = [
 [[package]]
 name = "hyperlight-common"
 version = "0.17.0"
-source = "git+https://github.com/danbugs/hyperlight?rev=c854bb43#c854bb43c98414c23e8bdab7d58736869b287f12"
+source = "git+https://github.com/danbugs/hyperlight?rev=ff80dda2#ff80dda2603fdb10a6b0f3c295cd857b46cf1dbc"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -793,7 +793,7 @@ dependencies = [
 [[package]]
 name = "hyperlight-host"
 version = "0.17.0"
-source = "git+https://github.com/danbugs/hyperlight?rev=c854bb43#c854bb43c98414c23e8bdab7d58736869b287f12"
+source = "git+https://github.com/danbugs/hyperlight?rev=ff80dda2#ff80dda2603fdb10a6b0f3c295cd857b46cf1dbc"
 dependencies = [
  "anyhow",
  "bindgen",
