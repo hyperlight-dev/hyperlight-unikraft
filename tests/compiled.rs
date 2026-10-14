@@ -115,6 +115,29 @@ fn c_futex_requeue_matches_linux() {
     );
 }
 
+/// sigsuspend() for a signal the caller blocks runs its handler before the
+/// old mask comes back, so `while (!got) sigsuspend(&old)` takes one call,
+/// for a signal queued before the call or arriving during it.
+#[test]
+fn c_sigsuspend_runs_the_handler() {
+    let (status, output) = run_c_check("sigsuspend");
+    assert!(
+        status.is_ok() && output.contains("sigsuspend: all checks pass"),
+        "expected every sigsuspend check to pass, got {status:?}: {output}"
+    );
+}
+
+/// A vfork() parent resumes for its own child's exit, not for another
+/// thread of its that ends while the child runs.
+#[test]
+fn c_vfork_parent_waits_for_its_child() {
+    let (status, output) = run_c_check("vfork_wake");
+    assert!(
+        status.is_ok() && output.contains("vfork wake: all checks pass"),
+        "expected the vfork check to pass, got {status:?}: {output}"
+    );
+}
+
 /// Run a C check program, keeping its output when it fails: the output
 /// says which check did.
 fn run_c_check(name: &str) -> (hyperlight_unikraft::Result<()>, String) {

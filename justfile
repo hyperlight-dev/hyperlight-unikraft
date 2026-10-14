@@ -802,7 +802,7 @@ build-test-bins:
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" "$alpine" sh -c '
             set -eu
             apk add --no-cache gcc musl-dev linux-headers >/dev/null
-            for src in condvar futex_requeue; do
+            for src in condvar futex_requeue sigsuspend vfork_wake; do
                 gcc -O2 -Wall -static-pie -fPIE -pthread -o /out/$src /c/$src.c
                 chown "$HOST_UID:$HOST_GID" /out/$src
             done'

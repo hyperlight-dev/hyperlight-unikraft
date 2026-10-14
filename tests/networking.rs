@@ -303,3 +303,49 @@ fn net_getaddrinfo_dual_stack_passive() {
         "expected the dual-stack passive lookup to succeed, got result={result:?}, output={output:?}",
     );
 }
+
+/// A stream that arrives in two parts is read as fast as it arrives, with
+/// a socket timeout set (Python then polls before each read): the second
+/// part must wake the guest, not wait out the timeout.
+#[test]
+fn net_recv_wakes_for_data_after_a_short_read() {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let rootfs = require_rootfs("python");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        conn.write_all(&[b'a'; 4096]).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        conn.write_all(&[b'b'; 4096]).unwrap();
+    });
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+    let code = format!(
+        "import socket, time\n\
+         s = socket.create_connection(('127.0.0.1', {port}), timeout=10)\n\
+         t, n = time.time(), 0\n\
+         while (b := s.recv(65536)):\n\
+         \x20   n += len(b)\n\
+         print('read', n, 'in', round(time.time() - t, 1))\n"
+    );
+    sandbox.run(code.as_str()).unwrap();
+    server.join().unwrap();
+    let output = sandbox.drain_output();
+    let secs: f64 = output
+        .trim()
+        .rsplit(' ')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(f64::MAX);
+    assert!(
+        output.starts_with("read 8192 in") && secs < 5.0,
+        "expected both parts well before the 10 s timeout, got: {output:?}",
+    );
+}

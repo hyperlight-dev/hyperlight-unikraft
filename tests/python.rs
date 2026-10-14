@@ -1239,6 +1239,48 @@ fn python_echo_output() {
     }
 }
 
+/// Children after and from threads, waits, kills, timeouts, sessions and
+/// process groups: what an agent's command runner does with processes.
+/// 1 GiB: the kernel keeps an exited process's memory (about 15 MiB a
+/// Python), and the demo starts over thirty of them.
+#[test]
+fn python_processes() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(1024)
+        .boot()
+        .unwrap();
+
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/process_demo.py");
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("Process demo passed"),
+        "expected process_demo.py to pass, got: {output:?}",
+    );
+}
+
+/// select() on host sockets reports only what is there, so a server's
+/// shutdown() returns.
+#[test]
+fn python_server_shutdown() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/server_shutdown.py");
+    sandbox.run(Exec::File(script)).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("Server shutdown demo passed"),
+        "expected server_shutdown.py to pass, got: {output:?}",
+    );
+}
+
 /// PYTHONPATH given after the interpreter started (a restored guest) is on
 /// sys.path for the call, in place of the one before it, and gone with it.
 #[test]
@@ -1269,6 +1311,21 @@ fn python_pythonpath_follows_the_environment() {
             && output.contains("path []"),
         "expected sys.path to follow PYTHONPATH, got: {output:?}",
     );
+}
+
+/// A guest out of memory kills the program that asked, as Linux's OOM
+/// killer would, rather than taking the kernel down with a fault.
+#[test]
+fn python_out_of_memory_is_a_kill() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    match sandbox.run("b = b'x' * (400 << 20)") {
+        Err(Error::GuestExited { status: 137 }) => {}
+        other => panic!("expected the guest to exit with 137, got {other:?}"),
+    }
 }
 
 /// A variable the guest had and the host set over it for a while has the

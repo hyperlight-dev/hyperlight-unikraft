@@ -41,6 +41,37 @@ fn agent_data_science() {
     );
 }
 
+/// A shell pipeline and its timeout: the commands an agent runs through
+/// `sh -c`, killed with their process group when they overrun.
+#[test]
+fn agent_shell_pipelines_and_group_kill() {
+    let rootfs = require_rootfs("agent");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(1536)
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            r#"
+import os, signal, subprocess, threading, time
+threading.Thread(target=lambda: None).start()
+r = subprocess.run("seq 1 100 | grep 7 | wc -l", shell=True, capture_output=True, text=True)
+print("pipeline", r.stdout.strip())
+p = subprocess.Popen(["/bin/sh", "-c", "sleep 30 & sleep 30"], start_new_session=True)
+time.sleep(0.2)
+t0 = time.monotonic()
+os.killpg(p.pid, signal.SIGKILL)
+print("killed", p.wait(), time.monotonic() - t0 < 5)
+"#,
+        )
+        .unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("pipeline 19") && output.contains("killed -9 True"),
+        "expected the pipeline to run and the group to die, got: {output:?}",
+    );
+}
+
 #[test]
 fn agent_shell_subprocess() {
     let rootfs = require_rootfs("agent");
