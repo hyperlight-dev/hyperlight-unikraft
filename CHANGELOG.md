@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A `dev` channel: each push to `main` whose CI passes replaces the `dev` pre-release (the `hluk` binaries and a `SHA256SUMS`) and publishes the images of that commit (`:dev-<sha7>`, `:initrd-dev-<sha7>`), so `main` can be installed and run between releases: `HLUK_VERSION=dev` with `install.sh` or `install.ps1`. A dev `hluk` pulls the images of its own commit and prints its build with `--version` (`0.17.0+dev.44ee170`); only the last two builds' images are kept. Releases and their tags are unchanged (`dev.yml`, docs/RELEASE.md).
 - A project site, <https://hyperlight-dev.github.io/hyperlight-unikraft>: startup times from CI, a density measurement (1,000 Python sandboxes in one process, about 2.8 MiB of host memory each), every template, and terminal recordings of `hluk init`, `hluk build` and a guest function call. Its source is `site/`, and `site.yml` publishes it to the `gh-pages` branch on pushes to `main`, beside the CI benchmark history. `just site-serve` previews it, `just site-record` re-records the demos and `site/tools/density.sh` repeats the density measurement.
 
+### Changed
+
+- The Linux release binaries are static, built with musl (`hluk-v<version>-x86_64-unknown-linux-musl.tar.gz` and `aarch64-unknown-linux-musl`), so they run on any distribution. The glibc builds of earlier releases need the glibc of the runner that built them, 2.39, which Debian 12 and Ubuntu 22.04 do not have (#141). `install.sh` installs the static one and, for a release before this, the glibc one.
+
 ### Fixed
 
 - `hluk init NAME --template go` wrote a `go.mod` that Go refused when the name was `go`, `toolchain` or a standard-library package such as `fmt`: the module path is now `example.com/NAME`.

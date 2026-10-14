@@ -18,7 +18,7 @@ User-facing changes are recorded in [`CHANGELOG.md`](../CHANGELOG.md) (Keep a Ch
 3. Bump `version` in `Cargo.toml` on `main` (semver, e.g. `0.2.0`), commit, and push (the `CHANGELOG.md` edit can ride in the same commit).
 4. Actions → **Create release** → **Run workflow**. It:
    - validates the version and that the tag doesn't exist,
-   - builds `hluk` for Linux (x86_64, arm64), macOS (Apple silicon, signed with the hypervisor entitlement) and Windows (x86_64), each on a native runner,
+   - builds `hluk` for Linux (x86_64, arm64; static, with musl, so it runs on any distribution), macOS (Apple silicon, signed with the hypervisor entitlement) and Windows (x86_64), each on a native runner,
    - creates tag `v<version>` and a GitHub Release whose notes are the matching `CHANGELOG.md` section plus GitHub's auto-generated PR list (via `just changelog-notes v<version>`; the run fails if that section is missing), with the binaries attached (`hluk-v<version>-<target>.tar.gz`/`.zip`) and a `SHA256SUMS` over them; the release stays a draft until the last of these is attached,
    - triggers `publish-images.yml` for that tag.
 
@@ -28,7 +28,7 @@ Nothing is pushed to crates.io as part of this — that is deliberate.
 
 ## What's published
 
-- **GitHub Release**: `hluk` binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`, their `SHA256SUMS`, and release notes extracted from the matching [`CHANGELOG.md`](../CHANGELOG.md) section.
+- **GitHub Release**: `hluk` binaries for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`, their `SHA256SUMS`, and release notes extracted from the matching [`CHANGELOG.md`](../CHANGELOG.md) section.
 - **GHCR** (`ghcr.io/<owner>/<repo>/…`):
   - `<runtime>` — one package per runtime (`python`, `node`, `agent`, `python-shell`, `bash`, `c`, `go`, `rust`, `dotnet-aot`, `dotnet-jit`, `java`, `powershell`, `quickjs`, `wasmtime`), with two tags, each a multi-platform index (linux/amd64 and linux/arm64):
     - `:latest` (+ `:v<version>`) — the rootfs filesystem image; build a custom guest `FROM <registry>/<runtime>`.
