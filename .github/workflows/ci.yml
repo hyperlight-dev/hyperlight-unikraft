@@ -221,6 +221,72 @@ jobs:
       - name: cargo test
         run: just test --locked
 
+  # ── Static Linux binaries ───────────────────────────────────
+  # The Linux release and dev binaries are static musl builds (release.yml,
+  # dev.yml), which the other jobs never compile.  Build both here, and
+  # boot a guest with the x86_64 one, where the hosted runner has KVM.
+  static-linux:
+    name: static-linux (${{ matrix.target }})
+    needs: rootfs
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: musl toolchain
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+          # The pinned toolchain first: `target add` installing it by itself
+          # is deprecated in rustup.
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+
+      - name: Build hluk (static)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Static, and runs
+        run: |
+          bin=target/${{ matrix.target }}/release/hluk
+          file "$bin" | grep -Eq 'static(ally|-pie) linked' || { file "$bin"; exit 1; }
+          "$bin" --version
+
+      - name: Restore guest images
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build-elfloader
+          key: ${{ needs.rootfs.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Enable KVM
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+
+      - name: Boot a guest
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          target/${{ matrix.target }}/release/hluk run \
+            --initrd build-elfloader/python-rootfs.cpio examples/python/hello.py
+
   # ── Demos ──────────────────────────────────────────────────────
   # End-to-end demo/example runs the integration tests don't cover (in-guest
   # HTTP servers, the autonomous appliance, pptx generation, a local agent, the
@@ -480,7 +546,7 @@ jobs:
   # ── Gate ──────────────────────────────────────────────────────
   ci-passed:
     if: always()
-    needs: [lint, lint-arm64, typos, kernel-verify, rootfs, test, demos, conformance, bench]
+    needs: [lint, lint-arm64, typos, kernel-verify, rootfs, test, static-linux, demos, conformance, bench]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
