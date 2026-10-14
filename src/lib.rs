@@ -748,6 +748,22 @@ struct Guest {
 
 // ── GuestConfig ─────────────────────────────────────────────────────────
 
+/// A guest output stream, and the host function that carries it.
+#[derive(Clone, Copy)]
+enum Stream {
+    Out,
+    Err,
+}
+
+impl Stream {
+    fn host_function(self) -> &'static str {
+        match self {
+            Stream::Out => "HostPrint",
+            Stream::Err => "HostPrintErr",
+        }
+    }
+}
+
 /// Runtime parameters for the guest's host functions.
 ///
 /// Built once during sandbox setup, then used to register identical
@@ -755,7 +771,8 @@ struct Guest {
 ///
 /// The fields are internal — a caller receives a `GuestConfig` from
 /// [`SandboxBuilder::boot`] and interacts with it through the
-/// methods ([`set_env_vars`](Self::set_env_vars), [`drain_output`](Self::drain_output)).
+/// methods ([`set_env_vars`](Self::set_env_vars), [`drain_stderr`](Self::drain_stderr),
+/// [`drain_output`](Self::drain_output)).
 pub(crate) struct GuestConfig {
     cmdline: String,
     scratch_size: usize,
@@ -786,6 +803,9 @@ pub(crate) struct GuestConfig {
     result: Arc<Mutex<Option<Vec<u8>>>>,
     /// The embedder's functions, served through `HostCall`.
     host_functions: HostFunctionTable,
+    /// Whether to register `HostPrintErr`; off only to test a host
+    /// without it ([`SandboxBuilder::without_host_print_err`]).
+    host_print_err: bool,
     /// What those events add up to.
     guest: Mutex<Guest>,
     /// Where this sandbox's time goes (off unless asked for).
@@ -825,6 +845,7 @@ impl GuestConfig {
             events: Arc::new(Mutex::new(Vec::new())),
             result: Arc::new(Mutex::new(None)),
             host_functions: HostFunctionTable::default(),
+            host_print_err: true,
             guest: Mutex::new(Guest::default()),
             profile: profile::Profile::new(),
             env_version: std::sync::atomic::AtomicU64::new(next_env_version()),
@@ -834,6 +855,11 @@ impl GuestConfig {
     /// The embedder's host functions; set before [`register`](Self::register).
     fn with_host_functions(mut self, table: HostFunctionTable) -> Self {
         self.host_functions = table;
+        self
+    }
+
+    fn with_host_print_err(mut self, on: bool) -> Self {
+        self.host_print_err = on;
         self
     }
 
@@ -899,14 +925,58 @@ impl GuestConfig {
         *self.resolv_conf.lock().unwrap() = with_single_request(content);
     }
 
-    /// Drain captured guest output, clearing the buffer.
+    /// Drain captured guest output, clearing the buffer and the
+    /// standard-error one, so a caller that never drains standard error
+    /// does not grow it.
     pub fn drain_output(&self) -> String {
-        self.output.lock().unwrap().split_off(0)
+        *self.stderr.lock().unwrap() = String::new();
+        std::mem::take(&mut *self.output.lock().unwrap())
     }
 
     /// Drain captured guest standard error, clearing that buffer.
     pub fn drain_stderr(&self) -> String {
-        self.stderr.lock().unwrap().split_off(0)
+        std::mem::take(&mut *self.stderr.lock().unwrap())
+    }
+
+    /// The print host function for `stream`: the guest's text to the host's
+    /// stdout or stderr, flushed, and captured — standard error both with the
+    /// rest and on its own.  It uses `print!`/`eprint!`, which a test harness
+    /// captures and which panic on a failed write, so `hluk run | head -1`
+    /// ends when its reader does.
+    fn print_host_function(
+        &self,
+        stream: Stream,
+    ) -> impl Fn(String) -> hyperlight_host::Result<i32> + Send + Sync + 'static {
+        let prof = self.profile.clone();
+        let output = self.output.clone();
+        let stderr = self.stderr.clone();
+        let name = stream.host_function();
+        move |msg: String| {
+            use std::io::Write;
+            let _profile = prof.host(name);
+            // Captured after the write, so a failed one leaves both
+            // buffers as they were.
+            match stream {
+                Stream::Out => {
+                    print!("{msg}");
+                    let _ = std::io::stdout().flush();
+                }
+                Stream::Err => {
+                    // Unbuffered: nothing to flush.
+                    eprint!("{msg}");
+                    stderr.lock().unwrap().push_str(&msg);
+                }
+            }
+            output.lock().unwrap().push_str(&msg);
+            Ok(msg.len() as i32)
+        }
+    }
+
+    /// Register `stream`'s print host function, name and closure from the
+    /// one value so they cannot disagree.
+    fn register_print(&self, target: &mut impl Registerable, stream: Stream) -> Result<()> {
+        target.register_host_function(stream.host_function(), self.print_host_function(stream))?;
+        Ok(())
     }
 
     /// Register host functions on any [`Registerable`] target.
@@ -917,39 +987,13 @@ impl GuestConfig {
         // Override Hyperlight's default HostPrint (which wraps output in
         // green ANSI on stdout) — send guest output to stdout uncolored,
         // and capture it for programmatic access.
-        let output = self.output.clone();
-        let prof = self.profile.clone();
-        target.register_host_function(
-            "HostPrint",
-            move |msg: String| -> hyperlight_host::Result<i32> {
-                let _profile = prof.host("HostPrint");
-                use std::io::Write;
-                let len = msg.len() as i32;
-                print!("{msg}");
-                let _ = std::io::stdout().flush();
-                output.lock().unwrap().push_str(&msg);
-                Ok(len)
-            },
-        )?;
+        self.register_print(target, Stream::Out)?;
 
-        // The guest's standard error (and its kernel's messages): to
-        // stderr, captured with the rest and on its own.
-        let output = self.output.clone();
-        let stderr = self.stderr.clone();
-        let prof = self.profile.clone();
-        target.register_host_function(
-            "HostPrintErr",
-            move |msg: String| -> hyperlight_host::Result<i32> {
-                let _profile = prof.host("HostPrintErr");
-                use std::io::Write;
-                let len = msg.len() as i32;
-                eprint!("{msg}");
-                let _ = std::io::stderr().flush();
-                output.lock().unwrap().push_str(&msg);
-                stderr.lock().unwrap().push_str(&msg);
-                Ok(len)
-            },
-        )?;
+        // Optional only so a test can stand in for a host without it, whose
+        // guest then sends standard error through HostPrint.
+        if self.host_print_err {
+            self.register_print(target, Stream::Err)?;
+        }
 
         let cmdline = self.cmdline.clone();
         let prof = self.profile.clone();
@@ -1561,6 +1605,7 @@ fn assemble_sandbox(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     host_functions: HostFunctionTable,
+    host_print_err: bool,
 ) -> Result<(UninitializedSandbox, GuestConfig)> {
     let scratch_size = scratch_mb * 1024 * 1024;
     info!(scratch_mb, "guest memory");
@@ -1633,7 +1678,8 @@ fn assemble_sandbox(
         network,
         listen_ports,
     )
-    .with_host_functions(host_functions);
+    .with_host_functions(host_functions)
+    .with_host_print_err(host_print_err);
 
     config.register(&mut usandbox)?;
 
@@ -1682,6 +1728,7 @@ pub struct SandboxBuilder {
     resolv_conf: Option<String>,
     host_functions: std::collections::BTreeMap<String, HostFunction>,
     profile: Option<bool>,
+    host_print_err: bool,
 }
 
 impl SandboxBuilder {
@@ -1700,6 +1747,7 @@ impl SandboxBuilder {
             resolv_conf: None,
             host_functions: std::collections::BTreeMap::new(),
             profile: None,
+            host_print_err: true,
         }
     }
 
@@ -1863,6 +1911,16 @@ impl SandboxBuilder {
         self
     }
 
+    /// Leave out the `HostPrintErr` host function, as an older or
+    /// third-party host does: the guest's standard error then reaches
+    /// `HostPrint`.  For testing that fallback, on a fresh boot: a snapshot
+    /// saved with `HostPrintErr` will not restore without it.
+    #[doc(hidden)]
+    pub fn without_host_print_err(mut self) -> Self {
+        self.host_print_err = false;
+        self
+    }
+
     /// Register the host functions, bring the guest to a running state, and
     /// return it as a [`AppSandbox`].
     ///
@@ -1883,6 +1941,7 @@ impl SandboxBuilder {
             resolv_conf,
             host_functions,
             profile,
+            host_print_err,
         } = self;
         // The empty name asks for the list of functions, one per line, so
         // neither it nor a line break can be in a function's name.
@@ -1912,8 +1971,14 @@ impl SandboxBuilder {
         let (sandbox, cfg) = match snapshot {
             Some(snapshot) => {
                 let started = Instant::now();
-                let (sandbox, cfg) =
-                    restore_snapshot(snapshot, mounts, network, listen_ports, host_functions)?;
+                let (sandbox, cfg) = restore_snapshot(
+                    snapshot,
+                    mounts,
+                    network,
+                    listen_ports,
+                    host_functions,
+                    host_print_err,
+                )?;
                 if let Some(on) = profile {
                     cfg.profile.set_enabled(on);
                 }
@@ -1963,6 +2028,7 @@ impl SandboxBuilder {
                     network,
                     listen_ports,
                     host_functions,
+                    host_print_err,
                 )?;
                 // Before the boot: the kernel fetches the environment once
                 // on its way to main(), so an entry-point program starts
@@ -2462,14 +2528,15 @@ impl AppSandbox {
     }
 
     /// Take the guest output captured so far: standard output and
-    /// standard error, in the order the guest wrote them.
+    /// standard error, in the order the guest wrote them.  It also drops
+    /// what [`drain_stderr`](Self::drain_stderr) would return, so take that
+    /// first.
     pub fn drain_output(&self) -> String {
         self.config.drain_output()
     }
 
     /// Take the guest standard error captured so far, apart from standard
-    /// output.  [`drain_output`](Self::drain_output) has it too, in place,
-    /// and each drains its own buffer.
+    /// output.  [`drain_output`](Self::drain_output) has it too, in place.
     pub fn drain_stderr(&self) -> String {
         self.config.drain_stderr()
     }
@@ -2508,6 +2575,7 @@ fn restore_snapshot(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     host_functions: HostFunctionTable,
+    host_print_err: bool,
 ) -> Result<(MultiUseSandbox, GuestConfig)> {
     let config = GuestConfig::new(
         String::new(),
@@ -2518,7 +2586,8 @@ fn restore_snapshot(
         network,
         listen_ports,
     )
-    .with_host_functions(host_functions);
+    .with_host_functions(host_functions)
+    .with_host_print_err(host_print_err);
     let mut hf = HostFunctions::default();
     config.register(&mut hf)?;
 
