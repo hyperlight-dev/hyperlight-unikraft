@@ -50,7 +50,7 @@ int main(int argc, char **argv)
 	 * subprocess.run(["python3", ...]) fails.  Replace it before
 	 * Py_Initialize copies environ into os.environ; a host --env PATH is
 	 * applied per call after this and still wins. */
-	setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
+	hl_py_set_path();
 
 	/* Initialize Python while VFS is fully alive — open(),
 	 * read(), etc. all work for loading /usr/lib/python3.12/ */

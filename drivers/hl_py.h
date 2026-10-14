@@ -28,29 +28,113 @@
  * so nothing to quote and no limit on count or length, and the user's
  * code keeps its own line numbers in tracebacks.
  */
+struct hl_py_env_ctx {
+	PyObject *environ;
+	PyObject *keys;		/* the host's names, this refresh */
+};
+
+/* The PATH the drivers start Python with (hl_py_set_path()): the guest's
+ * own, even when the host gives the same value at boot, so taking the
+ * host's away puts it back rather than unsetting PATH. */
+static const char HL_PY_PATH[] = "/usr/local/bin:/usr/bin:/bin";
+
+static inline void hl_py_set_path(void)
+{
+	setenv("PATH", HL_PY_PATH, 1);
+}
+
+/* The names the host's environment had at the last refresh */
+static PyObject *g_hl_py_host_keys;
+/* The guest's own values of names the host set over them, to put back
+ * when the host stops sending them */
+static PyObject *g_hl_py_own_env;
+
 static void hl_py_env_visitor(const char *key, const char *val, void *ctx)
 {
-	PyObject *environ = ctx;
+	struct hl_py_env_ctx *c = ctx;
 	PyObject *k = PyUnicode_DecodeFSDefault(key);
 	PyObject *v = PyUnicode_DecodeFSDefault(val);
+	PyObject *own;
 
-	if (!k || !v || PyObject_SetItem(environ, k, v) < 0)
-		PyErr_Print();
+	if (!k || !v)
+		goto err;
+	/* A name the host takes over keeps the guest's value aside (os.environ
+	 * still has it: setenv() reached only the C side).  At the first
+	 * refresh, made at boot (hl_py_serve()), a value equal to the host's
+	 * is the host's own, given at boot, not the guest's: taking it away
+	 * unsets it.  PATH is the exception: the driver set it itself. */
+	if (!(g_hl_py_host_keys && PySet_Contains(g_hl_py_host_keys, k) == 1) &&
+	    PySet_Contains(c->keys, k) != 1 &&
+	    (own = PyObject_GetItem(c->environ, k))) {
+		if (!g_hl_py_own_env)
+			g_hl_py_own_env = PyDict_New();
+		if ((g_hl_py_host_keys || strcmp(key, "PATH") == 0 ||
+		     PyObject_RichCompareBool(own, v, Py_EQ) != 1) &&
+		    g_hl_py_own_env &&
+		    PyDict_SetDefault(g_hl_py_own_env, k, own) == NULL)
+			PyErr_Print();
+		Py_DECREF(own);
+	}
+	PyErr_Clear();
+	if (PyObject_SetItem(c->environ, k, v) < 0 || PySet_Add(c->keys, k) < 0)
+		goto err;
+	Py_DECREF(k);
+	Py_DECREF(v);
+	return;
+err:
+	PyErr_Print();
 	Py_XDECREF(k);
 	Py_XDECREF(v);
 }
 
 /* Refresh the environment: setenv() for the C side, os.environ for
- * Python's. */
+ * Python's.  The host sends its whole environment each time, so a name it
+ * sent before and not now was taken away: it goes back to the guest's own
+ * value, or from os.environ (and so from the C environ) if the guest had
+ * none, or a PYTHONPATH dropped would stay. */
 static void hl_py_env_refresh(void)
 {
 	PyObject *os = PyImport_ImportModule("os");
-	PyObject *environ = os ? PyObject_GetAttrString(os, "environ") : NULL;
+	struct hl_py_env_ctx c = {
+		.environ = os ? PyObject_GetAttrString(os, "environ") : NULL,
+		.keys = PySet_New(NULL),
+	};
 
-	if (!environ)
+	if (!c.environ || !c.keys) {
 		PyErr_Print();
-	hl_env_refresh(environ ? hl_py_env_visitor : NULL, environ);
-	Py_XDECREF(environ);
+		hl_env_refresh(NULL, NULL);
+		goto out;
+	}
+	if (hl_env_refresh(hl_py_env_visitor, &c) < 0)
+		goto out;
+	if (g_hl_py_host_keys) {
+		PyObject *gone = PyNumber_Subtract(g_hl_py_host_keys, c.keys);
+		PyObject *it = gone ? PyObject_GetIter(gone) : NULL, *k;
+
+		while (it && (k = PyIter_Next(it))) {
+			PyObject *own = g_hl_py_own_env
+				? PyDict_GetItemWithError(g_hl_py_own_env, k) : NULL;
+
+			if (own) {
+				if (PyObject_SetItem(c.environ, k, own) < 0 ||
+				    PyDict_DelItem(g_hl_py_own_env, k) < 0)
+					PyErr_Print();
+			} else if (!PyErr_Occurred() &&
+				   PyMapping_HasKey(c.environ, k) &&
+				   PyObject_DelItem(c.environ, k) < 0) {
+				PyErr_Print();
+			}
+			Py_DECREF(k);
+		}
+		if (PyErr_Occurred())
+			PyErr_Print();
+		Py_XDECREF(it);
+		Py_XDECREF(gone);
+	}
+	Py_XSETREF(g_hl_py_host_keys, Py_NewRef(c.keys));
+out:
+	Py_XDECREF(c.keys);
+	Py_XDECREF(c.environ);
 	Py_XDECREF(os);
 }
 
@@ -137,6 +221,7 @@ static unsigned long g_hl_py_serving;
 
 static PyObject *g_hl_py_dumps, *g_hl_py_loads, *g_hl_py_host_error;
 static PyObject *g_hl_py_call_fn;	/* hyperlight._call */
+static PyObject *g_hl_py_sync_path_fn;	/* hyperlight._sync_path */
 
 /* hyperlight.call(name, *args): the host function `name`, its arguments
  * and result as JSON. */
@@ -248,7 +333,66 @@ static const char HL_PY_MODULE_SRC[] =
 	"        async def wait():\n"
 	"            return await r\n"
 	"        r = asyncio.run(wait())\n"
-	"    return None if r is None else _json.dumps(r)\n";
+	"    return None if r is None else _json.dumps(r)\n"
+	"# PYTHONPATH as sys.path has it: read once, at startup, as Python does,\n"
+	"# an empty entry of a nonempty one being the working directory.\n"
+	"def _pythonpath():\n"
+	"    import os\n"
+	"    text = os.environ.get('PYTHONPATH', '')\n"
+	"    return [os.path.abspath(p) for p in text.split(os.pathsep)] if text else []\n"
+	"_path_from_env = list(dict.fromkeys(_pythonpath()))\n"
+	"_pythonpath_text = __import__('os').environ.get('PYTHONPATH', '')\n"
+	"# What sys.path holds whatever PYTHONPATH says: the standard library\n"
+	"# and site-packages, which a PYTHONPATH that names them only moves.\n"
+	"def _base_path():\n"
+	"    import os\n"
+	"    # The stdlib zip, not one PYTHONPATH named at boot\n"
+	"    base = {x for x in _sys.path if x.endswith('.zip') and x not in _path_from_env}\n"
+	"    try:\n"
+	"        import sysconfig\n"
+	"        p = sysconfig.get_paths()\n"
+	"        base.update(p[k] for k in ('stdlib', 'platstdlib', 'purelib', 'platlib'))\n"
+	"        base.add(os.path.join(p['platstdlib'], 'lib-dynload'))\n"
+	"    except Exception:\n"
+	"        pass  # an image without sysconfig's data: only the zip is known\n"
+	"    return {os.path.abspath(x) for x in base}\n"
+	"_base = _base_path()\n"
+	"# The order startup gave sys.path, for a standard directory a PYTHONPATH\n"
+	"# moved to go back to\n"
+	"_startup_path = list(_sys.path)\n"
+	"def _sync_path():\n"
+	"    # A host sets PYTHONPATH per call, often after the interpreter\n"
+	"    # started (a warm guest): put its entries where startup would have.\n"
+	"    global _path_from_env, _pythonpath_text\n"
+	"    # The text, not the paths: a relative entry is resolved once, as\n"
+	"    # at startup, not again after the program changes directory.\n"
+	"    import os\n"
+	"    text = os.environ.get('PYTHONPATH', '')\n"
+	"    if text == _pythonpath_text:\n"
+	"        return\n"
+	"    _pythonpath_text = text\n"
+	"    # Once each, as startup's site.removeduppaths() leaves it\n"
+	"    new = list(dict.fromkeys(_pythonpath()))\n"
+	"    if new == _path_from_env:\n"
+	"        return\n"
+	"    path = _sys.path\n"
+	"    # Where the old entries were, else the front, as at startup\n"
+	"    at = min((path.index(p) for p in _path_from_env if p in path), default=0)\n"
+	"    gone = [p for p in _path_from_env if p not in _base]\n"
+	"    path[:] = ([p for p in path[:at] if p not in new] + new +\n"
+	"               [p for p in path[at:] if p not in new and p not in gone])\n"
+	"    # A standard directory the last PYTHONPATH named and this one does\n"
+	"    # not goes back before what followed it at startup: the last first,\n"
+	"    # so each one's successor is already back in place.\n"
+	"    for p in sorted(set(_path_from_env) & set(_startup_path),\n"
+	"                    key=_startup_path.index, reverse=True):\n"
+	"        if p in _base and p not in new and p in path:\n"
+	"            path.remove(p)\n"
+	"            after = _startup_path[_startup_path.index(p) + 1:]\n"
+	"            path.insert(next((path.index(q) for q in after\n"
+	"                              if q in path and q not in new),\n"
+	"                             len(path)), p)\n"
+	"    _path_from_env = new\n";
 
 static PyObject *hl_py_module_init(void)
 {
@@ -273,7 +417,8 @@ static PyObject *hl_py_module_init(void)
 		goto fail;
 	Py_DECREF(r);
 	g_hl_py_call_fn = PyObject_GetAttrString(m, "_call");
-	if (!g_hl_py_call_fn)
+	g_hl_py_sync_path_fn = PyObject_GetAttrString(m, "_sync_path");
+	if (!g_hl_py_call_fn || !g_hl_py_sync_path_fn)
 		goto fail;
 	return m;
 fail:
@@ -342,6 +487,13 @@ static int hl_py_call(const char *name, size_t name_len, const char *input,
 static int hl_py_run(const uint8_t *fc, size_t fc_len)
 {
 	hl_py_env_refresh();
+	if (g_hl_py_sync_path_fn) {
+		PyObject *r = PyObject_CallNoArgs(g_hl_py_sync_path_fn);
+
+		if (!r)
+			PyErr_Print();
+		Py_XDECREF(r);
+	}
 
 	/* Extract the code string from the FunctionCall FlatBuffer */
 	size_t code_len;
@@ -451,6 +603,10 @@ static inline __attribute__((noreturn)) void hl_py_serve(void)
 	if (!m)
 		PyErr_Print();
 	Py_XDECREF(m);
+	/* Learn the host's environment while it is still the one the
+	 * interpreter started with, so a variable it gave at boot is known
+	 * for the host's, whatever it sends before the first call. */
+	hl_py_env_refresh();
 	hl_driver_serve_calls();
 	g_hl_py_tstate = PyEval_SaveThread();
 	hl_driver_run(hl_py_dispatch);

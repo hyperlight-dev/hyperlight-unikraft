@@ -1195,11 +1195,11 @@ impl GuestConfig {
     /// the host and calls `setenv()` for every returned variable.
     ///
     /// **Caveat — full replace, not merge**: This replaces the entire
-    /// env var set, not merging with the previous one.  Variables
-    /// removed from the host side will **not** be unset in the guest's
-    /// glibc `environ` — `hl_env_refresh()` only calls `setenv()`,
-    /// never `unsetenv()`.  Stale variables from earlier dispatches
-    /// linger in the guest until it is restored from a snapshot.
+    /// env var set, not merging with the previous one.  The Python
+    /// drivers unset a variable removed from the host side; the others'
+    /// `hl_env_refresh()` only calls `setenv()`, never `unsetenv()`, so
+    /// there stale variables from earlier dispatches linger until the
+    /// guest is restored from a snapshot.
     ///
     /// ```no_run
     /// # use hyperlight_unikraft::SandboxBuilder;
@@ -1209,7 +1209,10 @@ impl GuestConfig {
     /// ```
     pub fn set_env_vars(&self, vars: &[(&str, &str)]) {
         let mut s = String::new();
-        for (k, v) in vars {
+        // A name given twice (a project's and a run's): the last wins, and
+        // the guest is told it once.
+        let last = |i: usize, k: &str| !vars[i + 1..].iter().any(|(later, _)| *later == k);
+        for (_, (k, v)) in vars.iter().enumerate().filter(|(i, (k, _))| last(*i, k)) {
             s.push_str(k);
             s.push('=');
             s.push_str(v);
@@ -3128,6 +3131,14 @@ mod tests {
             Some(SNAPSHOT_KEY)
         );
         assert_eq!(describe_snapshot_tag("0.14.0"), "0.14.0");
+    }
+
+    /// A name given twice reaches the guest once, with the last value.
+    #[test]
+    fn env_names_given_twice_keep_the_last() {
+        let config = GuestConfig::new(String::new(), 0, 0, 0, Vec::new(), None, None);
+        config.set_env_vars(&[("A", "1"), ("B", "2"), ("A", "3")]);
+        assert_eq!(*config.env_str.lock().unwrap(), "B=2\0A=3\0");
     }
 
     /// Listen ports alone opt into networking, inbound only (see

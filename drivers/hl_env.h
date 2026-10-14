@@ -41,9 +41,9 @@ static char *g_hl_env_buf;
  * Fetch the host's environment and setenv() every variable, overriding
  * what was there; cb, if non-NULL, sees each one too.
  *
- * Returns the number of variables set: 0 if there are none, if the
- * device is not open, or on a kernel without the ioctl (then there is
- * nothing to refresh from).
+ * Returns the number of variables set, 0 if there are none; -1 if the
+ * environment could not be read (the device is not open, or the kernel
+ * has no such ioctl), when there is nothing to refresh from.
  */
 static inline int hl_env_refresh(hl_env_cb_t cb, void *ctx)
 {
@@ -51,11 +51,11 @@ static inline int hl_env_refresh(hl_env_cb_t cb, void *ctx)
 	int count = 0;
 
 	if (g_hl_call_fd < 0)
-		return 0;
+		return -1;
 	if (!g_hl_env_buf) {
 		g_hl_env_buf = malloc(g_hl_call_cap);
 		if (!g_hl_env_buf)
-			return 0;
+			return -1;
 	}
 
 	env.buf = g_hl_env_buf;
@@ -65,7 +65,7 @@ static inline int hl_env_refresh(hl_env_cb_t cb, void *ctx)
 		if (errno != ENOTTY)
 			fprintf(stderr, "hl_env: cannot read the host environment: %s\n",
 				strerror(errno));
-		return 0;
+		return -1;
 	}
 
 	for (char *p = env.buf, *end = env.buf + env.len; p < end;

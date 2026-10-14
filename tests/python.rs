@@ -1238,3 +1238,169 @@ fn python_echo_output() {
         assert!(!stderr.contains("marker-out"), "echo {echo}: {stderr}");
     }
 }
+
+/// PYTHONPATH given after the interpreter started (a restored guest) is on
+/// sys.path for the call, in place of the one before it, and gone with it.
+#[test]
+fn python_pythonpath_follows_the_environment() {
+    let rootfs = require_rootfs("python");
+    let snap_dir = temp_dir("py-pythonpath");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox.snapshot_to(&snap_dir).unwrap();
+
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap_dir)
+        .unwrap()
+        .boot()
+        .unwrap();
+    let probe = "import sys; print('path', [p for p in sys.path if p.startswith('/lib-')])";
+    sandbox.set_env_vars(&[("PYTHONPATH", "/lib-a:/lib-b")]);
+    sandbox.run(probe).unwrap();
+    sandbox.set_env_vars(&[("PYTHONPATH", "/lib-c")]);
+    sandbox.run(probe).unwrap();
+    sandbox.set_env_vars(&[]);
+    sandbox.run(probe).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("path ['/lib-a', '/lib-b']")
+            && output.contains("path ['/lib-c']")
+            && output.contains("path []"),
+        "expected sys.path to follow PYTHONPATH, got: {output:?}",
+    );
+}
+
+/// A variable the guest had and the host set over it for a while has the
+/// guest's own value again once the host stops sending it.
+#[test]
+fn python_env_var_taken_back_restores_the_guests_own() {
+    let rootfs = require_rootfs("python");
+    let snap_dir = temp_dir("py-env-own");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox.snapshot_to(&snap_dir).unwrap();
+
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap_dir)
+        .unwrap()
+        .boot()
+        .unwrap();
+    let probe = "import os; print('PATH=' + os.environ.get('PATH', '<unset>'))";
+    sandbox.run(probe).unwrap();
+    let own = sandbox.drain_output();
+    sandbox.set_env_vars(&[("PATH", "/opt/bin")]);
+    sandbox.run(probe).unwrap();
+    sandbox.set_env_vars(&[]);
+    sandbox.run(probe).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        own.contains("PATH=/usr/local/bin")
+            && output.starts_with("PATH=/opt/bin")
+            && output.ends_with(&own),
+        "expected PATH to come back to {own:?}, got: {output:?}",
+    );
+}
+
+/// A variable the host gave at boot and then stops sending is unset: it
+/// was the host's, not the guest's own.
+#[test]
+fn python_env_var_given_at_boot_can_be_taken_away() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .env("PYTHONPATH", "/boot-lib")
+        .boot()
+        .unwrap();
+    let probe = "import os, sys; print(os.environ.get('PYTHONPATH'), '/boot-lib' in sys.path)";
+    // Changed before the first call, then taken away: still the host's.
+    sandbox.set_env_vars(&[("PYTHONPATH", "/other")]);
+    sandbox.run(probe).unwrap();
+    sandbox.set_env_vars(&[]);
+    sandbox.run(probe).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.starts_with("/other False") && output.contains("None False"),
+        "expected PYTHONPATH to be gone, got: {output:?}",
+    );
+}
+
+/// The driver's own PATH stays the guest's when the host gives the same
+/// value at boot: taking the host's away leaves PATH set, not unset.
+#[test]
+fn python_path_given_at_boot_as_the_drivers_is_kept() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .boot()
+        .unwrap();
+    let probe = "import os; print('PATH=' + os.environ.get('PATH', '<unset>'))";
+    sandbox.set_env_vars(&[]);
+    sandbox.run(probe).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("PATH=/usr/local/bin:/usr/bin:/bin"),
+        "expected the driver's PATH, got: {output:?}",
+    );
+}
+
+/// An empty entry of a nonempty PYTHONPATH is the working directory, as at
+/// startup; and a standard directory a PYTHONPATH moved to the front goes
+/// back where it was once that PYTHONPATH is gone, also when the next one
+/// moves another.
+#[test]
+fn python_pythonpath_keeps_empty_entries_and_the_standard_order() {
+    let rootfs = require_rootfs("python");
+    let snap_dir = temp_dir("py-pythonpath-order");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox.snapshot_to(&snap_dir).unwrap();
+
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap_dir)
+        .unwrap()
+        .boot()
+        .unwrap();
+    sandbox
+        .run("import sys, sysconfig; print('site', sysconfig.get_paths()['purelib']); print('start', sys.path)")
+        .unwrap();
+    let start = sandbox.drain_output();
+    let site = start
+        .lines()
+        .find_map(|l| l.strip_prefix("site "))
+        .expect("purelib")
+        .to_owned();
+    let start = start
+        .lines()
+        .find_map(|l| l.strip_prefix("start "))
+        .expect("sys.path")
+        .to_owned();
+
+    sandbox.set_env_vars(&[("PYTHONPATH", "/lib-a:")]);
+    sandbox
+        .run("import os, sys; print('cwd', os.path.abspath('') in sys.path)")
+        .unwrap();
+    let dynload = start
+        .split('\'')
+        .find(|p| p.ends_with("/lib-dynload"))
+        .expect("lib-dynload")
+        .to_owned();
+    sandbox.set_env_vars(&[("PYTHONPATH", dynload.as_str())]);
+    sandbox.run("pass").unwrap();
+    sandbox.set_env_vars(&[("PYTHONPATH", site.as_str())]);
+    sandbox
+        .run("import sys; print('front', sys.path[0])")
+        .unwrap();
+    sandbox.set_env_vars(&[]);
+    sandbox.run("import sys; print('end', sys.path)").unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("cwd True")
+            && output.contains(&format!("front {site}"))
+            && output.contains(&format!("end {start}")),
+        "expected {start} back after {site} was moved, got: {output:?}",
+    );
+}
