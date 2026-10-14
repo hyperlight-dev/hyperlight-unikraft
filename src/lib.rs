@@ -96,6 +96,10 @@ pub enum Error {
     /// kernel is not one of ours, or the entry failed.
     #[error("the guest halted without a word: its kernel reported neither a boundary nor an exit")]
     GuestSilent,
+    /// The entry returned a Yield record too short to read: its kernel is
+    /// not one of ours.
+    #[error("the guest returned a {len}-byte Yield; a Yield is at least {YIELD_LEN} bytes")]
+    MalformedYield { len: usize },
     /// The snapshot in `dir` was saved by a build with another
     /// [`SNAPSHOT_KEY`]: another kernel, or another host contract.
     #[error(
@@ -517,26 +521,79 @@ const GUEST_MSRS: &[u32] = &[
     0xC000_0084, // IA32_FMASK — syscall RFLAGS mask
 ];
 
-/// The TSC frequency, in Hz, measured once against the monotonic clock.
-///
-/// Hyperlight passes the host TSC through unscaled (it only saves and
-/// restores the TSC register), so the rate the guest sees is this one.
-/// Twenty milliseconds against a nanosecond clock give it to a few parts
-/// per million, provided the two endpoints are clean: each clock reading
-/// is bracketed by two counter reads and kept only when nothing ran in
-/// between, so a preemption cannot skew the one sample the process keeps.
-/// The invariant TSC does not drift with the core frequency, so measuring
-/// once is enough.
-///
-/// TODO: the kernel asks only at boot.  A snapshot restored on a host with
-/// a different TSC rate keeps the old frequency, so its monotonic clock
-/// and sleeps run fast or slow by the ratio; the resume entry should ask
-/// again and re-base the clock (the wall clock is already re-anchored
-/// there).
-/// Yield flags (plat/hyperlight/step.c): the call in flight started and is
-/// still running; it returned, with a status and a result.
+/// Yield flags (plat/hyperlight/step.c): the reader took the call in
+/// flight; it returned, with a status and a result.  Both are set for a
+/// call that started and returned in one entry.
 const YIELD_CALL_STARTED: i32 = 1;
 const YIELD_CALL_DONE: i32 = 2;
+/// A driver holds `/dev/hlcall` open: what a restored guest tells its new
+/// host on the first entry.
+const YIELD_DRIVER_READY: i32 = 4;
+/// An entry's returned Yield: the next wakeup (u64 ns), the flags and the
+/// call's status (i32 each), then the call's result.
+const YIELD_LEN: usize = 16;
+
+/// Record a Yield -- sent by the `Yield` host function, or returned by an
+/// entry as its result -- as the events it stands for, in order.
+fn note_yield(
+    events: &mut Vec<Event>,
+    result: &Mutex<Option<Vec<u8>>>,
+    ns: u64,
+    flags: i32,
+    status: i32,
+    bytes: Vec<u8>,
+) {
+    if flags & YIELD_DRIVER_READY != 0 {
+        events.push(Event::DriverReady);
+    }
+    // What the entry saw of the call in flight rides on its Yield, so a
+    // call costs no exit of its own: still running, or returned with its
+    // status and result.
+    if flags & YIELD_CALL_STARTED != 0 {
+        events.push(Event::CallStarted);
+    }
+    if flags & YIELD_CALL_DONE != 0 {
+        if !bytes.is_empty() {
+            *result.lock().unwrap() = Some(bytes);
+        }
+        events.push(Event::Outcome(if status == 0 {
+            Yield::CallDone
+        } else {
+            Yield::CallFailed { status }
+        }));
+    }
+    // Keep the absolute deadline so time the host spends elsewhere
+    // counts against it and the guest timer still fires on schedule.
+    let until = (ns != 0).then(|| Instant::now() + Duration::from_nanos(ns));
+    events.push(Event::Outcome(Yield::Blocked { until }));
+}
+
+/// What a restored guest needs from its new host, as the kernel reads it
+/// (the `resume` entry's parameter, or `GetResumeState`'s reply): the
+/// wall clock (u64 ns), then the mount table and the resolver
+/// configuration, each a u32 length and its bytes.  The entry also
+/// carries the environment, under its version (a u64, a u32 length and
+/// `GetEnvVars`'s answer), so the first call after a restore need not
+/// fetch it.
+fn resume_state(mounts: &str, resolv: &str, env: Option<(u64, &str)>) -> Vec<u8> {
+    let mut state = Vec::with_capacity(resume_state_len(mounts, resolv, env.map(|(_, e)| e)));
+    state.extend_from_slice(&wall_clock_ns().to_le_bytes());
+    for part in [mounts.as_bytes(), resolv.as_bytes()] {
+        state.extend_from_slice(&(part.len() as u32).to_le_bytes());
+        state.extend_from_slice(part);
+    }
+    if let Some((version, env)) = env {
+        state.extend_from_slice(&version.to_le_bytes());
+        state.extend_from_slice(&(env.len() as u32).to_le_bytes());
+        state.extend_from_slice(env.as_bytes());
+    }
+    state
+}
+
+/// The length of [`resume_state`]'s answer.
+fn resume_state_len(mounts: &str, resolv: &str, env: Option<&str>) -> usize {
+    16 + mounts.len() + resolv.len() + env.map_or(0, |e| 12 + e.len())
+}
 
 /// A fresh environment version: the kernel answers a driver's GETENV
 /// from its copy while calls carry the version it fetched under.  Unique
@@ -557,6 +614,22 @@ fn wall_clock_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// The TSC frequency, in Hz, measured once against the monotonic clock.
+///
+/// Hyperlight passes the host TSC through unscaled (it only saves and
+/// restores the TSC register), so the rate the guest sees is this one.
+/// Twenty milliseconds against a nanosecond clock give it to a few parts
+/// per million, provided the two endpoints are clean: each clock reading
+/// is bracketed by two counter reads and kept only when nothing ran in
+/// between, so a preemption cannot skew the one sample the process keeps.
+/// The invariant TSC does not drift with the core frequency, so measuring
+/// once is enough.
+///
+/// TODO: the kernel asks only at boot.  A snapshot restored on a host with
+/// a different TSC rate keeps the old frequency, so its monotonic clock
+/// and sleeps run fast or slow by the ratio; the resume entry should ask
+/// again and re-base the clock (the wall clock is already re-anchored
+/// there).
 fn host_tsc_hz() -> u64 {
     static HZ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *HZ.get_or_init(|| {
@@ -714,15 +787,16 @@ pub enum Yield {
     Blocked { until: Option<Instant> },
 }
 
-/// One thing the guest said, through one of its six event host functions
-/// (see the kernel's `plat/hyperlight/step.c`).  Three of them are a
-/// [`Yield`] as is: `Yield(ns)` is [`Yield::Blocked`], `CallDone(status)`
-/// is [`Yield::CallDone`] or [`Yield::CallFailed`], `Exited(status)` is
-/// [`Yield::Exited`].  The other three are facts about the guest that no
-/// step returns by themselves.  An entry can say several (`CallDone`,
-/// then `Blocked`; or nothing at all), while the VM is still running; once
-/// it halts, [`GuestConfig::absorb`] reads them in order and reduces them
-/// to the one [`Yield`] the entry amounts to.
+/// One thing the guest said (see the kernel's `plat/hyperlight/step.c`):
+/// through an event host function while the VM runs, or in the Yield an
+/// entry returns, which [`note_yield`] turns into events after the halt.
+/// Three are a [`Yield`] as is: a Yield's wakeup is [`Yield::Blocked`],
+/// `CallDone(status)` is [`Yield::CallDone`] or [`Yield::CallFailed`],
+/// `Exited(status)` is [`Yield::Exited`].  The others are facts about the
+/// guest that no step returns by themselves.  An entry can say several
+/// (`CallDone`, then `Blocked`; or nothing at all); once it halts,
+/// [`GuestConfig::absorb`] reads them in order and reduces them to the one
+/// [`Yield`] the entry amounts to.
 #[derive(Debug, Clone, Copy)]
 enum Event {
     /// A way the entry could end, as the guest put it.
@@ -789,6 +863,9 @@ pub(crate) struct GuestConfig {
     /// The environment's version, sent with every call (see
     /// [`next_env_version`]): new when it changes, and on every restore.
     env_version: std::sync::atomic::AtomicU64,
+    /// The mount table as `vfs.fstab` entries ([`fstab_entries`]), made
+    /// once.
+    fstab: std::sync::OnceLock<Arc<str>>,
 }
 
 impl GuestConfig {
@@ -823,7 +900,17 @@ impl GuestConfig {
             guest: Mutex::new(Guest::default()),
             profile: profile::Profile::new(),
             env_version: std::sync::atomic::AtomicU64::new(next_env_version()),
+            fstab: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The mount table this host serves, as `vfs.fstab` entries.
+    fn fstab(&self) -> Result<Arc<str>> {
+        if let Some(fstab) = self.fstab.get() {
+            return Ok(fstab.clone());
+        }
+        let fstab = fstab_entries(&self.mounts)?;
+        Ok(self.fstab.get_or_init(|| fstab.into()).clone())
     }
 
     /// The embedder's host functions; set before [`register`](Self::register).
@@ -935,14 +1022,14 @@ impl GuestConfig {
         // The mount table this host serves.  A restored guest makes its own
         // match on `resume`; a fresh guest boots with the same list from its
         // cmdline.
-        let fstab = fstab_entries(&self.mounts)?;
+        let fstab = self.fstab()?;
         let mounts = fstab.clone();
         let prof = self.profile.clone();
         target.register_host_function(
             "GetMounts",
             move || -> hyperlight_host::Result<String> {
                 let _profile = prof.host("GetMounts");
-                Ok(mounts.clone())
+                Ok(mounts.to_string())
             },
         )?;
 
@@ -1040,10 +1127,9 @@ impl GuestConfig {
         )?;
 
         // ── Resume state ──────────────────────────────────────────
-        // What a restored guest asks its new host for on `resume`, in one
-        // exit rather than three: the wall clock (u64 ns), then the mount
-        // table and the resolver configuration, each a u32 length and its
-        // bytes, as GetMounts and GetResolvConf answer them.
+        // What a restored guest needs from its new host, for a kernel the
+        // `resume` entry does not bring it to (one built before the entry
+        // carried it, given with `from_kernel`): see `resume_state`.
         let mounts = fstab;
         let resolv_conf = self.resolv_conf.clone();
         let prof = self.profile.clone();
@@ -1053,14 +1139,7 @@ impl GuestConfig {
                 let _profile = prof.host("GetResumeState");
                 // The same answers GetWallClockNs, GetMounts and
                 // GetResolvConf give, one exit for all three.
-                let resolv = resolv_conf.lock().unwrap();
-                let mut state = Vec::with_capacity(16 + mounts.len() + resolv.len());
-                state.extend_from_slice(&wall_clock_ns().to_le_bytes());
-                for part in [mounts.as_bytes(), resolv.as_bytes()] {
-                    state.extend_from_slice(&(part.len() as u32).to_le_bytes());
-                    state.extend_from_slice(part);
-                }
-                Ok(state)
+                Ok(resume_state(&mounts, &resolv_conf.lock().unwrap(), None))
             },
         )?;
 
@@ -1104,27 +1183,14 @@ impl GuestConfig {
                   bytes: Vec<u8>|
                   -> hyperlight_host::Result<i32> {
                 let _profile = prof.host("Yield");
-                let mut events = events.lock().unwrap();
-                // What the entry saw of the call in flight rides on its
-                // Yield, so a call costs no exit of its own: still running,
-                // or returned with its status and result.
-                if flags & YIELD_CALL_STARTED != 0 {
-                    events.push(Event::CallStarted);
-                }
-                if flags & YIELD_CALL_DONE != 0 {
-                    if !bytes.is_empty() {
-                        *result.lock().unwrap() = Some(bytes);
-                    }
-                    events.push(Event::Outcome(if status == 0 {
-                        Yield::CallDone
-                    } else {
-                        Yield::CallFailed { status }
-                    }));
-                }
-                // Keep the absolute deadline so time the host spends elsewhere
-                // counts against it and the guest timer still fires on schedule.
-                let until = (ns != 0).then(|| Instant::now() + Duration::from_nanos(ns));
-                events.push(Event::Outcome(Yield::Blocked { until }));
+                note_yield(
+                    &mut events.lock().unwrap(),
+                    &result,
+                    ns,
+                    flags,
+                    status,
+                    bytes,
+                );
                 Ok(0)
             },
         )?;
@@ -1241,8 +1307,42 @@ impl GuestConfig {
         // An entry starts with an empty inbox: a previous one that failed
         // in the hypervisor may have left events behind.
         self.events.lock().unwrap().clear();
-        self.profile
-            .entry(name, || sandbox.call::<()>(name, args))?;
+        let mut returned = match self
+            .profile
+            .entry(name, || sandbox.call::<Vec<u8>>(name, args))
+        {
+            Ok(returned) => returned,
+            // A kernel from before entries returned their Yield (one given
+            // with `from_kernel`) returns nothing, and sends its Yield with
+            // the `Yield` host function instead.
+            Err(hyperlight_host::HyperlightError::ReturnValueConversionFailure(
+                hyperlight_host::func::ReturnValue::Void(()),
+                _,
+            )) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        // The entry's Yield comes back as its result rather than through
+        // the `Yield` host function, which saves an exit.  Empty when the
+        // entry kept none.
+        if !returned.is_empty() {
+            if returned.len() < YIELD_LEN {
+                return Err(Error::MalformedYield {
+                    len: returned.len(),
+                });
+            }
+            let ns = u64::from_le_bytes(returned[..8].try_into().unwrap());
+            let flags = i32::from_le_bytes(returned[8..12].try_into().unwrap());
+            let status = i32::from_le_bytes(returned[12..16].try_into().unwrap());
+            returned.drain(..YIELD_LEN);
+            note_yield(
+                &mut self.events.lock().unwrap(),
+                &self.result,
+                ns,
+                flags,
+                status,
+                returned,
+            );
+        }
         let yielded = self.absorb()?;
         debug!(?yielded, name, "entry");
         Ok(yielded)
@@ -1477,7 +1577,7 @@ pub const FSTAB_ENTRIES_MAX: usize = 3584;
 /// hostfs entry per mount, whose source-device field is the mount's index
 /// (hostfs routes host calls by it) and whose options make the mount
 /// point.  A fresh guest reads them off its cmdline ([`fstab_arg`]); a
-/// restored guest fetches them through `GetMounts` on its `resume` entry.
+/// restored guest gets them with its `resume` entry.
 /// The list is unquoted: entries are separated by spaces and fields by
 /// colons, so a guest path holding either is refused here, where the
 /// error can say why.
@@ -2304,12 +2404,27 @@ impl AppSandbox {
     }
 
     /// Announce a restore to the kernel with one `resume` entry, on which
-    /// it reseeds its CSPRNG and re-establishes the guest's host sockets.
+    /// it reseeds its CSPRNG and re-establishes the guest's host sockets,
+    /// mounts, clock and resolver from the state the entry carries.
     /// Like a step, it runs the scheduler to the next boundary, so a
     /// terminal outcome (a call in flight at snapshot time finishing, or
     /// the process exiting) is kept for the next [`step`](Self::step).
     fn resume(&mut self) -> Result<()> {
-        let yielded = self.config.enter(&mut self.sandbox, "resume", ())?;
+        // The state the kernel would otherwise fetch with host calls.  The
+        // environment rides along when the whole of it fits a host call's
+        // payload, like any guest function call's; a larger one the first
+        // call fetches with GetEnvVars, as before.
+        let fstab = self.config.fstab()?;
+        let resolv = self.config.resolv_conf.lock().unwrap();
+        let env = self.config.env_str.lock().unwrap();
+        let fits = resume_state_len(&fstab, &resolv, Some(&env)) <= HOST_CALL_MAX;
+        let state = resume_state(
+            &fstab,
+            &resolv,
+            fits.then(|| (self.config.env_version(), env.as_str())),
+        );
+        drop((resolv, env));
+        let yielded = self.config.enter(&mut self.sandbox, "resume", (state,))?;
         match self.note(yielded) {
             Yield::Blocked { .. } => {}
             terminal => self.pending = Some(terminal),
@@ -2463,8 +2578,8 @@ impl AppSandbox {
 /// Creates a default [`GuestConfig`] (the snapshot already has the guest's
 /// cmdline/initrd), registers host functions, and rebuilds a
 /// [`MultiUseSandbox`] from the snapshot.  `mounts` are the restored
-/// guest's: the kernel reads them through `GetMounts` on its `resume`
-/// entry and makes its mount table match.
+/// guest's: the `resume` entry brings them to the kernel, which makes its
+/// mount table match.
 fn restore_snapshot(
     snapshot: Arc<Snapshot>,
     mounts: Vec<Mount>,
@@ -2505,6 +2620,42 @@ fn restore_snapshot(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn resume_state_layout() {
+        let state = resume_state("m", "rr", Some((7, "A=1\0")));
+        let mut want = Vec::new();
+        want.extend_from_slice(&state[..8]);
+        want.extend_from_slice(&1u32.to_le_bytes());
+        want.extend_from_slice(b"m");
+        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(b"rr");
+        want.extend_from_slice(&7u64.to_le_bytes());
+        want.extend_from_slice(&4u32.to_le_bytes());
+        want.extend_from_slice(b"A=1\0");
+        assert_eq!(state, want);
+        assert_eq!(resume_state("m", "rr", None).len(), 8 + 4 + 1 + 4 + 2);
+        assert_eq!(resume_state_len("m", "rr", Some("A=1\0")), state.len());
+        assert_eq!(resume_state_len("m", "rr", None), 8 + 4 + 1 + 4 + 2);
+    }
+
+    #[test]
+    fn note_yield_reports_in_order() {
+        let mut events = Vec::new();
+        let result = Mutex::new(None);
+        let flags = YIELD_DRIVER_READY | YIELD_CALL_STARTED | YIELD_CALL_DONE;
+        note_yield(&mut events, &result, 0, flags, 0, b"out".to_vec());
+        assert!(matches!(
+            events[..],
+            [
+                Event::DriverReady,
+                Event::CallStarted,
+                Event::Outcome(Yield::CallDone),
+                Event::Outcome(Yield::Blocked { until: None })
+            ]
+        ));
+        assert_eq!(result.lock().unwrap().as_deref(), Some(&b"out"[..]));
+    }
     use std::io::Write;
 
     use super::*;

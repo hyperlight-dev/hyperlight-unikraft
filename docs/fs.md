@@ -94,7 +94,7 @@ Passing `:ro` sets `MNT_RDONLY` on the VFS mount.  The kernel rejects writes at 
 
 ### Snapshots
 
-Mounts belong to the run: give them to `hluk run` or `hluk snapshot run` (or to the `SandboxBuilder` that boots or restores), and save a snapshot without any.  On its `resume` entry the kernel fetches the host's mount list (with `GetResumeState`, which also brings the clock and resolver; `GetMounts` answers the same on its own), the same `vfs.fstab` entries a boot carries, and makes its mount table match: it mounts what the list adds, unmounts what the list lacks, and remounts an entry whose index or read-only flag changed.  Every hostfs node names its mount by index, so the host directory behind a guest path can differ between save and restore.
+Mounts belong to the run: give them to `hluk run` or `hluk snapshot run` (or to the `SandboxBuilder` that boots or restores), and save a snapshot without any.  On its `resume` entry the kernel takes the host's mount list, which the entry carries with the clock and resolver (`GetMounts` answers the same on its own), the same `vfs.fstab` entries a boot carries, and makes its mount table match: it mounts what the list adds, unmounts what the list lacks, and remounts an entry whose index or read-only flag changed.  Every hostfs node names its mount by index, so the host directory behind a guest path can differ between save and restore.
 
 ```sh
 hluk snapshot save --initrd rootfs.cpio --output .snapshots/python

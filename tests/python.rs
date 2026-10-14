@@ -170,6 +170,43 @@ print(f'RESTORED_VAR={v}')
     );
 }
 
+/// The environment reaches the first call after an in-place restore: with
+/// the `resume` entry when it fits, fetched by the call when it does not.
+#[test]
+fn python_env_vars_across_restore() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .profile(true)
+        .boot()
+        .unwrap();
+    let snap = sandbox.snapshot().unwrap();
+    // 4 + 65,515 + 1 bytes: a GetEnvVars reply holds it, the resume state
+    // with it does not.
+    let big = "x".repeat(65_515);
+    for (value, fetched) in [("small", false), (big.as_str(), true)] {
+        sandbox.set_env_vars(&[("VAR", value)]);
+        sandbox.profile().reset();
+        sandbox.restore(snap.clone()).unwrap();
+        sandbox
+            .run("import os; print('len', len(os.environ.get('VAR', '')))")
+            .unwrap();
+        let output = sandbox.drain_output();
+        assert!(
+            output.contains(&format!("len {}", value.len())),
+            "{} bytes: {output:?}",
+            value.len()
+        );
+        let report = sandbox.profile().report();
+        assert_eq!(
+            report.contains("host GetEnvVars"),
+            fetched,
+            "{} bytes: {report}",
+            value.len()
+        );
+    }
+}
+
 /// Env vars are stateful across dispatches without restore.
 #[test]
 fn python_env_vars_stateful_across_dispatches() {

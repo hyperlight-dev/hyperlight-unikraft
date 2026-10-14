@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A `dev` channel: each push to `main` whose CI passes replaces the `dev` pre-release (the `hluk` binaries and a `SHA256SUMS`) and publishes the images of that commit (`:dev-<sha7>`, `:initrd-dev-<sha7>`), so `main` can be installed and run between releases: `HLUK_VERSION=dev` with `install.sh` or `install.ps1`. A dev `hluk` pulls the images of its own commit and prints its build with `--version` (`0.17.0+dev.44ee170`); only the last two builds' images are kept. Releases and their tags are unchanged (`dev.yml`, docs/RELEASE.md).
 - A project site, <https://hyperlight-dev.github.io/hyperlight-unikraft>: startup times from CI, a density measurement (1,000 Python sandboxes in one process, about 2.8 MiB of host memory each), every template, and terminal recordings of `hluk init`, `hluk build` and a guest function call. Its source is `site/`, and `site.yml` publishes it to the `gh-pages` branch on pushes to `main`, beside the CI benchmark history. `just site-serve` previews it, `just site-record` re-records the demos and `site/tools/density.sh` repeats the density measurement.
 
+### Changed
+
+- Restoring a snapshot and making one guest function call takes two VM exits on x86_64, the halts that end its two entries, where it took about 12 (arm64 adds one: its kernel reseeds its CSPRNG from the host). An entry returns its `Yield` as the guest function's result. The `resume` entry carries the mounts, clock and resolver, and the environment when it fits a host call (a larger one is fetched by the first call). The kernel leaves the SYSCALL MSRs to hyperlight, which restores them. A kernel built before this, given with `from_kernel`, still works, sending its `Yield` and fetching its state by host call. A kernel built from these sources needs this `hluk` or later.
+
 ### Fixed
 
 - `hluk init NAME --template go` wrote a `go.mod` that Go refused when the name was `go`, `toolchain` or a standard-library package such as `fmt`: the module path is now `example.com/NAME`.
