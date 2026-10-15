@@ -1,6 +1,6 @@
 # Reproducible build environment for the Unikraft elfloader kernel.
 # Pinned to Ubuntu 24.04 (gcc-13) so every machine produces the same binary.
-FROM ubuntu:24.04
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 
 # gcc-aarch64-linux-gnu cross-builds the arm64 kernel.
 RUN apt-get update -q && \

@@ -9,7 +9,7 @@ ARG ROOTFS_SUFFIX=
 FROM hluk-python-shell-rootfs${ROOTFS_SUFFIX}:latest AS base
 
 # pip runs in a real Linux stage, then the packages are copied into the rootfs.
-FROM python:3.12-slim-bookworm AS installer
+FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS installer
 COPY --from=base / /rootfs/
 RUN pip install --no-cache-dir --target /rootfs/usr/local/lib/python3.12/site-packages \
         flask

@@ -9,7 +9,7 @@
 # classes the dispatcher loads while it warms up (javac's included)
 # starts the JVM from mapped, pre-parsed classes.
 
-FROM eclipse-temurin:25-jdk-alpine AS build
+FROM eclipse-temurin:25-jdk-alpine@sha256:3fd2d245c4e0eba615fe366a71b8bd25f5db7104f53e4026b24bf508b880bd2a AS build
 
 RUN apk add --no-cache gcc musl-dev binutils
 

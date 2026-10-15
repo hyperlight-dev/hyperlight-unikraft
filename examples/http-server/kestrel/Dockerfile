@@ -11,7 +11,7 @@
 # -arm64 when `just build-rootfs` builds for another platform
 # (HLUK_ROOTFS_PLATFORM), so the base is that platform's image too.
 ARG ROOTFS_SUFFIX=
-FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS build
+FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine@sha256:188d6a75ab67d2b2d61b4bbcd2d88030d1a058945236f0bf1d548dec312092a4 AS build
 WORKDIR /src
 COPY examples/http-server/kestrel/Program.cs examples/http-server/kestrel/KestrelHyperlight.csproj ./
 RUN dotnet publish -c Release --os linux-musl --self-contained \

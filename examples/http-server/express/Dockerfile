@@ -9,7 +9,7 @@
 # -arm64 when `just build-rootfs` builds for another platform
 # (HLUK_ROOTFS_PLATFORM), so the base is that platform's image too.
 ARG ROOTFS_SUFFIX=
-FROM node:21-alpine AS deps
+FROM node:21-alpine@sha256:78c45726ea205bbe2f23889470f03b46ac988d14b6d813d095e2e9909f586f93 AS deps
 WORKDIR /nm
 RUN npm install --no-audit --no-fund express@4
 

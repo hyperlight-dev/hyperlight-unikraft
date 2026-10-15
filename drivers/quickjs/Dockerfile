@@ -7,7 +7,7 @@
 #
 # Build context: repository root.
 
-FROM alpine:3.20 AS build
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS build
 
 ARG QUICKJS_VERSION=0.17.0
 ARG QUICKJS_SHA256=559bc4c420475e55c7ab4510adbc562f55d7524d75e8e89d79ce4bb02f5687d9

@@ -15,7 +15,7 @@
 #             --scratch-mb 1536 examples/agent-framework/local.py
 FROM hluk-python-shell-rootfs:latest AS base
 
-FROM python:3.12-slim-bookworm AS installer
+FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS installer
 RUN apt-get update && apt-get install -y --no-install-recommends git build-essential cmake \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=base / /rootfs/
@@ -31,7 +31,7 @@ RUN find /rootfs/usr/local/lib/python3.12/site-packages \
 
 # Download the GGUF model in its own stage (layer caching). Swap MODEL_URL to
 # use a different model.
-FROM debian:bookworm-slim AS model
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS model
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 ARG MODEL_URL=https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf

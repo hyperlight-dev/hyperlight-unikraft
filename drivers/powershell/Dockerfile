@@ -31,7 +31,7 @@ RUN set -eu; \
     stage /etc/passwd /etc/passwd; \
     stage /etc/group /etc/group
 
-FROM debian:bookworm-slim AS pwsh-arm64
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS pwsh-arm64
 
 ARG PWSH_VERSION=7.4.6
 # The release's own hashes.sha256 lists this checksum.
@@ -69,7 +69,7 @@ RUN mkdir -p /empty-tmp /stub-proc/self && \
     printf 'pwsh\0-NoProfile\0-File\0/tmp/hl_dispatch.ps1\0' > /stub-proc/self/cmdline
 
 # ── Compile the driver ──────────────────────────────────────────
-FROM alpine:3.20 AS build-driver
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS build-driver
 
 RUN apk add --no-cache gcc musl-dev
 

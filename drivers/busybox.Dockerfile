@@ -10,7 +10,7 @@
 # so this image must be built first (see `just build-busybox`, invoked by
 # `just build-rootfs` for those runtimes and by `just build-all-rootfs`).
 # An arm64 build is tagged hluk-busybox-arm64 and passed in as BUSYBOX.
-FROM alpine:3.20
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 RUN apk add --no-cache gcc musl-dev make perl linux-headers
 
