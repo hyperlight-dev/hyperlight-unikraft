@@ -613,7 +613,7 @@ publish-urunc registry version="" stable="true":
     ( cd "{{root_dir}}/demos/urunc" && just stage && docker build -f Containerfile -t hluk-hello-urunc . )
     just _push hluk-hello-urunc "{{registry}}/hello-urunc" "{{version}}" "" "{{stable}}"
 
-# Clean rebuild of a rootfs — pulls fresh base images, no Docker cache.
+# Clean rebuild of a rootfs — pulls its pinned base images, no Docker cache.
 # Also nukes stale snapshots. Use when base images or drivers change.
 [unix]
 rebuild-rootfs runtime:
@@ -628,7 +628,7 @@ rebuild-rootfs runtime:
     if grep -q '^ARG RUST_VERSION' "$dockerfile"; then
         rust=$(just _rust-version)
     fi
-    # Pull fresh base images (skip local build stages like "hluk-python-rootfs")
+    # Pull the base images (skip local build stages like "hluk-python-rootfs")
     for img in $(grep '^FROM ' "$dockerfile" | awk '{print $2}' | sed "s/\${RUST_VERSION[^}]*}/$rust/" | sort -u); do
         if docker pull "$img" 2>/dev/null; then
             echo "==> Pulled $img"
@@ -790,10 +790,16 @@ build-test-bins:
         gcc -O2 -Wall -static-pie -fPIE -o "$bins/c/$src" "{{examples_dir}}/c/$src.c"
     done
     g++ -O2 -Wall -static-pie -fPIE -o "$bins/c/hello_cpp" "{{examples_dir}}/c/hello_cpp.cpp"
+    # The images run below are the ones the drivers build FROM, read from
+    # their Dockerfiles so both stay on the same digest.
+    base_image() { sed -n "s|^FROM \(--platform=[^ ]* \)\{0,1\}\($2[^ ]*\).*|\2|p" "$1" | head -n 1; }
+    alpine=$(base_image "{{drivers_dir}}/c/Dockerfile" alpine:)
+    dotnet_sdk=$(base_image "{{drivers_dir}}/dotnet-jit/Dockerfile" mcr.microsoft.com/dotnet/sdk:)
+    : "${alpine:?no alpine FROM in drivers/c/Dockerfile}" "${dotnet_sdk:?no SDK FROM in drivers/dotnet-jit/Dockerfile}"
     # With musl, in Alpine: its condition variables hand waiters over with
     # FUTEX_REQUEUE, which glibc's do not use.
     docker run --rm -v "{{examples_dir}}/c:/c:ro" -v "$bins/c:/out" \
-        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" alpine:3.20 sh -c '
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" "$alpine" sh -c '
             set -eu
             apk add --no-cache gcc musl-dev linux-headers >/dev/null
             for src in condvar futex_requeue; do
@@ -836,7 +842,7 @@ build-test-bins:
     # call __getauxval, a symbol musl lacks, and fails to load in the guest.
     docker run --rm -v "{{root_dir}}:/src" -w /src -e HOME=/tmp \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-        mcr.microsoft.com/dotnet/sdk:9.0-alpine sh -c '
+        "$dotnet_sdk" sh -c '
             set -eu
             apk add --no-cache clang lld build-base zlib-dev >/dev/null
             for proj in hello env_vars caps; do
@@ -1670,7 +1676,7 @@ build-all-rootfs:
 build-all-rootfs:
     @Write-Error "build-all-rootfs needs Docker + cpio on Linux. Build there (just build-all-rootfs) and copy build-elfloader/ here."; exit 1
 
-# Rebuild all rootfs images from scratch (--no-cache, pulls fresh
+# Rebuild all rootfs images from scratch (--no-cache, pulls the pinned
 # base images, invalidates snapshots).
 [unix]
 rebuild-all-rootfs:
