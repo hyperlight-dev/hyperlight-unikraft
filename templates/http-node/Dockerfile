@@ -4,7 +4,7 @@
 #
 # The guest runs the script with cwd = /, so require() resolves from
 # /node_modules (Node's search walks up from the module's directory).
-FROM node:22-alpine AS deps
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS deps
 WORKDIR /nm
 COPY package.json .
 RUN npm install --omit=dev --no-audit --no-fund
