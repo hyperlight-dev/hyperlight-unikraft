@@ -97,7 +97,7 @@
    },
    {
     "path": "hluk.toml",
-    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/dotnet-aot:initrd-vX.Y.Z\"\n\n[build]\ncommand = \"\"\"docker run --rm -v \"$PWD:/src\" -w /src -e HOME=/tmp \\\n  -e HOST_UID=\"$(id -u)\" -e HOST_GID=\"$(id -g)\" \\\n  mcr.microsoft.com/dotnet/sdk:9.0-alpine sh -c '\\\n    apk add --no-cache clang lld build-base zlib-dev >/dev/null && \\\n    dotnet publish -c Release -v q --nologo -o bin && rm -f bin/*.dbg && \\\n    chown -R \"$HOST_UID:$HOST_GID\" bin obj'\"\"\"\n\n[run]\nmounts = [\"./bin:/mnt/app:ro\"]\nexec = \"/mnt/app/App\"\nwarm = true\n"
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/dotnet-aot:initrd-vX.Y.Z\"\n\n[build]\ncommand = \"\"\"docker run --rm -v \"$PWD:/src\" -w /src -e HOME=/tmp \\\n  -e HOST_UID=\"$(id -u)\" -e HOST_GID=\"$(id -g)\" \\\n  mcr.microsoft.com/dotnet/sdk:9.0-alpine@sha256:188d6a75ab67d2b2d61b4bbcd2d88030d1a058945236f0bf1d548dec312092a4 sh -c '\\\n    apk add --no-cache clang lld build-base zlib-dev >/dev/null && \\\n    dotnet publish -c Release -v q --nologo -o bin && rm -f bin/*.dbg && \\\n    chown -R \"$HOST_UID:$HOST_GID\" bin obj'\"\"\"\n\n[run]\nmounts = [\"./bin:/mnt/app:ro\"]\nexec = \"/mnt/app/App\"\nwarm = true\n"
    }
   ]
  },
@@ -131,7 +131,7 @@
    },
    {
     "path": "Dockerfile",
-    "text": "# The guest rootfs for hello: the app, published self-contained and\n# trimmed for linux-musl by the .NET SDK, on the published dotnet-aot base\n# (exec driver, musl linker, glibc compat symlinks). `hluk build` builds it\n# for the host's CPU and exports it as .hluk/rootfs.cpio; `hluk run` boots it.\nFROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS build\nWORKDIR /src\nCOPY Program.cs App.csproj ./\nRUN dotnet publish -c Release --os linux-musl --self-contained \\\n    -p:PublishTrimmed=true \\\n    -p:InvariantGlobalization=true \\\n    -o /out\n\nFROM ghcr.io/hyperlight-dev/hyperlight-unikraft/dotnet-aot:vX.Y.Z\nCOPY --from=build /out/ /app/\n# The C++ runtime the CoreCLR host needs.\nCOPY --from=build /usr/lib/libstdc++.so.6 /usr/lib/libstdc++.so.6\nCOPY --from=build /usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1\n"
+    "text": "# The guest rootfs for hello: the app, published self-contained and\n# trimmed for linux-musl by the .NET SDK, on the published dotnet-aot base\n# (exec driver, musl linker, glibc compat symlinks). `hluk build` builds it\n# for the host's CPU and exports it as .hluk/rootfs.cpio; `hluk run` boots it.\nFROM mcr.microsoft.com/dotnet/sdk:9.0-alpine@sha256:188d6a75ab67d2b2d61b4bbcd2d88030d1a058945236f0bf1d548dec312092a4 AS build\nWORKDIR /src\nCOPY Program.cs App.csproj ./\nRUN dotnet publish -c Release --os linux-musl --self-contained \\\n    -p:PublishTrimmed=true \\\n    -p:InvariantGlobalization=true \\\n    -o /out\n\nFROM ghcr.io/hyperlight-dev/hyperlight-unikraft/dotnet-aot:vX.Y.Z\nCOPY --from=build /out/ /app/\n# The C++ runtime the CoreCLR host needs.\nCOPY --from=build /usr/lib/libstdc++.so.6 /usr/lib/libstdc++.so.6\nCOPY --from=build /usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1\n"
    },
    {
     "path": "hluk.toml",
@@ -152,7 +152,7 @@
    },
    {
     "path": "Dockerfile",
-    "text": "# The guest rootfs for hello: the published node base plus the packages\n# package.json names. `hluk build` builds it and exports it as\n# .hluk/rootfs.cpio; `hluk run` boots it.\n#\n# The guest runs the script with cwd = /, so require() resolves from\n# /node_modules (Node's search walks up from the module's directory).\nFROM node:22-alpine AS deps\nWORKDIR /nm\nCOPY package.json .\nRUN npm install --omit=dev --no-audit --no-fund\n\nFROM ghcr.io/hyperlight-dev/hyperlight-unikraft/node:vX.Y.Z\nCOPY --from=deps /nm/node_modules /node_modules\n"
+    "text": "# The guest rootfs for hello: the published node base plus the packages\n# package.json names. `hluk build` builds it and exports it as\n# .hluk/rootfs.cpio; `hluk run` boots it.\n#\n# The guest runs the script with cwd = /, so require() resolves from\n# /node_modules (Node's search walks up from the module's directory).\nFROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS deps\nWORKDIR /nm\nCOPY package.json .\nRUN npm install --omit=dev --no-audit --no-fund\n\nFROM ghcr.io/hyperlight-dev/hyperlight-unikraft/node:vX.Y.Z\nCOPY --from=deps /nm/node_modules /node_modules\n"
    },
    {
     "path": "package.json",
@@ -177,7 +177,7 @@
    },
    {
     "path": "Dockerfile",
-    "text": "# The guest rootfs for hello: the published python-shell base plus the\n# packages in requirements.txt. `hluk build` builds it and exports it as\n# .hluk/rootfs.cpio; `hluk run` boots it.\nFROM ghcr.io/hyperlight-dev/hyperlight-unikraft/python-shell:vX.Y.Z AS base\n\n# pip runs in a real Linux stage, then the packages are copied into the\n# rootfs, which is FROM scratch and has no shell to run pip in.\nFROM python:3.12-slim-bookworm AS installer\nCOPY --from=base / /rootfs/\nCOPY requirements.txt /tmp/requirements.txt\nRUN pip install --no-cache-dir -r /tmp/requirements.txt \\\n        --target /rootfs/usr/local/lib/python3.12/site-packages\n\nFROM scratch\nCOPY --from=installer /rootfs/ /\n"
+    "text": "# The guest rootfs for hello: the published python-shell base plus the\n# packages in requirements.txt. `hluk build` builds it and exports it as\n# .hluk/rootfs.cpio; `hluk run` boots it.\nFROM ghcr.io/hyperlight-dev/hyperlight-unikraft/python-shell:vX.Y.Z AS base\n\n# pip runs in a real Linux stage, then the packages are copied into the\n# rootfs, which is FROM scratch and has no shell to run pip in.\nFROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS installer\nCOPY --from=base / /rootfs/\nCOPY requirements.txt /tmp/requirements.txt\nRUN pip install --no-cache-dir -r /tmp/requirements.txt \\\n        --target /rootfs/usr/local/lib/python3.12/site-packages\n\nFROM scratch\nCOPY --from=installer /rootfs/ /\n"
    },
    {
     "path": "requirements.txt",
