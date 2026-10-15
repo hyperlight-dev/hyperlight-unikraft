@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792105932325,
+  "lastUpdate": 1792107903416,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python benchmarks": [
@@ -5119,6 +5119,190 @@ window.BENCHMARK_DATA = {
           {
             "name": "rss/stdlib",
             "value": 8,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": false,
+          "id": "7ed4eb137c6285f8c478ff87d55441969a797490",
+          "message": "tests: retry the HTTP GET examples when the server fails\n\ndotnet_jit_http_get, java_http_get, node_http_get and python_http_get\nfetch httpbin.org, which answers 502 often enough to fail CI on pull\nrequests that have nothing to do with networking.  A 5xx is the\nservice's failure, not the guest's, so the example now runs again, up\nto three times, 2 s then 5 s apart, each time in a fresh sandbox (a\nreused one keeps the failed attempt's sockets).  A run that fails any\nother way, or gets any other status, still fails the test at once: a\nDNS or connection error exercises the guest's resolver and network\nstack, which an outside request is there to test.  The output keeps\nevery attempt, and a retry is a CI warning, so retries that become the\nrule are seen.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-10-15T23:33:56Z",
+          "tree_id": "f8e915338b960b068abc60350203c611e711ceec",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/7ed4eb137c6285f8c478ff87d55441969a797490"
+        },
+        "date": 1792107902125,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 214.432,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 212.772,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 213.63,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 260.79,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 16.063,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 8.781,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 13.211,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 73.792,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 6.126,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 1.653,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 3.115,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 54.872,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 0.885,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 0.878,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 1.284,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 1.054,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.646,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.181,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 0.766,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 44.357,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 10.332,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 2.41,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 5.045,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 108.362,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 74.1,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 74.1,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 74.1,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 74.1,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 8,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 7,
             "unit": "MB"
           }
         ]
