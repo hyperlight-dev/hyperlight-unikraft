@@ -1,4 +1,7 @@
-#syntax=harbor.nbfc.io/nubificus/bunny:latest
+#syntax=harbor.nbfc.io/nubificus/bunny:latest@sha256:5c65c1e8a31692ab49a84ac784bbe3737c819239548cd2e4db086262bdf31a36
+#
+# The frontend is bunny build 6c2f6bc, pinned by its multi-arch index:
+# "latest" is the only tag that names one, and the digest decides.
 #
 # Package a hyperlight-unikraft guest (kernel + rootfs CPIO) as an OCI image
 # that urunc's hyperlight-unikraft monitor runs. The bunny frontend turns these

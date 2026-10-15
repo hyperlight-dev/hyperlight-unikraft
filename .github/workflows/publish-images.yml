@@ -149,9 +149,10 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       # The default docker driver builds one platform; a buildx builder
-      # builds the kernel image for both.
+      # builds the kernel image for both.  Its BuildKit image is pinned,
+      # as the base images are.
       - name: Set up a multi-platform builder
-        run: docker buildx create --use
+        run: docker buildx create --use --driver-opt image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - name: Publish kernel image
         run: just publish-kernel "${{ env.IMAGE_BASE }}" "${{ env.VERSION }}" "${{ env.STABLE }}"
 
