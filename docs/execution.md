@@ -45,7 +45,8 @@ Everything a caller does with an [`AppSandbox`](../src/lib.rs) is one of these. 
 | `call(function, input)` | `run(Exec::Call { function, input })`, returning the result of a function the guest defined ([calls.md](calls.md)). |
 | `join()` | `step` until the process exits, and hand back its status. |
 | `snapshot()` / `snapshot_to(dir)` | Captures the guest at the current boundary, a call in flight included; `snapshot_to` also writes it to a directory. |
-| `restore(snapshot)` / `restore_from(dir)` | Replaces the guest with the snapshot in place and runs its `resume` entry. |
+| `snapshot_with_scratch_mb(mb)` | Like `snapshot()`, but a sandbox restored from it gets `mb` MiB of scratch. It refuses a size above the sandbox's current scratch or too small for the transport and page tables. A size too small for the kernel makes `restore`, or a boot from the snapshot, fail. A guest function call that runs out of scratch ends with its process killed (status 137 with a single-process driver, such as python's) or the guest aborted, depending on what runs out first. A restore recovers the sandbox. |
+| `restore(snapshot)` / `restore_from(dir)` | Replaces the guest with the snapshot in place and runs its `resume` entry. The sandbox takes the snapshot's scratch size. |
 
 ## Three kinds of guest
 
@@ -169,7 +170,7 @@ A server is the same: `join` parks on its listener between requests and returns 
 
 A snapshot can be taken at any boundary, and a restored guest continues from exactly there.  Two boundaries are worth naming.
 
-**After boot, for a warm start.**  With a driver image, `boot()` returns once the runtime is initialised and the driver is parked: the interpreter is up, and in the `agent` image the heavy imports are already done.  A snapshot there is a warm image; every guest restored from it skips that work.
+**After boot, for a warm start.**  With a driver image, `boot()` returns once the runtime is initialised and the driver is parked: the interpreter is up, and in the `agent` image the heavy imports are already done.  A snapshot there is a warm image; every guest restored from it skips that work.  Booting needs room to unpack the rootfs, which guest function calls do not: `snapshot_with_scratch_mb` takes the warm image with less scratch, and every restore of it costs less.
 
 ```mermaid
 sequenceDiagram

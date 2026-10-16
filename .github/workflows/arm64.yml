@@ -124,8 +124,8 @@ jobs:
             targets: >-
               --lib --bins --test bash --test cli --test compiled
               --test native_kernel --test networking --test project
-              --test python --test python_shell --test quickjs --test resolv
-              --test snapshot_mounts --test step --test wasmtime
+              --test python --test python_shell --test quickjs --test resize
+              --test resolv --test snapshot_mounts --test step --test wasmtime
           - os: macos
             runner: [self-hosted, macos, arm64, hvf]
             targets: --all-targets

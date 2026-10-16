@@ -774,8 +774,7 @@ dependencies = [
 [[package]]
 name = "hyperlight-common"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "360d5876788b26af66bf055bca6b4f2c9c930a0fdcaebda4bd7f808c6bd93068"
+source = "git+https://github.com/hyperlight-dev/hyperlight?rev=68bde0c52a542caffa0188f9996748faec51adbd#68bde0c52a542caffa0188f9996748faec51adbd"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -794,8 +793,7 @@ dependencies = [
 [[package]]
 name = "hyperlight-host"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40f8b85ddd688890477158b9921b228973d1b70c84b866698838df0f32d2aa44"
+source = "git+https://github.com/hyperlight-dev/hyperlight?rev=68bde0c52a542caffa0188f9996748faec51adbd#68bde0c52a542caffa0188f9996748faec51adbd"
 dependencies = [
  "anyhow",
  "bindgen",
