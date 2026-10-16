@@ -92,3 +92,8 @@ tempfile = "3"
 # The FlatBuffer decoder's external-value source, mirrored in the tests.
 anyhow = "1"
 bytes = "1"
+
+# Do not merge: hyperlight's scratch-resize branch, until it is released.
+[patch.crates-io]
+hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "68bde0c52a542caffa0188f9996748faec51adbd" }
+hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "68bde0c52a542caffa0188f9996748faec51adbd" }
