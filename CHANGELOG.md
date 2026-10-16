@@ -4,6 +4,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Fixed
+
+- The kernel allocated scratch pages the host reserves at the top of scratch. It now stops below them.
+- A guest that ran out of scratch during a copy-on-write fault crashed the VM (an unexpected exit) instead of aborting.
+
 ## [v0.18.0]
 
 ### Added
