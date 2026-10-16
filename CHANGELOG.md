@@ -4,6 +4,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Added
+
+- `AppSandbox::snapshot_with_scratch_mb` takes a snapshot that restores with less scratch: boot with what unpacking the rootfs needs, then run guest function calls with what they need. A size too small for the kernel makes the restore fail (restoring a snapshot that fits recovers the sandbox) and a boot from the snapshot fail. A guest function call that runs out of scratch ends with its process killed (status 137 with a single-process driver, such as python's) or the guest aborted, depending on what runs out first. A restore recovers the sandbox.
+
+### Changed
+
+- The host places the transport arena at a fixed address below the top of scratch, so a snapshot keeps it when restored with a different scratch size. Snapshots saved by an earlier release are refused: save them again. A native Unikraft kernel (`--kernel`, `SandboxBuilder::from_kernel`) built against an earlier `plat/hyperlight` can allocate over the arena: rebuild it against this kernel tree.
+
 ### Fixed
 
 - The kernel allocated scratch pages the host reserves at the top of scratch. It now stops below them.
