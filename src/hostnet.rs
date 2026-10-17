@@ -201,6 +201,7 @@ struct SocketTable {
     /// once and spin the step loop.
     want_readable: HashSet<i32>,
     want_writable: HashSet<i32>,
+    async_sockets: HashMap<i32, Arc<async_io::Async<Arc<OwnedFd>>>>,
 }
 
 impl SocketTable {
@@ -211,6 +212,7 @@ impl SocketTable {
             next_fd: 3, // skip stdin/stdout/stderr
             want_readable: HashSet::new(),
             want_writable: HashSet::new(),
+            async_sockets: HashMap::new(),
         }
     }
 
@@ -357,6 +359,7 @@ impl SocketTable {
     }
 
     fn remove(&mut self, fd: i32) -> Res<Arc<OwnedFd>> {
+        self.async_sockets.remove(&fd);
         self.want_readable.remove(&fd);
         self.want_writable.remove(&fd);
         self.meta.remove(&fd);
@@ -909,6 +912,7 @@ impl Net {
         tbl.meta.clear();
         tbl.want_readable.clear();
         tbl.want_writable.clear();
+        tbl.async_sockets.clear();
     }
 
     /// Whether the guest is parked on any socket: something the
@@ -919,6 +923,85 @@ impl Net {
             .iter()
             .chain(&tbl.want_writable)
             .any(|fd| tbl.sockets.contains_key(fd))
+    }
+
+    /// Reactor bridge while the guest still uses net_poll's interest sets.
+    /// Cached registrations avoid an OS register/deregister on every step.
+    pub(crate) async fn wait_ready_async(&self) -> std::io::Result<()> {
+        use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+
+        let mut waits = FuturesUnordered::new();
+        {
+            let mut table = self.table();
+            let wanted: Vec<_> = table
+                .sockets
+                .iter()
+                .filter_map(|(&fd, socket)| {
+                    let read = table.want_readable.contains(&fd);
+                    let write = table.want_writable.contains(&fd);
+                    (read || write).then(|| (fd, socket.clone(), read, write))
+                })
+                .collect();
+            for (fd, socket, read, write) in wanted {
+                // macOS can replace a UDP socket without changing its guest fd.
+                if table
+                    .async_sockets
+                    .get(&fd)
+                    .is_some_and(|s| !Arc::ptr_eq(s.get_ref(), &socket))
+                {
+                    table.async_sockets.remove(&fd);
+                }
+                let registered = match table.async_sockets.entry(fd) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(entry) => entry
+                        .insert(Arc::new(async_io::Async::new(socket)?))
+                        .clone(),
+                };
+                for (enabled, events) in [(read, PollFlags::IN), (write, PollFlags::OUT)] {
+                    if enabled {
+                        let registered = registered.clone();
+                        waits.push(
+                            async move {
+                                let check = |socket: &Arc<OwnedFd>| {
+                                    let mut fds = [PollFd::new(socket.as_ref(), events)];
+                                    rustix::event::poll(
+                                        &mut fds,
+                                        Some(&Timespec {
+                                            tv_sec: 0,
+                                            tv_nsec: 0,
+                                        }),
+                                    )
+                                    .map_err(std::io::Error::from)?;
+                                    if fds[0].revents().is_empty() {
+                                        Err(std::io::ErrorKind::WouldBlock.into())
+                                    } else {
+                                        Ok(())
+                                    }
+                                };
+                                if events == PollFlags::IN {
+                                    registered.read_with(check).await?;
+                                } else {
+                                    registered.write_with(check).await?;
+                                }
+                                Ok::<_, std::io::Error>((fd, events))
+                            }
+                            .boxed(),
+                        );
+                    }
+                }
+            }
+        }
+        let Some(result) = waits.next().await else {
+            return std::future::pending().await;
+        };
+        let (fd, events) = result?;
+        let mut table = self.table();
+        if events == PollFlags::IN {
+            table.want_readable.remove(&fd);
+        } else {
+            table.want_writable.remove(&fd);
+        }
+        Ok(())
     }
 
     /// Block until a socket the guest is parked on becomes ready or
@@ -1388,6 +1471,33 @@ mod tests {
 
     fn udp(net: &Net) -> i32 {
         net.socket(AF_INET, SOCK_DGRAM, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn async_readiness_rearms_without_stale_events_and_releases_sockets() {
+        let net = open_net();
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        let addr = net.local_addr(fd).unwrap();
+        for _ in 0..2 {
+            assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 0);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), net.wait_ready_async())
+                    .await
+                    .is_err()
+            );
+            peer.send_to(b"data", addr).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), net.wait_ready_async())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!net.has_waitable());
+            assert_eq!(net.recvfrom(fd, 16).unwrap().0, b"data");
+        }
+        assert_eq!(net.table().async_sockets.len(), 1);
+        net.table().remove(fd).unwrap();
+        assert!(net.table().async_sockets.is_empty());
     }
 
     /// Wait until `fd` reports `events` (bounded), returning revents.

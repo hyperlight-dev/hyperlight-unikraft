@@ -38,6 +38,10 @@ hyperlight-common = "0.18"
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+# Temporary reactor bridge for the existing rustix socket readiness API.
+async-io = "2"
 
 # Host I/O.  Filesystem: cap-std's `Dir` is the capability that keeps
 # guest paths inside the mount on every host OS.  Networking: the guest

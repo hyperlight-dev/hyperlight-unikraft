@@ -35,6 +35,7 @@ pub use hyperlight_host::{HostFunctions, sandbox::snapshot::Snapshot};
 
 use tracing::{debug, info};
 
+mod async_calls;
 mod errno;
 mod hostfs;
 mod hostnet;
@@ -54,6 +55,18 @@ pub use profile::Profile;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// This kernel does not negotiate the async host-call protocol.
+    #[error("the kernel does not support async host calls version 1")]
+    AsyncHostCallsUnsupported,
+    /// Drive outstanding async host calls with an async API.
+    #[error("async host calls are pending; use step_async, run_async or join_async")]
+    AsyncHostCallsPending,
+    /// Host futures cannot be captured in a guest snapshot.
+    #[error("cannot snapshot while async host calls are outstanding")]
+    AsyncSnapshotPending,
+    /// A host readiness wait failed.
+    #[error("waiting for guest I/O: {0}")]
+    Wait(#[source] std::io::Error),
     /// The driver reported the call failed, with the status it gave (see
     /// [`Yield::CallFailed`]).  The guest is alive; its output has the
     /// details.
@@ -172,7 +185,12 @@ pub type HostFunction =
     Arc<dyn Fn(&str) -> std::result::Result<String, String> + Send + Sync + 'static>;
 
 /// The host functions a sandbox offers, by name.
-type HostFunctionTable = Arc<std::collections::BTreeMap<String, HostFunction>>;
+enum RegisteredHostFunction {
+    Sync(HostFunction),
+    Async(async_calls::Handler),
+}
+
+type HostFunctionTable = Arc<std::collections::BTreeMap<String, RegisteredHostFunction>>;
 
 /// What `HostCall` answers: a tag byte, then the result or the error
 /// message.  The drivers read it back (`hl_driver.h`'s `hl_host_call`).
@@ -183,7 +201,12 @@ const HOST_CALL_ERR: u8 = 1;
 /// empty name, which no function can have, lists the registered names one
 /// per line: how a driver learns what to offer before anything is called
 /// (the quickjs driver builds its `host:` modules from it).
-fn dispatch_host_call(table: &HostFunctionTable, name: &str, args: &[u8]) -> Vec<u8> {
+fn dispatch_host_call(
+    table: &HostFunctionTable,
+    inbox: &Mutex<async_calls::Inbox>,
+    name: &str,
+    args: &[u8],
+) -> Vec<u8> {
     // The name is the guest's: quoted in an error, it is cut short, so a
     // long one cannot push the reply past what the guest can take.
     let shown = || name.chars().take(128).collect::<String>();
@@ -195,11 +218,31 @@ fn dispatch_host_call(table: &HostFunctionTable, name: &str, args: &[u8]) -> Vec
             .join("\n"))
     } else {
         match (table.get(name), std::str::from_utf8(args)) {
-            (Some(f), Ok(args)) => f(args),
+            (Some(RegisteredHostFunction::Sync(f)), Ok(args)) => f(args),
+            (Some(RegisteredHostFunction::Async(f)), Ok(args)) => {
+                match inbox
+                    .lock()
+                    .unwrap()
+                    .submit(name.into(), args.into(), f.clone())
+                {
+                    Ok(id) => {
+                        let mut reply = Vec::with_capacity(9);
+                        reply.push(2);
+                        reply.extend_from_slice(&id.to_le_bytes());
+                        return reply;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             (Some(_), Err(_)) => Err(format!("{}: the arguments are not UTF-8 text", shown())),
             (None, _) => Err(format!("no host function {:?}", shown())),
         }
     };
+    encode_host_reply(name, reply)
+}
+
+fn encode_host_reply(name: &str, reply: std::result::Result<String, String>) -> Vec<u8> {
+    let shown = || name.chars().take(128).collect::<String>();
     let (tag, text) = match reply {
         Ok(text) => (HOST_CALL_OK, text),
         Err(message) => (HOST_CALL_ERR, message),
@@ -406,12 +449,10 @@ pub(crate) const HOST_CALL_MAX: usize = G2H_HALF_PAGES * PAGE_SIZE - MSG_OVERHEA
 /// a host call's whole message (the kernel sizes `/dev/hlcall` buffers,
 /// which also take host call replies, from it), so it gets as many pages
 /// as a G2H half.
-const H2G_POOL_PAGES: usize = G2H_HALF_PAGES;
+const H2G_POOL_PAGES: usize = G2H_HALF_PAGES + 1;
 
-// Hyperlight keeps one H2G buffer spare for a call with byte parameters;
-// hluk's guest functions (`step`, `Exec`, `Call`, ...) take strings and
-// integers only, and the kernel serves no other, so every buffer is the
-// call's.
+// A completion batch uses a byte parameter: reserve the extra H2G buffer
+// Hyperlight keeps for control traffic, without reducing the result limit.
 const _: () = {
     assert!(HOST_CALL_MAX >= 64 * 1024);
     // The guest posts min(queue size, pool / buffer size) receive
@@ -1102,6 +1143,7 @@ pub(crate) struct GuestConfig {
     result: Arc<Mutex<Option<Vec<u8>>>>,
     /// The embedder's functions, served through `HostCall`.
     host_functions: HostFunctionTable,
+    async_inbox: Arc<Mutex<async_calls::Inbox>>,
     /// Whether to register `HostWriteErr`; off only to test a host
     /// without it ([`SandboxBuilder::without_host_write_err`]).
     host_write_err: bool,
@@ -1150,6 +1192,7 @@ impl GuestConfig {
             events: Arc::new(Mutex::new(Vec::new())),
             result: Arc::new(Mutex::new(None)),
             host_functions: HostFunctionTable::default(),
+            async_inbox: Arc::default(),
             host_write_err: true,
             guest: Mutex::new(Guest::default()),
             profile: profile::Profile::new(),
@@ -1566,12 +1609,29 @@ impl GuestConfig {
         // The embedder's functions, all behind one name: the kernel
         // forwards a driver's HLCALL_IOC_HOSTCALL here as it is.
         let table = self.host_functions.clone();
+        let inbox = self.async_inbox.clone();
         let prof = self.profile.clone();
         target.register_host_function(
             "HostCall",
             move |name: String, args: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
                 let _profile = prof.host("HostCall");
-                Ok(dispatch_host_call(&table, &name, &args))
+                Ok(dispatch_host_call(&table, &inbox, &name, &args))
+            },
+        )?;
+        let inbox = self.async_inbox.clone();
+        target.register_host_function(
+            "AsyncHostCallVersion",
+            move || -> hyperlight_host::Result<u64> {
+                inbox.lock().unwrap().negotiated = true;
+                Ok(async_calls::VERSION)
+            },
+        )?;
+        let inbox = self.async_inbox.clone();
+        target.register_host_function(
+            "CancelAsyncHostCall",
+            move |id: u64| -> hyperlight_host::Result<i32> {
+                inbox.lock().unwrap().cancel(id);
+                Ok(0)
             },
         )?;
         let events = self.events.clone();
@@ -2073,7 +2133,7 @@ pub struct SandboxBuilder {
     listen_ports: Option<ListenPorts>,
     env_vars: Vec<(String, String)>,
     resolv_conf: Option<String>,
-    host_functions: std::collections::BTreeMap<String, HostFunction>,
+    host_functions: std::collections::BTreeMap<String, RegisteredHostFunction>,
     profile: Option<bool>,
     host_write_err: bool,
     output_limit: usize,
@@ -2260,7 +2320,44 @@ impl SandboxBuilder {
     where
         F: Fn(&str) -> std::result::Result<String, String> + Send + Sync + 'static,
     {
-        self.host_functions.insert(name.into(), Arc::new(function));
+        self.host_functions.insert(
+            name.into(),
+            RegisteredHostFunction::Sync(Arc::new(function)),
+        );
+        self
+    }
+
+    /// Register a host function whose work runs outside the VM entry.
+    ///
+    /// Arguments and results have the same JSON convention as
+    /// [`host_function`](Self::host_function). Only the calling guest
+    /// thread parks. Use [`AppSandbox::run_async`] or
+    /// [`AppSandbox::step_async`] to drive its future. The factory is
+    /// invoked lazily by the executor, so it may construct Tokio timers.
+    /// Sync and async registrations share a namespace; the last wins.
+    ///
+    /// ```no_run
+    /// use hyperlight_unikraft::SandboxBuilder;
+    /// #[tokio::main(flavor = "current_thread")]
+    /// async fn main() -> hyperlight_unikraft::Result<()> {
+    ///     let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
+    ///         .async_host_function("later", |args| async move {
+    ///             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    ///             Ok(args)
+    ///         })
+    ///         .boot()?;
+    ///     sandbox.run_async("import hyperlight; hyperlight.call('later', 42)").await
+    /// }
+    /// ```
+    pub fn async_host_function<F, Fut>(mut self, name: impl Into<String>, function: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<String, String>> + Send + 'static,
+    {
+        self.host_functions.insert(
+            name.into(),
+            RegisteredHostFunction::Async(Arc::new(move |args| Box::pin(function(args)))),
+        );
         self
     }
 
@@ -2480,9 +2577,11 @@ impl SandboxBuilder {
         };
         let mut app = AppSandbox {
             sandbox,
+            async_calls: async_calls::PendingCalls::new(cfg.async_inbox.clone()),
             config: cfg,
             exited,
             pending: None,
+            async_poisoned: false,
         };
         if restored {
             // Put the image right for this host before anyone can observe
@@ -2490,6 +2589,7 @@ impl SandboxBuilder {
             // guest's host sockets (see `resume`).
             app.resume()?;
         }
+        app.check_async_support()?;
         Ok(app)
     }
 }
@@ -2615,9 +2715,175 @@ pub struct AppSandbox {
     /// A terminal result produced while delivering a call, handed out by
     /// the next [`step`](Self::step).
     pending: Option<Yield>,
+    async_calls: async_calls::PendingCalls,
+    async_poisoned: bool,
+}
+
+struct AsyncDrive<'a> {
+    sandbox: &'a mut AppSandbox,
+    finished: bool,
+}
+
+impl Drop for AsyncDrive<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.sandbox.async_poisoned = true;
+            self.sandbox.async_calls.clear();
+            self.sandbox.config.console.finish();
+            tracing::warn!("unfinished async drive dropped; sandbox poisoned (restore to recover)");
+        }
+    }
 }
 
 impl AppSandbox {
+    fn check_ready(&self) -> Result<()> {
+        if self.sandbox.status().is_unrecoverable() {
+            return Err(HyperlightError::UnrecoverableSandbox.into());
+        }
+        if self.async_poisoned || self.sandbox.status().is_poisoned() {
+            return Err(HyperlightError::PoisonedSandbox.into());
+        }
+
+        Ok(())
+    }
+
+    fn check_async_support(&self) -> Result<()> {
+        if self
+            .config
+            .host_functions
+            .values()
+            .any(|f| matches!(f, RegisteredHostFunction::Async(_)))
+            && !self.config.async_inbox.lock().unwrap().negotiated
+        {
+            return Err(Error::AsyncHostCallsUnsupported);
+        }
+        Ok(())
+    }
+
+    /// Execute a call while driving async host functions, timers and I/O.
+    ///
+    /// Requires a Tokio runtime with time enabled. Dropping the future
+    /// after it starts but before it completes poisons the sandbox and
+    /// drops its pending host calls. Restore a snapshot to recover.
+    /// VM entries remain synchronous; an executor timeout cannot interrupt
+    /// a CPU-bound guest. Use [`interrupt_handle`](Self::interrupt_handle).
+    pub async fn run_async(&mut self, exec: impl Into<Exec>) -> Result<()> {
+        self.submit(exec)?;
+        loop {
+            match self.step_async().await? {
+                Yield::CallDone => return Ok(()),
+                Yield::CallFailed { status } => return Err(Error::CallFailed { status }),
+                Yield::Exited { status } => return Err(Error::GuestExited { status }),
+                Yield::Blocked { .. } => {}
+            }
+        }
+    }
+
+    /// Async counterpart of [`call`](Self::call), with the cancellation
+    /// behavior of [`run_async`](Self::run_async).
+    pub async fn call_async(&mut self, function: &str, input: &str) -> Result<String> {
+        self.run_async(Exec::Call {
+            function: function.to_string(),
+            input: input.to_string(),
+        })
+        .await?;
+        self.take_text_result()
+    }
+
+    /// Async counterpart of [`join`](Self::join).
+    pub async fn join_async(&mut self) -> Result<i32> {
+        self.check_ready()?;
+        if self.exited.is_none() && self.has_driver() && !self.config.call_in_flight() {
+            return Err(Error::NothingToJoin);
+        }
+        loop {
+            match self.step_async().await? {
+                Yield::Exited { status } => return Ok(status),
+                Yield::CallDone | Yield::CallFailed { .. } if self.has_driver() => {
+                    return Err(Error::NothingToJoin);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Wait asynchronously for work, then run the guest to its next boundary.
+    ///
+    /// Host-call completions are batched into one entry. Timers and socket
+    /// readiness are watched concurrently, even while host calls are pending.
+    /// Dropping the future during its wait poisons the sandbox and drops
+    /// pending operations. An explicit restore is required to reuse it.
+    /// An idle driver with nothing to wait for returns `Blocked` immediately.
+    pub async fn step_async(&mut self) -> Result<Yield> {
+        self.check_ready()?;
+        let mut drive = AsyncDrive {
+            sandbox: self,
+            finished: false,
+        };
+        let result = drive.sandbox.step_async_inner().await;
+        drive.finished = result.is_ok();
+        result
+    }
+
+    async fn step_async_inner(&mut self) -> Result<Yield> {
+        use futures::future::{pending, poll_fn};
+
+        if let Some(y) = self.pending.take() {
+            return Ok(y);
+        }
+        if let Some(exit) = self.exited {
+            return Ok(exit);
+        }
+        if !self.async_calls.is_pending() && !self.config.can_wake() {
+            if self.config.call_in_flight() || !self.has_driver() {
+                return Err(Error::Deadlocked);
+            }
+            return Ok(Yield::Blocked { until: None });
+        }
+        let deadline = self.config.next_wakeup_at();
+        let timer = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => pending().await,
+            }
+        };
+        let net = self.config.net.clone();
+        let io = async {
+            match net.as_ref().filter(|net| net.has_waitable()) {
+                Some(net) => net.wait_ready_async().await.map_err(Error::Wait),
+                None => pending().await,
+            }
+        };
+        let completed = tokio::select! {
+            _ = poll_fn(|cx| self.async_calls.poll_batch(cx)) => true,
+            _ = timer => false,
+            result = io => { result?; false },
+        };
+        let result = if completed {
+            self.config.enter(
+                &mut self.sandbox,
+                "step_async",
+                (self.async_calls.take_batch(),),
+            )
+        } else {
+            self.config.enter(&mut self.sandbox, "step", ())
+        };
+        match result {
+            Ok(yielded) => {
+                if completed {
+                    self.async_calls.delivered();
+                }
+                Ok(self.note(yielded))
+            }
+            Err(error) => {
+                if self.sandbox.status().is_poisoned() {
+                    self.async_calls.clear();
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Execute code or a script file in the guest and wait for it to finish.
     ///
     /// Accepts inline code (`"print('hi')"`), a file path
@@ -2673,6 +2939,10 @@ impl AppSandbox {
             function: function.to_string(),
             input: input.to_string(),
         })?;
+        self.take_text_result()
+    }
+
+    fn take_text_result(&self) -> Result<String> {
         let bytes = self.take_result().unwrap_or_default();
         String::from_utf8(bytes).map_err(|e| {
             // Put it back, so take_result hands it over as bytes.
@@ -2712,6 +2982,7 @@ impl AppSandbox {
     /// or [`submit`](Self::submit) there.  Also errors if the guest
     /// deadlocks ([`Error::Deadlocked`], see [`run`](Self::run)).
     pub fn join(&mut self) -> Result<i32> {
+        self.check_ready()?;
         if self.exited.is_none() && self.has_driver() && !self.config.call_in_flight() {
             return Err(Error::NothingToJoin);
         }
@@ -2753,6 +3024,7 @@ impl AppSandbox {
     /// driver ([`Error::NoDriver`]), or already has a call in flight
     /// ([`Error::CallInFlight`]: the kernel serves one at a time).
     pub fn submit(&mut self, exec: impl Into<Exec>) -> Result<()> {
+        self.check_ready()?;
         if let Some(Yield::Exited { status }) = self.exited {
             return Err(Error::GuestExited { status });
         }
@@ -2821,6 +3093,7 @@ impl AppSandbox {
     /// Remember an exit; everything else needs no bookkeeping.
     fn note(&mut self, yielded: Yield) -> Yield {
         if let Yield::Exited { .. } = yielded {
+            self.async_calls.clear();
             self.exited = Some(yielded);
         }
         yielded
@@ -2851,11 +3124,15 @@ impl AppSandbox {
     /// guest can run, however long that takes, and returns at once when
     /// nothing could ever wake it (see [`GuestConfig::can_wake`]).
     fn step_with(&mut self, timeout: Option<Duration>) -> Result<Yield> {
+        self.check_ready()?;
         if let Some(y) = self.pending.take() {
             return Ok(y);
         }
         if let Some(exit) = self.exited {
             return Ok(exit);
+        }
+        if self.async_calls.is_pending() {
+            return Err(Error::AsyncHostCallsPending);
         }
         // A guest nothing can wake -- no timer, no live host socket -- while
         // something is owed that only it can produce (a call's return, or
@@ -2885,8 +3162,12 @@ impl AppSandbox {
     /// Errors with [`Error::GuestExited`] once the guest process has
     /// exited: there is nothing left to resume.
     pub fn snapshot(&mut self) -> Result<Arc<Snapshot>> {
+        self.check_ready()?;
         if let Some(Yield::Exited { status }) = self.exited {
             return Err(Error::GuestExited { status });
+        }
+        if self.async_calls.is_pending() {
+            return Err(Error::AsyncSnapshotPending);
         }
         Ok(self.sandbox.snapshot()?)
     }
@@ -2903,6 +3184,7 @@ impl AppSandbox {
     /// guest right for this host with a `resume` entry, as
     /// [`SandboxBuilder::boot`] does, with this sandbox's mounts.
     pub fn restore(&mut self, snapshot: Arc<Snapshot>) -> Result<()> {
+        self.async_poisoned = true;
         let sandbox = &mut self.sandbox;
         self.config
             .profile
@@ -2914,8 +3196,13 @@ impl AppSandbox {
         }
         self.exited = None;
         self.pending = None;
+        self.async_calls.clear();
+        self.config.async_inbox.lock().unwrap().negotiated = false;
         self.config.forget();
-        self.resume()
+        self.resume()?;
+        self.check_async_support()?;
+        self.async_poisoned = false;
+        Ok(())
     }
 
     /// [`restore`](Self::restore) with the snapshot read from `dir`, where
@@ -3033,6 +3320,59 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    #[ignore = "requires a hypervisor and build-elfloader/python-rootfs.cpio"]
+    fn malformed_batches_do_not_partially_wake_waiters() {
+        let rootfs =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("build-elfloader/python-rootfs.cpio");
+        let mut app = SandboxBuilder::from_initrd(rootfs)
+            .async_host_function("wait", |_| std::future::pending())
+            .echo_output(false)
+            .boot()
+            .unwrap();
+        app.submit("import hyperlight; assert hyperlight.call('wait') == 7")
+            .unwrap();
+        let valid = vec![
+            1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, b'7',
+        ];
+        let mut bad_version = valid.clone();
+        bad_version[0] = 2;
+        let mut unknown_id = valid.clone();
+        unknown_id[8] = 2;
+        let mut bad_length = valid.clone();
+        bad_length[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut duplicate = valid.clone();
+        duplicate[4] = 2;
+        duplicate.extend_from_slice(&valid[8..]);
+        let mut bad_tag = valid.clone();
+        bad_tag[20] = 2;
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        for batch in [
+            vec![],
+            bad_version,
+            unknown_id,
+            bad_length,
+            duplicate,
+            bad_tag,
+            valid[..valid.len() - 1].to_vec(),
+            trailing,
+        ] {
+            assert!(matches!(
+                app.config.enter(&mut app.sandbox, "step_async", (batch,)),
+                Err(Error::GuestSilent)
+            ));
+            assert!(app.config.call_in_flight());
+        }
+        assert_eq!(
+            app.config
+                .enter(&mut app.sandbox, "step_async", (valid,))
+                .unwrap(),
+            Yield::CallDone
+        );
+        app.async_calls.clear();
+    }
 
     /// OCI tags forbid `+`, so a `+build` suffix on the crate version would
     /// make every snapshot save panic.

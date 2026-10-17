@@ -4,6 +4,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Added
+
+- Async embedder host functions through `SandboxBuilder::async_host_function`,
+  driven by `AppSandbox::run_async`, `call_async`, `join_async` and `step_async`.
+  Pending calls park only their guest thread; the host batches completions through
+  the existing step pump. Dropping an unfinished driving future poisons the
+  sandbox until an explicit restore. Snapshots with outstanding host calls are
+  refused. Synchronous host functions retain their existing path.
+- The Python driver releases the GIL while making a host call, so other Python
+  threads can progress while an async host function is pending. Rebuild
+  Python-based rootfs images to get this behavior.
+
+### Changed
+
+- The embedded kernels negotiate async host-call protocol version 1. The
+  host-to-guest pool reserves one extra page for completion batches; the host-call
+  payload limit is unchanged. The new kernels change the snapshot compatibility
+  key, so snapshots from earlier builds must be recreated.
+
 ## [v0.18.0]
 
 ### Added

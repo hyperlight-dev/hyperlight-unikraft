@@ -78,9 +78,56 @@ The CLI registers no host functions, so a host function call fails there. Use th
 | java | `Host.call(int.class, "math.add", 2, 3)`, or `Host.call(...)` for a `Map`, `List`, `String`, `Long` (`BigInteger` past its range), `Double`, `Boolean` or `null` | throws `hyperlight.HostException` |
 | wasmtime | an import: `add` of module `math` (core module), or `add` of an interface `ns:pkg/math` (component) | traps |
 
-- **Host function calls are synchronous.** The guest waits while your function runs on the thread driving the sandbox. In Python, only the thread running the code or guest function can make a host function call; others get a `RuntimeError`.
+- **Synchronous handlers** run on the thread driving the sandbox. Async handlers (below) park the calling guest thread instead. In Python, only the thread running the code or guest function can use its high-level host-call helper; others get a `RuntimeError`.
 - **Snapshots.** Functions belong to the sandbox, not the guest. A restored guest calls the functions of the builder that restored it, so different hosts can serve the same snapshot with different functions. One catch: a quickjs `host:` module is built the first time it is imported, so a snapshot taken after `import ... from "host:db"` keeps that module's exports.
 - **Limits.** A host function call's name and arguments together are at most 69,620 bytes (the 64 KiB the transport's pool is sized for, plus what rounding the pool up to whole pages leaves over), as is a guest function's result; what your function returns, at most 69,619, since the reply also says whether it succeeded. A longer reply reaches the guest as an error saying so. The empty name is reserved: it lists the registered functions.
+
+### Async host functions
+
+`SandboxBuilder::async_host_function(name, f)` accepts
+`Fn(String) -> Future<Output = Result<String, String>> + Send + Sync`.
+The returned future must be `Send + 'static`. JSON arguments and results use the
+same conventions as synchronous functions. The factory runs lazily, outside the
+VM entry, so it can construct Tokio timers or start asynchronous I/O.
+
+```rust
+use hyperlight_unikraft::SandboxBuilder;
+use std::time::Duration;
+
+async fn example() -> hyperlight_unikraft::Result<()> {
+let mut sandbox = SandboxBuilder::from_initrd("build-elfloader/python-rootfs.cpio")
+    .async_host_function("later", |args| async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Ok(args)
+    })
+    .boot()?;
+sandbox.run_async(
+    "import hyperlight; assert hyperlight.call('later', 42) == [42]"
+).await?;
+Ok(())
+}
+```
+
+Use a Tokio runtime with time enabled. `run_async`, `call_async`, `join_async`
+and `step_async` drive pending host functions while also watching existing guest
+timers and socket readiness. Synchronous handlers keep their existing fast path,
+and synchronous APIs still work when no async operations are pending.
+
+**Cancellation poisons the sandbox.** Dropping a polled, unfinished driving
+future (including through `tokio::time::timeout`) drops its pending host work.
+Further execution and snapshots fail with `PoisonedSandbox`; restore a previously
+saved snapshot to recover. Dropping an unpolled future does nothing. Completed
+steps remain valid boundaries: use `submit` and await individual `step_async`
+calls to retain control between steps. A snapshot with outstanding async calls
+is refused even at such a boundary. Operations with external effects are never
+automatically replayed or rolled back.
+
+VM entries are still synchronous. An executor timeout does not interrupt a guest
+that never yields; use `interrupt_handle` from another thread for that case.
+Async registration requires a kernel implementing version 1 of the
+[async host-call protocol](async-host-calls.md); incompatible kernels fail at boot.
+Rebuild Python-based rootfs images as well: the updated driver releases the GIL
+during a host call so other Python threads can run while it waits.
 
 ### WebAssembly imports
 
