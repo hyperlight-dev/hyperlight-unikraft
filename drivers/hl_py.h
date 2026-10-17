@@ -232,7 +232,7 @@ static PyObject *hl_py_host_call(PyObject *self, PyObject *const *args,
 	const char *name, *a, *out;
 	Py_ssize_t name_len, a_len;
 	size_t out_len;
-	int rc;
+	int rc, saved_errno;
 
 	(void)self;
 	if (nargs < 1 || !PyUnicode_Check(args[0])) {
@@ -266,8 +266,11 @@ static PyObject *hl_py_host_call(PyObject *self, PyObject *const *args,
 		Py_DECREF(json);
 		return NULL;
 	}
+	/* An async host call parks this thread, not Python's other threads. */
+	Py_BEGIN_ALLOW_THREADS
 	rc = hl_host_call(name, (size_t)name_len, a, (size_t)a_len, &out, &out_len);
-	int saved_errno = errno;
+	saved_errno = errno;
+	Py_END_ALLOW_THREADS
 
 	Py_DECREF(json);
 	if (rc < 0) {
