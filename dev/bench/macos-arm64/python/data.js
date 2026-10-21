@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792623481907,
+  "lastUpdate": 1792626358825,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python benchmarks": [
@@ -471,6 +471,170 @@ window.BENCHMARK_DATA = {
           {
             "name": "parallel-exec/stdlib",
             "value": 76.652,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 75.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 75.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 75.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 75.8,
+            "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a7facb316caae77e6a277a03873cad6481c9035e",
+          "message": "Merge pull request #177 from hyperlight-dev/dependabot/github_actions/dot-github/actions/arm64-host/actions-a055b02c66\n\nbuild(deps): bump astral-sh/setup-uv from 10.2.0 to 10.3.0 in /.github/actions/arm64-host in the actions group across 1 directory",
+          "timestamp": "2026-10-21T16:13:59-07:00",
+          "tree_id": "3b7d6b6c8ee5c3e379bb2272d1dc7f9e43412178",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/a7facb316caae77e6a277a03873cad6481c9035e"
+        },
+        "date": 1792626357331,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 198.77,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 193.032,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 130.431,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 177.558,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 6.964,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 3.514,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 3.341,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 52.421,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 5.566,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 0.418,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 1.155,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 137.261,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 7.028,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 4.799,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 3.207,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 4.114,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 3.656,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.07,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 0.751,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 126.201,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 23.336,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 7.598,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 27.699,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 219.04,
             "unit": "ms"
           },
           {
