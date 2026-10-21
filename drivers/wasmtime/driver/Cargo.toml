@@ -19,7 +19,7 @@ wasmtime = { version = "49", default-features = false, features = [
     "addr2line", "demangle",
 ] }
 wasmtime-wasi = { version = "49", default-features = false, features = ["p1", "p3"] }
-wasmparser = "0.261"
+wasmparser = "0.262"
 wat = "1"
 serde_json = "1"
 rand_core = "0.10"
