@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792629413397,
+  "lastUpdate": 1792632207372,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python-shell benchmarks": [
@@ -511,6 +511,190 @@ window.BENCHMARK_DATA = {
           {
             "name": "parallel-exec/stdlib",
             "value": 263.853,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 105.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 105.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 105.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 105.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 6,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": false,
+          "id": "b11c33e8d180dd06ce5087a575a77100c029fef4",
+          "message": "arm64-host: a job-scoped hluk cache\n\nPoint HLUK_CACHE_DIR at the job's temp directory on the self-hosted\nhosts, which the runner empties when the job ends, cancelled or not, so\nthe images a job pulls and the warm snapshots it saves go with it,\ninstead of staying in the runner user's home for later jobs, and\nhyperlight's, to find the disk full.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-10-22T00:42:05Z",
+          "tree_id": "fb01edfe62fe98b17eeca80462299a1a01013e18",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/b11c33e8d180dd06ce5087a575a77100c029fef4"
+        },
+        "date": 1792632206047,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 14124.975,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 14279.581,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 16692.854,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 16283.475,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 53.807,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 32.33,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 51.204,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 71.828,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 47.968,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 26.63,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 41.362,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 67.115,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 14.178,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 10.235,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 16.919,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 15.437,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 1.483,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 1.255,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 4.916,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 106.383,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 78.766,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 49.325,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 216.524,
             "unit": "ms"
           },
           {
