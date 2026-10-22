@@ -42,7 +42,7 @@
   "files": [
    {
     "path": "repl.sh",
-    "text": "# The whole guest session: read a line, run it, print a prompt, until stdin\n# closes. `eval` runs each line in this shell, so `cd` and variables persist\n# from one command to the next.\necho \"hello: a shell inside a Hyperlight micro-VM. Ctrl-D to leave.\"\nwhile true; do\n    printf '%s' \"${PS1:-# }\"\n    if ! IFS= read -r cmd; then\n        # End of input.  A last line with no newline has still filled cmd:\n        # run it, and stop here rather than read past the end.\n        [ -n \"$cmd\" ] && eval \"$cmd\"\n        break\n    fi\n    eval \"$cmd\"\ndone\necho\n"
+    "text": "# The whole guest session: read a line, run it, print a prompt, until stdin\n# closes. `eval` runs each line in this shell, so `cd` and variables persist\n# from one command to the next.\necho \"hello: a shell inside a Hyperlight micro-VM. Ctrl-D to leave.\"\nwhile true; do\n    # A prompt for a terminal; input piped in runs without one.\n    [ -t 0 ] && printf '%s' \"${PS1:-# }\"\n    if ! IFS= read -r cmd; then\n        # End of input.  A last line with no newline has still filled cmd:\n        # run it, and stop here rather than read past the end.\n        [ -n \"$cmd\" ] && eval \"$cmd\"\n        break\n    fi\n    eval \"$cmd\"\ndone\necho\n"
    },
    {
     "path": "hluk.toml",
