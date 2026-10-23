@@ -168,7 +168,10 @@ $(".cells").innerHTML = "<i></i>".repeat(1000);
 
 // Templates merged since the latest release: `hluk init` from a release
 // doesn't know them yet. Empty this when the next release ships.
-const UNRELEASED = { java: "New since the latest release: install with HLUK_VERSION=dev to use it now." };
+const UNRELEASED = {
+  java: "New since the latest release: install with HLUK_VERSION=dev to use it now.",
+  php: "New since the latest release: install with HLUK_VERSION=dev to use it now.",
+};
 
 function filesHtml(files) {
   return files.map(f => `<div class="file"><h3>${escapeHtml(f.path)}</h3><pre class="code"><code>${escapeHtml(f.text.trimEnd())}</code></pre></div>`).join("");

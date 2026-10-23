@@ -224,6 +224,23 @@
   ]
  },
  {
+  "name": "php",
+  "runtime": "php",
+  "tier": 2,
+  "description": "A PHP 8.5 script, run by PHP embedded in the guest (SQLite, mbstring, DOM, OpenSSL)",
+  "build": false,
+  "files": [
+   {
+    "path": "main.php",
+    "text": "<?php\n// A script: the functions it declares stay for the next call, so a handler\n// defined here (or in warm_exec, to have it in the snapshot) can be called\n// many times from an embedder with AppSandbox::call(\"handler\", json).\nfunction handler(array $event): array\n{\n    return ['greeting' => \"Hello, {$event['name']}!\"];\n}\n\necho \"Hello from hello!\\n\";\necho json_encode(handler(['name' => 'PHP ' . PHP_VERSION . ' on Hyperlight'])), \"\\n\";\n"
+   },
+   {
+    "path": "hluk.toml",
+    "text": "manifest_version = 1\n\n[app]\nname = \"hello\"\n\n[rootfs]\nimage = \"ghcr.io/hyperlight-dev/hyperlight-unikraft/php:initrd-vX.Y.Z\"\n\n[run]\nscript = \"main.php\"\nwarm = true\n"
+   }
+  ]
+ },
+ {
   "name": "powershell",
   "runtime": "powershell",
   "tier": 3,
