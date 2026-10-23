@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>az-cli shell</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #1e1e1e; color: #ccc; font: 13px system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { padding: 6px 12px; display: flex; gap: 12px; align-items: baseline; }
+  header b { color: #fff; }
+  #status { margin-left: auto; }
+  #term { flex: 1; min-height: 0; padding: 0 0 4px 8px; }
+</style>
+</head>
+<body>
+<header><b>az-cli shell</b><span>one Hyperlight micro-VM per tab</span><span id="status">connecting…</span></header>
+<div id="term"></div>
+<script>
+  const status = document.getElementById("status");
+  const term = new Terminal({ cursorBlink: true, fontSize: 14, convertEol: false });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById("term"));
+  fit.fit();
+
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  const enc = new TextEncoder();
+  const resize = () => {
+    fit.fit();
+    if (ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
+  };
+  const t0 = performance.now();
+  let first = true;
+  ws.onopen = () => { status.textContent = "starting micro-VM…"; resize(); };
+  ws.onmessage = (e) => {
+    if (first) { first = false; status.textContent = `connected · first output after ${Math.round(performance.now() - t0)} ms`; }
+    term.write(new Uint8Array(e.data));
+  };
+  ws.onclose = () => { status.textContent = "session ended (reload for a new micro-VM)"; term.options.cursorBlink = false; };
+  term.onData((d) => ws.readyState === WebSocket.OPEN && ws.send(enc.encode(d)));
+  window.addEventListener("resize", resize);
+  term.focus();
+</script>
+</body>
+</html>

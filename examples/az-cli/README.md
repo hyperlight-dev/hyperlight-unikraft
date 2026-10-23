@@ -29,6 +29,15 @@ az-shell:/root$ exit
 
 Sign in with `--use-device-code`: the guest has no browser. Pass `--tenant` when a tenant requires MFA for Azure Resource Manager; without it, az signs in to the home tenant and then fails to reach the others (`AADSTS50076`).
 
+## In a browser
+
+```bash
+pip install websockets
+python3 examples/az-cli/web/server.py     # http://localhost:8080
+```
+
+Each browser tab gets its own micro-VM and its own `~/.azure`, removed when the tab closes: browser (xterm.js) → websocket → `server.py` → `run.sh` under a pseudo-terminal → micro-VM. The micro-VM has no inbound port; the server owns the socket. The server listens on 127.0.0.1 only.
+
 ## The `hluk run` command
 
 `run.sh` runs this:
@@ -73,7 +82,7 @@ x86_64, KVM, signed out (az exits before any network call), 5 runs after a warm-
 
 - Network: only the three hosts above. Storage data plane (`*.blob.core.windows.net`), Key Vault (`*.vault.azure.net`), `az extension add`, `az upgrade` and `az bicep install` fail with `bad address` until their hosts are added (`--net-allow`, or `--net` for everything).
 - No `ssh`, `docker`, `kubectl` or `jq`: `az ssh`, `az acr login` and `az aks` with kubectl do not work. Use `--query` instead of `jq`.
-- Line-at-a-time input: no tab completion, history or `az interactive`.
+- Line-at-a-time input: no tab completion, history or `az interactive`. The guest always reports a 24×80 terminal.
 - Files outside `/root/.azure` are in guest memory and go when the guest exits; `--mount` moves files in and out.
 
 ## Files
@@ -84,3 +93,4 @@ x86_64, KVM, signed out (az exits before any network call), 5 runs after a warm-
 | `az.c` | `/bin/az`, an ELF launcher for `python3 -m azure.cli`: the guest runs ELF executables only, not `#!` scripts. |
 | `shell.sh` | Guest side: the prompt loop. |
 | `run.sh` | Host side: the `hluk run` command above. `AZ_HOME` and `HLUK` override the defaults. |
+| `web/server.py`, `web/index.html` | The browser terminal: a websocket per tab, relayed to `run.sh`. |
