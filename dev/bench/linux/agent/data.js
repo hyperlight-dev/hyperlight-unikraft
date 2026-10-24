@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792800951185,
+  "lastUpdate": 1792801682156,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "agent benchmarks": [
@@ -9943,6 +9943,190 @@ window.BENCHMARK_DATA = {
           {
             "name": "rss/stdlib",
             "value": 13,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "74541cf8063692a558a6b9029ec147d913871bd1",
+          "message": "Merge pull request #199 from hyperlight-dev/php2shell-demo\n\nAdd a PHP RCE containment demo",
+          "timestamp": "2026-10-24T00:17:17Z",
+          "tree_id": "9153126bad07e53801c9251cf216abbd034a4bb2",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/74541cf8063692a558a6b9029ec147d913871bd1"
+        },
+        "date": 1792801681481,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 6075.478,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 6108.732,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 6099.419,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 6092.402,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 51.779,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 35.617,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 40.925,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 55.369,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 16.695,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 11.787,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 13.314,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 25.753,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 1.446,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 1.422,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 2.109,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 1.5,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.691,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.241,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 0.895,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 10.311,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 27.381,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 19.357,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 21.244,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 38.182,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 840.2,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 840.2,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 840.2,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 840.2,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 14,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 12,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 14,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 14,
             "unit": "MB"
           }
         ]
