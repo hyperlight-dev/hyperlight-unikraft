@@ -15,7 +15,7 @@
 # under QEMU, and cross-compiling R2R code for another architecture is
 # supported.  The runtime identifier names the target architecture .NET's
 # way (x64, arm64); TARGETARCH is Docker's (amd64, arm64).
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0-alpine@sha256:a4ef33907bcb0cf387a5e43fa9180667bf68d47527d5d219a9d8ee280c184130 AS dispatch
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0-alpine@sha256:5c27d494a591387d9613551a2b4f8f54873cfb5469a4d667bfe092a845b0baf0 AS dispatch
 
 WORKDIR /src
 COPY drivers/dotnet-jit/HlDotnetDispatch/ ./
@@ -25,7 +25,7 @@ RUN dotnet publish -c Release \
         --self-contained -o /dispatch
 
 # Native parts (C driver, musl, C++ runtime, OpenSSL) for the target.
-FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine@sha256:a4ef33907bcb0cf387a5e43fa9180667bf68d47527d5d219a9d8ee280c184130 AS build
+FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine@sha256:5c27d494a591387d9613551a2b4f8f54873cfb5469a4d667bfe092a845b0baf0 AS build
 
 # Compile the C driver
 RUN apk add --no-cache gcc musl-dev
