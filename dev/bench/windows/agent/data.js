@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793126066805,
+  "lastUpdate": 1793141698756,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "agent benchmarks": [
@@ -9048,6 +9048,190 @@ window.BENCHMARK_DATA = {
           {
             "name": "rss/compute",
             "value": 34,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 33,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 36,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 37,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "danbugs",
+            "username": "danbugs"
+          },
+          "distinct": true,
+          "id": "3edd6887f972a30599f0e456b866764b5732b473",
+          "message": "benchmarks: raise the linux agent cold-snap ceilings for slower runners\n\nMain's agent bench measured cold-snap/hello at 42 ms on one runner and\n35 ms on another, with the same kernel. Raise cold-snap/hello 30 -> 50,\ncold-snap/mount 38 -> 55 and restore-cost/hello 4 -> 5.\n\nSigned-off-by: danbugs <danilochiarlone@gmail.com>",
+          "timestamp": "2026-10-27T22:13:45Z",
+          "tree_id": "19370f35ea086a7a30d9dfd7d5e92837e00ebc21",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/3edd6887f972a30599f0e456b866764b5732b473"
+        },
+        "date": 1793141693970,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 14389.546,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 14292.981,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 14573.895,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 14439.111,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 260.9,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 232.522,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 265.756,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 302.89,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 78.901,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 67.58,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 76.634,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 101.831,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 55.557,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 55.284,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 59.616,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 55.899,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 3.058,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.613,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 4.326,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 12.3,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 102.654,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 88.024,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 96.611,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 134.863,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 841.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 841.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 841.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 841.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 35,
             "unit": "MB"
           },
           {
