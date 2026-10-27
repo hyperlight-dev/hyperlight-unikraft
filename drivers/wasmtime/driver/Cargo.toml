@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-wasmtime = { version = "49", default-features = false, features = [
+wasmtime = { version = "50", default-features = false, features = [
     "cranelift", "wat", "runtime", "component-model", "component-model-async", "std",
     "addr2line", "demangle",
 ] }
