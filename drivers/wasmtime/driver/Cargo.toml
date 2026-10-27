@@ -14,11 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-wasmtime = { version = "49", default-features = false, features = [
+wasmtime = { version = "50", default-features = false, features = [
     "cranelift", "wat", "runtime", "component-model", "component-model-async", "std",
     "addr2line", "demangle",
 ] }
-wasmtime-wasi = { version = "49", default-features = false, features = ["p1", "p3"] }
+wasmtime-wasi = { version = "50", default-features = false, features = ["p1", "p3"] }
 wasmparser = "0.262"
 wat = "1"
 serde_json = "1"
