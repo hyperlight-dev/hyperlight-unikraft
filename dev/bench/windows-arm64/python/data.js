@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793072605332,
+  "lastUpdate": 1793158517525,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python benchmarks": [
@@ -3095,6 +3095,188 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot-size/stdlib",
             "value": 75.8,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 16,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 14,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 16,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 23,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]",
+            "email": "49699333+dependabot[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "67f960bfa87ce259e4e9ac5921260082109c77e2",
+          "message": "build(deps): bump libc from 0.2.190 to 0.2.191 in the cargo group across 1 directory (#215)\n\nBumps the cargo group with 1 update in the /drivers/wasmtime/driver\ndirectory: [libc](https://github.com/rust-lang/libc).\n\nUpdates `libc` from 0.2.190 to 0.2.191\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/rust-lang/libc/releases\">libc's\nreleases</a>.</em></p>\n<blockquote>\n<h2>0.2.191</h2>\n<h3>Support</h3>\n<ul>\n<li>Emscripten: Support v4.0.12 to v6.0.11 (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5610\">#5610</a>)</li>\n</ul>\n<h3>Added</h3>\n<ul>\n<li>Apple: Add <code>F_SETNOSIGPIPE</code> and\n<code>F_GETNOSIGPIPE</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5609\">#5609</a>)</li>\n<li>Apple: add <code>ifaliasreq</code> and <code>in6_aliasreq</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5557\">#5557</a>)</li>\n<li>FreeBSD: Add <code>PT_*</code> constants (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5625\">#5625</a>)</li>\n<li>Haiku: Add <code>AI_*</code> and <code>NI_*</code> constants from\nnetdb.h (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5585\">#5585</a>)</li>\n<li>Hurd: Add <code>POSIX_SPAWN_*</code> flags (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5578\">#5578</a>)</li>\n<li>NuttX: Add <code>AT_SYMLINK_NOFOLLOW</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5614\">#5614</a>)</li>\n<li>OpenBSD: Add <code>sensordev</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5534\">#5534</a>)</li>\n<li>QuRT: Add <code>isatty</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5618\">#5618</a>)</li>\n<li>WASI: Add <code>pthread_condattr_{get,set}clock</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5626\">#5626</a>)</li>\n</ul>\n<h3>Fixed</h3>\n<ul>\n<li>FreeBSD-aarch64: Fix <code>gpregs</code> and <code>fpregs</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5603\">#5603</a>)</li>\n</ul>\n<h3>Changed</h3>\n<ul>\n<li>AIX: Restore 'c_ulong' as the type of 'statvfs.f_fsid'. (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5616\">#5616</a>)</li>\n<li>Android: Make <code>prop_info</code> an extern type (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5561\">#5561</a>)</li>\n<li>Apple: Mach API is now available on non-MacOS targets again. This\nshould resolve some issues building ecosystem crates. (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pulls/5612\">#5612</a>),\n(<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5636\">#5636</a>)</li>\n<li>FreeBSD: Add back <code>NOTE_PCTRLMASK</code> with a deprecation\nwarning (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5600\">#5600</a>)</li>\n</ul>\n</blockquote>\n</details>\n<details>\n<summary>Changelog</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/rust-lang/libc/blob/0.2.191/CHANGELOG.md\">libc's\nchangelog</a>.</em></p>\n<blockquote>\n<h2><a\nhref=\"https://github.com/rust-lang/libc/compare/0.2.190...0.2.191\">0.2.191</a>\n- 2026-10-16</h2>\n<h3>Support</h3>\n<ul>\n<li>Emscripten: Support v4.0.12 to v6.0.11 (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5610\">#5610</a>)</li>\n</ul>\n<h3>Added</h3>\n<ul>\n<li>Apple: Add <code>F_SETNOSIGPIPE</code> and\n<code>F_GETNOSIGPIPE</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5609\">#5609</a>)</li>\n<li>Apple: add <code>ifaliasreq</code> and <code>in6_aliasreq</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5557\">#5557</a>)</li>\n<li>FreeBSD: Add <code>PT_*</code> constants (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5625\">#5625</a>)</li>\n<li>Haiku: Add <code>AI_*</code> and <code>NI_*</code> constants from\nnetdb.h (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5585\">#5585</a>)</li>\n<li>Hurd: Add <code>POSIX_SPAWN_*</code> flags (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5578\">#5578</a>)</li>\n<li>NuttX: Add <code>AT_SYMLINK_NOFOLLOW</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5614\">#5614</a>)</li>\n<li>OpenBSD: Add <code>sensordev</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5534\">#5534</a>)</li>\n<li>QuRT: Add <code>isatty</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5618\">#5618</a>)</li>\n<li>WASI: Add <code>pthread_condattr_{get,set}clock</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5626\">#5626</a>)</li>\n</ul>\n<h3>Fixed</h3>\n<ul>\n<li>FreeBSD-aarch64: Fix <code>gpregs</code> and <code>fpregs</code> (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5603\">#5603</a>)</li>\n</ul>\n<h3>Changed</h3>\n<ul>\n<li>AIX: Restore 'c_ulong' as the type of 'statvfs.f_fsid'. (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5616\">#5616</a>)</li>\n<li>Android: Make <code>prop_info</code> an extern type (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5561\">#5561</a>)</li>\n<li>Apple: Mach API is now available on non-MacOS targets again. This\nshould resolve some issues building ecosystem crates. (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pulls/5612\">#5612</a>),\n(<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5636\">#5636</a>)</li>\n<li>FreeBSD: Add back <code>NOTE_PCTRLMASK</code> with a deprecation\nwarning (<a\nhref=\"https://redirect.github.com/rust-lang/libc/pull/5600\">#5600</a>)</li>\n</ul>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/ccc2ff4aaab962f7fde7b8edda7379c045b1ca12\"><code>ccc2ff4</code></a>\nlibc: Release 0.2.191</li>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/bce6efbe0a9d77770b579b933af5cbbe0b5a916d\"><code>bce6efb</code></a>\napple: Add <code>mach_task_self</code> and <code>mach_task_self_</code>\nto semver checks</li>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/ecf4fd4d0febb45e5199d8f82b956ab45817423f\"><code>ecf4fd4</code></a>\napple: Re-restrict <code>mach_vm_map</code> to MacOS-only</li>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/b0e042335159940bff94be6693107f76d43dc4ea\"><code>b0e0423</code></a>\nRevert &quot;apple: Disable <code>mach.h</code> API on Apple mobile\nOSs&quot;</li>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/9c7f568d7a00751d7d32cb0014f4edbff68bff0b\"><code>9c7f568</code></a>\napple: add <code>ifaliasreq</code> and <code>in6_aliasreq</code></li>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/018c7e9d0d1f84601180ea83d9240c5812909570\"><code>018c7e9</code></a>\nwasi: Add pthread_condattr_{get,set}clock</li>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/2c7718527e806c3b40dff13268f8119276100672\"><code>2c77185</code></a>\nopenbsd: add sensordev structure</li>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/e10813cff2a5cfb6ea654f9ead821572de2f278f\"><code>e10813c</code></a>\nhurd: Add missing <code>POSIX_SPAWN_*</code> flags</li>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/2ea4bc1d8d8ee12b8b12237ee9fdc64bcdb4acac\"><code>2ea4bc1</code></a>\nFix FreeBSD/aarch64</li>\n<li><a\nhref=\"https://github.com/rust-lang/libc/commit/6d666fdfdee785cec793de163fdcbd0ad83f5567\"><code>6d666fd</code></a>\ndragonfly: Parse version from headers rather than CLI</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/rust-lang/libc/compare/0.2.190...0.2.191\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-28T00:24:09Z",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/67f960bfa87ce259e4e9ac5921260082109c77e2"
+        },
+        "date": 1793158515342,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 976.512,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 991.981,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 929.549,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 1015.348,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 72.68,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 49.628,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 69.255,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 215.513,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 50.664,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 20.134,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 31.915,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 153.18,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 19.222,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 18.972,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 21.816,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 21.162,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 3.047,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.676,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 4.103,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 30.258,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 22.612,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 7.892,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 16.86,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 72.444,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 75.9,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 75.9,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 75.9,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 75.9,
             "unit": "MiB"
           },
           {
