@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793146150233,
+  "lastUpdate": 1793147022288,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python-shell benchmarks": [
@@ -12255,6 +12255,190 @@ window.BENCHMARK_DATA = {
           {
             "name": "parallel-exec/stdlib",
             "value": 29.21,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 102.9,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 102.9,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 102.9,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 102.9,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 6,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 6,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ea3600ab2b2e52b593f6333b6da831fc1b9a4deb",
+          "message": "build(deps): bump the actions group across 1 directory with 2 updates (#216)\n\nBumps the actions group with 2 updates in the / directory:\n[Swatinem/rust-cache](https://github.com/swatinem/rust-cache) and\n[pypa/gh-action-pypi-publish](https://github.com/pypa/gh-action-pypi-publish).\n\nUpdates `Swatinem/rust-cache` from 2.9.2 to 2.9.3\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/swatinem/rust-cache/releases\">Swatinem/rust-cache's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v2.9.3</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Issue-375: stop cleanup timestamp pruning after the first entry by\n<a\nhref=\"https://github.com/TethysSvensson\"><code>@​TethysSvensson</code></a>\nin <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/377\">Swatinem/rust-cache#377</a></li>\n<li>fix: log rustup toolchain list failure as info instead of warning by\n<a href=\"https://github.com/SDAChess\"><code>@​SDAChess</code></a> in <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/394\">Swatinem/rust-cache#394</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a\nhref=\"https://github.com/TethysSvensson\"><code>@​TethysSvensson</code></a>\nmade their first contribution in <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/377\">Swatinem/rust-cache#377</a></li>\n<li><a href=\"https://github.com/SDAChess\"><code>@​SDAChess</code></a>\nmade their first contribution in <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/394\">Swatinem/rust-cache#394</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/Swatinem/rust-cache/compare/v2.9.2...v2.9.3\">https://github.com/Swatinem/rust-cache/compare/v2.9.2...v2.9.3</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Changelog</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/Swatinem/rust-cache/blob/master/CHANGELOG.md\">Swatinem/rust-cache's\nchangelog</a>.</em></p>\n<blockquote>\n<h1>Changelog</h1>\n<h2>2.9.3</h2>\n<ul>\n<li>Fix timestamp based pruning</li>\n<li>Add missing <code>await</code>s</li>\n<li>Do not emit warning on missing <code>rustup</code></li>\n</ul>\n<h2>2.9.2</h2>\n<ul>\n<li>Fix <code>credentials.toml</code> cleanup</li>\n<li>Improvements to cleanup, preserving more valid targets</li>\n<li>Improvements to <code>cargo install</code> handling</li>\n<li>Correctly sort/dedupe Rust versions</li>\n</ul>\n<h2>2.9.1</h2>\n<ul>\n<li>Fix regression in hash calculation</li>\n</ul>\n<h2>2.9.0</h2>\n<ul>\n<li>Update to <code>node24</code></li>\n<li>Support running from within a <code>nix</code> shell</li>\n<li>Consider all installed toolchains for cache key</li>\n<li>Use case-insensitive comparison to determine exact cache hit</li>\n</ul>\n<h2>2.8.2</h2>\n<ul>\n<li>Don't overwrite env for cargo-metadata call</li>\n</ul>\n<h2>2.8.1</h2>\n<ul>\n<li>Set empty <code>CARGO_ENCODED_RUSTFLAGS</code> when retrieving\nmetadata</li>\n<li>Various dependency updates</li>\n</ul>\n<h2>2.8.0</h2>\n<ul>\n<li>Add support for <code>warpbuild</code> cache provider</li>\n<li>Add new <code>cache-workspace-crates</code> feature</li>\n</ul>\n<h2>2.7.8</h2>\n<ul>\n<li>Include CPU arch in the cache key</li>\n</ul>\n<h2>2.7.7</h2>\n<ul>\n<li>Also cache <code>cargo install</code> metadata</li>\n</ul>\n<h2>2.7.6</h2>\n<!-- raw HTML omitted -->\n</blockquote>\n<p>... (truncated)</p>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/d1527c8f67ef9af357290475d4af4b0fab8f12e0\"><code>d1527c8</code></a>\n2.9.3</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/f0fca6fc1c91b0c4158e7b92bdd2582341575c8e\"><code>f0fca6f</code></a>\nupdate dependencies and rebuild</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/b49b17f98024bf3c4d14fb465de5bad92750344b\"><code>b49b17f</code></a>\nadd missing awaits</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/6a7bc3ebce750e0a16a430dd57485acfdb38b05f\"><code>6a7bc3e</code></a>\nBump the dev-minor group across 1 directory with 2 updates (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/383\">#383</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/4ece996238f932eddbc3099e93131a4089950e4f\"><code>4ece996</code></a>\nBump the actions group across 1 directory with 6 updates (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/392\">#392</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/8103aff431aa12c1132e226b21f6a655ea749803\"><code>8103aff</code></a>\nBump the prd-minor group across 1 directory with 2 updates (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/389\">#389</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/0e361f3528cccdd0ac5d0e0dda2bde9bcfc77a1f\"><code>0e361f3</code></a>\nfix: log rustup toolchain list failure as info instead of warning (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/393\">#393</a>)\n(<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/394\">#394</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/f0d9c3887740aee45f6153b24b3a6b815192ec16\"><code>f0d9c38</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/380\">#380</a>\nfrom Swatinem/dependabot/github_actions/actions-8ff58...</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/ccd9742ce3913201b7e871cc4b4f95ee3930f15b\"><code>ccd9742</code></a>\nBump the actions group with 2 updates</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/258712b0b7b1ddf8bddc9fc3b0faca682b2736c3\"><code>258712b</code></a>\nfix: stop cleanup timestamp pruning after the first entry (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/377\">#377</a>)</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/swatinem/rust-cache/compare/6323deb102c322ba6fcbdcafc7e3dddab59af2b6...d1527c8f67ef9af357290475d4af4b0fab8f12e0\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\nUpdates `pypa/gh-action-pypi-publish` from 1.14.2 to 1.14.3\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/releases\">pypa/gh-action-pypi-publish's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v1.14.3</h2>\n<!-- raw HTML omitted -->\n<blockquote>\n<p>[!important]\n🚨 This release includes fixes for <a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/security/advisories/GHSA-5xjx-3w67-w9x9\">GHSA-5xjx-3w67-w9x9</a>\npatched up by <a\nhref=\"https://github.com/sethmlarson\"><code>@​sethmlarson</code></a><a\nhref=\"https://github.com/sponsors/sethmlarson\">💰</a> in <a\nhref=\"https://redirect.github.com/pypa/gh-action-pypi-publish/issues/427\">#427</a>\nand in other places across the ecosystem.</p>\n<p>Additional ecosystem and related mitigations beyond you might want to\nwatch out for:</p>\n<ul>\n<li><a\nhref=\"https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576\">https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576</a></li>\n<li><a\nhref=\"https://emudhra.we-have-a-problem.com\">https://emudhra.we-have-a-problem.com</a></li>\n</ul>\n</blockquote>\n<h2>🛠️ Security Tightening</h2>\n<p><a href=\"https://github.com/webknjaz\"><code>@​webknjaz</code></a><a\nhref=\"https://github.com/sponsors/webknjaz\">💰</a> made sure the\ndependency tree within the action runtime uses hash-checking from now on\nvia <a\nhref=\"https://redirect.github.com/pypa/gh-action-pypi-publish/pull/420\">pypa/gh-action-pypi-publish#420</a>.</p>\n<p><strong>🪞 Full Diff</strong>: <a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/compare/v1.14.2...v1.14.3\">https://github.com/pypa/gh-action-pypi-publish/compare/v1.14.2...v1.14.3</a></p>\n<p><strong>🧔‍♂️ Release Manager:</strong> <a\nhref=\"https://github.com/sponsors/webknjaz\"><code>@​webknjaz</code></a>\n<a href=\"https://stand-with-ukraine.pp.ua\">🇺🇦</a></p>\n<p><strong>💬 Discuss</strong> <a\nhref=\"https://bsky.app/profile/webknjaz.me/post/3mydcjweyak2f\">on\nBluesky 🦋</a>, <a\nhref=\"https://mastodon.social/@webknjaz/117474743338290807\">on Mastodon\n🐘</a> and <a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/discussions/429\">on\nGitHub</a>.</p>\n<p><a href=\"https://github.com/sponsors/webknjaz\"><img\nsrc=\"https://img.shields.io/badge/%40webknjaz-transparent?logo=githubsponsors&amp;logoColor=%23EA4AAA&amp;label=Sponsor&amp;color=2a313c\"\nalt=\"GH Sponsors badge\" /></a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/commit/7245906fb61fa33a13554f9d5fb856fe61758086\"><code>7245906</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/pypa/gh-action-pypi-publish/issues/427\">#427</a>\nfrom sethmlarson/certifi-sigstore</li>\n<li><a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/commit/331eccb0e13a5c1124ed9f414a079ef2bef1095f\"><code>331eccb</code></a>\nUpgrade certifi and sigstore</li>\n<li><a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/commit/f68fee44f9faa979857cda34894b750df5f571ca\"><code>f68fee4</code></a>\n💰 Sync the FUNDING config</li>\n<li><a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/commit/c0d6f8e4af2ad8247a7da213b199ea78dac8395e\"><code>c0d6f8e</code></a>\nMerge branch 'integrity/runtime/deptree' into unstable/v1</li>\n<li><a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/commit/909009990f9cf7e7c6a64e602638cf9e91af47f8\"><code>9090099</code></a>\n🧪 Make smoke test deps hash-pinned in CI</li>\n<li><a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/commit/34e40c24acd7b4a9150956d646c8c7ba667a14f3\"><code>34e40c2</code></a>\n📌 Bump pip-tools managed transitive deptrees</li>\n<li><a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/commit/e800ed547ac29cbc9324311809e2f36fe82148f9\"><code>e800ed5</code></a>\n👷 Enable hash-checking in the runtime deptree 🔗</li>\n<li><a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/commit/dd8c5f4f1f65ddf01533969008446145facc7b02\"><code>dd8c5f4</code></a>\n🔧 Make pip-tools config available in container</li>\n<li>See full diff in <a\nhref=\"https://github.com/pypa/gh-action-pypi-publish/compare/dc37677b2e1c63e2034f94d8a5b11f265b73ba33...7245906fb61fa33a13554f9d5fb856fe61758086\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-27T17:20:49-07:00",
+          "tree_id": "5d58ea19fb69157d9aaf7e7614351a66cbf43c41",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/ea3600ab2b2e52b593f6333b6da831fc1b9a4deb"
+        },
+        "date": 1793147021029,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 470.139,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 476.578,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 468.397,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 478.958,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 26.139,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 19.071,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 23.538,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 38.444,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 10.865,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 6.235,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 7.975,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 20.021,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 1.544,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 1.481,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 1.982,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 1.6,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.646,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.204,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 0.758,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 10.238,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 17.594,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 10.141,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 12.71,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 29.458,
             "unit": "ms"
           },
           {
