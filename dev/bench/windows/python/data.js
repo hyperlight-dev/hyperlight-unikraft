@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793259190504,
+  "lastUpdate": 1793314070377,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python benchmarks": [
@@ -13011,6 +13011,190 @@ window.BENCHMARK_DATA = {
           {
             "name": "snapshot-size/stdlib",
             "value": 76.4,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 15,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 13,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 15,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 21,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danilochiarlone@gmail.com",
+            "name": "Dan Chiarlone",
+            "username": "danbugs"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7a8e8dfb07eb9691ff97486c94e735228247fc71",
+          "message": "Merge pull request #228 from hyperlight-dev/ramfs-growth\n\nkernel: grow a written file by half at least, not to its exact size",
+          "timestamp": "2026-10-29T15:44:08-07:00",
+          "tree_id": "9fa0e11733b4ccafa0a3873723ea747bee7e3e14",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/7a8e8dfb07eb9691ff97486c94e735228247fc71"
+        },
+        "date": 1793314067525,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 694.838,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 693.878,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 699.853,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 745.639,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 74.341,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 47.474,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 68.577,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 179.318,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 21.504,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 8.688,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 15.374,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 78.143,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 10.75,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 10.634,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 14.007,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 11.117,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.468,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.414,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 2.357,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 35.543,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 25.407,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 9.762,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 19.877,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 125.564,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 76.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 76.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 76.3,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 76.3,
             "unit": "MiB"
           },
           {
