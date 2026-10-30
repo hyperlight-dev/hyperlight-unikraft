@@ -905,29 +905,34 @@ const SHELL_BUILTINS: &[&str] = &[
 /// The program a shell command line starts with, past any `KEY=VALUE`
 /// assignments and grouping (`CGO_ENABLED=0 go build …` starts `go`, `(cd
 /// x && make)` starts `cd`); `None` when it is the shell's own, or when
-/// only the shell knows what it is: a word it expands or unquotes first
-/// (`${CC:-gcc}`, `"$GO"`, `~/bin/tool`, `cmd`'s `%CC%`).
+/// only the shell knows what it is: a word it expands, unquotes or splits
+/// first (`${CC:-gcc}`, `"$GO"`, `~/bin/tool`, `cmd`'s `%CC%`, `./[b]uild.sh`).
 fn command_program(command: &str) -> Option<&str> {
     let assignment = |word: &str| {
         word.split_once('=').is_some_and(|(name, _)| {
-            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         })
     };
     let program = command
         .split_whitespace()
         .map(|word| word.trim_start_matches(['(', '{']))
         .find(|word| !word.is_empty() && !assignment(word))?;
-    let expanded =
-        program.starts_with('~') || program.contains(['$', '%', '`', '"', '\'', '*', '?']);
+    // Only a plain word names the program as written; the shell expands,
+    // unquotes or splits anything else first, so leave that to it.
+    let plain = |c: char| {
+        c.is_ascii_alphanumeric() || "._+/-".contains(c) || (cfg!(windows) && "\\:".contains(c))
+    };
+    let expanded = program.starts_with('-') || !program.chars().all(plain);
     (!expanded && !SHELL_BUILTINS.contains(&program)).then_some(program)
 }
 
-/// Whether `program` resolves: a path that exists, relative to `dir`, where
+/// Whether `program` resolves: a path to a file, relative to `dir`, where
 /// the command runs, or a name found in PATH (with the executable
 /// extensions Windows adds).
 fn on_path(program: &str, dir: &Path) -> bool {
     if program.contains('/') || program.contains('\\') {
-        return dir.join(program).exists();
+        return dir.join(program).is_file();
     }
     let Some(path) = std::env::var_os("PATH") else {
         return true;
@@ -1685,6 +1690,15 @@ mod tests {
         assert_eq!(command_program("${CC:=gcc} main.c"), None);
         assert_eq!(command_program("%CC% main.c"), None);
         assert_eq!(command_program("./build.sh --release"), Some("./build.sh"));
+        assert_eq!(command_program("(make)"), None);
+        assert_eq!(command_program("make&&cp out bin/"), None);
+        assert_eq!(command_program("./[b]uild.sh"), None);
+        assert_eq!(command_program("CC=$(command -v gcc) $CC main.c"), None);
+        assert_eq!(command_program("2=foo make"), None);
+        if !cfg!(windows) {
+            assert_eq!(command_program("\\make -j4"), None);
+            assert_eq!(command_program("./build\\ tool.sh"), None);
+        }
         let here = Path::new(".");
         assert!(on_path("sh", here) || on_path("cmd", here));
         assert!(!on_path("hluk-no-such-program-xyz", here));
