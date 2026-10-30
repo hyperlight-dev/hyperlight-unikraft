@@ -587,7 +587,7 @@ fn run_build(manifest: &Manifest, rootfs_hint: bool) -> CliResult<()> {
         // The toolchain is the project's, not hluk's: say which one is
         // missing rather than let the shell's "not found" stand alone.
         if let Some(program) = command_program(&build.command)
-            && !on_path(program)
+            && !on_path(program, &manifest.dir)
         {
             return Err(format!(
                 "the build command needs `{program}`, which is not on PATH: install it, or \
@@ -904,20 +904,35 @@ const SHELL_BUILTINS: &[&str] = &[
 
 /// The program a shell command line starts with, past any `KEY=VALUE`
 /// assignments and grouping (`CGO_ENABLED=0 go build …` starts `go`, `(cd
-/// x && make)` starts `cd`); `None` when it is the shell's own.
+/// x && make)` starts `cd`); `None` when it is the shell's own, or when
+/// only the shell knows what it is: a word it expands, unquotes or splits
+/// first (`${CC:-gcc}`, `"$GO"`, `~/bin/tool`, `cmd`'s `%CC%`, `./[b]uild.sh`).
 fn command_program(command: &str) -> Option<&str> {
+    let assignment = |word: &str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
     let program = command
         .split_whitespace()
         .map(|word| word.trim_start_matches(['(', '{']))
-        .find(|word| !word.is_empty() && !word.contains('='))?;
-    (!SHELL_BUILTINS.contains(&program)).then_some(program)
+        .find(|word| !word.is_empty() && !assignment(word))?;
+    // Only a plain word names the program as written; the shell expands,
+    // unquotes or splits anything else first, so leave that to it.
+    let plain = |c: char| {
+        c.is_ascii_alphanumeric() || "._+/-".contains(c) || (cfg!(windows) && "\\:".contains(c))
+    };
+    let expanded = program.starts_with('-') || !program.chars().all(plain);
+    (!expanded && !SHELL_BUILTINS.contains(&program)).then_some(program)
 }
 
-/// Whether `program` resolves: a path that exists, or a name found in PATH
-/// (with the executable extensions Windows adds).
-fn on_path(program: &str) -> bool {
+/// Whether `program` resolves: a path to a file, relative to `dir`, where
+/// the command runs, or a name found in PATH (with the executable
+/// extensions Windows adds).
+fn on_path(program: &str, dir: &Path) -> bool {
     if program.contains('/') || program.contains('\\') {
-        return Path::new(program).exists();
+        return dir.join(program).is_file();
     }
     let Some(path) = std::env::var_os("PATH") else {
         return true;
@@ -1668,8 +1683,38 @@ mod tests {
             None
         );
         assert_eq!(command_program("   "), None);
-        assert!(on_path("sh") || on_path("cmd"));
-        assert!(!on_path("hluk-no-such-program-xyz"));
+        // Only the shell knows what these run.
+        assert_eq!(command_program("${CC:-gcc} -o bin/app main.c"), None);
+        assert_eq!(command_program("CC=clang \"$CC\" main.c"), None);
+        assert_eq!(command_program("~/bin/build"), None);
+        assert_eq!(command_program("${CC:=gcc} main.c"), None);
+        assert_eq!(command_program("%CC% main.c"), None);
+        assert_eq!(command_program("./build.sh --release"), Some("./build.sh"));
+        assert_eq!(command_program("(make)"), None);
+        assert_eq!(command_program("make&&cp out bin/"), None);
+        assert_eq!(command_program("./[b]uild.sh"), None);
+        assert_eq!(command_program("CC=$(command -v gcc) $CC main.c"), None);
+        assert_eq!(command_program("2=foo make"), None);
+        if !cfg!(windows) {
+            assert_eq!(command_program("\\make -j4"), None);
+            assert_eq!(command_program("./build\\ tool.sh"), None);
+        }
+        let here = Path::new(".");
+        assert!(on_path("sh", here) || on_path("cmd", here));
+        assert!(!on_path("hluk-no-such-program-xyz", here));
+    }
+
+    #[test]
+    fn a_build_script_is_found_where_the_command_runs() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("scripts")).unwrap();
+        fs::write(project.path().join("scripts").join("build.sh"), "").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(on_path("./scripts/build.sh", project.path()));
+        assert!(on_path("scripts/build.sh", project.path()));
+        assert!(!on_path("./scripts/build.sh", elsewhere.path()));
+        let absolute = project.path().join("scripts").join("build.sh");
+        assert!(on_path(absolute.to_str().unwrap(), elsewhere.path()));
     }
 
     #[test]
