@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A guest that ran out of scratch during a copy-on-write fault crashed the VM (an unexpected exit) instead of aborting.
 - On x86, a page fault the kernel could not handle early in boot or in its fault handler ended the guest as if it had finished: a guest function call that hit one looked complete. The guest aborts.
 - `hluk build`, and `hluk run --build`, refused a `[build] command` that would have run: a program named by a relative path (`./build.sh`) was looked for in the directory `hluk` ran in rather than the project's, where the command runs, so `hluk build -f path/to/project` from elsewhere said it was not on PATH; and a program the shell names by expanding a word (`${CC:-gcc}`, `"$GO"`, `~/bin/tool`, `%CC%`) was looked up as written. Such a program is now looked for in the project's directory, or left to the shell.
+- `hluk build`, and `hluk run --build`, refused a `[build] command` that starts with a shell builtin it did not know as one: `until`, `unset`, `ulimit`, `umask` and other `sh` builtins on Unix, and `cmd`'s builtins (`call`, `copy`, `del`, `type`, …, in any case) on Windows, were looked up in PATH. They are left to the shell. A program named by a path that is not a file is no longer said to be missing from PATH, which a path is not looked up in: the message names the project's directory, where the command runs.
 
 ## [v0.20.1]
 
