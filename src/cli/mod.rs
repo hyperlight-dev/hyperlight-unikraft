@@ -927,16 +927,12 @@ fn command_program(command: &str) -> Option<&str> {
     (!expanded && !SHELL_BUILTINS.contains(&program)).then_some(program)
 }
 
-/// Whether `program` resolves: a path to a file, relative to `dir`, where
-/// the command runs, or a name found in PATH (with the executable
-/// extensions Windows adds).
+/// Whether `program` resolves where the command's shell looks for it: a
+/// path to a file, relative to `dir`, where the command runs, or a name
+/// found in PATH; on Windows, as `cmd` does, a name is looked for in `dir`
+/// before PATH, and a name or a path also with each executable extension
+/// (PATHEXT) added.
 fn on_path(program: &str, dir: &Path) -> bool {
-    if program.contains('/') || program.contains('\\') {
-        return dir.join(program).is_file();
-    }
-    let Some(path) = std::env::var_os("PATH") else {
-        return true;
-    };
     let exts: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".EXE;.CMD;.BAT".into())
@@ -946,12 +942,22 @@ fn on_path(program: &str, dir: &Path) -> bool {
     } else {
         Vec::new()
     };
-    std::env::split_paths(&path).any(|dir| {
+    let found_in = |dir: &Path| {
         dir.join(program).is_file()
             || exts
                 .iter()
                 .any(|ext| dir.join(format!("{program}{ext}")).is_file())
-    })
+    };
+    if program.contains('/') || program.contains('\\') {
+        return found_in(dir);
+    }
+    if cfg!(windows) && found_in(dir) {
+        return true;
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return true;
+    };
+    std::env::split_paths(&path).any(|dir| found_in(&dir))
 }
 
 /// Run a command line through the platform's shell in `dir`.
@@ -1715,6 +1721,27 @@ mod tests {
         assert!(!on_path("./scripts/build.sh", elsewhere.path()));
         let absolute = project.path().join("scripts").join("build.sh");
         assert!(on_path(absolute.to_str().unwrap(), elsewhere.path()));
+    }
+
+    #[test]
+    fn a_build_program_is_found_where_cmd_looks_on_windows() {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("hluk-build.bat"), "").unwrap();
+        fs::create_dir(project.path().join("scripts")).unwrap();
+        fs::write(project.path().join("scripts").join("build.cmd"), "").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // cmd runs a name in its directory before PATH, with or without
+        // the extension; sh looks for a name in PATH alone.
+        for name in ["hluk-build.bat", "hluk-build"] {
+            assert_eq!(on_path(name, project.path()), cfg!(windows), "{name}");
+            assert!(!on_path(name, elsewhere.path()), "{name}");
+        }
+        // cmd adds the extension to a path too.
+        let path = Path::new("scripts").join("build");
+        let path = path.to_str().unwrap();
+        assert_eq!(on_path(path, project.path()), cfg!(windows));
+        assert!(!on_path(path, elsewhere.path()));
+        assert!(on_path("scripts/build.cmd", project.path()));
     }
 
     #[test]
