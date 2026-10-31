@@ -590,11 +590,7 @@ fn run_build(manifest: &Manifest, rootfs_hint: bool) -> CliResult<()> {
         if let Some(program) = command_program(&build.command)
             && !on_path(program, &manifest.dir)
         {
-            return Err(format!(
-                "the build command needs `{program}`, which is not on PATH: install it, or \
-                 build elsewhere and point the manifest at the result"
-            )
-            .into());
+            return Err(missing_program(program, &manifest.dir).into());
         }
         eprintln!("$ {}", build.command);
         let status = shell(&build.command, &manifest.dir)
@@ -899,8 +895,18 @@ fn scratch_hint(rootfs_bytes: u64, scratch_mb: usize, by: SizedBy) {
 /// Shell builtins and syntax a build command may start with, which no PATH
 /// lookup would find; a command starting with one is left to the shell.
 const SHELL_BUILTINS: &[&str] = &[
-    "cd", "export", "set", "source", ".", "eval", "exec", "echo", "true", "false", "test", "[",
-    "if", "for", "while", "case", "mkdir",
+    "cd", "export", "set", "unset", "source", ".", "eval", "exec", "echo", "true", "false", "test",
+    "[", "if", "for", "while", "until", "case", "mkdir", "ulimit", "umask", "alias", "command",
+    "type", "trap", "readonly", "shift", "wait", "read", "exit",
+];
+
+/// The builtins of `cmd`, which runs a build command on Windows, and which
+/// takes them in any case (`CALL build.bat`).
+const CMD_BUILTINS: &[&str] = &[
+    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "echo",
+    "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "md", "mkdir", "mklink", "move",
+    "path", "pause", "popd", "prompt", "pushd", "rd", "rem", "ren", "rename", "rmdir", "set",
+    "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol",
 ];
 
 /// The program a shell command line starts with, past any `KEY=VALUE`
@@ -938,7 +944,38 @@ fn command_program(command: &str) -> Option<&str> {
         c.is_ascii_alphanumeric() || "._+/-".contains(c) || (cfg!(windows) && "\\:".contains(c))
     };
     let expanded = program.starts_with('-') || !program.chars().all(plain);
-    (!expanded && !SHELL_BUILTINS.contains(&program)).then_some(program)
+    let builtin = if cfg!(windows) {
+        CMD_BUILTINS.iter().any(|b| b.eq_ignore_ascii_case(program))
+    } else {
+        SHELL_BUILTINS.contains(&program)
+    };
+    (!expanded && !builtin).then_some(program)
+}
+
+/// Whether a build command's program is named by a path, which is looked
+/// for where the command runs, rather than by a name looked up in PATH.
+fn names_a_path(program: &str) -> bool {
+    program.contains('/') || program.contains('\\')
+}
+
+/// Why a build command cannot run: the program it starts with, which
+/// `on_path` did not find in `dir` (a path) or in PATH (a name).
+fn missing_program(program: &str, dir: &Path) -> String {
+    if !names_a_path(program) {
+        return format!(
+            "the build command needs `{program}`, which is not on PATH: install it, or build \
+             elsewhere and point the manifest at the result"
+        );
+    }
+    if Path::new(program).is_absolute() {
+        return format!("the build command needs `{program}`, which is not a file");
+    }
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    format!(
+        "the build command needs `{program}`, which is not a file in the project's directory, \
+         {}, where the command runs",
+        dir.display()
+    )
 }
 
 /// Whether `program` resolves where the command's shell looks for it: a
@@ -955,7 +992,7 @@ fn on_path(program: &str, dir: &Path) -> bool {
 /// any name as found.
 fn resolves(program: &str, dir: &Path, path: Option<&OsStr>) -> bool {
     let exts = executable_extensions();
-    if program.contains('/') || program.contains('\\') {
+    if names_a_path(program) {
         return found_in(program, dir, &exts);
     }
     if cfg!(windows) && found_in(program, dir, &exts) {
@@ -1753,6 +1790,56 @@ mod tests {
         let here = Path::new(".");
         assert!(on_path("sh", here) || on_path("cmd", here));
         assert!(!on_path("hluk-no-such-program-xyz", here));
+    }
+
+    #[test]
+    fn build_command_program_skips_builtins() {
+        for command in ["! grep -q x out.txt", "[ -d bin ] || make"] {
+            assert_eq!(command_program(command), None, "{command}");
+        }
+        if cfg!(windows) {
+            for command in [
+                "call build.bat",
+                "CALL build.bat",
+                "copy a b",
+                "del out",
+                "type x",
+            ] {
+                assert_eq!(command_program(command), None, "{command}");
+            }
+            assert_eq!(command_program("ulimit -n 4096"), Some("ulimit"));
+        } else {
+            for command in [
+                ": nothing to build",
+                "until make; do sleep 1; done",
+                "unset CC && make",
+                "ulimit -n 4096 && make",
+                "umask 022 && make",
+            ] {
+                assert_eq!(command_program(command), None, "{command}");
+            }
+            assert_eq!(command_program("call build.bat"), Some("call"));
+        }
+    }
+
+    #[test]
+    fn a_missing_build_program_is_named_where_it_was_looked_for() {
+        let project = tempfile::tempdir().unwrap();
+        let script = missing_program("./nope.sh", project.path());
+        assert!(
+            script.contains("not a file in the project's directory")
+                && script.contains(&project.path().display().to_string())
+                && !script.contains("PATH"),
+            "{script}"
+        );
+        let absolute = project.path().join("nope.sh");
+        let absolute = missing_program(absolute.to_str().unwrap(), project.path());
+        assert!(
+            absolute.ends_with("which is not a file") && !absolute.contains("PATH"),
+            "{absolute}"
+        );
+        let name = missing_program("hluk-no-such-program-xyz", project.path());
+        assert!(name.contains("which is not on PATH"), "{name}");
     }
 
     #[test]
