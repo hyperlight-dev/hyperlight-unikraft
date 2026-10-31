@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A guest that ran out of scratch during a copy-on-write fault crashed the VM (an unexpected exit) instead of aborting.
 - On x86, a page fault the kernel could not handle early in boot or in its fault handler ended the guest as if it had finished: a guest function call that hit one looked complete. The guest aborts.
 - `hluk build`, and `hluk run --build`, refused a `[build] command` that would have run: a program named by a relative path (`./build.sh`) was looked for in the directory `hluk` ran in rather than the project's, where the command runs, so `hluk build -f path/to/project` from elsewhere said it was not on PATH; and a program the shell names by expanding a word (`${CC:-gcc}`, `"$GO"`, `~/bin/tool`, `%CC%`) was looked up as written. Such a program is now looked for in the project's directory, or left to the shell.
+- `hluk build`, and `hluk run --build`, looked a `[build] command`'s program up in PATH as `hluk` would, not as the command's shell does: a relative entry (`node_modules/.bin`, `.`, or an empty one) was taken from the directory `hluk` ran in rather than the project's, where the command runs, so `command = "tsc"` with `node_modules/.bin` on PATH was refused from outside the project; and a command that sets PATH for its program (`PATH=$PWD/tools:$PATH mytool`) had the program looked up in `hluk`'s PATH. A relative entry is now taken from the project's directory, and a command that sets PATH is left to the shell.
 
 ## [v0.20.1]
 
