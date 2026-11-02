@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A guest that ran out of scratch during a copy-on-write fault crashed the VM (an unexpected exit) instead of aborting.
 - On x86, a page fault the kernel could not handle early in boot or in its fault handler ended the guest as if it had finished: a guest function call that hit one looked complete. The guest aborts.
 - `hluk build`, and `hluk run --build`, refused a `[build] command` that would have run: a program named by a relative path (`./build.sh`) was looked for in the directory `hluk` ran in rather than the project's, where the command runs, so `hluk build -f path/to/project` from elsewhere said it was not on PATH; and a program the shell names by expanding a word (`${CC:-gcc}`, `"$GO"`, `~/bin/tool`, `%CC%`) was looked up as written. Such a program is now looked for in the project's directory, or left to the shell.
+- In the `agent` and `python-shell` images, and images built `FROM` them, Python's `ssl.create_default_context()` loaded no CA, so HTTPS from Python (`urllib.request`, `http.client`) failed with `CERTIFICATE_VERIFY_FAILED`: the images carry Debian's bundle at `/etc/ssl/certs/ca-certificates.crt`, but the OpenSSL that Python links looks for `/usr/lib/ssl/cert.pem`, and the hashed links in `/etc/ssl/certs` point into `/usr/share/ca-certificates`, which the images leave out. The bundle is now at `/usr/lib/ssl/cert.pem` too. `pip` was not affected, as it brings its own bundle.
 
 ## [v0.20.1]
 
