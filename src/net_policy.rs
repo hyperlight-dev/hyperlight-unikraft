@@ -39,8 +39,11 @@
 //!   addresses the guest was told for a listed name are recorded, so the
 //!   connect that follows is recognised; under a filter, with the name
 //!   they were given for, which the filter is asked about at the connect.
-//! - **The destination** (`allows`): the address of every connect and
-//!   sendto.  An allow list allows only what was listed, resolved when the
+//! - **The destination** (`allows`): the address of every TCP connect and
+//!   UDP send (connected or not).  UDP connect selects a peer and source
+//!   address without sending anything, so libc can use it for address-family
+//!   and routing probes, including loopback, without granting payload access.
+//!   An allow list allows only what was listed, resolved when the
 //!   list was built, or recorded from an answer; nothing is resolved on the
 //!   host's behalf, so a guest connecting to an address it was never given
 //!   is refused.  A block list refuses what was resolved when it was built
@@ -69,15 +72,15 @@ use tracing::debug;
 /// would be refused addresses it was rightly told.
 const MAX_LEARNED_IPS: usize = 4096;
 
-/// The most a block list waits for its names to resolve at a connect.  The
-/// lookup runs while the VM is stopped inside the host call, so it is
+/// The most a block list waits for its names to resolve at a TCP connect
+/// or UDP send.  The lookup runs while the VM is stopped inside the host call, so it is
 /// bounded; a name that has not answered by then counts as blocked.
 const LOOKUP_DEADLINE: Duration = Duration::from_millis(250);
 
 /// The most resolver threads a block list may have running at once, across
-/// all connects.  A `std` name lookup cannot be cancelled and runs to
-/// completion even after the caller stops waiting, so without a cap a guest
-/// that floods connects while DNS is slow could pile them up without limit.
+/// all destination checks.  A `std` name lookup cannot be cancelled and
+/// runs to completion even after the caller stops waiting, so without a cap
+/// a guest that floods checks while DNS is slow could pile them up without limit.
 const MAX_INFLIGHT_LOOKUPS: usize = 32;
 
 /// Live resolver threads, counted against [`MAX_INFLIGHT_LOOKUPS`].
@@ -283,7 +286,7 @@ impl std::error::Error for ResolveError {
 /// Resolve every entry: IP literals as they are, hostnames through the
 /// system resolver.  Returns the addresses and the hostnames among the
 /// entries; the hostnames decide which DNS questions the guest may send,
-/// and a block list looks them up again at each connect.
+/// and a block list looks them up again at each TCP connect or UDP send.
 fn resolve_entries(
     entries: &[impl AsRef<str>],
 ) -> Result<(HashSet<IpAddr>, Vec<String>), ResolveError> {
@@ -416,7 +419,8 @@ const MAX_NAMES_PER_IP: usize = 16;
 /// it may connect or send to an address ([`allows`]), given the names DNS
 /// told it the address belongs to.  Both are asked each time, so a filter
 /// whose answers change (an allow list the embedder edits while the guest
-/// runs) takes effect at the next question or connect, without a re-boot.
+/// runs) takes effect at the next question, TCP connect or UDP send,
+/// without a re-boot.
 ///
 /// Both run while the guest is stopped in a host call: they should answer
 /// from memory, not the network, and must not call into the sandbox.  A
@@ -435,7 +439,7 @@ pub trait NetworkFilter: Send + Sync {
     /// the guest has no address for it.
     fn allows_name(&self, name: &str) -> bool;
 
-    /// Whether the guest may connect or send to `destination`.
+    /// Whether the guest may TCP-connect or send a datagram to `destination`.
     fn allows(&self, destination: &Destination<'_>) -> bool;
 }
 
@@ -550,7 +554,7 @@ impl fmt::Debug for Filter {
 ///
 /// Like [`AllowList`], stores both literal IPs and hostnames.  The
 /// hostnames decide which DNS questions the guest may not ask, and are
-/// looked up again at every connect (see [`BlockList::blocks`]) for the
+/// looked up again at every TCP connect or UDP send (see [`BlockList::blocks`]) for the
 /// guest that has an address without asking.
 #[derive(Clone, Debug)]
 pub struct BlockList {

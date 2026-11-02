@@ -8,7 +8,8 @@
 //! via WinSock and `WSAPoll`) wrapper over exactly that API, so every
 //! host function here is one library call plus wire encoding.  Policy —
 //! [`NetworkPolicy`] for outbound, [`ListenPorts`] for bind — is checked
-//! before the corresponding syscall.
+//! before the corresponding syscall that transmits: TCP connect, and
+//! every UDP send.  UDP connect only selects a peer and source address.
 //!
 //! A host function call is a synchronous VM exit: the guest is paused
 //! until it returns, so no host call may block on a peer that lives in
@@ -461,7 +462,7 @@ impl Net {
         self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Outbound policy (connect, sendto), for a UDP socket or not.
+    /// Outbound policy (TCP connect, UDP send/sendto).
     fn allow_outbound(&self, addr: &SocketAddr, udp: bool) -> Res<()> {
         if self.policy.as_ref().is_some_and(|p| p.allows(addr, udp)) {
             Ok(())
@@ -560,7 +561,11 @@ impl Net {
     /// retry timeout, about two minutes on Linux.
     fn connect(&self, fd: i32, addr: SocketAddr) -> Res<()> {
         let meta = self.table().meta(fd)?;
-        self.allow_outbound(&addr, meta.udp)?;
+        // UDP connect sends nothing.  libc also uses it to discover address
+        // families and source addresses; check its destination at each send.
+        if !meta.udp {
+            self.allow_outbound(&addr, false)?;
+        }
         let mut tbl = self.table();
         {
             let sock = tbl.get(fd)?;
@@ -620,6 +625,11 @@ impl Net {
         // checked here, where it still is one (see `NetworkPolicy::allows_query`),
         // with the table unlocked, as the check may ask the embedder's filter.
         let meta = self.table().meta(fd)?;
+        if meta.udp
+            && let Some(peer) = meta.peer
+        {
+            self.allow_outbound(&peer, true)?;
+        }
         if meta.peer.is_some_and(|p| p.port() == 53)
             && !self
                 .policy
@@ -644,7 +654,7 @@ impl Net {
         // (Linux and Windows ignore it), so checking `addr` would check the
         // wrong destination: a guest connected to a resolver on port 53
         // could name an allowed address and send anything there.  The peer
-        // was checked at the connect; `send` checks a DNS question to it.
+        // was checked at the TCP connect; `send` checks a DNS question to it.
         if !udp {
             return self.send(fd, data);
         }
@@ -1814,6 +1824,172 @@ mod tests {
         assert_eq!(net.connect(t, loopback(80)), Err(errno::EACCES));
         let u = udp(&net);
         assert_eq!(net.sendto(u, b"x", loopback(80)), Err(errno::EACCES));
+    }
+
+    #[test]
+    fn restricted_datagram_connect_does_not_authorize_payloads() {
+        use crate::net_policy::{BlockList, Destination, Filter, NetworkFilter};
+        use std::net::UdpSocket;
+
+        struct DenyAll;
+        impl NetworkFilter for DenyAll {
+            fn allows_name(&self, _: &str) -> bool {
+                false
+            }
+            fn allows(&self, _: &Destination<'_>) -> bool {
+                false
+            }
+        }
+
+        let policies = [
+            NetworkPolicy::AllowList(AllowList::empty()),
+            NetworkPolicy::BlockList(BlockList::from_hosts(&["192.0.2.1"]).unwrap()),
+            NetworkPolicy::Filter(Filter::new(DenyAll)),
+        ];
+        for policy in policies {
+            let net = Net::new(policy, None);
+            let first = UdpSocket::bind(loopback(0)).unwrap();
+            let second = UdpSocket::bind(loopback(0)).unwrap();
+            first.set_nonblocking(true).unwrap();
+            second.set_nonblocking(true).unwrap();
+            let s = udp(&net);
+            for peer in [&first, &second] {
+                let addr = peer.local_addr().unwrap();
+                net.connect(s, addr).unwrap();
+                assert_eq!(net.peer_addr(s).unwrap(), addr);
+                assert_eq!(net.table().meta(s).unwrap().peer, Some(addr));
+                assert!(net.local_addr(s).unwrap().ip().is_loopback());
+                assert_ne!(net.local_addr(s).unwrap().port(), 0);
+                assert_eq!(net.send(s, b"blocked"), Err(errno::EACCES));
+                assert_eq!(net.send(s, b""), Err(errno::EACCES));
+                assert_eq!(net.sendto(s, b"blocked", addr), Err(errno::EACCES));
+                assert_eq!(net.recvfrom(s, 64), Err(errno::EAGAIN));
+            }
+            let previous = net.peer_addr(s).unwrap();
+            assert!(net.connect(s, "[::1]:9".parse().unwrap()).is_err());
+            assert_eq!(net.peer_addr(s).unwrap(), previous);
+            assert_eq!(net.send(s, b"still blocked"), Err(errno::EACCES));
+
+            net.disconnect(s).unwrap();
+            assert_eq!(net.peer_addr(s), Err(errno::ENOTCONN));
+            assert_eq!(net.table().meta(s).unwrap().peer, None);
+            assert!(net.send(s, b"no peer").is_err());
+            let addr = first.local_addr().unwrap();
+            assert_eq!(net.sendto(s, b"blocked", addr), Err(errno::EACCES));
+            net.connect(s, addr).unwrap();
+            assert_eq!(net.send(s, b"blocked again"), Err(errno::EACCES));
+            for peer in [&first, &second] {
+                assert_eq!(
+                    peer.recv_from(&mut [0u8; 64]).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+            net.close(s).unwrap();
+            assert_eq!(net.send(s, b"closed"), Err(errno::EBADF));
+        }
+    }
+
+    #[test]
+    fn restricted_ipv6_datagram_probes_cannot_send_to_host() {
+        use std::net::UdpSocket;
+
+        let net = Net::new(NetworkPolicy::AllowList(AllowList::empty()), None);
+        let Ok(peer) = UdpSocket::bind("[::1]:0") else {
+            eprintln!("SKIP: no IPv6 loopback");
+            return;
+        };
+        peer.set_nonblocking(true).unwrap();
+        let s = net.socket(AF_INET6, SOCK_DGRAM, 17).unwrap();
+        let addr = peer.local_addr().unwrap();
+        net.connect(s, addr).unwrap();
+        assert_eq!(net.peer_addr(s).unwrap(), addr);
+        assert_eq!(net.send(s, b"blocked"), Err(errno::EACCES));
+        assert_eq!(net.sendto(s, b"blocked", addr), Err(errno::EACCES));
+        assert_eq!(
+            peer.recv_from(&mut [0u8; 64]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        net.disconnect(s).unwrap();
+
+        let v4 = UdpSocket::bind(loopback(0)).unwrap();
+        v4.set_nonblocking(true).unwrap();
+        let mapped = SocketAddr::new(
+            Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(),
+            v4.local_addr().unwrap().port(),
+        );
+        net.connect(s, mapped).unwrap();
+        assert_eq!(net.send(s, b"mapped"), Err(errno::EACCES));
+        assert_eq!(net.sendto(s, b"mapped", mapped), Err(errno::EACCES));
+        assert_eq!(
+            v4.recv_from(&mut [0u8; 64]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn datagram_probes_do_not_authorize_unlisted_or_metadata_destinations() {
+        let net = Net::new(NetworkPolicy::AllowList(AllowList::empty()), None);
+        let s = udp(&net);
+        for peer in ["192.0.2.1:9", "169.254.169.254:80", "0.0.0.0:9"] {
+            let addr = peer.parse().unwrap();
+            net.connect(s, addr).unwrap();
+            assert_eq!(net.send(s, b"blocked"), Err(errno::EACCES));
+            assert_eq!(net.sendto(s, b"blocked", addr), Err(errno::EACCES));
+            net.disconnect(s).unwrap();
+        }
+        net.reset();
+        assert_eq!(net.send(s, b"reset"), Err(errno::EBADF));
+        assert_eq!(net.poll(&[(s, POLLIN | POLLOUT)], 0), (1, vec![POLLNVAL]));
+    }
+
+    #[test]
+    fn connected_datagram_sends_recheck_the_filter_unlocked() {
+        use crate::net_policy::{Destination, Filter, NetworkFilter};
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Switch {
+            net: Arc<OnceLock<Arc<Net>>>,
+            allow: Arc<AtomicBool>,
+        }
+        impl NetworkFilter for Switch {
+            fn allows_name(&self, name: &str) -> bool {
+                name == "allowed.test"
+            }
+            fn allows(&self, _: &Destination<'_>) -> bool {
+                assert!(self.net.get().unwrap().table.try_lock().is_ok());
+                self.allow.load(Ordering::SeqCst)
+            }
+        }
+        let cell = Arc::new(OnceLock::new());
+        let allow = Arc::new(AtomicBool::new(false));
+        let net = Arc::new(Net::new(
+            NetworkPolicy::Filter(Filter::new(Switch {
+                net: cell.clone(),
+                allow: allow.clone(),
+            })),
+            None,
+        ));
+        cell.set(net.clone()).ok();
+        let s = udp(&net);
+        let addr = "192.0.2.1:9".parse().unwrap();
+        net.connect(s, addr).unwrap();
+        assert_eq!(net.send(s, b"denied"), Err(errno::EACCES));
+        allow.store(true, Ordering::SeqCst);
+        assert_eq!(net.send(s, b"allowed"), Ok(7));
+        allow.store(false, Ordering::SeqCst);
+        assert_eq!(net.send(s, b"revoked"), Err(errno::EACCES));
+        assert_eq!(net.sendto(s, b"revoked", addr), Err(errno::EACCES));
+
+        allow.store(true, Ordering::SeqCst);
+        let resolver = "192.0.2.1:53".parse().unwrap();
+        net.connect(s, resolver).unwrap();
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x06denied\x04test\x00\x00\x01\x00\x01");
+        for data in [b"not DNS".as_slice(), query.as_slice()] {
+            assert_eq!(net.send(s, data), Err(errno::EACCES));
+            assert_eq!(net.sendto(s, data, resolver), Err(errno::EACCES));
+        }
     }
 
     /// What listen ports alone give a guest (GuestConfig::new): it serves
