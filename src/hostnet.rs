@@ -1929,17 +1929,30 @@ mod tests {
     #[test]
     fn datagram_probes_do_not_authorize_unlisted_or_metadata_destinations() {
         let net = Net::new(NetworkPolicy::AllowList(AllowList::empty()), None);
-        let s = udp(&net);
-        for peer in ["192.0.2.1:9", "169.254.169.254:80", "0.0.0.0:9"] {
+        for peer in ["192.0.2.1:9", "169.254.169.254:80", "0.0.0.0:9", "[::1]:9"] {
             let addr = peer.parse().unwrap();
-            net.connect(s, addr).unwrap();
-            assert_eq!(net.send(s, b"blocked"), Err(errno::EACCES));
+            let s = udp(&net);
+            // Routing and unspecified-peer behavior belong to the host.
+            // An incompatible family also exercises real connect failure.
+            let control =
+                net::socket_with(AddressFamily::INET, SocketType::DGRAM, socket_flags(), None)
+                    .unwrap();
+            rustix::io::ioctl_fionbio(&control, true).unwrap();
+            let expected = net::connect(&control, &addr).map_err(from_rustix);
+            assert_eq!(net.connect(s, addr), expected, "UDP connect to {addr}");
             assert_eq!(net.sendto(s, b"blocked", addr), Err(errno::EACCES));
-            net.disconnect(s).unwrap();
+            if expected.is_ok() {
+                assert_eq!(net.send(s, b"blocked"), Err(errno::EACCES));
+                net.disconnect(s).unwrap();
+            } else {
+                assert_eq!(net.table().meta(s).unwrap().peer, None);
+                assert_eq!(net.peer_addr(s), Err(errno::ENOTCONN));
+                assert!(net.send(s, b"no peer").is_err());
+            }
+            net.reset();
+            assert_eq!(net.send(s, b"reset"), Err(errno::EBADF));
+            assert_eq!(net.poll(&[(s, POLLIN | POLLOUT)], 0), (1, vec![POLLNVAL]));
         }
-        net.reset();
-        assert_eq!(net.send(s, b"reset"), Err(errno::EBADF));
-        assert_eq!(net.poll(&[(s, POLLIN | POLLOUT)], 0), (1, vec![POLLNVAL]));
     }
 
     #[test]
