@@ -390,7 +390,8 @@ fn java_thread_runs_between_calls() {
         "the call waited for the thread: {out:?}"
     );
     let mut out = String::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // 120 s, not 30: the nightly's nested-virt arm64 runner needs many steps to reach tick 5.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !out.contains("tick 5") && Instant::now() < deadline {
         sandbox.step(Duration::from_millis(500)).unwrap();
         out.push_str(&sandbox.drain_output());
@@ -826,7 +827,8 @@ fn java_host_call_after_the_call_is_refused() {
         .unwrap();
     sandbox.call("start", "").unwrap();
     let mut out = String::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // 120 s, not 30: the nightly's nested-virt arm64 runner needs many steps to reach the bg output.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !out.contains("bg:") && Instant::now() < deadline {
         sandbox.step(Duration::from_millis(100)).unwrap();
         out.push_str(&sandbox.drain_output());
