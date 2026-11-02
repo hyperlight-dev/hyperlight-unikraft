@@ -269,7 +269,8 @@ fn dotnet_jit_thread_runs_between_calls() {
         "the call waited for the thread: {out:?}"
     );
     let mut out = String::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // 120 s, not 30: the nightly's nested-virt arm64 runner needs many steps to reach tick 5.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !out.contains("tick 5") && Instant::now() < deadline {
         sandbox.step(Duration::from_millis(500)).unwrap();
         out.push_str(&sandbox.drain_output());

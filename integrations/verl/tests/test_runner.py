@@ -505,7 +505,8 @@ URL = "hyperlight://" + (os.path.abspath(os.environ["HLUK_INITRD"]) if os.getenv
 # The memory tests' run timeout: on the Linux arm64 runners (VMs on Apple silicon, so nested
 # virtualization) the guest's first touch of each page is many times slower: filling a 405 MiB
 # guest took over 10 s there, where x86 takes under 1 s, so these get several times that.
-MEMORY_TEST_TIMEOUT = 120
+# 120 s still timed out on the 900 MiB case there (#242), so give them more again.
+MEMORY_TEST_TIMEOUT = 360
 
 
 def _why(response, error):
