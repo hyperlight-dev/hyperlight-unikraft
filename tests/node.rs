@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use common::{hluk_with_stdin_scratch, require_rootfs, run_http_get, temp_dir};
 use std::time::{Duration, Instant};
 
-use hyperlight_unikraft::{Exec, Mount, SandboxBuilder, Yield};
+use hyperlight_unikraft::{AllowList, Exec, Mount, NetworkPolicy, SandboxBuilder, Yield};
 
 #[test]
 fn node_exec_file() {
@@ -135,6 +135,62 @@ fn node_http_get() {
         output.contains("Status: 200"),
         "expected http_get.js to get Status: 200, got:\n{output}",
     );
+}
+
+#[test]
+fn node_restricted_addrconfig_cold_and_restored() {
+    let policy = || NetworkPolicy::AllowList(AllowList::from_hosts(&["github.com"]).unwrap());
+    let resolver = "nameserver 1.1.1.1\noptions ndots:1 single-request\n";
+    let code = r#"
+(async () => {
+    const assert = require('node:assert/strict');
+    const dns = require('node:dns');
+    const net = require('node:net');
+    const { once } = require('node:events');
+    const addresses = await dns.promises.lookup('github.com', {
+        all: true, hints: dns.ADDRCONFIG
+    });
+    assert.ok(addresses.length > 0);
+    const socket = net.createConnection({ host: 'github.com', port: 443 });
+    socket.setTimeout(5000, () => socket.destroy(new Error('connect timeout')));
+    await once(socket, 'connect');
+    socket.destroy();
+    const resolver = new dns.promises.Resolver({ timeout: 500, tries: 1 });
+    await assert.rejects(resolver.resolve4('example.com'));
+    console.log('restricted ADDRCONFIG and TCP ok; undeclared name denied');
+})()
+"#;
+    let snap = temp_dir("node-restricted-dns");
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("node"))
+        .scratch_mb(512)
+        .network(policy())
+        .resolv_conf(resolver)
+        .boot()
+        .unwrap();
+    sandbox.snapshot_to(snap.path()).unwrap();
+    for _ in 0..2 {
+        sandbox.run(code).unwrap();
+        let output = sandbox.drain_output();
+        assert!(
+            output.contains("restricted ADDRCONFIG and TCP ok; undeclared name denied"),
+            "{output:?}"
+        );
+    }
+    drop(sandbox);
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(snap.path())
+        .unwrap()
+        .network(policy())
+        .resolv_conf(resolver)
+        .boot()
+        .unwrap();
+    for _ in 0..2 {
+        sandbox.run(code).unwrap();
+        let output = sandbox.drain_output();
+        assert!(
+            output.contains("restricted ADDRCONFIG and TCP ok; undeclared name denied"),
+            "{output:?}"
+        );
+    }
 }
 
 #[test]

@@ -162,6 +162,105 @@ fn net_policy_allowlist_blocks() {
     );
 }
 
+#[test]
+fn restricted_datagram_probes_cannot_reach_host_services() {
+    use std::net::{TcpListener, UdpSocket};
+
+    let mut receivers = Vec::new();
+    let mut listeners = Vec::new();
+    let mut targets = Vec::new();
+    for (family, ip) in [(2, "127.0.0.1"), (10, "::1")] {
+        let receiver = match UdpSocket::bind((ip, 0)) {
+            Ok(s) => s,
+            Err(e) if family == 10 => {
+                eprintln!("SKIP: no IPv6 loopback: {e}");
+                continue;
+            }
+            Err(e) => panic!("bind IPv4 loopback: {e}"),
+        };
+        let listener = TcpListener::bind((ip, 0)).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        targets.push((
+            family,
+            ip,
+            receiver.local_addr().unwrap().port(),
+            listener.local_addr().unwrap().port(),
+        ));
+        receivers.push(receiver);
+        listeners.push(listener);
+    }
+    let code = format!(
+        r#"
+import errno, os, socket
+for family, ip, udp_port, tcp_port in {targets:?}:
+    s = socket.socket(family, socket.SOCK_DGRAM)
+    peer = (ip, udp_port)
+    s.connect(peer)
+    for send in (
+        lambda: s.send(b'send'),
+        lambda: os.write(s.fileno(), b'write'),
+        lambda: s.sendto(b'sendto', peer),
+        lambda: s.sendmsg([b'send', b'msg']),
+        lambda: s.sendmsg([b'named'], [], 0, peer),
+    ):
+        try:
+            send()
+        except OSError as e:
+            assert e.errno == errno.EACCES, repr(e)
+        else:
+            raise AssertionError('host loopback UDP payload permitted')
+    s.close()
+    t = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        t.connect((ip, tcp_port))
+    except OSError as e:
+        assert e.errno == errno.EACCES, repr(e)
+    else:
+        raise AssertionError('host loopback TCP permitted')
+    t.close()
+print('loopback probes ok; all payload paths refused')
+"#
+    );
+    let snap = common::temp_dir("restricted-loopback");
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowList(AllowList::empty()))
+        .boot()
+        .unwrap();
+    sandbox.snapshot_to(snap.path()).unwrap();
+    sandbox.run(code.as_str()).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("loopback probes ok; all payload paths refused"),
+        "{output:?}"
+    );
+    drop(sandbox);
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(snap.path())
+        .unwrap()
+        .network(NetworkPolicy::AllowList(AllowList::empty()))
+        .boot()
+        .unwrap();
+    sandbox.run(code.as_str()).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("loopback probes ok; all payload paths refused"),
+        "{output:?}"
+    );
+    for receiver in receivers {
+        assert_eq!(
+            receiver.recv_from(&mut [0u8; 64]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    for listener in listeners {
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
 /// BlockList blocks connections to a listed IP.
 #[test]
 fn net_policy_blocklist_blocks() {

@@ -92,7 +92,7 @@ All functions return negative `-errno` values on error.
 | `AllowAll` | Everything, except the metadata addresses. |
 | `AllowList(AllowList)` | Only the listed names and addresses. |
 | `BlockList(BlockList)` | Everything except the listed names and addresses. |
-| `Filter(Filter)` | What the embedder's `NetworkFilter` allows, by name and port, asked at every question and connect. |
+| `Filter(Filter)` | What the embedder's `NetworkFilter` allows, by name and port, asked at every question, TCP connect and UDP send. |
 
 Under every variant the cloud metadata addresses are refused: the link-local ranges (`169.254.0.0/16`, `fe80::/10`) and AWS's IPv6 endpoint `fd00:ec2::254`.  The two lists and a filter also refuse loopback, and the unspecified address (`0.0.0.0`, `::`), which a connect sends to loopback, since a guest socket is a host socket and host services trust `127.0.0.1`; `AllowAll` permits it, so a server and a client can meet inside one guest.  An IPv4 address written as IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is judged as `a.b.c.d`.
 
@@ -102,17 +102,25 @@ The guest resolves names itself, so a destination reaches the host as an address
 
 | Host call | Check |
 |-----------|-------|
-| `net_connect(fd, address)` | The destination, by address.  Every connect, TCP or UDP. |
+| `net_connect(fd, address)` | The destination, by address, for TCP.  UDP only selects a peer and source address; it sends nothing. |
 | `net_sendto(fd, data, address)` | The destination; and, if the address is port 53, the DNS question in `data`, by name. |
-| `net_send(fd, data)` | The DNS question in `data`, by name, on a socket the guest connected to port 53.  Other sends are not checked: their destination was, at the connect. |
+| `net_send(fd, data)` | The destination of every connected UDP send; and the DNS question in `data`, by name, on a socket the guest connected to port 53.  Other TCP sends use the destination checked at connect. |
 | `net_recvfrom(fd)` | Nothing is refused; under an allow list, an answer from a resolver the guest may ask has its addresses recorded. |
 | `net_bind(fd, address)` | The inbound rule, [`ListenPorts`](#listenports). |
 
 Nothing else is inspected.
 
+UDP `connect()` is also how libc probes configured address families and source
+addresses (`AI_ADDRCONFIG` in musl, address sorting in glibc).  These probes use
+the real host socket and retain its family and routing errors, but transmit no
+datagram.  Selecting even a loopback peer therefore succeeds when the host
+supports it; every actual UDP send still checks its destination, including
+after a reconnect or an `AF_UNSPEC` disconnect.  This does not grant access to
+host-loopback services or to any unlisted destination.
+
 **The question.**  Under an allow list the guest may ask only about listed names; under a block list, not about a blocked one; anything to port 53 that is not a well-formed query is refused.  An allow list lets questions reach the well-known resolvers (`8.8.8.8`, `8.8.4.4`, `1.1.1.1`, `1.0.0.1`) and the host's own from `/etc/resolv.conf`, on UDP only, and records only their answers.
 
-**The destination.**  An allow list allows an address that was listed, resolved when the list was built, or recorded from an answer, and nothing else: the host resolves nothing on the guest's behalf, so an address the guest was never given is refused.  A block list refuses an address that was listed or resolved at build time, and whatever a blocked name resolves to now, looked up at the connect with a 250 ms deadline; a lookup that fails or runs late counts as blocked.  So every connect under a block list pays a bounded lookup per blocked name, and a blocked name that stops resolving refuses every connect until it resolves again or is removed.
+**The destination.**  An allow list allows an address that was listed, resolved when the list was built, or recorded from an answer, and nothing else: the host resolves nothing on the guest's behalf, so an address the guest was never given is refused.  A block list refuses an address that was listed or resolved at build time, and whatever a blocked name resolves to now, looked up at the TCP connect or UDP send with a 250 ms deadline; a lookup that fails or runs late counts as blocked.  So every TCP connect and UDP send under a block list pays a bounded lookup per blocked name, and a blocked name that stops resolving refuses each until it resolves again or is removed.
 
 **What that promises.**  An allow list refuses everything it was not told about.  A block list refuses the name in every question and every address the name is known to have; it cannot refuse an address the guest obtained some other way that the name is not currently shown to have, which no name-based rule can.  An embedder who needs a guarantee lists what is allowed.
 
@@ -146,7 +154,7 @@ https.0.write().unwrap().push("files.pythonhosted.org".into());
 # Ok::<(), hyperlight_unikraft::Error>(())
 ```
 
-It is asked the two things the host can tell: `allows_name(name)` for each name in a DNS question, in lower case without the trailing dot, and `allows(&Destination)` for each connect and `sendto`, with the address, whether the socket is UDP, and `names`, the names whose answers gave the guest that address (recorded as under an allow list: only answers from a resolver the guest may ask, only for names `allows_name` allows; empty for an address the guest did not get from DNS).  Both are asked every time, so a change to what the filter allows applies from the next question or connect, without booting again.  Before the filter is asked, loopback, the unspecified address and the metadata addresses are refused and the resolvers an allow list exempts take questions on UDP port 53, as under `AllowList`.  The host sees no further than the address, the port and the names DNS gave the address: the scheme, path and method of what goes over the socket are not visible to a filter, nor which of the sites sharing an address (a CDN, a shared host) the guest talks to.  It runs while the guest is stopped in a host call, so it should answer from memory and must not call into the sandbox; a panic in it counts as a refusal.  `allows_name` is asked again when an answer arrives, before its addresses are credited to the name.  Answers over TCP are not read, so an address the guest learns only that way is not credited to its name.  What a `Filter` records is shared by its clones: give each sandbox its own, made with `Filter::from_arc` from the one filter to share the rules.
+It is asked the two things the host can tell: `allows_name(name)` for each name in a DNS question, in lower case without the trailing dot, and `allows(&Destination)` for each TCP connect and UDP send (connected or not), with the address, whether the socket is UDP, and `names`, the names whose answers gave the guest that address (recorded as under an allow list: only answers from a resolver the guest may ask, only for names `allows_name` allows; empty for an address the guest did not get from DNS).  Both are asked every time, so a change to what the filter allows applies from the next question, TCP connect or UDP send, without booting again.  Before the filter is asked, loopback, the unspecified address and the metadata addresses are refused and the resolvers an allow list exempts take questions on UDP port 53, as under `AllowList`.  The host sees no further than the address, the port and the names DNS gave the address: the scheme, path and method of what goes over the socket are not visible to a filter, nor which of the sites sharing an address (a CDN, a shared host) the guest talks to.  It runs while the guest is stopped in a host call, so it should answer from memory and must not call into the sandbox; a panic in it counts as a refusal.  `allows_name` is asked again when an answer arrives, before its addresses are credited to the name.  Answers over TCP are not read, so an address the guest learns only that way is not credited to its name.  What a `Filter` records is shared by its clones: give each sandbox its own, made with `Filter::from_arc` from the one filter to share the rules.
 
 ### ListenPorts
 
