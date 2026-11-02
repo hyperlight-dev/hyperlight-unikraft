@@ -70,6 +70,13 @@ RUN set -eu; \
     # CA certificates — needed for HTTPS (pip, requests, etc.)
     stage /etc/ssl/certs /etc/ssl/certs; \
     stage /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf; \
+    # OpenSSL's default CA file is cert.pem in its OPENSSLDIR (/usr/lib/ssl),
+    # and the hashed links in /etc/ssl/certs point into
+    # /usr/share/ca-certificates, which is not staged: link the bundle there,
+    # so ssl.create_default_context() loads it.
+    cafile=$(python3 -c 'import ssl; print(ssl.get_default_verify_paths().openssl_cafile)'); \
+    mkdir -p "/rootfs$(dirname "$cafile")"; \
+    ln -s /etc/ssl/certs/ca-certificates.crt "/rootfs$cafile"; \
     # C++ runtime + glibc compat stubs — needed by pip-installed packages
     # with C extensions (numpy, scipy, etc.).  Modern glibc merges
     # pthread/dl/rt into libc but many .so files still reference them by name.

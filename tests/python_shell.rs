@@ -35,6 +35,7 @@ fn python_shell_ssl_available() {
             r#"
 import ssl
 print(f'ssl={ssl.OPENSSL_VERSION}')
+print('ca-certs', ssl.create_default_context().cert_store_stats()['x509_ca'] > 0)
 import sqlite3
 print('sqlite3-ok')
 import ctypes
@@ -46,6 +47,10 @@ print('ctypes-ok')
     assert!(
         output.contains("ssl="),
         "SSL not available in python-shell: {output:?}"
+    );
+    assert!(
+        output.contains("ca-certs True"),
+        "OpenSSL's default verify paths hold no CA in python-shell: {output:?}"
     );
     assert!(
         output.contains("sqlite3-ok"),
