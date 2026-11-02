@@ -48,8 +48,8 @@ static int pwsh_dispatch(const uint8_t *fc, size_t fc_len)
 	/* Guest command (--guest-exec / autonomous): the command is written to a
 	 * temp file and a fixed launcher reads it, splits it, and invokes the
 	 * named guest script with its args; an empty command runs the conventional
-	 * /entrypoint.ps1. Uses .NET methods rather than cmdlets (Test-Path/…)
-	 * because module loading is limited in the rootfs. */
+	 * /entrypoint.ps1. Uses .NET methods rather than cmdlets (Test-Path/…),
+	 * so that a guest command does not load a module first. */
 	size_t gx_len = code_len;
 	const char *gx = fc_name_is(fc, fc_len, "GuestExec") ? code : NULL;
 	static const char GX_LAUNCHER[] =
