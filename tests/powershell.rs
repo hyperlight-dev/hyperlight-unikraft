@@ -79,6 +79,32 @@ fn powershell_env_vars() {
     );
 }
 
+/// Cmdlets run by name: PowerShell finds the modules that hold them only
+/// when its FileSystem provider resolves paths, which takes a mount at `/`
+/// in /proc/mounts (#138).
+#[test]
+fn powershell_cmdlets_are_found_by_name() {
+    let rootfs = require_rootfs("powershell");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(1024)
+        .boot()
+        .unwrap();
+    sandbox
+        .run(
+            "Write-Output ('drives=' + ([IO.DriveInfo]::GetDrives().Name -join ',')); \
+             Write-Output ('source=' + (Get-Command Write-Output).Source); \
+             Write-Output ('opt=' + (Test-Path /opt))",
+        )
+        .unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.lines().any(|line| line.trim() == "drives=/")
+            && output.contains("source=Microsoft.PowerShell.Utility")
+            && output.contains("opt=True"),
+        "expected the / drive, Write-Output's module and /opt to be found, got: {output:?}"
+    );
+}
+
 /// A script's exit code is the call's status, as it is for an exec'd
 /// program: `exit 3` fails the call, and the next call runs as usual.
 #[test]

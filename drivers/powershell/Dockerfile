@@ -64,9 +64,13 @@ RUN set -eu; \
 
 FROM pwsh-${TARGETARCH} AS pwsh-base
 
-# Create dirs that FROM scratch doesn't have
+# Create dirs that FROM scratch doesn't have, and the /proc files pwsh
+# reads.  .NET lists the drives from /proc/mounts: without a mount at /,
+# PowerShell's FileSystem provider resolves no path, so it finds no module
+# and runs no cmdlet by name.
 RUN mkdir -p /empty-tmp /stub-proc/self && \
-    printf 'pwsh\0-NoProfile\0-File\0/tmp/hl_dispatch.ps1\0' > /stub-proc/self/cmdline
+    printf 'pwsh\0-NoProfile\0-File\0/tmp/hl_dispatch.ps1\0' > /stub-proc/self/cmdline && \
+    printf 'rootfs / ramfs rw 0 0\n' > /stub-proc/mounts
 
 # ── Compile the driver ──────────────────────────────────────────
 FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS build-driver
@@ -86,7 +90,7 @@ FROM scratch
 
 COPY --from=pwsh-base /rootfs/ /
 
-# /tmp + a /proc/self/cmdline for pwsh to read
+# /tmp, and the /proc files pwsh reads
 COPY --from=pwsh-base /empty-tmp/ /tmp/
 COPY --from=pwsh-base /stub-proc/ /proc/
 
