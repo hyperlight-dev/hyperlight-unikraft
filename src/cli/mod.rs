@@ -936,7 +936,7 @@ fn command_program(command: &str) -> Option<&str> {
         sets_path |= word.starts_with("PATH=");
     };
     // A path is found without PATH, so it can still be checked.
-    if sets_path && !program.contains(['/', '\\']) {
+    if sets_path && !names_a_path(program) {
         return None;
     }
     // Only a plain word names the program as written; the shell expands,
