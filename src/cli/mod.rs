@@ -920,15 +920,18 @@ fn command_program(command: &str) -> Option<&str> {
         .split_whitespace()
         .map(|word| word.trim_start_matches(['(', '{']))
         .filter(|word| !word.is_empty());
+    let mut sets_path = false;
     let program = loop {
         let word = words.next()?;
         if !assignment(word) {
             break word;
         }
-        if word.starts_with("PATH=") {
-            return None;
-        }
+        sets_path |= word.starts_with("PATH=");
     };
+    // A path is found without PATH, so it can still be checked.
+    if sets_path && !program.contains(['/', '\\']) {
+        return None;
+    }
     // Only a plain word names the program as written; the shell expands,
     // unquotes or splits anything else first, so leave that to it.
     let plain = |c: char| {
@@ -1728,6 +1731,7 @@ mod tests {
         assert_eq!(command_program("PATH=$PWD/tools:$PATH mytool build"), None);
         assert_eq!(command_program("CC=gcc PATH=bin make"), None);
         assert_eq!(command_program("MYPATH=bin make"), Some("make"));
+        assert_eq!(command_program("PATH=bin ./build.sh"), Some("./build.sh"));
         if !cfg!(windows) {
             assert_eq!(command_program("\\make -j4"), None);
             assert_eq!(command_program("./build\\ tool.sh"), None);
