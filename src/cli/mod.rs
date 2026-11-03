@@ -896,8 +896,9 @@ fn scratch_hint(rootfs_bytes: u64, scratch_mb: usize, by: SizedBy) {
 /// lookup would find; a command starting with one is left to the shell.
 const SHELL_BUILTINS: &[&str] = &[
     "cd", "export", "set", "unset", "source", ".", "eval", "exec", "echo", "true", "false", "test",
-    "[", "if", "for", "while", "until", "case", "mkdir", "ulimit", "umask", "alias", "command",
-    "type", "trap", "readonly", "shift", "wait", "read", "exit",
+    "[", "if", "for", "while", "until", "case", "mkdir", "ulimit", "umask", "alias", "unalias",
+    "command", "type", "hash", "getopts", "trap", "readonly", "shift", "wait", "read", "exit",
+    "return", "break", "continue", "times", "pwd", "kill", "jobs", "fg", "bg", "fc",
 ];
 
 /// The builtins of `cmd`, which runs a build command on Windows, and which
@@ -1815,6 +1816,10 @@ mod tests {
                 "unset CC && make",
                 "ulimit -n 4096 && make",
                 "umask 022 && make",
+                "hash -r && make",
+                "unalias -a && make",
+                "getopts ab opt",
+                "times",
             ] {
                 assert_eq!(command_program(command), None, "{command}");
             }
