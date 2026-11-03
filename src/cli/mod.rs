@@ -943,17 +943,25 @@ fn command_program(command: &str) -> Option<&str> {
 
 /// Whether `program` resolves where the command's shell looks for it: a
 /// path to a file, relative to `dir`, where the command runs, or a name
-/// found in PATH; on Windows, as `cmd` does, a name is looked for in `dir`
-/// before PATH, and a name or a path is tried with each executable
-/// extension (PATHEXT) added, and as written only when it has an extension.
+/// found in PATH, whose relative entries are relative to `dir` too; on
+/// Windows, as `cmd` does, a name is looked for in `dir` before PATH, and a
+/// name or a path is tried with each executable extension (PATHEXT) added,
+/// and as written only when it has an extension.
 fn on_path(program: &str, dir: &Path) -> bool {
+    resolves(program, dir, std::env::var_os("PATH").as_deref())
+}
+
+/// `on_path` with PATH's value given, `None` when it is unset, which takes
+/// any name as found.
+fn resolves(program: &str, dir: &Path, path: Option<&OsStr>) -> bool {
+    let exts = executable_extensions();
     if program.contains('/') || program.contains('\\') {
-        return found_in(program, dir);
+        return found_in(program, dir, &exts);
     }
-    if cfg!(windows) && found_in(program, dir) {
+    if cfg!(windows) && found_in(program, dir, &exts) {
         return true;
     }
-    std::env::var_os("PATH").is_none_or(|path| in_search_path(program, dir, &path))
+    path.is_none_or(|path| in_search_path(program, dir, path))
 }
 
 /// Whether the name `program` is in `path`, a list like PATH's, as the
@@ -961,22 +969,28 @@ fn on_path(program: &str, dir: &Path) -> bool {
 /// (`node_modules/.bin`, `.`, or an empty one, which means `.`) is
 /// relative to `dir`, not to where `hluk` runs.
 fn in_search_path(program: &str, dir: &Path, path: &OsStr) -> bool {
-    std::env::split_paths(path).any(|entry| found_in(program, &dir.join(entry)))
+    let exts = executable_extensions();
+    std::env::split_paths(path).any(|entry| found_in(program, &dir.join(entry), &exts))
 }
 
-/// Whether `program` is a file in `base` that the command's shell would
-/// run: as written, or on Windows with each executable extension (PATHEXT)
-/// added.
-fn found_in(program: &str, base: &Path) -> bool {
-    let exts: Vec<String> = if cfg!(windows) {
+/// The extensions `cmd` adds to a program's name (PATHEXT); none elsewhere.
+fn executable_extensions() -> Vec<String> {
+    if cfg!(windows) {
         std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".EXE;.CMD;.BAT".into())
             .split(';')
+            // An empty entry (`.EXE;.CMD;`) is no extension.
+            .filter(|e| !e.is_empty())
             .map(|e| e.to_ascii_lowercase())
             .collect()
     } else {
         Vec::new()
-    };
+    }
+}
+
+/// Whether `program` is a file in `base` that the command's shell would
+/// run: as written, or with one of `exts` added.
+fn found_in(program: &str, base: &Path, exts: &[String]) -> bool {
     // cmd runs a file as written only when it has an extension; one without
     // runs only by a PATHEXT extension added to its name.
     let as_written = !cfg!(windows) || Path::new(program).extension().is_some();
@@ -1761,21 +1775,27 @@ mod tests {
         fs::create_dir(project.path().join("scripts")).unwrap();
         fs::write(project.path().join("scripts").join("build.cmd"), "").unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
+        // A PATH that finds nothing, so that only where cmd looks first counts.
+        let no_path = Some(OsStr::new("/hluk-no-such-dir"));
         // cmd runs a name in its directory before PATH, with or without
         // the extension; sh looks for a name in PATH alone.
         for name in ["hluk-build.bat", "hluk-build"] {
-            assert_eq!(on_path(name, project.path()), cfg!(windows), "{name}");
-            assert!(!on_path(name, elsewhere.path()), "{name}");
+            assert_eq!(
+                resolves(name, project.path(), no_path),
+                cfg!(windows),
+                "{name}"
+            );
+            assert!(!resolves(name, elsewhere.path(), no_path), "{name}");
         }
         // cmd adds the extension to a path too.
         let path = Path::new("scripts").join("build");
         let path = path.to_str().unwrap();
-        assert_eq!(on_path(path, project.path()), cfg!(windows));
-        assert!(!on_path(path, elsewhere.path()));
-        assert!(on_path("scripts/build.cmd", project.path()));
+        assert_eq!(resolves(path, project.path(), no_path), cfg!(windows));
+        assert!(!resolves(path, elsewhere.path(), no_path));
+        assert!(resolves("scripts/build.cmd", project.path(), no_path));
         // cmd does not run a file without an extension.
         fs::write(project.path().join("hluk-tool"), "").unwrap();
-        assert!(!on_path("hluk-tool", project.path()));
+        assert!(!resolves("hluk-tool", project.path(), no_path));
     }
 
     #[test]
@@ -1783,8 +1803,10 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let bin = project.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("tsc"), "").unwrap();
-        fs::write(project.path().join("build-tool"), "").unwrap();
+        // cmd runs a file without an extension only by a PATHEXT one.
+        let ext = if cfg!(windows) { ".cmd" } else { "" };
+        fs::write(bin.join(format!("tsc{ext}")), "").unwrap();
+        fs::write(project.path().join(format!("build-tool{ext}")), "").unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let path = std::env::join_paths(["node_modules/.bin", "."]).unwrap();
         assert!(in_search_path("tsc", project.path(), &path));
