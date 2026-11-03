@@ -930,8 +930,8 @@ fn command_program(command: &str) -> Option<&str> {
 /// Whether `program` resolves where the command's shell looks for it: a
 /// path to a file, relative to `dir`, where the command runs, or a name
 /// found in PATH; on Windows, as `cmd` does, a name is looked for in `dir`
-/// before PATH, and a name or a path also with each executable extension
-/// (PATHEXT) added.
+/// before PATH, and a name or a path is tried with each executable
+/// extension (PATHEXT) added, and as written only when it has an extension.
 fn on_path(program: &str, dir: &Path) -> bool {
     let exts: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
@@ -942,11 +942,14 @@ fn on_path(program: &str, dir: &Path) -> bool {
     } else {
         Vec::new()
     };
-    let found_in = |dir: &Path| {
-        dir.join(program).is_file()
+    // cmd runs a file as written only when it has an extension; one without
+    // runs only by a PATHEXT extension added to its name.
+    let as_written = !cfg!(windows) || Path::new(program).extension().is_some();
+    let found_in = |base: &Path| {
+        (as_written && base.join(program).is_file())
             || exts
                 .iter()
-                .any(|ext| dir.join(format!("{program}{ext}")).is_file())
+                .any(|ext| base.join(format!("{program}{ext}")).is_file())
     };
     if program.contains('/') || program.contains('\\') {
         return found_in(dir);
@@ -1742,6 +1745,9 @@ mod tests {
         assert_eq!(on_path(path, project.path()), cfg!(windows));
         assert!(!on_path(path, elsewhere.path()));
         assert!(on_path("scripts/build.cmd", project.path()));
+        // cmd does not run a file without an extension.
+        fs::write(project.path().join("hluk-tool"), "").unwrap();
+        assert!(!on_path("hluk-tool", project.path()));
     }
 
     #[test]
