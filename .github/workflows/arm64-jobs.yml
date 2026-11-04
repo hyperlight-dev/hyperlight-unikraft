@@ -293,7 +293,16 @@ jobs:
           failed=
           for demo in supply-chain autonomous http-flask http-express http-kestrel pptx agent-fw-local; do
             echo "::group::$demo"
-            python ci/run_demo.py "$demo" || failed="$failed $demo"
+            if ! python ci/run_demo.py "$demo"; then
+              # http-express wedges the guest vCPU on the nested-virt linux-arm64
+              # runner (hyperlight-dev/hyperlight#2025); don't fail the job for it
+              # there.  Revert when #2025 is fixed.
+              if [ "$demo" = http-express ] && [ "${{ matrix.os }}" = linux ]; then
+                echo "::warning::$demo: known nested-virt linux-arm64 failure (hyperlight#2025); not failing the job"
+              else
+                failed="$failed $demo"
+              fi
+            fi
             echo "::endgroup::"
           done
           if [ -n "$failed" ]; then
@@ -313,6 +322,10 @@ jobs:
       ${{ fromJSON(format(needs.plan.outputs[matrix.os], format('integrations-arm64-{0}-{1}-{2}-{3}-{4}',
       matrix.package, matrix.deps, matrix.os, github.run_id, github.run_attempt))) }}
     timeout-minutes: 45
+    # smolagents and mcp wedge the guest vCPU on the nested-virt linux-arm64
+    # runner (hyperlight-dev/hyperlight#2025); let them soft-fail there so the
+    # nightly isn't red for a known bug.  Revert when #2025 is fixed.
+    continue-on-error: ${{ matrix.os == 'linux' && (matrix.package == 'smolagents' || matrix.package == 'mcp') }}
     strategy:
       fail-fast: false
       matrix:
