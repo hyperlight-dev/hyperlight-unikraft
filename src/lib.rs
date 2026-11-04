@@ -188,6 +188,12 @@ pub type HostFunction =
 /// The host functions a sandbox offers, by name.
 type HostFunctionTable = Arc<std::collections::BTreeMap<String, HostFunction>>;
 
+/// The function [`SandboxBuilder::on_interrupt_handle`] stores.  The mutex
+/// keeps the builder `Sync` without asking that of the function, which is
+/// only ever taken out whole by `boot`; it is never locked.
+type InterruptHandleHook =
+    Mutex<Box<dyn FnOnce(Arc<dyn hyperlight_host::hypervisor::InterruptHandle>) + Send + 'static>>;
+
 /// What `HostCall` answers: a tag byte, then the result or the error
 /// message.  The drivers read it back (`hl_driver.h`'s `hl_host_call`).
 const HOST_CALL_OK: u8 = 0;
@@ -2273,7 +2279,15 @@ pub struct SandboxBuilder {
     echo_output: bool,
     console_terminal: bool,
     guest_log_level: Option<tracing::level_filters::LevelFilter>,
+    on_interrupt_handle: Option<InterruptHandleHook>,
 }
+
+// A builder is made on one thread and booted on another, or shared before
+// the boot.
+const _: () = {
+    fn send_sync<T: Send + Sync>() {}
+    let _ = send_sync::<SandboxBuilder>;
+};
 
 impl SandboxBuilder {
     /// A builder with no source and every setting at its default.
@@ -2296,6 +2310,7 @@ impl SandboxBuilder {
             echo_output: true,
             console_terminal: false,
             guest_log_level: None,
+            on_interrupt_handle: None,
         }
     }
 
@@ -2524,6 +2539,44 @@ impl SandboxBuilder {
         self
     }
 
+    /// Hand `f` the sandbox's interrupt handle (the one
+    /// [`AppSandbox::interrupt_handle`] returns) as soon as the sandbox
+    /// exists, before [`boot`](Self::boot) returns.  From a snapshot, that
+    /// is before the `resume` entry, so a guest that spins there can be
+    /// stopped: a kill that cancels the entry fails `boot` with
+    /// `Error::Hyperlight(ExecutionCanceledByHost)` and frees the sandbox.
+    /// A kill that races the end of the entry can lose: the guest halts as
+    /// the kill lands, whatever `kill` returned, and `boot` succeeds.  A
+    /// fresh guest boots inside Hyperlight's `evolve`, before there is a
+    /// handle, so there `f` gets it after the boot, with no entry left to
+    /// come; `boot` can still fail after it ([`Error::GuestSilent`], say),
+    /// and the handle then belongs to a sandbox that is gone, where `kill`
+    /// does nothing and returns `false`.  If `boot` fails before the
+    /// sandbox exists ([`Error::HostFunctionName`] or
+    /// [`Error::SnapshotSettings`], say, or a snapshot Hyperlight cannot
+    /// make a sandbox from, or a fresh guest whose `evolve` fails), `f` is
+    /// never called, only dropped: a channel it would send on disconnects.
+    ///
+    /// `f` runs on `boot`'s thread, before any entry still to come: it
+    /// should not block, as `boot` waits for it, and a panic in it unwinds
+    /// out of `boot`.  Kill from another thread.  A kill counts only once
+    /// Hyperlight has started the guest call, which clears earlier kills
+    /// as it begins, so one made earlier, in `f` say, is dropped.  A kill
+    /// after the call has started but while the vCPU is not running
+    /// (before it enters the guest, or during a host function call) has
+    /// nothing to signal, so `kill` returns `false`, yet the call is
+    /// cancelled when the vCPU next runs, if it does.  So keep killing
+    /// until `kill` returns `true` or `boot` returns, then stop the killer,
+    /// and wait for it, before the sandbox's next guest call: a late kill
+    /// would cancel that call.
+    pub fn on_interrupt_handle<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(Arc<dyn hyperlight_host::hypervisor::InterruptHandle>) + Send + 'static,
+    {
+        self.on_interrupt_handle = Some(Mutex::new(Box::new(f)));
+        self
+    }
+
     /// Leave out the `HostWriteErr` host function, as an older or
     /// third-party host does: the guest's standard error then reaches
     /// `HostWrite`.  For testing that fallback, on a fresh boot: a snapshot
@@ -2559,6 +2612,7 @@ impl SandboxBuilder {
             echo_output,
             console_terminal,
             guest_log_level,
+            on_interrupt_handle,
         } = self;
         // The empty name asks for the list of functions, one per line, so
         // neither it nor a line break can be in a function's name.
@@ -2687,6 +2741,14 @@ impl SandboxBuilder {
                 (sandbox, cfg)
             }
         };
+        // The earliest the handle exists.  No guest code has run in a
+        // restored sandbox yet, and its resume entry below is the first; a
+        // fresh guest booted inside evolve, and boot enters it no more.
+        if let Some(f) = on_interrupt_handle {
+            // Never poisoned: never locked.
+            let f = f.into_inner().unwrap_or_else(|e| e.into_inner());
+            f(sandbox.interrupt_handle());
+        }
 
         // A fresh guest has spoken during boot: a step-model kernel reports
         // boot complete, and a process that ran to completion meanwhile (a
@@ -3329,8 +3391,14 @@ impl AppSandbox {
     }
 
     /// A handle that can break an entry in progress from another thread
-    /// (see [`hyperlight_host::hypervisor::InterruptHandle`]): the way out
-    /// of a step that will not come back, at the cost of the sandbox.
+    /// (see [`hyperlight_host::hypervisor::InterruptHandle`]), the way out
+    /// of a step that will not come back, at the cost of the guest, which
+    /// serves nothing more until a restore.  It stays the sandbox's across
+    /// [`restore`](Self::restore) and [`restore_from`](Self::restore_from),
+    /// so it also stops their `resume` entry, which then fails with
+    /// `Error::Hyperlight(ExecutionCanceledByHost)`; a later restore
+    /// recovers the sandbox.  For a boot, see
+    /// [`SandboxBuilder::on_interrupt_handle`].
     pub fn interrupt_handle(&self) -> Arc<dyn hyperlight_host::hypervisor::InterruptHandle> {
         self.sandbox.interrupt_handle()
     }
@@ -3409,6 +3477,38 @@ mod tests {
             describe_snapshot_tag(&tag),
             format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    /// The builder is `Sync` without the function being so: it may hold a
+    /// `Cell`, or an `mpsc::Receiver`.
+    #[test]
+    fn the_interrupt_handle_hook_need_not_be_sync() {
+        let cell = std::cell::Cell::new(false);
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let builder = SandboxBuilder::from_initrd("rootfs.cpio").on_interrupt_handle(move |_| {
+            cell.set(true);
+            let _ = rx.try_recv();
+        });
+        fn sync<T: Sync>(_: &T) {}
+        sync(&builder);
+    }
+
+    /// A boot that fails before the sandbox exists drops the function
+    /// uncalled, so a channel it would send on disconnects.
+    #[test]
+    fn a_boot_that_fails_first_never_calls_the_interrupt_handle_hook() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let err = SandboxBuilder::from_initrd("rootfs.cpio")
+            .host_function("", |_| Ok(String::new()))
+            .on_interrupt_handle(move |h| tx.send(h).unwrap())
+            .boot()
+            .err()
+            .expect("booted with an empty host function name");
+        assert!(matches!(err, Error::HostFunctionName { .. }), "{err:?}");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
