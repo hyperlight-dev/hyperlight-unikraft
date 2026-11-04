@@ -199,8 +199,9 @@ jobs:
       # Linux runs the suites with small guests but on Sundays (see the top
       # of arm64.yml); macOS and Windows run all the targets, always.
       SMALL_GUESTS: >-
-        --lib --bins --test bash --test cli --test compiled --test cpio --test fs_backend
-        --test native_kernel --test networking --test php --test project
+        --lib --bins --test bash --test cli --test compiled --test cpio
+        --test dirty_bytes --test fs_backend --test native_kernel
+        --test networking --test php --test project
         --test python --test python_shell --test quickjs --test resize
         --test resolv --test snapshot_mounts --test step --test wasmtime
     steps:

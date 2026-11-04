@@ -2706,12 +2706,15 @@ impl SandboxBuilder {
             config: cfg,
             exited,
             pending: None,
+            clean_scratch_bytes: 0,
         };
         if restored {
             // Put the image right for this host before anyone can observe
             // it: the kernel reseeds its CSPRNG and re-establishes the
             // guest's host sockets (see `resume`).
             app.resume()?;
+        } else {
+            app.mark_clean()?;
         }
         Ok(app)
     }
@@ -2839,6 +2842,10 @@ pub struct AppSandbox {
     /// A terminal result produced while delivering a call, handed out by
     /// the next [`step`](Self::step).
     pending: Option<Yield>,
+    /// hyperlight's scratch allocation count when the guest was last made
+    /// clean ([`dirty_bytes`](Self::dirty_bytes)): after the resume entry,
+    /// so that what the kernel writes to resume is not the guest's.
+    clean_scratch_bytes: u64,
 }
 
 impl AppSandbox {
@@ -3047,11 +3054,41 @@ impl AppSandbox {
     /// terminal outcome (a call in flight at snapshot time finishing, or
     /// the process exiting) is kept for the next [`step`](Self::step).
     fn resume(&mut self) -> Result<()> {
-        let yielded = self.config.enter(&mut self.sandbox, "resume", ())?;
-        match self.note(yielded) {
+        let yielded = self.config.enter(&mut self.sandbox, "resume", ());
+        // Count from here even when the entry failed: the last baseline
+        // belongs to the guest state the restore discarded.
+        let clean = self.mark_clean();
+        match self.note(yielded?) {
             Yield::Blocked { .. } => {}
             terminal => self.pending = Some(terminal),
         }
+        clean
+    }
+
+    /// Bytes of memory the guest has written since this sandbox was last
+    /// restored ([`restore`](Self::restore), or a boot from a snapshot) or
+    /// snapshotted.  What the kernel writes on a restore to resume the
+    /// guest is not counted; after a snapshot, what it writes to pick up
+    /// again on the next entry is.
+    ///
+    /// Every page the guest writes after a restore comes from its scratch
+    /// page allocator, and this is how far that allocator has moved.  The
+    /// kernel takes pages for its own frame allocator a chunk at a time, so
+    /// this can be ahead of what the guest wrote by up to about 1 MiB, and
+    /// by more around a large allocation, whose chunk is several times its
+    /// size.  The guest controls the value: a malicious guest can make it
+    /// report less or more than it wrote.
+    ///
+    /// A freshly booted sandbox writes into memory its kernel set aside at
+    /// boot, so until its first snapshot or restore this stays near 0.
+    pub fn dirty_bytes(&self) -> Result<u64> {
+        let allocated = self.sandbox.scratch_allocated_bytes()?;
+        Ok(allocated.saturating_sub(self.clean_scratch_bytes))
+    }
+
+    /// Count [`dirty_bytes`](Self::dirty_bytes) from here.
+    fn mark_clean(&mut self) -> Result<()> {
+        self.clean_scratch_bytes = self.sandbox.scratch_allocated_bytes()?;
         Ok(())
     }
 
@@ -3124,15 +3161,18 @@ impl AppSandbox {
     pub fn snapshot(&mut self) -> Result<Arc<Snapshot>> {
         self.ensure_running()?;
         let snapshot = self.sandbox.snapshot()?;
+        self.mark_clean()?;
         record_scratch_mb(snapshot, self.config.scratch_size.map(|size| size / MIB))
     }
 
-    /// [`snapshot`](Self::snapshot), but a sandbox restored from it gets
-    /// `mb` MiB of scratch.  Booting needs room to unpack the rootfs; guest
+    /// [`snapshot`](Self::snapshot), but with `mb` MiB of scratch: this
+    /// sandbox continues on `mb` MiB, and so does a sandbox restored from
+    /// the snapshot.  Booting needs room to unpack the rootfs; guest
     /// function calls need far less, so restores of a smaller snapshot cost
     /// less.  A larger one gives guest function calls more room than the
     /// sandbox booted with.  The snapshot records `mb`
-    /// ([`snapshot_scratch_mb`]).
+    /// ([`snapshot_scratch_mb`]), as do later plain snapshots of this
+    /// sandbox.
     ///
     /// - `mb` above hyperlight's maximum memory size errors with
     ///   `Error::Hyperlight(MemoryRequestTooBig)`.
@@ -3143,13 +3183,14 @@ impl AppSandbox {
     ///   that error, the same variant, leaves the sandbox usable.  So does
     ///   the error for a larger size whose scratch would cover a guest
     ///   mapping, which the kernel does not make.
-    /// - Whether the kernel fits is not checked.  If it does not,
-    ///   [`restore`](Self::restore) fails with
-    ///   `Error::Hyperlight(GuestAborted)`; until a restore of a snapshot
-    ///   that fits recovers the sandbox, a guest function call fails with
-    ///   [`Error::NoDriver`] and a snapshot with
-    ///   `Error::Hyperlight(PoisonedSandbox)`.  A new sandbox booted from
-    ///   the snapshot fails to boot, with `Error::Hyperlight(GuestAborted)`.
+    /// - Whether the kernel fits is not checked.  If it does not, this
+    ///   sandbox's next entry, and [`restore`](Self::restore) of the
+    ///   snapshot, fail with `Error::Hyperlight(GuestAborted)`; until a
+    ///   restore of a snapshot that fits recovers the sandbox, a snapshot
+    ///   fails with `Error::Hyperlight(PoisonedSandbox)`, and after a failed
+    ///   restore a guest function call fails with [`Error::NoDriver`].  A
+    ///   new sandbox booted from the snapshot fails to boot, with
+    ///   `Error::Hyperlight(GuestAborted)`.
     /// - Scratch also holds the transport, page tables and the kernel's own
     ///   state, so a guest function call gets less than `mb`.  One that
     ///   runs out either gets its process killed when the kernel's memory
@@ -3158,15 +3199,18 @@ impl AppSandbox {
     ///   (`Error::Hyperlight(GuestAborted)`) when scratch itself runs out,
     ///   which copies of the snapshot's pages also draw on.  A restore
     ///   recovers the sandbox from either.
-    /// - At the sandbox's own size this is [`snapshot`](Self::snapshot);
-    ///   any other size captures a new snapshot each time, so keep the
-    ///   result.
+    /// - At the sandbox's own size this is [`snapshot`](Self::snapshot).
+    ///   Any other size captures a new snapshot and moves the sandbox to
+    ///   it.
     /// - Errors with [`Error::GuestExited`] once the guest process has
     ///   exited.
     pub fn snapshot_with_scratch_mb(&mut self, mb: usize) -> Result<Arc<Snapshot>> {
         self.ensure_running()?;
         let options = SnapshotOptions::default().scratch_size(mb_to_bytes(mb));
         let snapshot = self.sandbox.snapshot_with_options(&options)?;
+        // The sandbox continues from the capture, on its scratch size.
+        self.config.scratch_size = Some(mb_to_bytes(mb));
+        self.mark_clean()?;
         record_scratch_mb(snapshot, Some(mb))
     }
 
