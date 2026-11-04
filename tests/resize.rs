@@ -38,6 +38,41 @@ const BIG: &str = r#"{"mb":32}"#;
 // More than the 256 MiB the sandbox boots with.
 const HUGE: &str = r#"{"mb":320}"#;
 
+/// The sandbox that takes a resized snapshot continues on its size: its
+/// guest function calls get that scratch, and its later plain snapshots
+/// record it.
+#[test]
+fn the_sandbox_continues_on_its_resized_snapshots_scratch() {
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox.run(SCRIPT).unwrap();
+
+    let small = sandbox.snapshot_with_scratch_mb(8).unwrap();
+    assert_eq!(snapshot_scratch_mb(&small), Some(8));
+    let plain = sandbox.snapshot().unwrap();
+    assert_eq!(snapshot_scratch_mb(&plain), Some(8));
+    let e = sandbox
+        .call("big", BIG)
+        .expect_err("32 MiB must not fit 8 MiB");
+    assert!(outgrew(&e), "{e}");
+    // A plain snapshot of it is an 8 MiB snapshot, in a new sandbox too.
+    let mut fresh = SandboxBuilder::from_snapshot(plain).boot().unwrap();
+    let e = fresh
+        .call("big", BIG)
+        .expect_err("32 MiB must not fit a fresh 8 MiB sandbox");
+    assert!(outgrew(&e), "{e}");
+
+    // Growing it gives this sandbox the room, with no restore.
+    sandbox.restore(small).unwrap();
+    let grown = sandbox.snapshot_with_scratch_mb(512).unwrap();
+    assert_eq!(snapshot_scratch_mb(&grown), Some(512));
+    let out = sandbox.call("big", HUGE).unwrap();
+    assert!(out.contains("335544320"), "{out}");
+    assert_eq!(snapshot_scratch_mb(&sandbox.snapshot().unwrap()), Some(512));
+}
+
 #[test]
 fn a_resized_snapshot_restores_with_another_scratch_size() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
@@ -111,9 +146,9 @@ fn a_resized_snapshot_restores_with_another_scratch_size() {
 
     // The smallest whole MiB the host accepts is less than a MiB above its
     // minimum (transport and page tables), while the kernel's frame
-    // allocator needs two 512 KiB chunks on top of that, so the restore
-    // fails, as does a boot from it, and restoring a larger snapshot
-    // recovers the sandbox.
+    // allocator needs two 512 KiB chunks on top of that, so the sandbox
+    // that took it aborts on its next entry, the restore fails, as does a
+    // boot from it, and restoring a larger snapshot recovers the sandbox.
     sandbox.restore(full.clone()).unwrap();
     let tiny = (1..8)
         .find_map(|mb| match sandbox.snapshot_with_scratch_mb(mb) {
@@ -122,6 +157,15 @@ fn a_resized_snapshot_restores_with_another_scratch_size() {
             Err(e) => panic!("{mb} MiB: {e}"),
         })
         .expect("a size the host accepts");
+    let e = sandbox
+        .call("handler", REQUEST)
+        .expect_err("a guest function call on the tiny scratch must fail");
+    assert!(matches!(e, Error::Hyperlight(GuestAborted(..))), "{e}");
+    let e = sandbox
+        .snapshot()
+        .err()
+        .expect("a snapshot after the abort must fail");
+    assert!(matches!(e, Error::Hyperlight(PoisonedSandbox)), "{e}");
     let e = sandbox
         .restore(tiny.clone())
         .expect_err("the tiny restore must fail");

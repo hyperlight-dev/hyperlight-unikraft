@@ -104,9 +104,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 anyhow = "1"
 bytes = "1"
 
-# hyperlight main, for scratch resize (#1947). crates.io takes no git
-# dependency, so hyperlight-unikraft is not published until a hyperlight
-# release replaces this.
+# hyperlight main, for scratch resize (#1947) and scratch_allocated_bytes
+# (#2019). crates.io takes no git dependency, so hyperlight-unikraft is not
+# published until a hyperlight release replaces this.
 [patch.crates-io]
-hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "a4563dbd585d47bfc0664d7b9559fbf0cb51d2c1" }
-hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "a4563dbd585d47bfc0664d7b9559fbf0cb51d2c1" }
+hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "6c17f7cd4e78b03d77fadf4cfe749d7ede96b7ab" }
+hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "6c17f7cd4e78b03d77fadf4cfe749d7ede96b7ab" }

@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `AppSandbox::snapshot_with_scratch_mb` takes a snapshot that restores with another scratch size: boot with what unpacking the rootfs needs, then run guest function calls with what they need, less or more. The snapshot records the size (`snapshot_scratch_mb`). A size too small for the kernel makes the restore fail (restoring a snapshot that fits recovers the sandbox) and a boot from the snapshot fail. A guest function call that runs out of scratch ends with its process killed (status 137 with a single-process driver, such as python's) or the guest aborted, depending on what runs out first. A restore recovers the sandbox.
+- `AppSandbox::snapshot_with_scratch_mb` takes a snapshot with another scratch size, which the sandbox continues on and a restore of the snapshot gets: boot with what unpacking the rootfs needs, then run guest function calls with what they need, less or more. The snapshot records the size (`snapshot_scratch_mb`), as do later snapshots of the sandbox. A size too small for the kernel makes the sandbox's next entry, the restore, and a boot from the snapshot fail (restoring a snapshot that fits recovers the sandbox). A guest function call that runs out of scratch ends with its process killed (status 137 with a single-process driver, such as python's) or the guest aborted, depending on what runs out first. A restore recovers the sandbox.
 
 ### Changed
 

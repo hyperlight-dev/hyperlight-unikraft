@@ -3127,12 +3127,14 @@ impl AppSandbox {
         record_scratch_mb(snapshot, self.config.scratch_size.map(|size| size / MIB))
     }
 
-    /// [`snapshot`](Self::snapshot), but a sandbox restored from it gets
-    /// `mb` MiB of scratch.  Booting needs room to unpack the rootfs; guest
+    /// [`snapshot`](Self::snapshot), but with `mb` MiB of scratch: this
+    /// sandbox continues on `mb` MiB, and so does a sandbox restored from
+    /// the snapshot.  Booting needs room to unpack the rootfs; guest
     /// function calls need far less, so restores of a smaller snapshot cost
     /// less.  A larger one gives guest function calls more room than the
     /// sandbox booted with.  The snapshot records `mb`
-    /// ([`snapshot_scratch_mb`]).
+    /// ([`snapshot_scratch_mb`]), as do later plain snapshots of this
+    /// sandbox.
     ///
     /// - `mb` above hyperlight's maximum memory size errors with
     ///   `Error::Hyperlight(MemoryRequestTooBig)`.
@@ -3143,13 +3145,14 @@ impl AppSandbox {
     ///   that error, the same variant, leaves the sandbox usable.  So does
     ///   the error for a larger size whose scratch would cover a guest
     ///   mapping, which the kernel does not make.
-    /// - Whether the kernel fits is not checked.  If it does not,
-    ///   [`restore`](Self::restore) fails with
-    ///   `Error::Hyperlight(GuestAborted)`; until a restore of a snapshot
-    ///   that fits recovers the sandbox, a guest function call fails with
-    ///   [`Error::NoDriver`] and a snapshot with
-    ///   `Error::Hyperlight(PoisonedSandbox)`.  A new sandbox booted from
-    ///   the snapshot fails to boot, with `Error::Hyperlight(GuestAborted)`.
+    /// - Whether the kernel fits is not checked.  If it does not, this
+    ///   sandbox's next entry, and [`restore`](Self::restore) of the
+    ///   snapshot, fail with `Error::Hyperlight(GuestAborted)`; until a
+    ///   restore of a snapshot that fits recovers the sandbox, a snapshot
+    ///   fails with `Error::Hyperlight(PoisonedSandbox)`, and after a failed
+    ///   restore a guest function call fails with [`Error::NoDriver`].  A
+    ///   new sandbox booted from the snapshot fails to boot, with
+    ///   `Error::Hyperlight(GuestAborted)`.
     /// - Scratch also holds the transport, page tables and the kernel's own
     ///   state, so a guest function call gets less than `mb`.  One that
     ///   runs out either gets its process killed when the kernel's memory
@@ -3158,15 +3161,17 @@ impl AppSandbox {
     ///   (`Error::Hyperlight(GuestAborted)`) when scratch itself runs out,
     ///   which copies of the snapshot's pages also draw on.  A restore
     ///   recovers the sandbox from either.
-    /// - At the sandbox's own size this is [`snapshot`](Self::snapshot);
-    ///   any other size captures a new snapshot each time, so keep the
-    ///   result.
+    /// - At the sandbox's own size this is [`snapshot`](Self::snapshot).
+    ///   Any other size captures a new snapshot and moves the sandbox to
+    ///   it.
     /// - Errors with [`Error::GuestExited`] once the guest process has
     ///   exited.
     pub fn snapshot_with_scratch_mb(&mut self, mb: usize) -> Result<Arc<Snapshot>> {
         self.ensure_running()?;
         let options = SnapshotOptions::default().scratch_size(mb_to_bytes(mb));
         let snapshot = self.sandbox.snapshot_with_options(&options)?;
+        // The sandbox continues from the capture, on its scratch size.
+        self.config.scratch_size = Some(mb_to_bytes(mb));
         record_scratch_mb(snapshot, Some(mb))
     }
 
