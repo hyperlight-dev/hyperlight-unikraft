@@ -140,6 +140,9 @@ jobs:
       - name: License headers
         run: ./dev/check-license-headers.sh
 
+      - name: Demo-harness unit tests
+        run: python3 ci/test_run_demo.py
+
   # ── arm64 hosts: build, lint and unit tests ─────────────────
   # macOS (Hypervisor.framework), Linux and Windows arm64 build different
   # cfg paths (the arm64 kernel, BSD sockets and errno, WHP on arm64).

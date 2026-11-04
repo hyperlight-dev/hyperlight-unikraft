@@ -46,16 +46,130 @@ def expect(out: str, needle: str, demo: str):
     print(f"ok: {demo} — found {needle!r}")
 
 
+class _DrainedServer:
+    """A demo server subprocess whose stdout+stderr are captured to a file.
+
+    The HTTP demos never close their stdout while they serve, which bites a
+    naive harness two ways: reading the pipe before the process exits blocks
+    until it does, and *not* reading it lets a chatty server fill the ~64 KiB
+    pipe buffer and block the guest mid-request.  Capturing to a regular file
+    sidesteps both — the OS never blocks the writer, and the log is read only
+    after the process has stopped.  `stop()` ends it with a bounded terminate →
+    kill, and reading a file never blocks, so a wedged guest — e.g. http-express
+    accepting the TCP connection but never answering on the nested-virt arm64
+    runner — can no longer hold the harness.  That wedge is what pinned the arm64
+    nightly's demos job at its 90-minute ceiling and, by holding a runner VM the
+    whole time, starved its co-tenant jobs into losing contact with the server.
+    """
+
+    _KEEP = 256 * 1024  # total log kept for error messages (the whole log if smaller)
+    _HEAD = 64 * 1024   # ... of which this much is the head, where a startup error sits
+
+    def __init__(self, cmd, cwd=None):
+        self._log = tempfile.TemporaryFile()
+        self._result = None
+        try:
+            self.proc = subprocess.Popen(cmd, cwd=cwd, stdout=self._log, stderr=subprocess.STDOUT)
+        except BaseException:
+            self._log.close()  # Popen never started; nothing else will close it
+            raise
+
+    def exited(self):
+        """The process's exit code, or None while it is still running."""
+        return self.proc.poll()
+
+    def log_bytes(self) -> int:
+        """How much the server has written to its log so far.
+
+        `fstat` reads the size without moving the file offset, which the
+        still-running child shares through its inherited stdout fd.  Returns 0
+        once stopped (the log is closed and its size no longer matters).
+        """
+        if self._log.closed:
+            return 0
+        return os.fstat(self._log.fileno()).st_size
+
+    def stop(self, grace: float = 10) -> str:
+        """Stop the server and return its log (head and tail if it is large).
+
+        Idempotent and bounded: SIGTERM, then SIGKILL, waiting at most `grace`
+        for each — so at worst ~2×`grace`, never the open-ended wait that hung
+        the job (reading a regular file never blocks).
+        """
+        if self._result is not None:
+            return self._result
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            try:
+                self.proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                # SIGKILL could not reap it within the grace (e.g. stuck in an
+                # uninterruptible syscall).  Don't pretend it stopped silently.
+                print(
+                    f"::warning::hluk (pid {self.proc.pid}) did not exit after SIGKILL",
+                    file=sys.stderr,
+                )
+        data = b""
+        try:
+            if not self._log.closed:
+                size = os.fstat(self._log.fileno()).st_size
+                self._log.seek(0)
+                if size <= self._KEEP:
+                    data = self._log.read(size)
+                else:
+                    # Keep the head — where a bind/startup error or traceback
+                    # sits — and the most recent tail, dropping the middle.  Read
+                    # fixed windows (never to EOF) so the counts stay consistent
+                    # even if a not-yet-reaped child is still appending past size.
+                    tail_len = self._KEEP - self._HEAD
+                    head = self._log.read(self._HEAD)
+                    self._log.seek(size - tail_len)
+                    tail = self._log.read(tail_len)
+                    omitted = size - self._KEEP
+                    data = head + f"\n...[{omitted} bytes omitted]...\n".encode() + tail
+        except OSError:
+            pass  # best-effort diagnostics: a read error must not break the stop
+        finally:
+            try:
+                self._log.close()
+            except OSError:
+                pass
+        self._result = data.decode("utf-8", "replace")
+        return self._result
+
+
+# Without the pipe's backpressure a flooding-but-unresponsive server would grow
+# the capture file unbounded across the ~300 s poll window; fail the demo well
+# before it can fill the runner's disk and take its co-tenants down with it.
+_MAX_LOG = 64 * 1024 * 1024
+
+
+def _fail(demo: str, reason: str, server: "_DrainedServer"):
+    """Stop the server, print its captured log, then emit a one-line error.
+
+    The log goes to the step's stdout, not into the `::error::` annotation: a
+    workflow command keeps only its first line and caps the annotation's size,
+    so a multi-line log embedded there would be lost.
+    """
+    log = server.stop()
+    if log.strip():
+        print(f"--- {demo} server log ---\n{log}")
+    sys.exit(f"::error::{demo}: {reason}")
+
+
 def serve_and_get(args, expected: str, demo: str):
     """Start an in-guest HTTP server, GET / until it answers, assert the body."""
-    proc = subprocess.Popen(
-        [str(HLUK), *args], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
+    server = _DrainedServer([str(HLUK), *args], cwd=ROOT)
     try:
         body = None
         for _ in range(60):
-            if proc.poll() is not None:
-                sys.exit(f"::error::{demo}: server exited before answering\n{proc.stdout.read()}")
+            if server.exited() is not None:
+                _fail(demo, "server exited before answering", server)
+            if server.log_bytes() > _MAX_LOG:
+                _fail(demo, f"server logged over {_MAX_LOG >> 20} MiB without answering", server)
             try:
                 with urllib.request.urlopen("http://127.0.0.1:8080/", timeout=3) as r:
                     body = r.read().decode(errors="replace")
@@ -63,17 +177,13 @@ def serve_and_get(args, expected: str, demo: str):
             except Exception:
                 time.sleep(2)
         if body is None:
-            sys.exit(f"::error::{demo}: server never came up on :8080\n{proc.stdout.read()}")
+            _fail(demo, "server never came up on :8080", server)
         print(f"response: {body.strip()}")
         if expected not in body:
-            sys.exit(f"::error::{demo}: unexpected response (wanted {expected!r})")
+            _fail(demo, f"unexpected response (wanted {expected!r})", server)
         print(f"ok: {demo} — got expected response")
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        server.stop()
 
 
 def demo_supply_chain():
