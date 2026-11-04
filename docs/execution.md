@@ -99,6 +99,8 @@ Either lane ends with the guest parked at a boundary (a `Yield`: the driver is w
 
 `resume` runs guest code: after the kernel's own work — reseeding the CSPRNG, re-binding the host sockets, re-anchoring the wall clock — it drives the scheduler to the next boundary, exactly as a `step` would.  Threads woken by a connection that died with the old host (a server's `recv` returning EOF) run there, and so does any timer that came due.  Nothing is dispatched.
 
+So a guest can spin in its `resume` entry, before `boot()` has returned an `AppSandbox` to take `interrupt_handle()` from.  `SandboxBuilder::on_interrupt_handle(f)` hands `f` the handle as soon as the sandbox exists, before that entry; a `kill()` through it that cancels the entry makes `boot()` fail with `Error::Hyperlight(ExecutionCanceledByHost)` and frees the sandbox.  A fresh guest boots inside Hyperlight's `evolve`, before there is a handle, so there `f` gets it after the boot.  When a kill counts, and how to stop killing safely, are in `SandboxBuilder::on_interrupt_handle`'s documentation.  `restore` and `restore_from` run their `resume` entry on a sandbox whose `interrupt_handle()` the caller already has, and a kill fails them the same way; a later restore recovers the sandbox.
+
 ## Driving a driver image: `run`, or `submit` + `step`
 
 ### `run`
