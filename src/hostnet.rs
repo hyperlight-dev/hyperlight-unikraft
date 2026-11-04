@@ -153,6 +153,39 @@ fn dns_message(data: &[u8], udp: bool) -> &[u8] {
     }
 }
 
+/// Opt-in network tracing (`HLUK_NET_TRACE=1`): prints the readiness decisions
+/// — the guest's `poll` requests, the inter-step `wait_ready`, and accept
+/// results — to stderr, to diagnose the linux-arm64 `--net` wedge where hluk
+/// accepts a connection but the guest never answers.  Off and free when unset.
+/// DEBUG ONLY — the `net-arm64-hang-debug` branch; not for merge.
+fn net_trace_on() -> bool {
+    // DEBUG branch (net-arm64-hang-debug): forced on so the CI dispatch captures
+    // the trace with no workflow/env change.  Only the `--net` path calls this,
+    // so it is silent for non-networking workloads.  Normally gated on
+    // HLUK_NET_TRACE; NOT FOR MERGE.
+    true
+}
+
+macro_rules! net_trace {
+    ($($arg:tt)*) => {
+        if net_trace_on() {
+            use std::io::Write as _;
+            let line = format!("[net-trace pid={}] {}", std::process::id(), format_args!($($arg)*));
+            eprintln!("{line}");
+            // Also append to a fixed path so it is readable live over SSH
+            // (via the ephemeral runner VM) regardless of how the harness
+            // captures stdio.  DEBUG branch only.
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/hluk-net-trace.log")
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    };
+}
+
 /// Never let a dead peer raise SIGPIPE in the host process.
 fn send_flags() -> SendFlags {
     #[cfg(target_os = "linux")]
@@ -540,8 +573,9 @@ impl Net {
 
     fn accept(&self, fd: i32) -> Res<(i32, Option<SocketAddr>)> {
         let mut tbl = self.table();
-        let (conn, peer) =
-            net::acceptfrom_with(tbl.get(fd)?, socket_flags()).map_err(from_rustix)?;
+        let r = net::acceptfrom_with(tbl.get(fd)?, socket_flags());
+        net_trace!("accept(gfd={}) ok={} err={:?}", fd, r.is_ok(), r.as_ref().err());
+        let (conn, peer) = r.map_err(from_rustix)?;
         #[cfg(target_vendor = "apple")]
         apple_socket_setup(&conn)?;
         rustix::io::ioctl_fionbio(&conn, true).map_err(from_rustix)?;
@@ -931,6 +965,10 @@ impl Net {
                 }
             }
         }
+        net_trace!(
+            "poll({:?}) ready={} revents={:?} park_r={:?} park_w={:?}",
+            entries, ready, revents, tbl.want_readable, tbl.want_writable
+        );
         (ready, revents)
     }
 
@@ -1006,6 +1044,12 @@ impl Net {
             .zip(&fds)
             .map(|((fd, _, _), p)| (*fd, p.revents()))
             .collect();
+        net_trace!(
+            "wait_ready: waited {:?} fired={} delivered={:?}",
+            wanted.iter().map(|(fd, _, f)| (*fd, *f)).collect::<Vec<_>>(),
+            fired,
+            delivered
+        );
         drop(fds);
         let mut tbl = self.table();
         for (fd, revents) in delivered {

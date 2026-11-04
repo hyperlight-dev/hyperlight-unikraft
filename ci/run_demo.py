@@ -165,7 +165,7 @@ def serve_and_get(args, expected: str, demo: str):
     server = _DrainedServer([str(HLUK), *args], cwd=ROOT)
     try:
         body = None
-        for _ in range(60):
+        for _ in range(2000):  # DEBUG branch: long window to attach live; not for merge
             if server.exited() is not None:
                 _fail(demo, "server exited before answering", server)
             if server.log_bytes() > _MAX_LOG:
