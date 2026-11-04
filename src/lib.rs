@@ -2706,12 +2706,15 @@ impl SandboxBuilder {
             config: cfg,
             exited,
             pending: None,
+            clean_scratch_bytes: 0,
         };
         if restored {
             // Put the image right for this host before anyone can observe
             // it: the kernel reseeds its CSPRNG and re-establishes the
             // guest's host sockets (see `resume`).
             app.resume()?;
+        } else {
+            app.mark_clean()?;
         }
         Ok(app)
     }
@@ -2839,6 +2842,10 @@ pub struct AppSandbox {
     /// A terminal result produced while delivering a call, handed out by
     /// the next [`step`](Self::step).
     pending: Option<Yield>,
+    /// hyperlight's scratch allocation count when the guest was last made
+    /// clean ([`dirty_bytes`](Self::dirty_bytes)): after the resume entry,
+    /// so that what the kernel writes to resume is not the guest's.
+    clean_scratch_bytes: u64,
 }
 
 impl AppSandbox {
@@ -3047,11 +3054,41 @@ impl AppSandbox {
     /// terminal outcome (a call in flight at snapshot time finishing, or
     /// the process exiting) is kept for the next [`step`](Self::step).
     fn resume(&mut self) -> Result<()> {
-        let yielded = self.config.enter(&mut self.sandbox, "resume", ())?;
-        match self.note(yielded) {
+        let yielded = self.config.enter(&mut self.sandbox, "resume", ());
+        // Count from here even when the entry failed: the last baseline
+        // belongs to the guest state the restore discarded.
+        let clean = self.mark_clean();
+        match self.note(yielded?) {
             Yield::Blocked { .. } => {}
             terminal => self.pending = Some(terminal),
         }
+        clean
+    }
+
+    /// Bytes of memory the guest has written since this sandbox was last
+    /// restored ([`restore`](Self::restore), or a boot from a snapshot) or
+    /// snapshotted.  What the kernel writes on a restore to resume the
+    /// guest is not counted; after a snapshot, what it writes to pick up
+    /// again on the next entry is.
+    ///
+    /// Every page the guest writes after a restore comes from its scratch
+    /// page allocator, and this is how far that allocator has moved.  The
+    /// kernel takes pages for its own frame allocator a chunk at a time, so
+    /// this can be ahead of what the guest wrote by up to about 1 MiB, and
+    /// by more around a large allocation, whose chunk is several times its
+    /// size.  The guest controls the value: a malicious guest can make it
+    /// report less or more than it wrote.
+    ///
+    /// A freshly booted sandbox writes into memory its kernel set aside at
+    /// boot, so until its first snapshot or restore this stays near 0.
+    pub fn dirty_bytes(&self) -> Result<u64> {
+        let allocated = self.sandbox.scratch_allocated_bytes()?;
+        Ok(allocated.saturating_sub(self.clean_scratch_bytes))
+    }
+
+    /// Count [`dirty_bytes`](Self::dirty_bytes) from here.
+    fn mark_clean(&mut self) -> Result<()> {
+        self.clean_scratch_bytes = self.sandbox.scratch_allocated_bytes()?;
         Ok(())
     }
 
@@ -3124,6 +3161,7 @@ impl AppSandbox {
     pub fn snapshot(&mut self) -> Result<Arc<Snapshot>> {
         self.ensure_running()?;
         let snapshot = self.sandbox.snapshot()?;
+        self.mark_clean()?;
         record_scratch_mb(snapshot, self.config.scratch_size.map(|size| size / MIB))
     }
 
@@ -3172,6 +3210,7 @@ impl AppSandbox {
         let snapshot = self.sandbox.snapshot_with_options(&options)?;
         // The sandbox continues from the capture, on its scratch size.
         self.config.scratch_size = Some(mb_to_bytes(mb));
+        self.mark_clean()?;
         record_scratch_mb(snapshot, Some(mb))
     }
 
