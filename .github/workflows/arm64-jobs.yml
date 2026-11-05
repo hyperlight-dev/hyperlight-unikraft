@@ -322,17 +322,18 @@ jobs:
       ${{ fromJSON(format(needs.plan.outputs[matrix.os], format('integrations-arm64-{0}-{1}-{2}-{3}-{4}',
       matrix.package, matrix.deps, matrix.os, github.run_id, github.run_attempt))) }}
     timeout-minutes: 45
-    # smolagents and mcp wedge the guest vCPU on the nested-virt linux-arm64
-    # runner (hyperlight-dev/hyperlight#2025); let them soft-fail there so the
-    # nightly isn't red for a known bug.  Revert when #2025 is fixed.
-    continue-on-error: ${{ matrix.os == 'linux' && (matrix.package == 'smolagents' || matrix.package == 'mcp') }}
     strategy:
       fail-fast: false
       matrix:
         package: [smolagents, mcp, verl, openai-agents]
         os: ${{ fromJSON(needs.plan.outputs.hosts) }}
         deps: [oldest, newest]
-        # verl and openai-agents run on Linux only
+        # verl and openai-agents run on Linux only.  smolagents and mcp wedge
+        # the guest vCPU on the nested-virt linux-arm64 runner
+        # (hyperlight-dev/hyperlight#2025): they hang to the 45-minute timeout,
+        # which ends as a cancellation that continue-on-error cannot mask, so
+        # skip them there rather than file a nightly issue for a known bug.
+        # Revert (hyperlight-unikraft#262) when #2025 is fixed.
         exclude:
           - package: verl
             os: macos
@@ -342,6 +343,10 @@ jobs:
             os: macos
           - package: openai-agents
             os: windows
+          - package: smolagents
+            os: linux
+          - package: mcp
+            os: linux
         include:
           - deps: oldest
             python: "3.10"
