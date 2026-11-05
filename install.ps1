@@ -2,7 +2,7 @@
 #
 #   irm https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/main/install.ps1 | iex
 #
-#   $env:HLUK_VERSION = 'v0.20.1'   a release instead of the latest
+#   $env:HLUK_VERSION = 'v0.21.0'   a release instead of the latest
 #   $env:HLUK_VERSION = 'dev'       the dev build: main's latest push that passed CI
 #   $env:HLUK_INSTALL_DIR = 'DIR'   where hluk.exe goes (default %LOCALAPPDATA%\hluk\bin)
 #
