@@ -15,10 +15,3 @@ dotenvy = "0.15"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# hyperlight main, for scratch resize (#1947) and scratch_allocated_bytes
-# (#2019). crates.io takes no git dependency, so hyperlight-unikraft is not
-# published until a hyperlight release replaces this.
-[patch.crates-io]
-hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "6c17f7cd4e78b03d77fadf4cfe749d7ede96b7ab" }
-hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight", rev = "6c17f7cd4e78b03d77fadf4cfe749d7ede96b7ab" }
