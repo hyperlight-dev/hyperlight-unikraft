@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The Hyperlight Authors.
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
@@ -9,8 +10,8 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use hyperlight_unikraft::{
-    AllowList, AppSandbox, BlockList, Error, Exec, ListenPorts, Mount, NetworkPolicy,
-    SandboxBuilder, load_snapshot,
+    AllowList, AppSandbox, BlockList, CALL_PAYLOAD_MAX, Error, Exec, ListenPorts, Mount,
+    NetworkPolicy, SandboxBuilder, load_snapshot,
 };
 
 mod cli;
@@ -440,36 +441,68 @@ fn parse_net_policy(
     Ok((policy, listen))
 }
 
-/// Resolve script/exec args into an Exec value.
-///
-/// Text files are passed as scripts.  Compiled binaries are rejected
-/// with a helpful error — use `--mount` + `--exec` for those.
+/// Resolve script/exec args into an Exec value: a script is read now
+/// ([`script_exec`]), before the guest boots or is restored.
 fn resolve_exec(script: Option<PathBuf>, exec: Option<String>) -> CliResult<Option<Exec>> {
     match (script, exec) {
-        (Some(path), _) => {
-            // Verify the file is valid UTF-8 (i.e. a script, not a binary)
-            if std::fs::read_to_string(&path).is_err() && path.exists() {
-                let dir = path
-                    .parent()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| ".".into());
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "binary".into());
-                return Err(format!(
-                    "{} is a compiled binary, not a script.\n\
-                     To run compiled binaries, mount a directory containing the binary:\n  \
-                     hluk run --initrd <rootfs.cpio> --mount {dir}:/mnt/bin --exec /mnt/bin/{name}",
-                    path.display(),
-                )
-                .into());
-            }
-            Ok(Some(Exec::File(path)))
-        }
+        (Some(path), _) => Ok(Some(script_exec(&path)?)),
         (_, Some(code)) => Ok(Some(Exec::Code(code))),
         _ => Ok(None),
     }
+}
+
+/// A host script as the guest runs it: its text, read once (a pipe, as
+/// `<(…)` gives, cannot be read again), and refused here, before the guest
+/// boots, when it is too large for a guest function call.
+fn script_exec(path: &Path) -> CliResult<Exec> {
+    let code = read_script(path)?;
+    if code.len() > CALL_PAYLOAD_MAX {
+        return Err(format!(
+            "{}: mount the script's directory (--mount) and run it from the guest, with \
+             --guest-exec or a short script that runs it",
+            Error::CallTooLarge { bytes: code.len() }
+        )
+        .into());
+    }
+    Ok(Exec::Code(code))
+}
+
+/// Read a host script, saying what is wrong with it when it cannot be
+/// read: it does not exist, it is a directory, the OS refused the read, or
+/// it is not UTF-8 text, which is most likely a compiled program, and gets
+/// the hint for running one.
+fn read_script(path: &Path) -> CliResult<String> {
+    let e = match std::fs::read_to_string(path) {
+        Ok(code) => return Ok(code),
+        Err(e) => e,
+    };
+    let shown = path.display();
+    Err(match e.kind() {
+        ErrorKind::NotFound => format!("script {shown} does not exist"),
+        // Windows refuses to open a directory ("Access is denied").
+        kind if kind == ErrorKind::IsADirectory || path.is_dir() => {
+            format!("script {shown} is a directory, not a file")
+        }
+        ErrorKind::InvalidData => {
+            // `Path::parent` of a bare name is "", not `None`.
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "binary".into());
+            format!(
+                "{shown} is a compiled binary, not a script.\n\
+                 To run compiled binaries, mount a directory containing the binary:\n  \
+                 hluk run --initrd <rootfs.cpio> --mount {}:/mnt/bin --exec /mnt/bin/{name}",
+                dir.display(),
+            )
+        }
+        _ => format!("cannot read script {shown}: {e}"),
+    }
+    .into())
 }
 
 // ── Commands ─────────────────────────────────────────────────────
@@ -595,17 +628,10 @@ fn drive_inner(
     Ok(0)
 }
 
-/// Run the workload; a script too large for a call says how to run it.
+/// Run the workload.  A script too large for a call was refused when it
+/// was read ([`script_exec`]).
 fn run_workload(sandbox: &mut AppSandbox, exec: Exec) -> CliResult<()> {
-    let script = matches!(exec, Exec::File(_));
-    match kernel_tail::workload(sandbox.run(exec)) {
-        Err(e @ Error::CallTooLarge { .. }) if script => Err(format!(
-            "{e}: mount the script's directory (--mount) and run it from the guest, with \
-             --guest-exec or a short script that runs it"
-        )
-        .into()),
-        result => Ok(result?),
-    }
+    Ok(kernel_tail::workload(sandbox.run(exec))?)
 }
 
 fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
@@ -678,6 +704,12 @@ fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
 }
 
 fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
+    // Precedence: host script / --exec code; else --guest-exec; else the
+    // rootfs's conventional entrypoint.  A script is read before the
+    // snapshot is loaded.
+    let no_workload = args.script.is_none() && args.exec.is_none() && args.guest_exec.is_none();
+    let exec = resolve_exec(args.script, args.exec)?
+        .unwrap_or_else(|| Exec::Guest(args.guest_exec.unwrap_or_default()));
     let mounts = parse_mounts(&args.mounts)?;
     let (policy, listen) =
         parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?;
@@ -720,11 +752,6 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
     let mut sandbox = boot(builder)?;
     info!(elapsed_ms = elapsed_ms(t), "restored from snapshot");
 
-    // Precedence: host script / --exec code; else --guest-exec; else the
-    // rootfs's conventional entrypoint.
-    let no_workload = args.script.is_none() && args.exec.is_none() && args.guest_exec.is_none();
-    let exec = resolve_exec(args.script, args.exec)?
-        .unwrap_or_else(|| Exec::Guest(args.guest_exec.unwrap_or_default()));
     drive(
         &mut sandbox,
         no_workload,
@@ -734,12 +761,6 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
 }
 
 // ── Bench helpers ────────────────────────────────────────────────
-
-/// Read a script file and return its source for dispatch.
-fn read_script(path: &std::path::Path) -> CliResult<String> {
-    Ok(std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?)
-}
 
 /// Percentile from a **sorted** slice (linear interpolation).
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -1445,5 +1466,105 @@ mod tests {
         let (policy, listen) = parse_net_policy(false, &[], &[], &[PortSpec::One(8080)]).unwrap();
         assert!(policy.is_none());
         assert!(listen.unwrap().allows(8080));
+    }
+
+    /// The script `script_exec` gets for `path`, or its error's text.
+    fn script(path: &Path) -> Result<String, String> {
+        match script_exec(path) {
+            Ok(Exec::Code(code)) => Ok(code),
+            Ok(other) => panic!("a script ran as {other:?}"),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_script_runs_as_the_text_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.py");
+        std::fs::write(&path, "print('hi')\n").unwrap();
+        assert_eq!(script(&path).unwrap(), "print('hi')\n");
+    }
+
+    #[test]
+    fn a_missing_script_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.py");
+        let err = script(&path).unwrap_err();
+        assert_eq!(err, format!("script {} does not exist", path.display()));
+    }
+
+    #[test]
+    fn a_directory_is_not_a_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = script(dir.path()).unwrap_err();
+        assert_eq!(
+            err,
+            format!("script {} is a directory, not a file", dir.path().display())
+        );
+    }
+
+    #[test]
+    fn a_script_that_is_not_text_gets_the_hint_for_a_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app");
+        std::fs::write(&path, b"\x7fELF\x02\x01\x01\x00\xff\xfe").unwrap();
+        let err = script(&path).unwrap_err();
+        assert!(err.contains("is a compiled binary"), "got: {err}");
+        assert!(
+            err.contains(&format!(
+                "--mount {}:/mnt/bin --exec /mnt/bin/app",
+                dir.path().display()
+            )),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_hluk_may_not_read_says_why() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.py");
+        std::fs::write(&path, "print('hi')\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it all the same.
+        if std::fs::read(&path).is_ok() {
+            return;
+        }
+        let err = script(&path).unwrap_err();
+        assert!(
+            err.starts_with(&format!("cannot read script {}: ", path.display())),
+            "got: {err}"
+        );
+        assert!(err.contains("ermission denied"), "got: {err}");
+        assert!(!err.contains("compiled binary"), "got: {err}");
+    }
+
+    /// A pipe, as `<(…)` gives, is read once, and its text is what runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_script_from_a_pipe_runs() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"print('piped')\n").unwrap();
+        drop(writer);
+        let path = PathBuf::from(format!("/dev/fd/{}", reader.as_raw_fd()));
+        assert_eq!(script(&path).unwrap(), "print('piped')\n");
+    }
+
+    #[test]
+    fn a_script_too_large_for_a_call_is_refused_before_the_guest_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.py");
+        std::fs::write(&path, "#".repeat(CALL_PAYLOAD_MAX + 1)).unwrap();
+        let err = script(&path).unwrap_err();
+        assert!(
+            err.contains(&format!("a call of {} bytes", CALL_PAYLOAD_MAX + 1)),
+            "got: {err}"
+        );
+        assert!(err.contains("--mount"), "got: {err}");
+        std::fs::write(&path, "#".repeat(CALL_PAYLOAD_MAX)).unwrap();
+        assert!(script(&path).is_ok());
     }
 }

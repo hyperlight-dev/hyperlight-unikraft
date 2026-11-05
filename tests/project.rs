@@ -302,6 +302,65 @@ fn run_without_a_manifest_points_at_init() {
     assert!(text(&out).contains("hluk init"), "got: {}", text(&out));
 }
 
+/// A script is checked before the guest boots or is restored, from the
+/// command line or the manifest, and the error says what is wrong with it.
+/// The rootfs is not one, so a run that got as far as booting would fail
+/// on it instead.
+#[test]
+fn run_checks_the_script_before_the_guest_boots() {
+    let root = temp_dir("project-script");
+    let cache = temp_dir("project-script-cache");
+    let dir = root.path();
+    std::fs::write(dir.join("rootfs.cpio"), "not a rootfs").unwrap();
+    std::fs::write(dir.join("app"), b"\x7fELF\x02\x01\x01\x00\xff\xfe").unwrap();
+    std::fs::create_dir(dir.join("src")).unwrap();
+
+    // A bare name's directory is this one.
+    let out = hluk(
+        dir,
+        cache.path(),
+        &["run", "--initrd", "rootfs.cpio", "app"],
+    );
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("app is a compiled binary"), "got: {t}");
+    assert!(
+        t.contains("--mount .:/mnt/bin --exec /mnt/bin/app"),
+        "got: {t}"
+    );
+
+    let out = hluk(
+        dir,
+        cache.path(),
+        &["run", "--initrd", "rootfs.cpio", "src"],
+    );
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("script src is a directory"), "got: {t}");
+
+    // The manifest's script is read, not only looked for.
+    std::fs::write(
+        dir.join("hluk.toml"),
+        "manifest_version = 1\n[app]\nname = \"s\"\n[rootfs]\npath = \"rootfs.cpio\"\n\
+         [run]\nscript = \"app\"\n",
+    )
+    .unwrap();
+    let out = hluk(dir, cache.path(), &["run", "--cold"]);
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("app is a compiled binary"), "got: {t}");
+
+    // `snapshot run` reads it before loading the snapshot.
+    let out = hluk(
+        dir,
+        cache.path(),
+        &["snapshot", "run", "no-such-snapshot", "nope.py"],
+    );
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("script nope.py does not exist"), "got: {t}");
+}
+
 #[test]
 fn templates_lists_every_tier_one_runtime_first() {
     let root = temp_dir("project-templates");
