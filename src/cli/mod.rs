@@ -34,7 +34,7 @@ use hyperlight_unikraft::{
 
 use crate::{
     Call, CliResult, PortSpec, base_builder, boot, drive, elapsed_ms, parse_envs, parse_mounts,
-    parse_net_policy, read_resolv_conf, resolve_exec,
+    parse_net_policy, read_resolv_conf, script_exec,
 };
 use manifest::{Manifest, RootfsSource, Workload};
 use rootfs::Fetch;
@@ -1162,24 +1162,20 @@ pub fn run(args: RunArgs) -> CliResult<()> {
         manifest = Some(m);
     }
 
-    // What to run: the command line's, else the manifest's.
-    let exec = match resolve_exec(args.script.clone(), args.exec.clone())? {
-        Some(exec) => Some(exec),
-        None => match &args.guest_exec {
-            Some(command) => Some(Exec::Guest(command.clone())),
-            None => manifest.as_ref().and_then(|m| match m.workload() {
-                Workload::Script(path) => Some(Exec::File(path)),
-                Workload::Exec(code) => Some(Exec::Code(code)),
-                Workload::GuestExec(command) => Some(Exec::Guest(command)),
-                Workload::None => None,
-            }),
-        },
+    // What to run: the command line's, else the manifest's.  A script is
+    // read now, before the guest boots, and runs as the text read.
+    let workload = match (&args.script, &args.exec, &args.guest_exec) {
+        (Some(path), _, _) => Workload::Script(path.clone()),
+        (None, Some(code), _) => Workload::Exec(code.clone()),
+        (None, None, Some(command)) => Workload::GuestExec(command.clone()),
+        (None, None, None) => manifest.as_ref().map_or(Workload::None, Manifest::workload),
     };
-    if let Some(Exec::File(path)) = &exec
-        && !path.is_file()
-    {
-        return Err(format!("script {} does not exist", path.display()).into());
-    }
+    let exec = match &workload {
+        Workload::Script(path) => Some(script_exec(path)?),
+        Workload::Exec(code) => Some(Exec::Code(code.clone())),
+        Workload::GuestExec(command) => Some(Exec::Guest(command.clone())),
+        Workload::None => None,
+    };
     let no_workload = exec.is_none();
     let exec = exec.unwrap_or_else(|| Exec::Guest(String::new()));
 
@@ -1283,7 +1279,7 @@ pub fn run(args: RunArgs) -> CliResult<()> {
             .len();
         scratch_hint(size, scratch_mb, sizing.how);
     }
-    if let Exec::Code(command) = &exec {
+    if let Workload::Exec(command) = &workload {
         check_pie(command, &mounts)?;
     }
     if let Some(entry) = &entry {
