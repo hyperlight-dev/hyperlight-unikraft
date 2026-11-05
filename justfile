@@ -471,12 +471,21 @@ changelog-notes version:
         grab { print }
     ' "{{root_dir}}/CHANGELOG.md" | sed -e '/./,$!d' | sed -e :strip -e '/^\n*$/{$d;N;bstrip}'
     # Plus GitHub's auto-generated PR list, stripped of its own heading.  From
-    # the last release's tag, named outright: left to choose, GitHub could
-    # take the `dev` pre-release's, which points at main too.
+    # the release before this one, named outright: left to choose, GitHub could
+    # take the `dev` pre-release's, which points at main too.  hluk's releases
+    # are the `vX.Y.Z` tags; the Python packages tag `<package>-v<version>`,
+    # and `v*` would take `verl-hyperlight-v0.1.1` for one.  Sorted field by
+    # field with `sort -t. -k1,1n -k2,2n -k3,3n` rather than `sort -V`, which
+    # older macOS lacks.
     if [ "{{version}}" != "Prerelease" ] && command -v gh >/dev/null 2>&1; then
-        prev="$(git -C "{{root_dir}}" tag -l 'v*' --sort=-v:refname | grep -vx "{{version}}" | head -1)" || true
+        ver="{{trim_start_match(version, "v")}}"
+        tag="v$ver"
+        prev="$(git -C "{{root_dir}}" tag -l 'v[0-9]*' | sed 's/^v//' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | grep -Fvx "$ver" \
+            | { cat; echo "$ver"; } | sort -t. -k1,1n -k2,2n -k3,3n \
+            | grep -Fx -B1 "$ver" | grep -Fvx "$ver" | sed 's/^/v/')" || true
         prs="$(gh api "repos/{owner}/{repo}/releases/generate-notes" \
-            -f tag_name="{{version}}" ${prev:+-f previous_tag_name="$prev"} \
+            -f tag_name="$tag" ${prev:+-f previous_tag_name="$prev"} \
             --jq '.body' 2>/dev/null | sed '1{/^## /d;}')" || true
         if [ -n "${prs:-}" ]; then
             printf '\n## Pull requests\n\n%s\n' "$prs"

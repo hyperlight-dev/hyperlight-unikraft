@@ -42,9 +42,9 @@ Five strings are replaced in every file, and nothing else is touched, so `{{` th
 | Placeholder | Becomes |
 |---|---|
 | `{{name}}` | the project name (`hluk init myapp` → `myapp`) |
-| `{{image}}` | the runnable rootfs of `runtime`: `ghcr.io/hyperlight-dev/hyperlight-unikraft/python:initrd-v0.20.1` |
-| `{{base}}` | the same rootfs as a filesystem image to build `FROM`: `…/python:v0.20.1` |
-| `{{version}}` | the release those images are pinned to: `0.20.1`, or `dev-44ee170` for a dev build |
+| `{{image}}` | the runnable rootfs of `runtime`: `ghcr.io/hyperlight-dev/hyperlight-unikraft/python:initrd-v0.21.0` |
+| `{{base}}` | the same rootfs as a filesystem image to build `FROM`: `…/python:v0.21.0` |
+| `{{version}}` | the release those images are pinned to: `0.21.0`, or `dev-44ee170` for a dev build |
 | `{{registry}}` | the registry they come from: `ghcr.io/hyperlight-dev/hyperlight-unikraft` |
 
 The version is the `hluk` that ran `init` (or its `--image-version`), not the one the template was written for, because a rootfs has to match the `hluk` that runs it. Write `image = "{{image}}"` in the manifest and `FROM {{base}}` in a Dockerfile rather than a fixed tag, and the template keeps working as `hluk` moves on.

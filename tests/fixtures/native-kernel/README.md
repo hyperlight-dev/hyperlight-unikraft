@@ -27,5 +27,5 @@ The build invokes `make -C kernel/unikraft A=<app>` directly (no per-app `Makefi
 
 - `helloworld.c` — the native app (`main()` prints a greeting, and a line to stderr)
 - `Makefile.uk` — Unikraft app build rules (registers `helloworld.c`)
-- `defconfig` — native Hyperlight config (paging + vmem + posix-environ, no elfloader app)
+- `defconfig` — native Hyperlight config (vmem + posix-environ, no elfloader app; `plat/hyperlight` selects paging)
 - `helloworld-native_hyperlight-x86_64` — the prebuilt kernel the test loads
