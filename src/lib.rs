@@ -598,13 +598,6 @@ impl GuestOutput {
     }
 }
 
-/// PEB heap size.
-///
-/// Only needed for the boot stack (allocated before `ukplat_mem_init`).
-/// Can be dropped to 0 once the guest allocates the boot stack from
-/// scratch instead.
-const HEAP_SIZE: u64 = 0x10_0000; // 1 MiB
-
 /// What a snapshot depends on, as a tag suffix `k<kernel>-c<contract>`:
 /// the embedded kernel's SHA-256 (its first 16 hex digits; the kernel's
 /// code and host-call protocol are in the snapshot's memory) and the host
@@ -2155,7 +2148,6 @@ fn assemble_sandbox(
     info!(scratch_mb, "guest memory");
     let mut cfg = SandboxConfiguration::default();
     cfg.set_scratch_size(scratch_size);
-    cfg.set_heap_size(HEAP_SIZE);
     apply_transport(&mut cfg);
     if let Some(level) = guest_log_level {
         cfg.set_max_guest_log_level(level);
@@ -3448,7 +3440,6 @@ fn restore_snapshot(
     // it override scratch.
     let mut sbcfg = SandboxConfiguration::default();
     apply_transport(&mut sbcfg);
-    sbcfg.set_heap_size(HEAP_SIZE);
     apply_guest_msrs(&mut sbcfg)?;
     if let Some(level) = guest_log_level {
         sbcfg.set_max_guest_log_level(level);

@@ -1,8 +1,7 @@
 CONFIG_UK_NAME="elfloader"
 CONFIG_PLAT_HYPERLIGHT=y
-# Paging + vmem (must be explicit — elfloader's imply doesn't stick)
-CONFIG_LIBUKPAGING=y
-CONFIG_LIBUKFALLOC=y
+# PLAT_HYPERLIGHT selects paging.
+# vmem must be explicit (elfloader's imply doesn't stick).
 CONFIG_LIBUKVMEM=y
 CONFIG_LIBUKVMEM_DEFAULT_BASE=0x0000001000000000
 CONFIG_LIBUKVMEM_DEMAND_PAGE_IN_SIZE=12

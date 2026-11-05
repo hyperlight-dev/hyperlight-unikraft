@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - The host places the transport arena at a fixed address below the top of scratch, so a snapshot keeps it when restored with a different scratch size. Snapshots saved by an earlier release are refused: save them again. A native Unikraft kernel (`--kernel`, `SandboxBuilder::from_kernel`) built against an earlier `plat/hyperlight` can allocate over the arena: rebuild it against this kernel tree.
+- For a native Unikraft kernel (`--kernel`, `SandboxBuilder::from_kernel`): `plat/hyperlight` now selects paging and refuses a build without a boot allocator, and the guest crashes if the canary word at the bottom of its 1 MiB boot stack (the init thread's, which also runs a native `main()` without `LIBUKBOOT_MAINTHREAD`) is found overwritten at the end of boot, at the start of an entry from the host, at the end of a call's entry, or at a shutdown.
 
 ### Fixed
 
