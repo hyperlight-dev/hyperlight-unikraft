@@ -224,6 +224,9 @@ fn names_contain(names: &[String], name: &str) -> bool {
 }
 
 /// The IPv4 address behind an IPv4-mapped IPv6 one, else the address as is.
+/// A destination is judged in this form, so every address it is compared
+/// with is kept in it too: a list's entries, what a blocked name resolves
+/// to, what a resolver answers and the resolvers themselves.
 fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
@@ -283,10 +286,11 @@ impl std::error::Error for ResolveError {
     }
 }
 
-/// Resolve every entry: IP literals as they are, hostnames through the
-/// system resolver.  Returns the addresses and the hostnames among the
-/// entries; the hostnames decide which DNS questions the guest may send,
-/// and a block list looks them up again at each TCP connect or UDP send.
+/// Resolve every entry: IP literals as they are (an IPv4-mapped one as its
+/// IPv4 address), hostnames through the system resolver.  Returns the
+/// addresses and the hostnames among the entries; the hostnames decide
+/// which DNS questions the guest may send, and a block list looks them up
+/// again at each TCP connect or UDP send.
 fn resolve_entries(
     entries: &[impl AsRef<str>],
 ) -> Result<(HashSet<IpAddr>, Vec<String>), ResolveError> {
@@ -295,7 +299,7 @@ fn resolve_entries(
     for entry in entries {
         let entry = entry.as_ref();
         if let Ok(ip) = entry.parse::<IpAddr>() {
-            ips.insert(ip);
+            ips.insert(canonical(ip));
             continue;
         }
         let addrs = (entry, 0u16).to_socket_addrs().map_err(|e| ResolveError {
@@ -304,7 +308,7 @@ fn resolve_entries(
         })?;
         let mut found = false;
         for sa in addrs {
-            ips.insert(sa.ip());
+            ips.insert(canonical(sa.ip()));
             found = true;
         }
         if !found {
@@ -380,7 +384,7 @@ impl AllowList {
         if let Ok(mut learned) = self.learned_ips.lock()
             && learned.len() < MAX_LEARNED_IPS
         {
-            learned.insert(ip);
+            learned.insert(canonical(ip));
         }
     }
 }
@@ -612,7 +616,7 @@ fn resolves_to_now(names: &[String], ip: &IpAddr) -> Option<bool> {
         thread::spawn(move || {
             let ips = (name.as_str(), 0u16)
                 .to_socket_addrs()
-                .map(|addrs| addrs.map(|a| a.ip()).collect::<HashSet<_>>());
+                .map(|addrs| addrs.map(|a| canonical(a.ip())).collect::<HashSet<_>>());
             let _ = tx.send((name, ips));
             INFLIGHT_LOOKUPS.fetch_sub(1, Ordering::Relaxed);
         });
@@ -743,7 +747,7 @@ fn dns_resolvers() -> &'static HashSet<IpAddr> {
                 }
             }
         }
-        set
+        set.into_iter().map(canonical).collect()
     })
 }
 
@@ -1123,6 +1127,36 @@ mod tests {
         assert!(!al.allows(&metadata, false));
         assert!(!al.allows(&loopback, false));
         assert!(al.allows(&allowed, false));
+    }
+
+    /// What a destination is compared with is IPv4 too when it is written
+    /// as IPv4-mapped IPv6: a list's entry (the form a dual-stack server
+    /// logs an IPv4 client in), and an address a DNS answer gives.  A block
+    /// list entry `::ffff:a.b.c.d` otherwise blocked nothing, since every
+    /// destination is judged as `a.b.c.d`.
+    #[test]
+    fn ipv4_mapped_entries_are_ipv4() {
+        let v4: SocketAddr = "10.0.0.5:80".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:10.0.0.5]:80".parse().unwrap();
+        let next: SocketAddr = "10.0.0.6:80".parse().unwrap();
+
+        let bl = NetworkPolicy::BlockList(BlockList::from_hosts(&["::ffff:10.0.0.5"]).unwrap());
+        assert!(!bl.allows(&v4, false));
+        assert!(!bl.allows(&mapped, true));
+        assert!(bl.allows(&next, false));
+
+        let al = NetworkPolicy::AllowList(AllowList::from_hosts(&["::ffff:10.0.0.5"]).unwrap());
+        assert!(al.allows(&v4, false));
+        assert!(al.allows(&mapped, true));
+        assert!(!al.allows(&next, false));
+
+        // An AAAA answer that gives a listed name a mapped address.
+        let al = NetworkPolicy::AllowList(AllowList::from_hosts(&["localhost"]).unwrap());
+        let resolver: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        assert!(!al.allows(&v4, false));
+        al.learn_from_dns_answer(resolver, &dns_answer("localhost", mapped.ip()));
+        assert!(al.allows(&v4, false));
+        assert!(!al.allows(&next, false));
     }
 
     #[test]
