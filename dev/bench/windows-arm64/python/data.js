@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794108792868,
+  "lastUpdate": 1794195839927,
   "repoUrl": "https://github.com/hyperlight-dev/hyperlight-unikraft",
   "entries": {
     "python benchmarks": [
@@ -5259,6 +5259,188 @@ window.BENCHMARK_DATA = {
           {
             "name": "parallel-exec/stdlib",
             "value": 70.714,
+            "unit": "ms"
+          },
+          {
+            "name": "snapshot-size/compute",
+            "value": 79.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/hello",
+            "value": 79.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/mount",
+            "value": 79.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "snapshot-size/stdlib",
+            "value": 79.7,
+            "unit": "MiB"
+          },
+          {
+            "name": "rss/compute",
+            "value": 16,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/hello",
+            "value": 14,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/mount",
+            "value": 17,
+            "unit": "MB"
+          },
+          {
+            "name": "rss/stdlib",
+            "value": 23,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Dan Chiarlone",
+            "username": "danbugs",
+            "email": "danilochiarlone@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "155d333bad549377e8026a596ce89c0d4cd8e9ef",
+          "message": "Merge pull request #271 from hyperlight-dev/fix/arm64-nightly-skip-hanging-legs\n\nci(arm64): skip known-hanging smolagents/mcp linux-arm64 integration legs",
+          "timestamp": "2026-11-06T15:35:26Z",
+          "url": "https://github.com/hyperlight-dev/hyperlight-unikraft/commit/155d333bad549377e8026a596ce89c0d4cd8e9ef"
+        },
+        "date": 1794195837708,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold/compute",
+            "value": 1043.428,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/hello",
+            "value": 844.882,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/mount",
+            "value": 990.653,
+            "unit": "ms"
+          },
+          {
+            "name": "cold/stdlib",
+            "value": 1014.597,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/compute",
+            "value": 77.323,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/hello",
+            "value": 49.149,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/mount",
+            "value": 72.11,
+            "unit": "ms"
+          },
+          {
+            "name": "cold-snap/stdlib",
+            "value": 198.775,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/compute",
+            "value": 50.526,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/hello",
+            "value": 19.448,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/mount",
+            "value": 31.557,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-restore/stdlib",
+            "value": 91.525,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/compute",
+            "value": 18.722,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/hello",
+            "value": 18.103,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/mount",
+            "value": 26.173,
+            "unit": "ms"
+          },
+          {
+            "name": "restore-cost/stdlib",
+            "value": 17.67,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/compute",
+            "value": 2.838,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/hello",
+            "value": 0.682,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/mount",
+            "value": 4.035,
+            "unit": "ms"
+          },
+          {
+            "name": "warm-stateful/stdlib",
+            "value": 30.419,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/compute",
+            "value": 22.234,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/hello",
+            "value": 7.938,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/mount",
+            "value": 16.219,
+            "unit": "ms"
+          },
+          {
+            "name": "parallel-exec/stdlib",
+            "value": 73.282,
             "unit": "ms"
           },
           {
