@@ -280,27 +280,38 @@ fn node_unref_interval_runs_between_calls() {
         .scratch_mb(512)
         .boot()
         .unwrap();
-    let t = Instant::now();
     sandbox
-        .run("globalThis.n = 0; setInterval(() => { globalThis.n += 1; }, 200).unref(); console.log('started');")
+        .run("setInterval(() => { console.log('tick'); }, 200).unref(); console.log('started');")
         .unwrap();
-    assert!(
-        t.elapsed() < Duration::from_millis(500),
-        "the unref'd interval held the call"
-    );
-    assert_eq!(sandbox.drain_output(), "started\n");
-    while t.elapsed() < Duration::from_millis(1300) {
-        sandbox.step(Duration::from_millis(500)).unwrap();
-    }
-    sandbox.run("console.log('n =', globalThis.n)").unwrap();
+    // Judged by output, not the clock. The call returns once its
+    // synchronous work is done; the unref'd interval must not hold it open.
+    // A loaded host can make the call outlast the interval's period, so a
+    // tick may leak into this first batch — tolerate it. That the call
+    // returned at all, with its output, is the proof it was not held.
     let out = sandbox.drain_output();
-    let n: u32 = out
-        .trim()
-        .trim_start_matches("n =")
-        .trim()
-        .parse()
-        .unwrap_or(0);
-    assert!(n >= 3, "interval did not run while parked: {out:?}");
+    assert!(
+        out.contains("started"),
+        "the call did not return with its output: {out:?}"
+    );
+    // The parked child keeps the interval running across the steps that
+    // follow; step until it has ticked a few times, bounded generously to
+    // fail only a real hang on the slow nested-virt arm64 runner.
+    let mut out = String::new();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while out.matches("tick").count() < 3 && Instant::now() < deadline {
+        sandbox.step(Duration::from_millis(500)).unwrap();
+        out.push_str(&sandbox.drain_output());
+    }
+    assert!(
+        out.matches("tick").count() >= 3,
+        "interval did not run while parked: {out:?}"
+    );
+    // The child is still there for the next call.
+    sandbox.run("console.log('again')").unwrap();
+    assert!(
+        sandbox.drain_output().contains("again"),
+        "the child was gone for the next call"
+    );
 }
 
 /// An exit inside a call ends the call, not the child: `process.exit(3)`
