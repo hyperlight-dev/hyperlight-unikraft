@@ -113,20 +113,24 @@ pub fn base_image(registry: &str, runtime: &str, version: &str) -> String {
     format!("{registry}/{runtime}:{}", version_tag(version))
 }
 
-/// A parsed image reference: `host/repository[:tag|@digest]`.
+/// A parsed image reference: `host/repository[:tag][@digest]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
     pub host: String,
     pub repository: String,
-    /// A tag, or a `sha256:…` digest.
+    /// A tag, or a `sha256:…` digest: what the image is pulled by.
     pub reference: String,
+    /// The tag written beside a digest (`:initrd-v0.14.1@sha256:…`, as an
+    /// image is pinned), which only labels it: the digest is pulled.
+    pub tag: Option<String>,
 }
 
 impl Reference {
-    /// Parse `ghcr.io/owner/repo/python:initrd-v0.14.1` and friends.  The
-    /// first component must be a registry host (it has a `.` or a `:`, or
-    /// is `localhost`): hluk images are never on Docker Hub, so the
-    /// implicit `docker.io` would only hide a typo.
+    /// Parse `ghcr.io/owner/repo/python:initrd-v0.14.1` and friends, a
+    /// digest in place of the tag or after it.  The first component must
+    /// be a registry host (it has a `.` or a `:`, or is `localhost`): hluk
+    /// images are never on Docker Hub, so the implicit `docker.io` would
+    /// only hide a typo.
     pub fn parse(s: &str) -> Result<Reference, String> {
         let s = s.trim();
         let (host, rest) = s
@@ -137,19 +141,28 @@ impl Reference {
                 "image {s:?}: must start with a registry host, e.g. {DEFAULT_REGISTRY}/python"
             ));
         }
-        let (repository, reference) = if let Some((repo, digest)) = rest.split_once('@') {
-            (repo, digest.to_string())
+        let (repository, tag, reference) = if let Some((name, digest)) = rest.split_once('@') {
+            match name.rsplit_once(':') {
+                Some((repo, tag)) => (repo, Some(tag), digest.to_string()),
+                None => (name, None, digest.to_string()),
+            }
         } else if let Some((repo, tag)) = rest.rsplit_once(':') {
-            (repo, tag.to_string())
+            (repo, None, tag.to_string())
         } else {
-            (rest, "latest".to_string())
+            (rest, None, "latest".to_string())
         };
-        if repository.is_empty() || reference.is_empty() {
+        if repository.is_empty() || reference.is_empty() || tag.is_some_and(str::is_empty) {
             return Err(format!("image {s:?}: empty repository or tag"));
         }
         // The registry would refuse these too, but the cache path is built
-        // from them, so nothing that is not a plain name gets that far.
-        if !valid_host(host) || !valid_repository(repository) || !valid_reference(&reference) {
+        // from them, so nothing that is not a plain name gets that far.  A
+        // tag beside a digest was split at its last `:`, so it has none and
+        // cannot pass for a digest here.
+        if !valid_host(host)
+            || !valid_repository(repository)
+            || !valid_reference(&reference)
+            || tag.is_some_and(|t| !valid_reference(t))
+        {
             return Err(format!(
                 "image {s:?}: a repository is lowercase path components, a tag is letters, \
                  digits, `.`, `_` and `-`, a digest is sha256:<64 hex digits>"
@@ -159,6 +172,7 @@ impl Reference {
             host: host.to_string(),
             repository: repository.to_string(),
             reference,
+            tag: tag.map(str::to_string),
         })
     }
 
@@ -229,16 +243,16 @@ fn valid_reference(reference: &str) -> bool {
 
 impl fmt::Display for Reference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.host, self.repository)?;
+        if let Some(tag) = &self.tag {
+            write!(f, ":{tag}")?;
+        }
         let sep = if self.reference.contains(':') {
             '@'
         } else {
             ':'
         };
-        write!(
-            f,
-            "{}/{}{sep}{}",
-            self.host, self.repository, self.reference
-        )
+        write!(f, "{sep}{}", self.reference)
     }
 }
 
@@ -460,8 +474,9 @@ impl Client {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => {
                 // A dev build's images come from the dev workflow, and only
-                // the last two builds' are kept.
-                let tag = reference.reference.as_str();
+                // the last two builds' are kept.  A pinned image says which
+                // by its tag.
+                let tag = reference.tag.as_deref().unwrap_or(&reference.reference);
                 let when = if tag.starts_with("dev-") || tag.starts_with("initrd-dev-") {
                     "A dev build's images are published with it and kept for the last two \
                      dev builds only: install the current one (HLUK_VERSION=dev with \
@@ -664,10 +679,27 @@ mod tests {
         let digest = format!("sha256:{}", "ab".repeat(32));
         let r = Reference::parse(&format!("ghcr.io/o/r@{digest}")).unwrap();
         assert_eq!(r.reference, digest);
+        assert_eq!(r.tag, None);
         assert_eq!(r.to_string(), format!("ghcr.io/o/r@{digest}"));
         assert_eq!(
             r.cache_relpath(),
             PathBuf::from(format!("ghcr.io/o/r/{}.cpio", digest.replace(':', "_")))
+        );
+
+        // Pinned: the digest is pulled and cached by, the tag kept to show.
+        let pinned = format!("localhost:5000/o/r:initrd-v0.14.1@{digest}");
+        let p = Reference::parse(&pinned).unwrap();
+        assert_eq!(p.host, "localhost:5000");
+        assert_eq!(p.repository, "o/r");
+        assert_eq!(p.reference, digest);
+        assert_eq!(p.tag.as_deref(), Some("initrd-v0.14.1"));
+        assert_eq!(p.to_string(), pinned);
+        assert_eq!(
+            p.cache_relpath(),
+            PathBuf::from(format!(
+                "localhost_5000/o/r/{}.cpio",
+                digest.replace(':', "_")
+            ))
         );
     }
 
@@ -693,6 +725,16 @@ mod tests {
             "gh cr.io/a/b:tag",
         ] {
             assert!(Reference::parse(bad).is_err(), "{bad} accepted");
+        }
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        for bad in [
+            format!("ghcr.io/a/b:@{digest}"),
+            format!("ghcr.io/a/b:../x@{digest}"),
+            format!("ghcr.io/a/b:t/x@{digest}"),
+            format!("ghcr.io/A/b:tag@{digest}"),
+            "ghcr.io/a/b:tag@sha256:abc".to_string(),
+        ] {
+            assert!(Reference::parse(&bad).is_err(), "{bad} accepted");
         }
         assert!(Reference::parse("localhost:5000/a.b/c_d-e:v1.0_rc-2").is_ok());
         assert!(Reference::parse(&format!("ghcr.io/a/b@sha256:{}", "ab".repeat(32))).is_ok());
@@ -750,6 +792,13 @@ mod tests {
         );
         assert_eq!(
             runtime_name(&format!("ghcr.io/o/r/agent@sha256:{}", "ab".repeat(32))),
+            Some("agent")
+        );
+        assert_eq!(
+            runtime_name(&format!(
+                "ghcr.io/o/r/agent:initrd-v0.14.0@sha256:{}",
+                "ab".repeat(32)
+            )),
             Some("agent")
         );
     }
