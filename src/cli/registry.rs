@@ -7,8 +7,9 @@
 //! `<registry>/<runtime>:initrd-v<version>`, whose single layer is a tar
 //! holding `initrd.cpio`.  This module speaks just enough of the
 //! distribution API to fetch that: the anonymous bearer-token dance, the
-//! manifest (through an index if the registry serves one), and the layer,
-//! checked against its digest and unpacked.
+//! manifest (through an index if the registry serves one), checked against
+//! its digest when it is fetched by one, and the layer, checked against its
+//! digest and unpacked.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -399,7 +400,7 @@ impl Client {
         &mut self,
         reference: &Reference,
     ) -> Result<(Option<String>, Vec<Layer>), String> {
-        let (digest, manifest) = self.fetch_manifest(reference, &reference.reference)?;
+        let (digest, manifest) = self.fetch_manifest(reference, None)?;
         if manifest.manifests.is_empty() {
             // A single image says its platform in its config: refuse one for
             // another architecture here rather than fail to run its binaries.
@@ -429,7 +430,7 @@ impl Client {
             .ok_or_else(|| {
                 format!("{reference}: the image index has no linux/{GUEST_ARCH} manifest")
             })?;
-        let (_, manifest) = self.fetch_manifest(reference, &entry.digest)?;
+        let (_, manifest) = self.fetch_manifest(reference, Some(&entry.digest))?;
         Ok((Some(entry.digest.clone()), manifest.layers))
     }
 
@@ -449,11 +450,18 @@ impl Client {
         Ok(config.architecture)
     }
 
+    /// The manifest `reference` names, or with `digest` the one an index
+    /// lists by that digest, and the digest the registry reports for it.
+    /// One fetched by digest is checked against it.
     fn fetch_manifest(
         &mut self,
         reference: &Reference,
-        tag_or_digest: &str,
+        digest: Option<&str>,
     ) -> Result<(Option<String>, ImageManifest), String> {
+        let tag_or_digest = digest.unwrap_or(&reference.reference);
+        // A parsed reference's tag has no `:`; an index entry is always a
+        // digest, whatever it holds.
+        let by_digest = digest.is_some() || reference.reference.contains(':');
         let url = reference.manifest_url(tag_or_digest);
         let mut response = self.get(&url, MANIFEST_ACCEPT)?;
         match response.status() {
@@ -492,9 +500,12 @@ impl Client {
             .map(str::to_string);
         let body = response
             .body_mut()
-            .read_to_string()
+            .read_to_vec()
             .map_err(|e| format!("{url}: {e}"))?;
-        let manifest: ImageManifest = serde_json::from_str(&body)
+        if by_digest {
+            check_manifest_digest(reference, tag_or_digest, &body)?;
+        }
+        let manifest: ImageManifest = serde_json::from_slice(&body)
             .map_err(|e| format!("{url}: not an image manifest: {e}"))?;
         Ok((digest, manifest))
     }
@@ -534,12 +545,7 @@ impl Client {
             done += n as u64;
             progress(done, expected);
         }
-        let hex: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let actual = format!("sha256:{hex}");
+        let actual = sha256_digest(hasher);
         if actual != layer.digest {
             return Err(format!(
                 "{reference}: layer digest mismatch (expected {}, got {actual})",
@@ -548,6 +554,36 @@ impl Client {
         }
         Ok(())
     }
+}
+
+/// What `hasher` has read, as a `sha256:<hex>` digest.
+fn sha256_digest(hasher: Sha256) -> String {
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("sha256:{hex}")
+}
+
+/// Check a manifest fetched by `digest` against it.  The layers are
+/// checked against the digests the manifest lists, so it is the manifest
+/// that vouches for them: one the registry swapped for another would bring
+/// its own layers, checked against its own digests.  Only `sha256:` is
+/// read, as for a layer.
+fn check_manifest_digest(reference: &Reference, digest: &str, body: &[u8]) -> Result<(), String> {
+    if !digest.starts_with("sha256:") {
+        return Err(format!(
+            "{reference}: manifest digest {digest} is not a sha256 one, which hluk cannot check"
+        ));
+    }
+    let actual = sha256_digest(Sha256::new_with_prefix(body));
+    if actual != digest {
+        return Err(format!(
+            "{reference}: manifest digest mismatch (expected {digest}, got {actual})"
+        ));
+    }
+    Ok(())
 }
 
 impl Default for Client {
@@ -669,6 +705,23 @@ mod tests {
             r.cache_relpath(),
             PathBuf::from(format!("ghcr.io/o/r/{}.cpio", digest.replace(':', "_")))
         );
+    }
+
+    /// A manifest fetched by digest is taken only if it hashes to it: the
+    /// layers are checked against what it lists, so a manifest the registry
+    /// swapped would vouch for layers of its own.
+    #[test]
+    fn a_manifest_fetched_by_digest_must_hash_to_it() {
+        let r = Reference::parse("ghcr.io/o/r:initrd-v1").unwrap();
+        // SHA-256 of "abc" (FIPS 180-2, appendix B.1).
+        let abc = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(check_manifest_digest(&r, abc, b"abc"), Ok(()));
+        let err = check_manifest_digest(&r, abc, b"abc\n").unwrap_err();
+        assert!(err.contains("manifest digest mismatch"), "{err}");
+        // A digest hluk cannot compute is refused, not taken on trust.
+        let sha512 = format!("sha512:{}", "ab".repeat(64));
+        let err = check_manifest_digest(&r, &sha512, b"abc").unwrap_err();
+        assert!(err.contains("not a sha256 one"), "{err}");
     }
 
     #[test]
