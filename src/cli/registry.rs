@@ -141,27 +141,33 @@ impl Reference {
                 "image {s:?}: must start with a registry host, e.g. {DEFAULT_REGISTRY}/python"
             ));
         }
-        let (repository, tag, reference) = if let Some((name, digest)) = rest.split_once('@') {
-            match name.rsplit_once(':') {
-                Some((repo, tag)) => (repo, Some(tag), digest.to_string()),
-                None => (name, None, digest.to_string()),
-            }
-        } else if let Some((repo, tag)) = rest.rsplit_once(':') {
-            (repo, None, tag.to_string())
-        } else {
-            (rest, None, "latest".to_string())
-        };
+        // What follows a `@` is a digest, never a tag: `@latest` would pull
+        // a mutable tag where the image was meant to be pinned.
+        let (repository, tag, reference, by_digest) =
+            if let Some((name, digest)) = rest.split_once('@') {
+                match name.rsplit_once(':') {
+                    Some((repo, tag)) => (repo, Some(tag), digest.to_string(), true),
+                    None => (name, None, digest.to_string(), true),
+                }
+            } else if let Some((repo, tag)) = rest.rsplit_once(':') {
+                (repo, None, tag.to_string(), false)
+            } else {
+                (rest, None, "latest".to_string(), false)
+            };
         if repository.is_empty() || reference.is_empty() || tag.is_some_and(str::is_empty) {
             return Err(format!("image {s:?}: empty repository or tag"));
         }
         // The registry would refuse these too, but the cache path is built
-        // from them, so nothing that is not a plain name gets that far.  A
-        // tag beside a digest was split at its last `:`, so it has none and
-        // cannot pass for a digest here.
+        // from them, so nothing that is not a plain name gets that far.
+        let valid_pull_reference = if by_digest {
+            valid_digest(&reference)
+        } else {
+            valid_tag(&reference)
+        };
         if !valid_host(host)
             || !valid_repository(repository)
-            || !valid_reference(&reference)
-            || tag.is_some_and(|t| !valid_reference(t))
+            || !valid_pull_reference
+            || tag.is_some_and(|t| !valid_tag(t))
         {
             return Err(format!(
                 "image {s:?}: a repository is lowercase path components, a tag is letters, \
@@ -226,19 +232,23 @@ fn valid_repository(repository: &str) -> bool {
     })
 }
 
-/// A tag (`initrd-v0.14.1`) or a `sha256:` digest.
-fn valid_reference(reference: &str) -> bool {
-    if let Some(hex) = reference.strip_prefix("sha256:") {
-        return hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit());
-    }
-    reference.len() <= 128
-        && reference
+/// A tag: `initrd-v0.14.1`.
+fn valid_tag(tag: &str) -> bool {
+    tag.len() <= 128
+        && tag
             .bytes()
             .next()
             .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && reference
+        && tag
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+}
+
+/// A `sha256:` digest.
+fn valid_digest(digest: &str) -> bool {
+    digest
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 impl fmt::Display for Reference {
@@ -733,6 +743,11 @@ mod tests {
             format!("ghcr.io/a/b:t/x@{digest}"),
             format!("ghcr.io/A/b:tag@{digest}"),
             "ghcr.io/a/b:tag@sha256:abc".to_string(),
+            // A pin must be a digest: neither a tag nor a bare hash is one.
+            "ghcr.io/a/b@latest".to_string(),
+            "ghcr.io/a/b:initrd-v0.21.0@latest".to_string(),
+            format!("ghcr.io/a/b@{}", "ab".repeat(32)),
+            format!("ghcr.io/a/b:initrd-v0.21.0@{}", "ab".repeat(32)),
         ] {
             assert!(Reference::parse(&bad).is_err(), "{bad} accepted");
         }
