@@ -94,7 +94,7 @@ All functions return negative `-errno` values on error.
 | `BlockList(BlockList)` | Everything except the listed names and addresses. |
 | `Filter(Filter)` | What the embedder's `NetworkFilter` allows, by name and port, asked at every question, TCP connect and UDP send. |
 
-Under every variant the cloud metadata addresses are refused: the link-local ranges (`169.254.0.0/16`, `fe80::/10`) and AWS's IPv6 endpoint `fd00:ec2::254`.  The two lists and a filter also refuse loopback, and the unspecified address (`0.0.0.0`, `::`), which a connect sends to loopback, since a guest socket is a host socket and host services trust `127.0.0.1`; `AllowAll` permits it, so a server and a client can meet inside one guest.  An IPv4 address written as IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is judged as `a.b.c.d`.
+Under every variant the cloud metadata addresses are refused: the link-local ranges (`169.254.0.0/16`, `fe80::/10`) and AWS's IPv6 endpoint `fd00:ec2::254`.  The two lists and a filter also refuse loopback, and the unspecified address (`0.0.0.0`, `::`), which a connect sends to loopback, since a guest socket is a host socket and host services trust `127.0.0.1`; `AllowAll` permits it, so a server and a client can meet inside one guest.  An IPv4 address written as IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is judged as `a.b.c.d`, whether it is the destination or what the destination is compared with: an entry of either list, what a listed name resolves to, or an address a DNS answer gives.
 
 ### Where it is checked
 
