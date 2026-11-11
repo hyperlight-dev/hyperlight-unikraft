@@ -539,6 +539,43 @@ fn build_runs_the_command_in_the_project_directory() {
 }
 
 #[test]
+fn the_rust_template_builds_only_for_linux() {
+    let root = temp_dir("project-rust");
+    let cache = temp_dir("project-rust-cache");
+    let out = hluk(
+        root.path(),
+        cache.path(),
+        &["init", "greeter", "--template", "rust", "--no-pull"],
+    );
+    assert!(out.status.success(), "init failed: {}", text(&out));
+    let project = root.path().join("greeter");
+    let out = Command::new(env!("CARGO_BIN_EXE_hluk"))
+        .arg("build")
+        .current_dir(&project)
+        .env("HLUK_CACHE_DIR", cache.path())
+        // The project's own settings, which these would override.
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("failed to run hluk");
+    if cfg!(target_os = "linux") {
+        // `hluk build` checks that the program is a PIE for this CPU.
+        assert!(out.status.success(), "build failed: {}", text(&out));
+        let program = std::fs::read(project.join("target/release/app")).unwrap();
+        assert!(program.starts_with(b"\x7fELF"), "not an ELF file");
+    } else {
+        // Refused before cargo makes a binary the guest cannot run.
+        assert!(!out.status.success(), "built: {}", text(&out));
+        assert!(
+            text(&out).contains("it must be built for Linux"),
+            "got: {}",
+            text(&out)
+        );
+    }
+}
+
+#[test]
 fn warm_exec_runs_before_the_snapshot_and_its_state_is_restored() {
     let root = temp_dir("project-warm-exec");
     let cache = temp_dir("project-warm-exec-cache");
