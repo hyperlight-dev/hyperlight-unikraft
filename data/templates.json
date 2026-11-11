@@ -317,7 +317,7 @@
   "files": [
    {
     "path": "src/main.rs",
-    "text": "fn main() {\n    println!(\"Hello from hello!\");\n    println!(\n        \"Rust on {}/{}, inside a Hyperlight micro-VM\",\n        std::env::consts::OS,\n        std::env::consts::ARCH\n    );\n}\n"
+    "text": "// The guest is Linux on the host's CPU, so a build for any other OS (a\n// Windows .exe, a macOS binary) makes a program the guest cannot run.\n// Refuse it here, before it looks like a successful build.\n#[cfg(not(target_os = \"linux\"))]\ncompile_error!(\n    \"this program runs in a Linux guest, so it must be built for Linux: run `hluk build` on \\\n     Linux, or in WSL on Windows\"\n);\n\nfn main() {\n    println!(\"Hello from hello!\");\n    println!(\n        \"Rust on {}/{}, inside a Hyperlight micro-VM\",\n        std::env::consts::OS,\n        std::env::consts::ARCH\n    );\n}\n"
    },
    {
     "path": "hluk.toml",
