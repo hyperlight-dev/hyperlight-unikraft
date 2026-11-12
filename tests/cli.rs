@@ -2,17 +2,19 @@
 // Copyright 2026 The Hyperlight Authors.
 mod common;
 
-use common::require_rootfs;
+use common::{require_rootfs, temp_dir};
 use hyperlight_unikraft::{Exec, SandboxBuilder};
 
-#[test]
-fn exec_file_not_found() {
+#[tokio::test]
+async fn exec_file_not_found() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    let result = sandbox.run(Exec::File("/nonexistent/script.py".into()));
+    let result = sandbox
+        .run(Exec::File("/nonexistent/script.py".into()))
+        .await;
     assert!(result.is_err());
 }
 
@@ -98,4 +100,169 @@ fn cli_call_flag() {
         String::from_utf8_lossy(&output.stderr).contains("no global function handler"),
         "{output:?}"
     );
+}
+
+#[test]
+fn cli_snapshot_and_benchmarks_drive_guest_timers() {
+    let rootfs = require_rootfs("python");
+    let root = temp_dir("cli-async-driving");
+    let snapshot = root.path().join("snapshot");
+    let script = root.path().join("timer.py");
+    std::fs::write(&script, "import time; time.sleep(0.01)\n").unwrap();
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_hluk"))
+            .args(args)
+            .current_dir(root.path())
+            .env("HLUK_CACHE_DIR", root.path().join("cache"))
+            .output()
+            .expect("failed to run hluk");
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    run(&[
+        "snapshot",
+        "save",
+        "--initrd",
+        rootfs.to_str().unwrap(),
+        "--scratch-mb",
+        "256",
+        "--warm-exec",
+        "import time\ntime.sleep(0.01)\ndef twice(value):\n    time.sleep(0.01)\n    return value * 2",
+        "--output",
+        snapshot.to_str().unwrap(),
+    ]);
+    let output = run(&[
+        "snapshot",
+        "run",
+        snapshot.to_str().unwrap(),
+        "--exec",
+        "time.sleep(0.01)",
+        "--call",
+        "twice",
+        "--input",
+        "21",
+    ]);
+    assert_eq!(output, "42\n");
+    let output = run(&[
+        "bench",
+        "cold",
+        "--initrd",
+        rootfs.to_str().unwrap(),
+        "--scratch-mb",
+        "256",
+        script.to_str().unwrap(),
+        "--samples",
+        "2",
+    ]);
+    assert!(output.contains("samples=2"), "{output}");
+    for mode in ["cold-snap", "warm-restore", "warm-stateful"] {
+        let output = run(&[
+            "bench",
+            mode,
+            snapshot.to_str().unwrap(),
+            script.to_str().unwrap(),
+            "--samples",
+            "2",
+        ]);
+        assert!(output.contains("samples=2"), "{mode}: {output}");
+    }
+    let output = run(&[
+        "bench",
+        "parallel",
+        snapshot.to_str().unwrap(),
+        script.to_str().unwrap(),
+        "--vms",
+        "2",
+        "--iterations",
+        "2",
+    ]);
+    assert!(output.contains("total_calls=4"), "{output}");
+    assert!(output.contains("samples=4"), "{output}");
+}
+
+#[test]
+fn cli_entry_waits_and_preserves_exit_status() {
+    let rootfs = require_rootfs("python");
+    let root = temp_dir("cli-async-join");
+    std::fs::write(
+        root.path().join("exit.py"),
+        "import time; time.sleep(0.01); raise SystemExit(7)\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hluk"))
+        .args([
+            "run",
+            "--cold",
+            "--initrd",
+            rootfs.to_str().unwrap(),
+            "--scratch-mb",
+            "256",
+            "--mount",
+            &format!("{}:/mnt/app:ro", root.path().display()),
+            "--entry",
+            "/usr/local/bin/python3 /mnt/app/exit.py",
+        ])
+        .current_dir(root.path())
+        .env("HLUK_CACHE_DIR", root.path().join("cache"))
+        .output()
+        .expect("failed to run hluk");
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+}
+
+#[test]
+fn cli_snapshots_capture_pending_network_readiness() {
+    let rootfs = require_rootfs("python");
+    let root = temp_dir("cli-network-snapshot");
+    let snapshot = root.path().join("snapshot");
+    let warm = "import socket; listener = socket.socket(); listener.bind(('127.0.0.1', 0)); listener.listen(1); print('warming')";
+    let exec = "assert listener.getsockname()[1] > 0; listener.close(); print('ready')";
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_hluk"))
+            .args(args)
+            .current_dir(root.path())
+            .env("HLUK_CACHE_DIR", root.path().join("cache"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    run(&[
+        "snapshot",
+        "save",
+        "--initrd",
+        rootfs.to_str().unwrap(),
+        "--scratch-mb",
+        "256",
+        "--net",
+        "--warm-exec",
+        warm,
+        "--output",
+        snapshot.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        run(&[
+            "snapshot",
+            "run",
+            snapshot.to_str().unwrap(),
+            "--net",
+            "--exec",
+            exec
+        ]),
+        "ready\n"
+    );
+    let args = [
+        "run",
+        "--warm",
+        "--initrd",
+        rootfs.to_str().unwrap(),
+        "--scratch-mb",
+        "256",
+        "--net",
+        "--warm-exec",
+        warm,
+        "--exec",
+        exec,
+    ];
+    assert_eq!(run(&args), "warming\nready\n");
+    assert_eq!(run(&args), "ready\n");
 }

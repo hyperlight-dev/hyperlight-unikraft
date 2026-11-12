@@ -44,8 +44,8 @@ fn require_native_kernel() -> PathBuf {
     p
 }
 
-#[test]
-fn native_kernel_boots_and_prints() {
+#[tokio::test]
+async fn native_kernel_boots_and_prints() {
     let kernel = require_native_kernel();
 
     // A bare native kernel: no initrd, no mounts, no networking.
@@ -65,5 +65,5 @@ fn native_kernel_boots_and_prints() {
     );
     // main() returned 0 during boot; the kernel reports it on the way down
     // even without the step model, so join() has nothing left to drive.
-    assert_eq!(sandbox.join().unwrap(), 0);
+    assert_eq!(sandbox.join().await.unwrap(), 0);
 }

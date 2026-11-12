@@ -9,15 +9,15 @@ use hyperlight_unikraft::{Exec, NetworkPolicy, SandboxBuilder};
 
 // ── Agent (full) tests ───────────────────────────────────────────
 
-#[test]
-fn agent_hello() {
+#[tokio::test]
+async fn agent_hello() {
     let rootfs = require_rootfs("agent");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/hello.py");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1536)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from the Hyperlight agent"),
@@ -25,15 +25,15 @@ fn agent_hello() {
     );
 }
 
-#[test]
-fn agent_data_science() {
+#[tokio::test]
+async fn agent_data_science() {
     let rootfs = require_rootfs("agent");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/data_science.py");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1536)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("slope") && output.contains("sklearn"),
@@ -43,8 +43,8 @@ fn agent_data_science() {
 
 /// A shell pipeline and its timeout: the commands an agent runs through
 /// `sh -c`, killed with their process group when they overrun.
-#[test]
-fn agent_shell_pipelines_and_group_kill() {
+#[tokio::test]
+async fn agent_shell_pipelines_and_group_kill() {
     let rootfs = require_rootfs("agent");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1536)
@@ -64,6 +64,7 @@ os.killpg(p.pid, signal.SIGKILL)
 print("killed", p.wait(), time.monotonic() - t0 < 5)
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -72,15 +73,15 @@ print("killed", p.wait(), time.monotonic() - t0 < 5)
     );
 }
 
-#[test]
-fn agent_shell_subprocess() {
+#[tokio::test]
+async fn agent_shell_subprocess() {
     let rootfs = require_rootfs("agent");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/shell_commands.py");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1536)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from hush shell!"),
@@ -96,7 +97,7 @@ async fn first_socket_in_child_releases_captured_pipes() {
         .boot()
         .unwrap();
     sandbox
-        .run_async(
+        .run(
             r#"
 import subprocess, sys
 r = subprocess.run(
@@ -111,8 +112,8 @@ print(r.stdout.strip())
     assert_eq!(sandbox.drain_output().trim(), "done");
 }
 
-#[test]
-fn agent_ssl_available() {
+#[tokio::test]
+async fn agent_ssl_available() {
     let rootfs = require_rootfs("agent");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1536)
@@ -130,6 +131,7 @@ import ctypes
 print('ctypes-ok')
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -150,8 +152,8 @@ print('ctypes-ok')
     );
 }
 
-#[test]
-fn agent_snapshot_round_trip() {
+#[tokio::test]
+async fn agent_snapshot_round_trip() {
     let rootfs = require_rootfs("agent");
     let snap_dir = temp_dir("agent-snap");
 
@@ -168,7 +170,7 @@ fn agent_snapshot_round_trip() {
         .boot()
         .unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/hello.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from the Hyperlight agent"),
@@ -180,8 +182,8 @@ fn agent_snapshot_round_trip() {
     );
 }
 
-#[test]
-fn agent_verify_all_packages() {
+#[tokio::test]
+async fn agent_verify_all_packages() {
     let rootfs = require_rootfs("agent");
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/verify_packages.py");
@@ -189,7 +191,7 @@ fn agent_verify_all_packages() {
         .scratch_mb(1536)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("ALL") && output.contains("packages verified"),
@@ -201,8 +203,8 @@ fn agent_verify_all_packages() {
     );
 }
 
-#[test]
-fn agent_pip_install() {
+#[tokio::test]
+async fn agent_pip_install() {
     let rootfs = require_rootfs("agent");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/pip_install.py");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -210,7 +212,7 @@ fn agent_pip_install() {
         .network(NetworkPolicy::AllowAll)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Success!"),
@@ -220,8 +222,8 @@ fn agent_pip_install() {
 
 // ── Agent custom rootfs test ─────────────────────────────────────
 
-#[test]
-fn agent_custom_packages() {
+#[tokio::test]
+async fn agent_custom_packages() {
     let rootfs = require_rootfs("agent-custom");
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/custom/custom_packages.py");
@@ -229,7 +231,7 @@ fn agent_custom_packages() {
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("pydantic=") && output.contains("yaml="),

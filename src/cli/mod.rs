@@ -1139,7 +1139,7 @@ fn host_path(guest: &str, mounts: &[Mount]) -> Option<PathBuf> {
 
 // ── run ──────────────────────────────────────────────────────────
 
-pub fn run(args: RunArgs) -> CliResult<()> {
+pub async fn run(args: RunArgs) -> CliResult<()> {
     // Where the guest comes from: a rootfs or kernel named on the command
     // line, a published image by name, or the project in this directory.
     let explicit = args.kernel.is_some() || args.initrd.is_some();
@@ -1415,7 +1415,7 @@ pub fn run(args: RunArgs) -> CliResult<()> {
             if !sandbox.has_driver() {
                 return Err("warm_exec needs a runtime driver in the rootfs".into());
             }
-            crate::kernel_tail::workload(sandbox.run(code.as_str()))?;
+            crate::kernel_tail::workload(sandbox.run(code.as_str()).await)?;
             info!(elapsed_ms = elapsed_ms(t), "warm_exec done");
         }
         // Written beside its slot under this process's own name and moved
@@ -1428,6 +1428,7 @@ pub fn run(args: RunArgs) -> CliResult<()> {
         if let Some(parent) = slot.parent() {
             fs::create_dir_all(parent)?;
         }
+        // The CLI has no embedder handlers; warm-up may leave network waits.
         match sandbox.snapshot_to(&part) {
             Ok(_) => {
                 fs::write(part.join(rootfs::STAMP_FILE), &key)?;
@@ -1463,6 +1464,7 @@ pub fn run(args: RunArgs) -> CliResult<()> {
         exec,
         Call::new(args.call.clone(), args.input.clone()),
     )
+    .await
 }
 
 /// A bare `--runtime` name must be one of the published images; a full

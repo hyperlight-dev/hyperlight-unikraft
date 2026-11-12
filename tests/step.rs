@@ -56,7 +56,10 @@ print('done', flush=True)
 /// or until `stop(output_so_far)` says to pause at the current boundary.
 /// Returns the accumulated output, the number of steps that ended on a
 /// guest timer, and whether the call finished.
-fn drive(sandbox: &mut AppSandbox, mut stop: impl FnMut(&str) -> bool) -> (String, usize, bool) {
+async fn drive(
+    sandbox: &mut AppSandbox,
+    mut stop: impl FnMut(&str) -> bool,
+) -> (String, usize, bool) {
     let start = Instant::now();
     let mut out = String::new();
     let mut timers = 0;
@@ -65,7 +68,7 @@ fn drive(sandbox: &mut AppSandbox, mut stop: impl FnMut(&str) -> bool) -> (Strin
             start.elapsed() < MAX_WALL,
             "step run did not finish in time; output so far: {out:?}"
         );
-        let y = sandbox.step(Duration::from_millis(50)).expect("step");
+        let y = sandbox.step().await.expect("step");
         out.push_str(&sandbox.drain_output());
         match y {
             Yield::CallDone | Yield::CallFailed { .. } | Yield::Exited { .. } => {
@@ -104,14 +107,14 @@ fn boot_python() -> AppSandbox {
 /// guest parks on each wait instead of spinning, the host sees timer
 /// yields, and the call is reported done once the script returns.  Wall
 /// time covers the waits, so the vCPU really was handed back.
-#[test]
-fn python_call_yields_on_timers() {
+#[tokio::test]
+async fn python_call_yields_on_timers() {
     let mut sandbox = boot_python();
     assert!(sandbox.has_driver());
     let t = Instant::now();
     sandbox.submit(tick_script(5, 20)).expect("submit");
     let mut out = sandbox.drain_output();
-    let (rest, timers, done) = drive(&mut sandbox, |_| false);
+    let (rest, timers, done) = drive(&mut sandbox, |_| false).await;
     out.push_str(&rest);
     assert!(done, "{out:?}");
     assert!(
@@ -126,7 +129,7 @@ fn python_call_yields_on_timers() {
         assert!(out.contains(line), "missing {line:?} in {out:?}");
     }
     // The guest is alive and takes the next call.
-    sandbox.run("print('again')").expect("second run");
+    sandbox.run("print('again')").await.expect("second run");
     assert!(sandbox.drain_output().contains("again"));
 }
 
@@ -134,8 +137,8 @@ fn python_call_yields_on_timers() {
 /// kernel reads from scratch and the driver learns through the device: a script far
 /// larger than any guest-side constant still runs.  (The previous kernel
 /// rejected anything over 16 KiB.)
-#[test]
-fn python_large_call_payload() {
+#[tokio::test]
+async fn python_large_call_payload() {
     let mut sandbox = boot_python();
     let mut script = String::new();
     for i in 0..2500 {
@@ -143,58 +146,63 @@ fn python_large_call_payload() {
     }
     script.push_str("print('big script ran', x02499)\n");
     assert!(script.len() > 32 * 1024, "{} bytes", script.len());
-    sandbox.run(script).expect("run");
+    sandbox.run(script).await.expect("run");
     let out = sandbox.drain_output();
     assert!(out.contains("big script ran 2499"), "{out:?}");
 }
 
 /// `join` on a driver image with nothing submitted can never return, so
 /// it refuses up front; `run` on a guest that dies mid-call reports it.
-#[test]
-fn python_join_and_exit_are_reported() {
+#[tokio::test]
+async fn python_join_and_exit_are_reported() {
     let mut sandbox = boot_python();
     let err = sandbox
         .join()
+        .await
         .expect_err("join with an idle driver must fail");
     assert!(matches!(err, Error::NothingToJoin), "{err}");
 
     // The driver process exits inside the call: the guest is gone.
     let err = sandbox
         .run("import os; print('bye', flush=True); os._exit(0)")
+        .await
         .expect_err("run must report the guest exiting");
     assert!(matches!(err, Error::GuestExited { status: 0 }), "{err}");
     assert!(sandbox.drain_output().contains("bye"));
     assert_eq!(
-        sandbox.step(Duration::ZERO).expect("step"),
+        sandbox.step().await.expect("step"),
         Yield::Exited { status: 0 }
     );
-    assert!(sandbox.run("print('never')").is_err());
+    assert!(sandbox.run("print('never')").await.is_err());
     // An exited guest joins at once, with the status it exited with.
-    assert_eq!(sandbox.join().expect("join after exit"), 0);
+    assert_eq!(sandbox.join().await.expect("join after exit"), 0);
 }
 
 /// `join` after `submit` reports `NothingToJoin` rather than hanging: the
 /// submitted call runs to completion, but the driver stays alive for the
 /// next call, so a join can never return.  (It used to loop forever once
 /// the call finished.)
-#[test]
-fn python_join_after_submit_is_refused() {
+#[tokio::test]
+async fn python_join_after_submit_is_refused() {
     let mut sandbox = boot_python();
     sandbox
         .submit("print('submitted', flush=True)")
         .expect("submit");
-    let err = sandbox.join().expect_err("join after submit must fail");
+    let err = sandbox
+        .join()
+        .await
+        .expect_err("join after submit must fail");
     assert!(matches!(err, Error::NothingToJoin), "{err}");
     // The submitted call still ran, and the guest takes the next one.
     assert!(sandbox.drain_output().contains("submitted"));
-    sandbox.run("print('again')").expect("run after join");
+    sandbox.run("print('again')").await.expect("run after join");
     assert!(sandbox.drain_output().contains("again"));
 }
 
 /// The kernel serves one call at a time: while one is in flight, `submit`
 /// and `run` are refused up front, and the guest is untouched.
-#[test]
-fn python_second_call_is_refused_while_one_is_in_flight() {
+#[tokio::test]
+async fn python_second_call_is_refused_while_one_is_in_flight() {
     let mut sandbox = boot_python();
     sandbox.submit(tick_script(2, 100)).expect("submit");
     assert!(matches!(
@@ -202,13 +210,16 @@ fn python_second_call_is_refused_while_one_is_in_flight() {
         Err(Error::CallInFlight)
     ));
     assert!(matches!(
-        sandbox.run("print('second')"),
+        sandbox.run("print('second')").await,
         Err(Error::CallInFlight)
     ));
-    let (out, _, done) = drive(&mut sandbox, |_| false);
+    let (out, _, done) = drive(&mut sandbox, |_| false).await;
     assert!(done, "{out:?}");
     assert!(out.contains("done") && !out.contains("second"), "{out:?}");
-    sandbox.run("print('second')").expect("run after the call");
+    sandbox
+        .run("print('second')")
+        .await
+        .expect("run after the call");
     assert!(sandbox.drain_output().contains("second"));
 }
 
@@ -216,9 +227,12 @@ fn python_second_call_is_refused_while_one_is_in_flight() {
 /// the call takes the requested time.  (CPython sleeps with
 /// `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`, which the kernel's
 /// posix-time now implements.)
-#[test]
-fn python_time_sleep_parks_the_guest() {
-    let mut sandbox = boot_python();
+#[tokio::test]
+async fn python_time_sleep_parks_the_guest() {
+    let mut sandbox = SandboxBuilder::from_initrd(common::require_rootfs("python"))
+        .profile(true)
+        .boot()
+        .expect("boot");
     let t = Instant::now();
     sandbox
         .submit(
@@ -226,9 +240,13 @@ fn python_time_sleep_parks_the_guest() {
              print('slept', round(time.monotonic() - t, 1), flush=True)",
         )
         .expect("submit");
-    let (out, timers, done) = drive(&mut sandbox, |_| false);
+    let (out, _, done) = drive(&mut sandbox, |_| false).await;
     assert!(done, "{out:?}");
-    assert!(timers >= 1, "the sleep never yielded a timer: {out:?}");
+    let report = sandbox.profile().report();
+    assert!(
+        report.contains("entry step "),
+        "no timer-driven entry: {report}"
+    );
     assert!(
         t.elapsed() >= Duration::from_millis(1800),
         "sleep returned after {:?}: {out:?}",
@@ -241,11 +259,12 @@ fn python_time_sleep_parks_the_guest() {
 /// interpreter's own exit handling) ends the guest: the call fails and
 /// the host learns the status.  (`sys.exit()` is not that: it ends the
 /// call with its code and leaves the interpreter up; see tests/python.rs.)
-#[test]
-fn python_os_exit_ends_the_guest() {
+#[tokio::test]
+async fn python_os_exit_ends_the_guest() {
     let mut sandbox = boot_python();
     let err = sandbox
         .run("import os; print('leaving', flush=True); os._exit(3)")
+        .await
         .expect_err("a process exit must fail the call");
     assert!(matches!(err, Error::GuestExited { status: 3 }), "{err}");
     // Nothing is left to snapshot.
@@ -255,18 +274,19 @@ fn python_os_exit_ends_the_guest() {
     );
     assert!(sandbox.drain_output().contains("leaving"));
     assert_eq!(
-        sandbox.step(Duration::ZERO).expect("step"),
+        sandbox.step().await.expect("step"),
         Yield::Exited { status: 3 }
     );
 }
 
 /// An uncaught exception must fail the call too, and leave the guest
 /// alive for the next one.
-#[test]
-fn python_uncaught_exception_fails_the_call() {
+#[tokio::test]
+async fn python_uncaught_exception_fails_the_call() {
     let mut sandbox = boot_python();
     let err = sandbox
         .run("raise RuntimeError('boom')")
+        .await
         .expect_err("an uncaught exception must fail the call");
     assert!(matches!(err, Error::CallFailed { status: 1 }), "{err}");
     assert!(sandbox.drain_output().contains("RuntimeError"));
@@ -274,7 +294,7 @@ fn python_uncaught_exception_fails_the_call() {
     sandbox.submit("1/0").expect("submit");
     let mut saw_failed = false;
     let out = loop {
-        match sandbox.step(Duration::from_millis(50)).expect("step") {
+        match sandbox.step().await.expect("step") {
             Yield::CallFailed { status } => {
                 assert_eq!(
                     status, 1,
@@ -290,18 +310,19 @@ fn python_uncaught_exception_fails_the_call() {
     };
     assert!(saw_failed, "expected CallFailed; output: {out:?}");
     assert!(out.contains("ZeroDivisionError"), "{out:?}");
-    sandbox.run("print('still here')").expect("next call");
+    sandbox.run("print('still here')").await.expect("next call");
     assert!(sandbox.drain_output().contains("still here"));
 }
 
 /// A guest whose every thread is blocked with no timer and no host socket
 /// can never make progress; `run` must say so rather than wait forever.
-#[test]
-fn python_deadlock_is_reported() {
+#[tokio::test]
+async fn python_deadlock_is_reported() {
     let mut sandbox = boot_python();
     let t = Instant::now();
     let err = sandbox
         .run("import threading; print('parking', flush=True); threading.Event().wait()")
+        .await
         .expect_err("a deadlocked guest must be reported");
     assert!(matches!(err, Error::Deadlocked), "{err}");
     assert!(
@@ -316,8 +337,8 @@ fn python_deadlock_is_reported() {
 /// step loop into a busy spin: the host watches a socket for readability
 /// only while the guest is parked on it, so a server that sleeps with an
 /// unread request costs one step per timer, not thousands.
-#[test]
-fn python_unread_socket_data_does_not_spin() {
+#[tokio::test]
+async fn python_unread_socket_data_does_not_spin() {
     init_logs();
     let rootfs = common::require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(&rootfs)
@@ -342,7 +363,7 @@ fn python_unread_socket_data_does_not_spin() {
     let t = Instant::now();
     let mut steps = 0u32;
     loop {
-        match sandbox.step(Duration::from_millis(200)).expect("step") {
+        match sandbox.step().await.expect("step") {
             Yield::Blocked { .. } => {}
             other => {
                 assert_eq!(other, Yield::CallDone);
@@ -367,8 +388,8 @@ fn python_unread_socket_data_does_not_spin() {
 /// handshake runs in the background, the guest thread parks, and the
 /// guest's own timeout decides.  192.0.2.1 (TEST-NET-1) is unroutable or
 /// refused depending on the network; either way the host returns fast.
-#[test]
-fn python_connect_to_unreachable_peer_does_not_hold_the_host() {
+#[tokio::test]
+async fn python_connect_to_unreachable_peer_does_not_hold_the_host() {
     init_logs();
     let rootfs = common::require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(&rootfs)
@@ -386,6 +407,7 @@ fn python_connect_to_unreachable_peer_does_not_hold_the_host() {
             "except OSError as e:\n",
             "    print('connect:', type(e).__name__, round(time.time() - t, 1), 's', flush=True)\n",
         ))
+        .await
         .expect("run");
     let out = sandbox.drain_output();
     assert!(out.contains("connect:"), "{out:?}");
@@ -401,8 +423,8 @@ fn python_connect_to_unreachable_peer_does_not_hold_the_host() {
 /// steps that follow.  (Unlike `python file.py`, which joins non-daemon
 /// threads at exit -- after running exit callbacks that stop thread pools,
 /// which a live interpreter cannot do.)
-#[test]
-fn python_threads_do_not_extend_the_call() {
+#[tokio::test]
+async fn python_threads_do_not_extend_the_call() {
     let mut sandbox = boot_python();
     let t = Instant::now();
     sandbox
@@ -414,6 +436,7 @@ fn python_threads_do_not_extend_the_call() {
             "threading.Thread(target=late).start()\n",
             "print('main done', flush=True)\n",
         ))
+        .await
         .expect("run");
     assert!(
         t.elapsed() < Duration::from_millis(400),
@@ -421,7 +444,9 @@ fn python_threads_do_not_extend_the_call() {
     );
     assert_eq!(sandbox.drain_output(), "main done\n");
     while t.elapsed() < Duration::from_millis(1200) {
-        sandbox.step(Duration::from_millis(500)).expect("step");
+        if sandbox.step().await.expect("step") == (Yield::Blocked { until: None }) {
+            break;
+        }
     }
     assert_eq!(sandbox.drain_output(), "thread done\n");
 }
@@ -429,8 +454,8 @@ fn python_threads_do_not_extend_the_call() {
 /// A module-level thread pool keeps idle non-daemon workers alive.  The
 /// call must still return: a driver that joined non-daemon threads would
 /// wait for them forever, and the host would report a deadlock.
-#[test]
-fn python_thread_pool_does_not_hold_the_call() {
+#[tokio::test]
+async fn python_thread_pool_does_not_hold_the_call() {
     let mut sandbox = boot_python();
     sandbox
         .run(concat!(
@@ -438,10 +463,12 @@ fn python_thread_pool_does_not_hold_the_call() {
             "ex = ThreadPoolExecutor()\n",
             "print('result', ex.submit(lambda: 21 * 2).result(), flush=True)\n",
         ))
+        .await
         .expect("run");
     assert_eq!(sandbox.drain_output(), "result 42\n");
     sandbox
         .run("print('again', ex.submit(lambda: 1).result(), flush=True)")
+        .await
         .expect("run");
     assert_eq!(sandbox.drain_output(), "again 1\n");
 }
@@ -450,8 +477,8 @@ fn python_thread_pool_does_not_hold_the_call() {
 /// driver parks with the interpreter lock released.  Before, the thread
 /// starved until the next call and woke the guest every 5 ms asking for
 /// the lock, so the steps here would number in the hundreds.
-#[test]
-fn python_thread_left_behind_runs_between_calls() {
+#[tokio::test]
+async fn python_thread_left_behind_runs_between_calls() {
     let mut sandbox = boot_python();
     sandbox
         .run(concat!(
@@ -462,11 +489,14 @@ fn python_thread_left_behind_runs_between_calls() {
             "        time.sleep(0.2)\n",
             "threading.Thread(target=tick, daemon=True).start()\n",
         ))
+        .await
         .expect("run");
     let t = Instant::now();
     let mut steps = 0;
     while t.elapsed() < Duration::from_millis(1500) {
-        sandbox.step(Duration::from_millis(500)).expect("step");
+        if sandbox.step().await.expect("step") == (Yield::Blocked { until: None }) {
+            break;
+        }
         steps += 1;
     }
     let out = sandbox.drain_output();
@@ -480,8 +510,8 @@ fn python_thread_left_behind_runs_between_calls() {
 /// A thread a call left behind is guest state like any other: a snapshot
 /// taken while it sleeps carries it, and it goes on ticking in the
 /// restored guest.
-#[test]
-fn python_thread_left_behind_survives_restore() {
+#[tokio::test]
+async fn python_thread_left_behind_survives_restore() {
     let mut sandbox = boot_python();
     sandbox
         .run(concat!(
@@ -492,10 +522,11 @@ fn python_thread_left_behind_survives_restore() {
             "        time.sleep(0.3)\n",
             "threading.Thread(target=tick, daemon=True).start()\n",
         ))
+        .await
         .expect("run");
     let t = Instant::now();
     while t.elapsed() < Duration::from_millis(500) {
-        sandbox.step(Duration::from_millis(500)).expect("step");
+        sandbox.step().await.expect("step");
     }
     let before = sandbox.drain_output();
     assert!(before.contains("tick 1"), "{before:?}");
@@ -505,7 +536,9 @@ fn python_thread_left_behind_survives_restore() {
     let mut sandbox = restore_from(&dir).boot().expect("restore");
     let t = Instant::now();
     while t.elapsed() < Duration::from_millis(1800) {
-        sandbox.step(Duration::from_millis(500)).expect("step");
+        if sandbox.step().await.expect("step") == (Yield::Blocked { until: None }) {
+            break;
+        }
     }
     let after = sandbox.drain_output();
     assert!(
@@ -517,8 +550,8 @@ fn python_thread_left_behind_survives_restore() {
 /// A guest restored from disk must report the current time, not the time
 /// it was checkpointed at: the kernel asks the host for the wall clock
 /// again on its resume entry.
-#[test]
-fn python_restored_guest_clock_is_current() {
+#[tokio::test]
+async fn python_restored_guest_clock_is_current() {
     let sandbox = boot_python();
     let dir = common::temp_dir("step-clock");
     checkpoint_to(sandbox, &dir);
@@ -527,6 +560,7 @@ fn python_restored_guest_clock_is_current() {
     let mut sandbox = restore_from(&dir).boot().expect("restore");
     sandbox
         .run("import time; print('T', time.time())")
+        .await
         .expect("run");
     let out = sandbox.drain_output();
     let guest: f64 = out
@@ -549,17 +583,18 @@ fn python_restored_guest_clock_is_current() {
 /// state, so unless the kernel reseeds on restore they draw the same
 /// "random" bytes.  The host announces a restore with a `resume` entry in
 /// place of the first `step`, and the kernel reseeds there.
-#[test]
-fn python_restored_clones_draw_different_random_bytes() {
+#[tokio::test]
+async fn python_restored_clones_draw_different_random_bytes() {
     let mut sandbox = boot_python();
-    sandbox.run("import os").expect("warm up");
+    sandbox.run("import os").await.expect("warm up");
     let dir = common::temp_dir("step-random");
     checkpoint_to(sandbox, &dir);
 
-    let draw = |label: &str| -> String {
+    let draw = async |label: &str| -> String {
         let mut clone = restore_from(&dir).boot().expect("restore");
         clone
             .run("import os; print('rand', os.urandom(16).hex(), flush=True)")
+            .await
             .expect("run");
         let out = clone.drain_output();
         out.lines()
@@ -567,8 +602,8 @@ fn python_restored_clones_draw_different_random_bytes() {
             .map(|h| h.trim().to_string())
             .unwrap_or_else(|| panic!("{label}: no random line in {out:?}"))
     };
-    let first = draw("first clone");
-    let second = draw("second clone");
+    let first = draw("first clone").await;
+    let second = draw("second clone").await;
     assert_ne!(
         first, second,
         "two guests restored from the same checkpoint drew identical random bytes"
@@ -578,8 +613,8 @@ fn python_restored_clones_draw_different_random_bytes() {
 /// A checkpoint taken at a step boundary *in the middle of a call* resumes
 /// that call: the restored guest's parked interpreter wakes, prints the
 /// ticks it had left, and reports the call done.
-#[test]
-fn python_checkpoint_resumes_mid_call() {
+#[tokio::test]
+async fn python_checkpoint_resumes_mid_call() {
     let mut sandbox = boot_python();
     // Five ticks: however long the restore takes, its resume entry runs at
     // most one overdue tick, which leaves the restored guest waits to park on.
@@ -587,13 +622,13 @@ fn python_checkpoint_resumes_mid_call() {
     sandbox.drain_output();
 
     // Run until the first tick has printed, then stop at that boundary.
-    let (head, _, done) = drive(&mut sandbox, |out| out.contains("tick 0"));
+    let (head, _, done) = drive(&mut sandbox, |out| out.contains("tick 0")).await;
     assert!(!done, "call finished before we could checkpoint: {head:?}");
     assert!(!head.contains("tick 1"), "ran past the boundary: {head:?}");
     let snapshot = sandbox.snapshot().expect("snapshot");
 
     // The original finishes on its own...
-    let (tail, _, done) = drive(&mut sandbox, |_| false);
+    let (tail, _, done) = drive(&mut sandbox, |_| false).await;
     assert!(done);
     assert!(
         tail.contains("tick 1") && tail.contains("tick 4") && tail.contains("done"),
@@ -606,7 +641,7 @@ fn python_checkpoint_resumes_mid_call() {
     let mut restored = SandboxBuilder::from_snapshot(snapshot)
         .boot()
         .expect("restore");
-    let (rest, timers, done) = drive(&mut restored, |_| false);
+    let (rest, timers, done) = drive(&mut restored, |_| false).await;
     assert!(done, "restored guest never completed the call: {rest:?}");
     assert!(
         timers >= 1,
@@ -620,24 +655,27 @@ fn python_checkpoint_resumes_mid_call() {
         rest.contains("tick 1") && rest.contains("tick 4") && rest.contains("done"),
         "{rest:?}"
     );
-    restored.run("print('again')").expect("run after restore");
+    restored
+        .run("print('again')")
+        .await
+        .expect("run after restore");
     assert!(restored.drain_output().contains("again"));
 }
 
 /// The same, through the on-disk layout: what a checkpoint/restore across
 /// two host processes does.
-#[test]
-fn python_checkpoint_round_trips_through_disk_mid_call() {
+#[tokio::test]
+async fn python_checkpoint_round_trips_through_disk_mid_call() {
     let mut sandbox = boot_python();
     sandbox.submit(tick_script(3, 30)).expect("submit");
     sandbox.drain_output();
-    let (_, _, done) = drive(&mut sandbox, |out| out.contains("tick 1"));
+    let (_, _, done) = drive(&mut sandbox, |out| out.contains("tick 1")).await;
     assert!(!done);
     let dir = common::temp_dir("step-python");
     checkpoint_to(sandbox, &dir);
 
     let mut restored = restore_from(&dir).boot().expect("restore");
-    let (rest, _, done) = drive(&mut restored, |_| false);
+    let (rest, _, done) = drive(&mut restored, |_| false).await;
     assert!(done, "restored guest never completed the call: {rest:?}");
     assert!(
         !rest.contains("tick 1"),
@@ -661,25 +699,29 @@ fn http_get(port: u16, path: &str) -> String {
 /// Step `sandbox` on this thread while `f` talks to it from another; `f`'s
 /// result is returned once it finishes.  The guest is left parked at a
 /// step boundary.
-fn while_serving<T: Send + 'static>(
+async fn while_serving<T: Send + 'static>(
     sandbox: &mut AppSandbox,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> T {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, mut rx) = futures::channel::oneshot::channel();
+    let mut output = sandbox.drain_output();
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
     let start = Instant::now();
     loop {
-        if let Ok(v) = rx.try_recv() {
+        if let Some(v) = rx.try_recv().expect("client thread failed") {
             return v;
         }
         assert!(
             start.elapsed() < MAX_WALL,
-            "client did not finish; output: {:?}",
-            sandbox.drain_output()
+            "client did not finish; output: {output:?}"
         );
-        match sandbox.step(Duration::from_millis(20)).expect("step") {
+        match tokio::time::timeout(MAX_WALL, sandbox.step())
+            .await
+            .expect("server did not reach a boundary")
+            .expect("step")
+        {
             Yield::Exited { status } => {
                 panic!(
                     "server exited with {status}; output: {:?}",
@@ -692,7 +734,20 @@ fn while_serving<T: Send + 'static>(
                     sandbox.drain_output()
                 )
             }
-            Yield::CallDone | Yield::Blocked { .. } => {}
+            Yield::CallDone => return rx.await.expect("client thread failed"),
+            Yield::Blocked { .. } => {
+                let current = sandbox.drain_output();
+                output.push_str(&current);
+                // Once the guest has sent the whole response, the client can
+                // finish without another VM entry. Do not start a pending step
+                // merely to wait for the client and then cancel it.
+                if current.contains("response sent") {
+                    return tokio::time::timeout(MAX_WALL, rx)
+                        .await
+                        .expect("client did not consume the response")
+                        .expect("client thread failed");
+                }
+            }
         }
     }
 }
@@ -701,8 +756,8 @@ fn while_serving<T: Send + 'static>(
 /// `Exec` and therefore still *inside* that call when the guest is
 /// checkpointed: the request count must carry over to a guest restored
 /// from disk in a fresh sandbox, which binds its listener again itself.
-#[test]
-fn python_http_server_survives_checkpoint_restore() {
+#[tokio::test]
+async fn python_http_server_survives_checkpoint_restore() {
     init_logs();
     let rootfs = common::require_rootfs("python");
     const PORT: u16 = 18089;
@@ -728,6 +783,7 @@ class H(http.server.BaseHTTPRequestHandler):
         body = f"count={{H.n}}".encode()
         self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
         self.wfile.write(body)
+        print("response sent", flush=True)
     def log_message(self, *a): pass
 socketserver.TCPServer.allow_reuse_address = True
 with socketserver.TCPServer(("0.0.0.0", {PORT}), H) as s:
@@ -739,14 +795,14 @@ with socketserver.TCPServer(("0.0.0.0", {PORT}), H) as s:
     // and keep stepping by hand.
     sandbox.submit(server).expect("submit");
 
-    let body = while_serving(&mut sandbox, || http_get(PORT, "/"));
+    let body = while_serving(&mut sandbox, || http_get(PORT, "/")).await;
     assert_eq!(
         body,
         "count=1",
         "first request; output: {:?}",
         sandbox.drain_output()
     );
-    let body = while_serving(&mut sandbox, || http_get(PORT, "/"));
+    let body = while_serving(&mut sandbox, || http_get(PORT, "/")).await;
     assert_eq!(body, "count=2");
 
     // Snapshot to disk: guest memory as an OCI layout, nothing else.  The
@@ -763,7 +819,7 @@ with socketserver.TCPServer(("0.0.0.0", {PORT}), H) as s:
         .listen_ports(ListenPorts::from_ports([PORT]))
         .boot()
         .expect("restore");
-    let body = while_serving(&mut restored, || http_get(PORT, "/"));
+    let body = while_serving(&mut restored, || http_get(PORT, "/")).await;
     assert_eq!(
         body,
         "count=3",
@@ -778,8 +834,8 @@ with socketserver.TCPServer(("0.0.0.0", {PORT}), H) as s:
 /// it closed and get back to `accept`, or it never serves another request.
 /// This keeps an HTTP/1.1 keep-alive connection open across the checkpoint
 /// and asserts the restored server still answers a new one.
-#[test]
-fn python_http_server_recovers_from_dead_keepalive_connection() {
+#[tokio::test]
+async fn python_http_server_recovers_from_dead_keepalive_connection() {
     let rootfs = common::require_rootfs("python");
     init_logs();
     const PORT: u16 = 18092;
@@ -801,6 +857,7 @@ class H(http.server.BaseHTTPRequestHandler):
         body = f"count={{H.n}}".encode()
         self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
         self.wfile.write(body)
+        print("response sent", flush=True)
     def log_message(self, *a): pass
 socketserver.TCPServer.allow_reuse_address = True
 with socketserver.TCPServer(("0.0.0.0", {PORT}), H) as s:
@@ -826,7 +883,8 @@ with socketserver.TCPServer(("0.0.0.0", {PORT}), H) as s:
             text.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
         s
-    });
+    })
+    .await;
 
     let snapshot = sandbox.snapshot().expect("snapshot");
     drop(sandbox);
@@ -839,7 +897,7 @@ with socketserver.TCPServer(("0.0.0.0", {PORT}), H) as s:
         .listen_ports(ListenPorts::from_ports([PORT]))
         .boot()
         .expect("restore");
-    let body = while_serving(&mut restored, || http_get(PORT, "/"));
+    let body = while_serving(&mut restored, || http_get(PORT, "/")).await;
     assert_eq!(
         body,
         "count=2",
@@ -853,8 +911,8 @@ with socketserver.TCPServer(("0.0.0.0", {PORT}), H) as s:
 /// a client that starts reading only after a delay, so the server's only
 /// thread parks on writability with no timer and no readable socket in
 /// sight.  Only the host watching writability can get it going again.
-#[test]
-fn python_server_large_response_to_slow_reader() {
+#[tokio::test]
+async fn python_server_large_response_to_slow_reader() {
     let rootfs = common::require_rootfs("python");
     init_logs();
     const PORT: u16 = 18093;
@@ -889,26 +947,15 @@ fn python_server_large_response_to_slow_reader() {
         let mut buf = Vec::new();
         let _ = s.read_to_end(&mut buf);
         buf.len()
-    });
+    })
+    .await;
     assert_eq!(received, BODY, "output: {:?}", sandbox.drain_output());
     // The server finished and closed while the client was still reading,
     // so its call completed inside `while_serving`; the guest is idle and
     // takes the next call.
     assert!(sandbox.drain_output().contains("sent"));
-    sandbox.run("print('again')").expect("next call");
+    sandbox.run("print('again')").await.expect("next call");
     assert!(sandbox.drain_output().contains("again"));
-}
-
-/// CPU time consumed so far by the calling thread, from procfs.
-#[cfg(target_os = "linux")]
-fn thread_cpu_time() -> Duration {
-    let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("procfs");
-    // Fields after the parenthesised command name; utime and stime are the
-    // 14th and 15th fields overall, in USER_HZ (always 100) ticks.
-    let rest = &stat[stat.rfind(')').expect("stat format") + 2..];
-    let f: Vec<&str> = rest.split_whitespace().collect();
-    let ticks: u64 = f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap();
-    Duration::from_millis(ticks * 10)
 }
 
 /// The point of the model: a server with nothing to do costs the host
@@ -917,8 +964,8 @@ fn thread_cpu_time() -> Duration {
 /// host parks in `poll(2)` on the guest's timer and sockets instead of the
 /// guest spinning in its idle loop.
 #[cfg(target_os = "linux")]
-#[test]
-fn idle_server_costs_no_cpu() {
+#[tokio::test]
+async fn idle_server_costs_no_cpu() {
     let rootfs = common::require_rootfs("python");
     init_logs();
     const PORT: u16 = 18091;
@@ -940,13 +987,11 @@ fn idle_server_costs_no_cpu() {
     sandbox.submit(server).expect("submit");
 
     let wall = Duration::from_secs(1);
-    let cpu_before = thread_cpu_time();
+    let cpu_before = common::thread_cpu_time();
     let start = Instant::now();
     let mut steps = 0;
     while start.elapsed() < wall {
-        let y = sandbox
-            .step(wall.saturating_sub(start.elapsed()))
-            .expect("step");
+        let y = sandbox.step().await.expect("step");
         assert!(
             matches!(y, Yield::Blocked { .. }),
             "server stopped: {y:?}, output {:?}",
@@ -954,7 +999,7 @@ fn idle_server_costs_no_cpu() {
         );
         steps += 1;
     }
-    let cpu = thread_cpu_time() - cpu_before;
+    let cpu = common::thread_cpu_time() - cpu_before;
 
     // serve_forever wakes every 0.5 s, so a second of idling is two or
     // three steps; each is microseconds of host work.
@@ -968,12 +1013,107 @@ fn idle_server_costs_no_cpu() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn async_idle_listener_and_timers_cost_no_cpu() {
+    let mut sandbox = SandboxBuilder::from_initrd(common::require_rootfs("python"))
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .echo_output(false)
+        .boot()
+        .unwrap();
+    sandbox
+        .submit(
+            r#"
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+s.settimeout(0.2)
+for _ in range(5):
+    try:
+        s.accept()
+        raise AssertionError("unexpected connection")
+    except socket.timeout:
+        pass
+s.close()
+"#,
+        )
+        .unwrap();
+    let cpu_before = common::thread_cpu_time();
+    let start = Instant::now();
+    let steps = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            match sandbox.step().await.unwrap() {
+                Yield::CallDone => break steps,
+                Yield::Blocked { .. } => {}
+                other => panic!("unexpected yield: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let cpu = common::thread_cpu_time() - cpu_before;
+    assert!(start.elapsed() >= Duration::from_millis(900));
+    assert!(steps <= 8, "idle listener took {steps} steps");
+    assert!(
+        cpu < Duration::from_millis(200),
+        "idle listener used {cpu:?} CPU"
+    );
+}
+
+#[tokio::test]
+async fn async_unread_socket_data_does_not_spin() {
+    let mut sandbox = SandboxBuilder::from_initrd(common::require_rootfs("python"))
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .echo_output(false)
+        .boot()
+        .unwrap();
+    sandbox
+        .submit(
+            "import socket, time\n\
+         s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1)\n\
+         print('port', s.getsockname()[1], flush=True)\n\
+         c, _ = s.accept()\n\
+         time.sleep(0.2)\n\
+         assert c.recv(5) == b'hello'\n\
+         c.close(); s.close()\n",
+        )
+        .unwrap();
+    let port: u16 = sandbox
+        .drain_output()
+        .lines()
+        .find_map(|line| line.strip_prefix("port "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client.write_all(b"hello").unwrap();
+    let steps = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            match sandbox.step().await.unwrap() {
+                Yield::CallDone => break steps,
+                Yield::Blocked { .. } => {}
+                other => panic!("unexpected yield: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(steps <= 4, "unread socket caused {steps} VM entries");
+}
+
 /// A plain Linux binary as the guest entry point — no driver, no `Exec`:
 /// the Go counter server from `examples/go` boots under the pump, answers
 /// HTTP, and keeps its in-memory request count across a checkpoint into a
 /// fresh sandbox.
-#[test]
-fn go_counter_entry_survives_checkpoint_restore() {
+#[tokio::test]
+async fn go_counter_entry_survives_checkpoint_restore() {
     init_logs();
     let rootfs = common::require_rootfs("go");
     let bins = common::require_bin("go", "counter");
@@ -997,11 +1137,11 @@ fn go_counter_entry_survives_checkpoint_restore() {
     );
 
     // Boot returned at the server's first idle; it should already be up.
-    let ready = while_serving(&mut sandbox, || http_get(PORT, "/readyz"));
+    let ready = while_serving(&mut sandbox, || http_get(PORT, "/readyz")).await;
     assert_eq!(ready.trim(), "ok", "output: {:?}", sandbox.drain_output());
-    let body = while_serving(&mut sandbox, || http_get(PORT, "/"));
+    let body = while_serving(&mut sandbox, || http_get(PORT, "/")).await;
     assert!(body.contains("count: 1"), "{body:?}");
-    let body = while_serving(&mut sandbox, || http_get(PORT, "/"));
+    let body = while_serving(&mut sandbox, || http_get(PORT, "/")).await;
     assert!(body.contains("count: 2"), "{body:?}");
 
     let dir = common::temp_dir("step-counter");
@@ -1013,7 +1153,7 @@ fn go_counter_entry_survives_checkpoint_restore() {
         .listen_ports(ListenPorts::from_ports([PORT]))
         .boot()
         .expect("restore");
-    let body = while_serving(&mut restored, || http_get(PORT, "/"));
+    let body = while_serving(&mut restored, || http_get(PORT, "/")).await;
     assert!(
         body.contains("count: 3"),
         "restored guest lost its state: {body:?}; output: {:?}",

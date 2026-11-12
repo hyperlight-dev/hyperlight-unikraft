@@ -9,14 +9,14 @@ use hyperlight_unikraft::{
 
 /// Networking disabled by default — guest socket calls fail because
 /// every socket() is refused with EACCES, as a policy refuses a destination.
-#[test]
-fn net_policy_disabled_by_default() {
+#[tokio::test]
+async fn net_policy_disabled_by_default() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run(SOCKET_PROBE).unwrap();
+    sandbox.run(SOCKET_PROBE).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("socket: errno 13"),
@@ -37,8 +37,8 @@ except OSError as e:
 /// The net_* host functions exist on every path, so a snapshot saved under
 /// a policy restores without one: the restore is accepted and the guest
 /// simply has no network.
-#[test]
-fn snapshot_under_a_policy_restores_without_one() {
+#[tokio::test]
+async fn snapshot_under_a_policy_restores_without_one() {
     let dir = common::temp_dir("net-then-none");
     let snap = dir.path().join("snap");
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
@@ -46,7 +46,7 @@ fn snapshot_under_a_policy_restores_without_one() {
         .network(NetworkPolicy::AllowAll)
         .boot()
         .unwrap();
-    sandbox.run(SOCKET_PROBE).unwrap();
+    sandbox.run(SOCKET_PROBE).await.unwrap();
     assert!(sandbox.drain_output().contains("socket: ok"));
     sandbox.snapshot_to(&snap).unwrap();
     drop(sandbox);
@@ -55,7 +55,7 @@ fn snapshot_under_a_policy_restores_without_one() {
         .unwrap()
         .boot()
         .unwrap();
-    sandbox.run(SOCKET_PROBE).unwrap();
+    sandbox.run(SOCKET_PROBE).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("socket: errno 13"),
@@ -65,8 +65,8 @@ fn snapshot_under_a_policy_restores_without_one() {
 
 /// And the other way round: a warm snapshot saved without a policy gets
 /// the network the restore names.
-#[test]
-fn snapshot_without_a_policy_restores_under_one() {
+#[tokio::test]
+async fn snapshot_without_a_policy_restores_under_one() {
     let dir = common::temp_dir("none-then-net");
     let snap = dir.path().join("snap");
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
@@ -81,7 +81,7 @@ fn snapshot_without_a_policy_restores_under_one() {
         .network(NetworkPolicy::AllowAll)
         .boot()
         .unwrap();
-    sandbox.run(SOCKET_PROBE).unwrap();
+    sandbox.run(SOCKET_PROBE).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("socket: ok"),
@@ -90,9 +90,9 @@ fn snapshot_without_a_policy_restores_under_one() {
 }
 
 /// AllowAll blocks link-local addresses (cloud metadata service).
-#[test]
-fn net_policy_allowall_blocks_link_local() {
-    let output = net_probe(Some(NetworkPolicy::AllowAll), None, "169.254.169.254", 80);
+#[tokio::test]
+async fn net_policy_allowall_blocks_link_local() {
+    let output = net_probe(Some(NetworkPolicy::AllowAll), None, "169.254.169.254", 80).await;
     assert!(
         output.contains("TCP_BLOCKED"),
         "expected link-local 169.254.169.254 to be TCP-blocked even with AllowAll, got: {output:?}",
@@ -107,14 +107,15 @@ fn net_policy_allowall_blocks_link_local() {
 /// patterns.  In the hostsock model all guest sockets are host sockets,
 /// so blocking loopback would prevent guest-internal networking.
 /// AllowList/BlockList still block loopback (defense in depth).
-#[test]
-fn net_policy_allowall_permits_loopback() {
+#[tokio::test]
+async fn net_policy_allowall_permits_loopback() {
     let output = net_probe(
         Some(NetworkPolicy::AllowAll),
         None,
         "127.0.0.1",
         UNUSED_PORT,
-    );
+    )
+    .await;
     // Loopback should pass the policy check.  TCP gives ECONNREFUSED
     // (nothing listening), not EACCES.  UDP sendto succeeds.
     assert!(
@@ -132,11 +133,11 @@ fn net_policy_allowall_permits_loopback() {
 /// Uses the host's own IP on a non-listening port — the kernel RSTs
 /// immediately (ECONNREFUSED), proving the policy check passed without
 /// waiting for a remote TCP handshake.
-#[test]
-fn net_policy_allowlist_permits() {
+#[tokio::test]
+async fn net_policy_allowlist_permits() {
     let ip = host_ip();
     let al = AllowList::from_hosts(&[ip.as_str()]).unwrap();
-    let output = net_probe(Some(NetworkPolicy::AllowList(al)), None, &ip, UNUSED_PORT);
+    let output = net_probe(Some(NetworkPolicy::AllowList(al)), None, &ip, UNUSED_PORT).await;
     assert!(
         !output.contains("TCP_BLOCKED"),
         "expected allowlisted IP {ip} to pass TCP policy check, got: {output:?}",
@@ -148,10 +149,10 @@ fn net_policy_allowlist_permits() {
 }
 
 /// AllowList blocks connections to an unlisted IP.
-#[test]
-fn net_policy_allowlist_blocks() {
+#[tokio::test]
+async fn net_policy_allowlist_blocks() {
     let al = AllowList::from_hosts(&["93.184.216.34"]).unwrap();
-    let output = net_probe(Some(NetworkPolicy::AllowList(al)), None, "1.2.3.4", 80);
+    let output = net_probe(Some(NetworkPolicy::AllowList(al)), None, "1.2.3.4", 80).await;
     assert!(
         output.contains("TCP_BLOCKED"),
         "expected unlisted IP 1.2.3.4 to be TCP-blocked by AllowList, got: {output:?}",
@@ -162,8 +163,8 @@ fn net_policy_allowlist_blocks() {
     );
 }
 
-#[test]
-fn restricted_datagram_probes_cannot_reach_host_services() {
+#[tokio::test]
+async fn restricted_datagram_probes_cannot_reach_host_services() {
     use std::net::{TcpListener, UdpSocket};
 
     let mut receivers = Vec::new();
@@ -229,7 +230,7 @@ print('loopback probes ok; all payload paths refused')
         .boot()
         .unwrap();
     sandbox.snapshot_to(snap.path()).unwrap();
-    sandbox.run(code.as_str()).unwrap();
+    sandbox.run(code.as_str()).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("loopback probes ok; all payload paths refused"),
@@ -241,7 +242,7 @@ print('loopback probes ok; all payload paths refused')
         .network(NetworkPolicy::AllowList(AllowList::empty()))
         .boot()
         .unwrap();
-    sandbox.run(code.as_str()).unwrap();
+    sandbox.run(code.as_str()).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("loopback probes ok; all payload paths refused"),
@@ -262,10 +263,10 @@ print('loopback probes ok; all payload paths refused')
 }
 
 /// BlockList blocks connections to a listed IP.
-#[test]
-fn net_policy_blocklist_blocks() {
+#[tokio::test]
+async fn net_policy_blocklist_blocks() {
     let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
-    let output = net_probe(Some(NetworkPolicy::BlockList(bl)), None, "1.2.3.4", 80);
+    let output = net_probe(Some(NetworkPolicy::BlockList(bl)), None, "1.2.3.4", 80).await;
     assert!(
         output.contains("TCP_BLOCKED"),
         "expected listed IP 1.2.3.4 to be TCP-blocked by BlockList, got: {output:?}",
@@ -279,11 +280,11 @@ fn net_policy_blocklist_blocks() {
 /// BlockList permits connections to an unlisted IP.
 ///
 /// Uses the host's own IP (same as allowlist_permits) for instant response.
-#[test]
-fn net_policy_blocklist_permits() {
+#[tokio::test]
+async fn net_policy_blocklist_permits() {
     let ip = host_ip();
     let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
-    let output = net_probe(Some(NetworkPolicy::BlockList(bl)), None, &ip, UNUSED_PORT);
+    let output = net_probe(Some(NetworkPolicy::BlockList(bl)), None, &ip, UNUSED_PORT).await;
     assert!(
         !output.contains("TCP_BLOCKED"),
         "expected unlisted IP {ip} to pass TCP BlockList policy check, got: {output:?}",
@@ -298,8 +299,8 @@ fn net_policy_blocklist_permits() {
 /// name; it cannot ask DNS about another name, and it cannot connect to
 /// an address it was never given.  Needs the internet, as
 /// `python_http_get` does.
-#[test]
-fn net_policy_allowlist_by_name_end_to_end() {
+#[tokio::test]
+async fn net_policy_allowlist_by_name_end_to_end() {
     let rootfs = require_rootfs("python");
     let al = AllowList::from_hosts(&["example.com"]).unwrap();
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -324,6 +325,7 @@ fn net_policy_allowlist_by_name_end_to_end() {
             "except OSError as e:\n",
             "    print('literal', 'refused' if e.errno == errno.EACCES else e)\n",
         ))
+        .await
         .unwrap();
     let out = sandbox.drain_output();
     assert!(out.contains("listed 200"), "{out:?}");
@@ -351,8 +353,8 @@ impl NetworkFilter for OneNameOnePort {
 /// allows, and nothing else: not that name on another port, not another
 /// name, not a literal address.  Turning the filter off applies at the
 /// next run, without booting again.  Needs the internet.
-#[test]
-fn net_policy_filter_end_to_end() {
+#[tokio::test]
+async fn net_policy_filter_end_to_end() {
     let rootfs = require_rootfs("python");
     let filter = std::sync::Arc::new(OneNameOnePort {
         name: "example.com",
@@ -386,6 +388,7 @@ fn net_policy_filter_end_to_end() {
             "except OSError:\n",
             "    print('other name refused')\n",
         ))
+        .await
         .unwrap();
     let out = sandbox.drain_output();
     assert!(out.contains("allowed 200"), "{out:?}");
@@ -403,6 +406,7 @@ fn net_policy_filter_end_to_end() {
             "except OSError:\n",
             "    print('now refused')\n",
         ))
+        .await
         .unwrap();
     let out = sandbox.drain_output();
     assert!(out.contains("now refused"), "{out:?}");
@@ -411,8 +415,8 @@ fn net_policy_filter_end_to_end() {
 /// A guest under a block list of one name cannot resolve it, cannot
 /// connect to the address it has now even without resolving, and can
 /// reach anything else.  Needs the internet.
-#[test]
-fn net_policy_blocklist_by_name_end_to_end() {
+#[tokio::test]
+async fn net_policy_blocklist_by_name_end_to_end() {
     use std::net::ToSocketAddrs;
     let rootfs = require_rootfs("python");
     // What the name resolves to right now, for the guest that has the
@@ -450,7 +454,7 @@ fn net_policy_blocklist_by_name_end_to_end() {
         ),
         ip = blocked_ip
     );
-    sandbox.run(&*code).unwrap();
+    sandbox.run(&*code).await.unwrap();
     let out = sandbox.drain_output();
     assert!(out.contains("blocked name failed"), "{out:?}");
     assert!(out.contains("blocked address refused"), "{out:?}");
@@ -461,8 +465,8 @@ fn net_policy_blocklist_by_name_end_to_end() {
 /// candidate through one IPv6 UDP socket, disconnecting it with an
 /// AF_UNSPEC connect in between.  A passive lookup, what `http.server`
 /// does to bind, is the shortest path to that: it must not abort the guest.
-#[test]
-fn net_getaddrinfo_dual_stack_passive() {
+#[tokio::test]
+async fn net_getaddrinfo_dual_stack_passive() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -474,7 +478,7 @@ fn net_getaddrinfo_dual_stack_passive() {
          ai = socket.getaddrinfo(None, 8000, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)\n\
          print('FAMILIES', sorted({a[0] for a in ai}))\n\
          print('GAI_OK')",
-    );
+    ).await;
     let output = sandbox.drain_output();
     assert!(
         result.is_ok() && output.contains("GAI_OK"),
@@ -485,8 +489,8 @@ fn net_getaddrinfo_dual_stack_passive() {
 /// A stream that arrives in two parts is read as fast as it arrives, with
 /// a socket timeout set (Python then polls before each read): the second
 /// part must wake the guest, not wait out the timeout.
-#[test]
-fn net_recv_wakes_for_data_after_a_short_read() {
+#[tokio::test]
+async fn net_recv_wakes_for_data_after_a_short_read() {
     use std::io::Write;
     use std::net::TcpListener;
     use std::time::Duration;
@@ -513,7 +517,7 @@ fn net_recv_wakes_for_data_after_a_short_read() {
          \x20   n += len(b)\n\
          print('read', n, 'in', round(time.time() - t, 1))\n"
     );
-    sandbox.run(code.as_str()).unwrap();
+    sandbox.run(code.as_str()).await.unwrap();
     server.join().unwrap();
     let output = sandbox.drain_output();
     let secs: f64 = output

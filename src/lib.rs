@@ -12,7 +12,7 @@
 //!     let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
 //!         .scratch_mb(256)
 //!         .boot()?;
-//!     sandbox.run_async("print('hello')").await?;
+//!     sandbox.run("print('hello')").await?;
 //!     let output = sandbox.drain_output();
 //!     assert!(output.contains("hello"));
 //!     Ok(())
@@ -20,7 +20,7 @@
 //! ```
 //!
 //! Driving methods are async and require Tokio's time and I/O drivers.
-//! Synchronous driving methods remain as migration adapters. Boot, submission, snapshots and
+//! There is no separate blocking driver. Boot, submission, snapshots and
 //! restore remain synchronous and may enqueue work for the next async step.
 
 use std::fmt::Write as _;
@@ -97,7 +97,7 @@ pub enum Error {
     )]
     Deadlocked,
     /// The guest has no driver to serve calls: its entry point is a plain
-    /// program, driven with [`AppSandbox::join_async`].
+    /// program, driven with [`AppSandbox::join`].
     #[error(
         "the guest has no driver to serve calls: its entry point is a plain program (drive it \
          with join)"
@@ -107,7 +107,7 @@ pub enum Error {
     #[error("a call is already in flight; step until it is done first")]
     CallInFlight,
     /// Nothing in the guest can exit: its driver is waiting for a call
-    /// (use [`AppSandbox::run_async`] or [`AppSandbox::submit`], not `join`).
+    /// (use [`AppSandbox::run`] or [`AppSandbox::submit`], not `join`).
     #[error(
         "nothing in the guest can exit: its driver is waiting for a call (use run or submit \
          instead of join)"
@@ -1003,7 +1003,7 @@ impl Mount {
     /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
     ///     .mount(Mount::backend(quota_backend(), "/output", false))
     ///     .boot()?;
-    /// sandbox.run_async("open('/output/result.txt', 'w').write('42')").await?;
+    /// sandbox.run("open('/output/result.txt', 'w').write('42')").await?;
     /// # Ok::<(), hyperlight_unikraft::Error>(())
     /// # }
     /// ```
@@ -1023,7 +1023,7 @@ impl Mount {
 
 // ── Cooperative step ────────────────────────────────────────────────────
 
-/// Why [`AppSandbox::step_async`] handed control back.
+/// Why [`AppSandbox::step`] handed control back.
 ///
 /// The guest runs its scheduler only until every thread is blocked, then
 /// yields the vCPU with a report; the host waits for what the report says
@@ -1047,7 +1047,7 @@ pub enum Yield {
     /// Every guest thread is blocked.  `until` is the guest's next timer,
     /// or `None` when only I/O on one of its host sockets can wake it.
     ///
-    /// [`AppSandbox::step_async`] returns this in two cases it does not tell
+    /// [`AppSandbox::step`] returns this in two cases it does not tell
     /// apart: the guest ran and blocked again, or the timeout ran out and
     /// the VM was never entered (then `until` is the last one heard).
     /// TODO: a distinct variant if a caller ever needs to know whether
@@ -1404,7 +1404,7 @@ impl GuestConfig {
     /// # use hyperlight_unikraft::SandboxBuilder;
     /// let sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio").boot().unwrap();
     /// sandbox.set_env_vars(&[("MY_VAR", "hello"), ("DEBUG", "1")]);
-    /// // the next sandbox.run_async(…) observes them
+    /// // the next sandbox.run(…) observes them
     /// ```
     pub fn set_env_vars(&self, vars: &[(&str, &str)]) {
         let mut s = String::new();
@@ -2300,7 +2300,7 @@ fn assemble_sandbox(
 ///     .network(NetworkPolicy::AllowAll)
 ///     .env("GREETING", "hi")
 ///     .boot()?;
-/// sandbox.run_async("import os; print(os.environ['GREETING'])").await?;
+/// sandbox.run("import os; print(os.environ['GREETING'])").await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -2496,11 +2496,11 @@ impl SandboxBuilder {
     /// code in the sandbox one capability rather than a directory or the
     /// network.  It takes the guest's argument text and returns its result
     /// text, or an error message the guest raises; the drivers pass JSON.
-    /// JavaScript calls it as `host.call_async(name, ...args)` (quickjs, node),
+    /// JavaScript calls it as `host.call(name, ...args)` (quickjs, node),
     /// and in quickjs `a.b` is also the export `b` of the module `host:a`;
-    /// Python as `hyperlight.call_async(name, *args)` or `hyperlight.host.a.b()`
+    /// Python as `hyperlight.call(name, *args)` or `hyperlight.host.a.b()`
     /// (python, python-shell, agent); C# as `Host.Call(name, args)`
-    /// (dotnet-jit); Java as `Host.call_async(name, args)` (java); PHP as
+    /// (dotnet-jit); Java as `Host.call(name, args)` (java); PHP as
     /// `Hyperlight\call($name, ...$args)` (php); the wasmtime image
     /// satisfies a module's or a component's import `a.b` with it.
     ///
@@ -2514,7 +2514,7 @@ impl SandboxBuilder {
     ///         Ok((a + b).to_string())
     ///     })
     ///     .boot()?;
-    /// sandbox.run_async("import { add } from 'host:math'; console.log(add(2, 3))").await?;
+    /// sandbox.run("import { add } from 'host:math'; console.log(add(2, 3))").await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -2536,8 +2536,8 @@ impl SandboxBuilder {
     ///
     /// Arguments and results have the same JSON convention as
     /// [`host_function`](Self::host_function). Only the calling guest
-    /// thread parks. Await [`AppSandbox::run_async`] or
-    /// [`AppSandbox::step_async`] to drive its future. The factory is
+    /// thread parks. Await [`AppSandbox::run`] or
+    /// [`AppSandbox::step`] to drive its future. The factory is
     /// invoked lazily by the executor, so it may construct Tokio timers.
     /// Sync and async registrations share a namespace; the last wins.
     /// Restoring a pending-call snapshot interrupts unfinished calls with
@@ -2553,7 +2553,7 @@ impl SandboxBuilder {
     ///             Ok(args)
     ///         })
     ///         .boot()?;
-    ///     sandbox.run_async("import hyperlight; hyperlight.call('later', 42)").await
+    ///     sandbox.run("import hyperlight; hyperlight.call('later', 42)").await
     /// }
     /// ```
     pub fn async_host_function<F, Fut>(mut self, name: impl Into<String>, function: F) -> Self
@@ -2592,7 +2592,7 @@ impl SandboxBuilder {
     ///     .echo_output(false)
     ///     .boot()?;
     /// sandbox.drain_output(); // the boot's
-    /// sandbox.run_async("print('x' * (2 << 20))").await?;
+    /// sandbox.run("print('x' * (2 << 20))").await?;
     /// let output = sandbox.take_output();
     /// assert_eq!(output.text.len(), 1 << 20);
     /// assert!(output.truncated());
@@ -2864,7 +2864,6 @@ impl SandboxBuilder {
             pending: None,
             clean_scratch_bytes: 0,
             async_poisoned: false,
-            blocking_runtime: None,
         };
         if restored {
             // Put the image right for this host before anyone can observe
@@ -2940,7 +2939,7 @@ pub enum Exec {
     /// as JSON and its return
     /// value (awaited) serialized back; in the wasmtime image an export of
     /// the module or component the guest has loaded, `input` a JSON array
-    /// of its arguments.  Other images fail the call.  [`AppSandbox::call_async`] waits for the result;
+    /// of its arguments.  Other images fail the call.  [`AppSandbox::call`] waits for the result;
     /// [`AppSandbox::take_result`] collects it after a
     /// [`submit`](AppSandbox::submit).
     Call { function: String, input: String },
@@ -2972,11 +2971,11 @@ impl From<String> for Exec {
 /// Two kinds of workload:
 ///
 /// * A *driver* image (the Python, Node, … rootfs) boots a runtime that
-///   waits for calls.  [`run`](Self::run_async) dispatches one and waits for it;
+///   waits for calls.  [`run`](Self::run) dispatches one and waits for it;
 ///   [`submit`](Self::submit) dispatches one and hands the boundaries in
-///   between to the caller through [`step`](Self::step_async).
+///   between to the caller through [`step`](Self::step).
 /// * An *entry-point* image (`--entry /bin/server`) is the workload
-///   itself.  There is nothing to dispatch; [`join`](Self::join_async) keeps it
+///   itself.  There is nothing to dispatch; [`join`](Self::join) keeps it
 ///   going until it exits.
 ///
 /// A guest restored from a snapshot is announced to the kernel with a
@@ -2999,7 +2998,7 @@ pub struct AppSandbox {
     /// every later step reports it again.
     exited: Option<Yield>,
     /// A terminal result produced while delivering a call, handed out by
-    /// the next [`step`](Self::step_async).
+    /// the next [`step`](Self::step).
     pending: Option<Yield>,
     /// hyperlight's scratch allocation count when the guest was last made
     /// clean ([`dirty_bytes`](Self::dirty_bytes)): after the resume entry,
@@ -3007,15 +3006,6 @@ pub struct AppSandbox {
     clean_scratch_bytes: u64,
     async_calls: async_calls::PendingCalls,
     async_poisoned: bool,
-    blocking_runtime: Option<Arc<BlockingRuntime>>,
-}
-
-struct BlockingRuntime(Option<tokio::runtime::Runtime>);
-
-impl Drop for BlockingRuntime {
-    fn drop(&mut self) {
-        self.0.take().unwrap().shutdown_background();
-    }
 }
 
 struct AsyncDriveDropGuard<'a> {
@@ -3035,74 +3025,6 @@ impl Drop for AsyncDriveDropGuard<'_> {
 }
 
 impl AppSandbox {
-    fn blocking_runtime(&mut self) -> Result<Arc<BlockingRuntime>> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(Error::Wait(std::io::Error::other(
-                "use async driving methods inside a Tokio runtime",
-            )));
-        }
-        if self.blocking_runtime.is_none() {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(Error::Wait)?;
-            self.blocking_runtime = Some(Arc::new(BlockingRuntime(Some(runtime))));
-        }
-        Ok(self.blocking_runtime.as_ref().unwrap().clone())
-    }
-
-    /// Execute a guest call synchronously. Prefer [`Self::run_async`] in async code.
-    pub fn run(&mut self, exec: impl Into<Exec>) -> Result<()> {
-        let runtime = self.blocking_runtime()?;
-        runtime.0.as_ref().unwrap().block_on(self.run_async(exec))
-    }
-
-    /// Call a guest function synchronously. Prefer [`Self::call_async`] in async code.
-    pub fn call(&mut self, function: &str, input: &str) -> Result<String> {
-        let runtime = self.blocking_runtime()?;
-        runtime
-            .0
-            .as_ref()
-            .unwrap()
-            .block_on(self.call_async(function, input))
-    }
-
-    /// Wait synchronously for guest exit. Prefer [`Self::join_async`] in async code.
-    pub fn join(&mut self) -> Result<i32> {
-        let runtime = self.blocking_runtime()?;
-        runtime.0.as_ref().unwrap().block_on(self.join_async())
-    }
-
-    /// Advance synchronously, retaining pending work if the timeout expires.
-    pub fn step(&mut self, timeout: Duration) -> Result<Yield> {
-        self.check_ready()?;
-        let runtime = self.blocking_runtime()?;
-        runtime.0.as_ref().unwrap().block_on(async {
-            if self.pending.is_none()
-                && self.exited.is_none()
-                && !self.async_calls.is_pending()
-                && !self.config.can_wake()
-                && !self.config.call_in_flight()
-                && self.has_driver()
-            {
-                tokio::time::sleep(timeout).await;
-                return Ok(Yield::Blocked { until: None });
-            }
-            let mut drive = AsyncDriveDropGuard {
-                sandbox: self,
-                finished: false,
-            };
-            let result = match tokio::time::timeout(timeout, drive.sandbox.step_inner()).await {
-                Ok(result) => result,
-                Err(_) => Ok(Yield::Blocked {
-                    until: drive.sandbox.config.next_wakeup_at(),
-                }),
-            };
-            drive.finished = result.is_ok();
-            result
-        })
-    }
-
     fn check_ready(&self) -> Result<()> {
         if self.sandbox.status().is_unrecoverable() {
             return Err(HyperlightError::UnrecoverableSandbox.into());
@@ -3133,7 +3055,7 @@ impl AppSandbox {
     /// Execute a call while driving async host functions, timers and I/O.
     ///
     /// Accepts inline code, a script file or a guest command (see [`Exec`]).
-    /// Submits the call and awaits [`step`](Self::step_async) until it finishes.
+    /// Submits the call and awaits [`step`](Self::step) until it finishes.
     /// Errors if the guest has no driver ([`Error::NoDriver`]), its call fails
     /// ([`Error::CallFailed`]), it exits before returning ([`Error::GuestExited`]),
     /// or nothing can wake a guest that still owes a result ([`Error::Deadlocked`]).
@@ -3143,10 +3065,10 @@ impl AppSandbox {
     /// drops its pending host calls. Restore a snapshot to recover.
     /// VM entries remain synchronous; an executor timeout cannot interrupt
     /// a CPU-bound guest. Use [`interrupt_handle`](Self::interrupt_handle).
-    pub async fn run_async(&mut self, exec: impl Into<Exec>) -> Result<()> {
+    pub async fn run(&mut self, exec: impl Into<Exec>) -> Result<()> {
         self.submit(exec)?;
         loop {
-            match self.step_async().await? {
+            match self.step().await? {
                 Yield::CallDone => return Ok(()),
                 Yield::CallFailed { status } => return Err(Error::CallFailed { status }),
                 Yield::Exited { status } => return Err(Error::GuestExited { status }),
@@ -3157,7 +3079,7 @@ impl AppSandbox {
 
     /// Call a function the guest has defined and await its UTF-8 result.
     ///
-    /// Load the handler with [`run`](Self::run_async) or from a warm snapshot.
+    /// Load the handler with [`run`](Self::run) or from a warm snapshot.
     /// See [`Exec::Call`] for each image's function and input conventions.
     /// Runtime requirements, errors and cancellation are as for `run`;
     /// a non-UTF-8 result returns [`Error::ResultNotText`].
@@ -3167,14 +3089,14 @@ impl AppSandbox {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> hyperlight_unikraft::Result<()> {
     /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/quickjs.cpio").boot()?;
-    /// sandbox.run_async("function greet(event) { return { message: 'Hello, ' + event.name } }").await?;
-    /// let out = sandbox.call_async("greet", r#"{"name":"World"}"#).await?;
+    /// sandbox.run("function greet(event) { return { message: 'Hello, ' + event.name } }").await?;
+    /// let out = sandbox.call("greet", r#"{"name":"World"}"#).await?;
     /// assert_eq!(out, r#"{"message":"Hello, World"}"#);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn call_async(&mut self, function: &str, input: &str) -> Result<String> {
-        self.run_async(Exec::Call {
+    pub async fn call(&mut self, function: &str, input: &str) -> Result<String> {
+        self.run(Exec::Call {
             function: function.to_string(),
             input: input.to_string(),
         })
@@ -3185,14 +3107,14 @@ impl AppSandbox {
     /// Drive an entry-point image until it exits and return its status.
     ///
     /// An idle driver image returns [`Error::NothingToJoin`].
-    /// Runtime requirements and cancellation are as for [`run`](Self::run_async).
-    pub async fn join_async(&mut self) -> Result<i32> {
+    /// Runtime requirements and cancellation are as for [`run`](Self::run).
+    pub async fn join(&mut self) -> Result<i32> {
         self.check_ready()?;
         if self.exited.is_none() && self.has_driver() && !self.config.call_in_flight() {
             return Err(Error::NothingToJoin);
         }
         loop {
-            match self.step_async().await? {
+            match self.step().await? {
                 Yield::Exited { status } => return Ok(status),
                 Yield::CallDone | Yield::CallFailed { .. } if self.has_driver() => {
                     return Err(Error::NothingToJoin);
@@ -3213,7 +3135,7 @@ impl AppSandbox {
     /// Requires Tokio's time and I/O drivers. This has no timeout argument.
     /// Cancelling it with `tokio::time::timeout` poisons the sandbox; it is not
     /// a bounded probe. Keep the future alive to wait again without cancellation.
-    pub async fn step_async(&mut self) -> Result<Yield> {
+    pub async fn step(&mut self) -> Result<Yield> {
         self.check_ready()?;
         let mut drive = AsyncDriveDropGuard {
             sandbox: self,
@@ -3301,7 +3223,7 @@ impl AppSandbox {
 
     /// The result of the last call, if its driver sent one: for a call
     /// submitted with [`submit`](Self::submit) and driven with
-    /// [`step`](Self::step_async) to [`Yield::CallDone`].  Taken, so a second
+    /// [`step`](Self::step) to [`Yield::CallDone`].  Taken, so a second
     /// take returns `None`.
     pub fn take_result(&self) -> Option<Vec<u8>> {
         self.config.result.lock().unwrap().take()
@@ -3311,11 +3233,11 @@ impl AppSandbox {
     ///
     /// The call is delivered by one VM entry, so the guest runs until it
     /// blocks before this returns.  From then on drive it with
-    /// [`step`](Self::step_async); [`Yield::CallDone`] marks the return.  This is
+    /// [`step`](Self::step); [`Yield::CallDone`] marks the return.  This is
     /// how to keep the boundaries for yourself: to talk to a server the
     /// script started, or to checkpoint in the middle of the call.
     /// Queued host calls are not polled here, even outside a Tokio runtime;
-    /// await [`step`](Self::step_async) to drive them.
+    /// await [`step`](Self::step) to drive them.
     ///
     /// ```no_run
     /// # use hyperlight_unikraft::{SandboxBuilder, Yield};
@@ -3324,7 +3246,7 @@ impl AppSandbox {
     /// # let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio").boot()?;
     /// sandbox.submit("import select; print('a'); select.select([], [], [], 1); print('b')")?;
     /// // 'a' is printed and the script is parked on its one-second wait.
-    /// let y = sandbox.step_async().await?;
+    /// let y = sandbox.step().await?;
     /// // Waited ~1 s (VM halted), re-entered, 'b' printed, script returned.
     /// assert_eq!(y, Yield::CallDone);
     /// # Ok(())
@@ -3404,7 +3326,7 @@ impl AppSandbox {
     /// it reseeds its CSPRNG and re-establishes the guest's host sockets.
     /// Like a step, it runs the scheduler to the next boundary, so a
     /// terminal outcome (a call in flight at snapshot time finishing, or
-    /// the process exiting) is kept for the next [`step`](Self::step_async).
+    /// the process exiting) is kept for the next [`step`](Self::step).
     fn resume(&mut self) -> Result<()> {
         let yielded = self.config.enter(&mut self.sandbox, "resume", ());
         // Count from here even when the entry failed: the last baseline
@@ -3595,8 +3517,8 @@ impl AppSandbox {
     }
 
     /// Whether a runtime driver in the guest serves calls, so whether
-    /// [`run`](Self::run_async) and [`submit`](Self::submit) can work.  False for
-    /// an entry-point image, which is driven with [`join`](Self::join_async).
+    /// [`run`](Self::run) and [`submit`](Self::submit) can work.  False for
+    /// an entry-point image, which is driven with [`join`](Self::join).
     /// Known once [`SandboxBuilder::boot`] returns, for a fresh and a
     /// restored guest alike.
     pub fn has_driver(&self) -> bool {
@@ -3771,7 +3693,7 @@ mod tests {
             app.restore(snapshot).unwrap();
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
-                    match app.step_async().await.unwrap() {
+                    match app.step().await.unwrap() {
                         Yield::Blocked { .. } => {}
                         result => break result,
                     }
@@ -3789,10 +3711,7 @@ mod tests {
             assert!(app.drain_output().contains("resumed"));
             if app.async_calls.is_pending() {
                 app.snapshot().unwrap();
-                assert_eq!(
-                    app.step_async().await.unwrap(),
-                    Yield::Blocked { until: None }
-                );
+                assert_eq!(app.step().await.unwrap(), Yield::Blocked { until: None });
             }
             assert!(!app.async_calls.is_pending());
             app.snapshot().unwrap();
@@ -3840,7 +3759,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 loop {
-                    match app.step_async().await.unwrap() {
+                    match app.step().await.unwrap() {
                         Yield::CallDone => break,
                         Yield::Blocked { .. } => {}
                         other => panic!("{other:?}: {}", app.drain_output()),

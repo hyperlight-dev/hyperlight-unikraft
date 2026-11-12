@@ -150,8 +150,8 @@ impl FsBackend for Memory {
 /// read back and removed.  A write past the backend's quota fails in the
 /// guest with the errno it gave, `EDQUOT`, and the backend keeps nothing
 /// of it; links, which the backend does not offer, are refused.
-#[test]
-fn python_on_a_backend_mount() {
+#[tokio::test]
+async fn python_on_a_backend_mount() {
     let rootfs = require_rootfs("python");
     let memory = Memory::new(64 * 1024);
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -192,6 +192,7 @@ fn python_on_a_backend_mount() {
             "with open('/mnt/mem/kept.txt', 'w') as f:\n",
             "    f.write('kept')\n",
         ))
+        .await
         .unwrap();
     let out = sandbox.drain_output();
     assert!(out.contains("listed ['b.txt']"), "{out:?}");
@@ -207,8 +208,8 @@ fn python_on_a_backend_mount() {
 
 /// A read-only backend mount is never asked to write: the guest is told
 /// `EROFS` first.
-#[test]
-fn read_only_backend_mount_is_not_asked_to_write() {
+#[tokio::test]
+async fn read_only_backend_mount_is_not_asked_to_write() {
     let rootfs = require_rootfs("python");
     let memory = Memory::new(1024);
     memory.write("given.txt", None, b"from the host").unwrap();
@@ -227,6 +228,7 @@ fn read_only_backend_mount_is_not_asked_to_write() {
             "except OSError as e:\n",
             "    print('write', errno.errorcode.get(e.errno, e.errno))\n",
         ))
+        .await
         .unwrap();
     let out = sandbox.drain_output();
     assert!(out.contains("read from the host"), "{out:?}");
@@ -283,8 +285,8 @@ impl FsBackend for Unruly {
 /// What a backend gets wrong stays with the guest's call: a panic is
 /// `EIO`, a "raw OS error" of 0 is no success, and names the kernel could
 /// not take are left out of a listing.
-#[test]
-fn a_backends_mistakes_stay_with_the_call() {
+#[tokio::test]
+async fn a_backends_mistakes_stay_with_the_call() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -303,6 +305,7 @@ fn a_backends_mistakes_stay_with_the_call() {
             "        print(errno.errorcode.get(e.errno, e.errno))\n",
             "print(sorted(os.listdir('/mnt/u')))\n",
         ))
+        .await
         .unwrap();
     let out = sandbox.drain_output();
     assert!(out.contains("EIO\nEIO\n['last', 'ok']"), "{out:?}");

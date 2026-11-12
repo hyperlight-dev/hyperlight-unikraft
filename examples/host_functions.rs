@@ -38,25 +38,32 @@ fn sandbox(runtime: &str) -> hyperlight_unikraft::Result<SandboxBuilder> {
     )
 }
 
-fn show(sandbox: &mut AppSandbox, function: &str, input: &str) -> hyperlight_unikraft::Result<()> {
-    let result = sandbox.call(function, input)?;
+async fn show(
+    sandbox: &mut AppSandbox,
+    function: &str,
+    input: &str,
+) -> hyperlight_unikraft::Result<()> {
+    let result = sandbox.call(function, input).await?;
     println!("  {function}({input}) = {result}");
     Ok(())
 }
 
-fn main() -> hyperlight_unikraft::Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> hyperlight_unikraft::Result<()> {
     println!("quickjs:");
     let mut js = sandbox("quickjs")?.boot()?;
     js.run(
         "import { add } from 'host:math';\n\
          globalThis.sumOfSquares = ({ a, b }) => add(a * a, b * b);",
-    )?;
-    show(&mut js, "sumOfSquares", r#"{"a": 3, "b": 4}"#)?;
+    )
+    .await?;
+    show(&mut js, "sumOfSquares", r#"{"a": 3, "b": 4}"#).await?;
 
     println!("node:");
     let mut node = sandbox("node")?.boot()?;
-    node.run("function sumOfSquares({ a, b }) { return host.call('math.add', a * a, b * b) }")?;
-    show(&mut node, "sumOfSquares", r#"{"a": 3, "b": 4}"#)?;
+    node.run("function sumOfSquares({ a, b }) { return host.call('math.add', a * a, b * b) }")
+        .await?;
+    show(&mut node, "sumOfSquares", r#"{"a": 3, "b": 4}"#).await?;
 
     println!("python:");
     let mut py = sandbox("python")?.boot()?;
@@ -64,8 +71,9 @@ fn main() -> hyperlight_unikraft::Result<()> {
         "from hyperlight import host\n\
          def sum_of_squares(e):\n    \
              return host.math.add(e['a'] ** 2, e['b'] ** 2)\n",
-    )?;
-    show(&mut py, "sum_of_squares", r#"{"a": 3, "b": 4}"#)?;
+    )
+    .await?;
+    show(&mut py, "sum_of_squares", r#"{"a": 3, "b": 4}"#).await?;
 
     println!("dotnet-jit:");
     let mut cs = sandbox("dotnet-jit")?.boot()?;
@@ -74,23 +82,23 @@ fn main() -> hyperlight_unikraft::Result<()> {
          public static class Squares {\n\
              public static long SumOfSquares(Pair p) => Host.Call<long>(\"math.add\", p.A * p.A, p.B * p.B);\n\
          }",
-    )?;
-    show(&mut cs, "SumOfSquares", r#"{"a": 3, "b": 4}"#)?;
+    ).await?;
+    show(&mut cs, "SumOfSquares", r#"{"a": 3, "b": 4}"#).await?;
 
     println!("java:");
     let mut java = sandbox("java")?.boot()?;
     java.run(
         "record Pair(long a, long b) {}\n\
          long sumOfSquares(Pair p) { return Host.call(long.class, \"math.add\", p.a() * p.a(), p.b() * p.b()); }",
-    )?;
-    show(&mut java, "sumOfSquares", r#"{"a": 3, "b": 4}"#)?;
+    ).await?;
+    show(&mut java, "sumOfSquares", r#"{"a": 3, "b": 4}"#).await?;
 
     println!("php:");
     let mut php = sandbox("php")?.boot()?;
     php.run(
         "function sum_of_squares(array $p): int { return Hyperlight\\call('math.add', $p['a'] ** 2, $p['b'] ** 2); }",
-    )?;
-    show(&mut php, "sum_of_squares", r#"{"a": 3, "b": 4}"#)?;
+    ).await?;
+    show(&mut php, "sum_of_squares", r#"{"a": 3, "b": 4}"#).await?;
 
     println!("wasmtime:");
     let component = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -100,9 +108,9 @@ fn main() -> hyperlight_unikraft::Result<()> {
         .boot()?;
     // A component that exports no `wasi:cli/run` is a library: loading it
     // keeps it for the calls that follow.
-    wasm.run(Exec::Guest("/app/calculator.wasm".into()))?;
-    show(&mut wasm, "sum-of-squares", "[3, 4]")?;
+    wasm.run(Exec::Guest("/app/calculator.wasm".into())).await?;
+    show(&mut wasm, "sum-of-squares", "[3, 4]").await?;
     // An async export (WASI 0.3) is awaited, timer and all.
-    show(&mut wasm, "slow-sum-of-squares", "[5, 12, 50]")?;
+    show(&mut wasm, "slow-sum-of-squares", "[5, 12, 50]").await?;
     Ok(())
 }

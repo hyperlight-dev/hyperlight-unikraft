@@ -34,7 +34,8 @@ hluk run --initrd rootfs.cpio \
     script.py
 ```
 
-From the Rust API (parameter order: host path, guest path):
+From the Rust API, inside a Tokio runtime with time and I/O enabled
+(parameter order: host path, guest path):
 
 ```rust
 use hyperlight_unikraft::{Mount, SandboxBuilder};
@@ -44,7 +45,7 @@ let mut guest = SandboxBuilder::from_initrd("rootfs.cpio")
     .mount(Mount::rw("/tmp/share", "/mnt/host"))
     .mount(Mount::ro("/data", "/mnt/data"))
     .boot()?;
-guest.run("open('/mnt/host/out.txt', 'w').write('hello')")?;
+guest.run("open('/mnt/host/out.txt', 'w').write('hello')").await?;
 ```
 
 Windows drive-letter paths are supported: `C:\data:/mnt/data:ro`.

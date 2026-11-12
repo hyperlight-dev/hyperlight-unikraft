@@ -34,7 +34,7 @@ os.close(fd)
 async fn finish(sandbox: &mut AppSandbox) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match sandbox.step_async().await.unwrap() {
+            match sandbox.step().await.unwrap() {
                 Yield::CallDone => break,
                 Yield::Blocked { .. } => {}
                 other => panic!("{other:?}: {}", sandbox.drain_output()),
@@ -78,7 +78,7 @@ async fn snapshot_leaves_original_work_and_default_restore_interrupts() {
         sandbox.snapshot().unwrap();
     }
     sandbox
-        .run_async("import hyperlight; assert hyperlight.call('work', 7) == 7")
+        .run("import hyperlight; assert hyperlight.call('work', 7) == 7")
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -112,7 +112,7 @@ print("preserved", flush=True)
     tokio::time::timeout(Duration::from_secs(5), async {
         while !sandbox.drain_output().contains("delivered") {
             assert!(matches!(
-                sandbox.step_async().await.unwrap(),
+                sandbox.step().await.unwrap(),
                 Yield::Blocked { .. }
             ));
         }
@@ -170,7 +170,7 @@ async fn restore_drops_the_old_running_future_without_replaying() {
     sandbox.submit(code).unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while !sandbox.drain_output().contains("checkpoint") {
-            sandbox.step_async().await.unwrap();
+            sandbox.step().await.unwrap();
         }
     })
     .await
@@ -233,10 +233,7 @@ fn restore_child() {
         .enable_all()
         .build()
         .unwrap();
-    assert_eq!(
-        runtime.block_on(sandbox.step_async()).unwrap(),
-        Yield::CallDone
-    );
+    assert_eq!(runtime.block_on(sandbox.step()).unwrap(), Yield::CallDone);
     sandbox.snapshot().unwrap();
 }
 
@@ -316,7 +313,7 @@ async fn pending_snapshot_recovers_a_cancelled_drive_by_interrupting() {
         .unwrap();
     sandbox.submit(script()).unwrap();
     let snapshot = sandbox.snapshot().unwrap();
-    let mut drive = Box::pin(sandbox.step_async());
+    let mut drive = Box::pin(sandbox.step());
     assert!(futures::poll!(drive.as_mut()).is_pending());
     assert_eq!(active.load(Ordering::SeqCst), 1);
     drop(drive);
@@ -348,7 +345,7 @@ async fn pending_listener_wait_restores_on_a_new_host_and_keeps_serving() {
         .boot()
         .unwrap();
     sandbox
-        .run_async(format!(
+        .run(format!(
             r#"
 import socket, threading
 listener = socket.socket()
@@ -377,9 +374,8 @@ worker.start()
             .boot()
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            let (guest, ()) = tokio::join!(
-                restored.run_async("worker.join(); listener.close()"),
-                async {
+            let (guest, ()) =
+                tokio::join!(restored.run("worker.join(); listener.close()"), async {
                     let client = tokio::net::TcpStream::connect(("127.0.0.1", port))
                         .await
                         .unwrap();
@@ -395,10 +391,9 @@ worker.start()
                         }
                     }
                     assert_eq!(&response, b"pong");
-                }
-            );
+                });
             guest.unwrap();
-            restored.step_async().await.unwrap();
+            restored.step().await.unwrap();
         })
         .await
         .unwrap();

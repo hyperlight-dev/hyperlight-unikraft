@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 use common::{guest_log, hluk_with_stdin, require_rootfs, temp_dir};
 use hyperlight_unikraft::{Exec, SandboxBuilder, load_snapshot, snapshot_scratch_mb};
 
-#[test]
-fn bash_inline_code() {
+#[tokio::test]
+async fn bash_inline_code() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run("echo 'hluk-bash-ok'").unwrap();
+    sandbox.run("echo 'hluk-bash-ok'").await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("hluk-bash-ok"),
@@ -23,15 +23,15 @@ fn bash_inline_code() {
     );
 }
 
-#[test]
-fn bash_exec_file() {
+#[tokio::test]
+async fn bash_exec_file() {
     let rootfs = require_rootfs("bash");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/bash/hello.sh");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello"),
@@ -39,8 +39,8 @@ fn bash_exec_file() {
     );
 }
 
-#[test]
-fn bash_snapshot_round_trip() {
+#[tokio::test]
+async fn bash_snapshot_round_trip() {
     let rootfs = require_rootfs("bash");
     let snap_dir = temp_dir("bash-snap");
 
@@ -59,7 +59,7 @@ fn bash_snapshot_round_trip() {
         .unwrap()
         .boot()
         .unwrap();
-    sandbox.run("echo 'restored-bash-ok'").unwrap();
+    sandbox.run("echo 'restored-bash-ok'").await.unwrap();
     let output = sandbox.drain_output();
     assert_eq!(
         snapshot_scratch_mb(&sandbox.snapshot().unwrap()),
@@ -72,15 +72,15 @@ fn bash_snapshot_round_trip() {
     );
 }
 
-#[test]
-fn bash_multiple_runs() {
+#[tokio::test]
+async fn bash_multiple_runs() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run("x=42").unwrap();
-    sandbox.run("echo \"x=$x\"").unwrap();
+    sandbox.run("x=42").await.unwrap();
+    sandbox.run("echo \"x=$x\"").await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("x=42"),
@@ -88,15 +88,15 @@ fn bash_multiple_runs() {
     );
 }
 
-#[test]
-fn bash_coreutils() {
+#[tokio::test]
+async fn bash_coreutils() {
     let rootfs = require_rootfs("bash");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/bash/coreutils.sh");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
 
     assert!(
@@ -180,8 +180,8 @@ fn bash_shell_interactive() {
     );
 }
 
-#[test]
-fn bash_env_vars() {
+#[tokio::test]
+async fn bash_env_vars() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -196,6 +196,7 @@ fn bash_env_vars() {
         .run(Exec::File(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/bash/env_vars.sh"),
         ))
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -215,8 +216,8 @@ fn bash_env_vars() {
 /// Pipes, `$(...)` substitutions and redirects of external commands work:
 /// the shell's vfork child ran on the kernel's TLS rather than the shell's,
 /// and crashed the guest when it made a system call before its `execve`.
-#[test]
-fn bash_pipes_and_substitutions() {
+#[tokio::test]
+async fn bash_pipes_and_substitutions() {
     let rootfs = require_rootfs("bash");
     // Its kernel's messages are checked: at a level RUST_LOG cannot change.
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -224,33 +225,38 @@ fn bash_pipes_and_substitutions() {
         .guest_log_level(tracing::level_filters::LevelFilter::ERROR)
         .boot()
         .unwrap();
-    sandbox.run("echo hello | tr a-z A-Z").unwrap();
+    sandbox.run("echo hello | tr a-z A-Z").await.unwrap();
     assert_eq!(sandbox.drain_output(), "HELLO\n");
-    sandbox.run(r#"x=$(echo hi); echo "got $x""#).unwrap();
+    sandbox.run(r#"x=$(echo hi); echo "got $x""#).await.unwrap();
     assert_eq!(sandbox.drain_output(), "got hi\n");
     sandbox
         .run("/bin/echo to-file > /tmp/f; cat /tmp/f")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "to-file\n");
     sandbox
         .run(r#"printf 'b\na\nb\n' | sort | uniq -c | wc -l"#)
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "2");
     // An exec'd program inherits fd 2 as the shell's own stderr file.
-    sandbox.run("ls /nope; true").unwrap();
+    sandbox.run("ls /nope; true").await.unwrap();
     assert!(sandbox.drain_stderr().contains("No such file"));
     sandbox.drain_output();
     // fd 2 is a file of its own: redirects still move it.
-    sandbox.run("ls /nope 2>&1 | wc -l").unwrap();
+    sandbox.run("ls /nope 2>&1 | wc -l").await.unwrap();
     assert_eq!(sandbox.drain_output().trim(), "1");
-    sandbox.run("ls /nope 2>/dev/null; echo rc=$?").unwrap();
+    sandbox
+        .run("ls /nope 2>/dev/null; echo rc=$?")
+        .await
+        .unwrap();
     assert_eq!(sandbox.drain_stderr(), "");
     assert_eq!(sandbox.drain_output(), "rc=1\n");
-    sandbox.run("echo to-err >&2").unwrap();
+    sandbox.run("echo to-err >&2").await.unwrap();
     assert_eq!(sandbox.drain_stderr(), "to-err\n");
     // A command that fails to execute: its vfork child exits without an
     // execve, and must not free the shell's stack on its way out.
-    let (run, log) = guest_log(|| sandbox.run("nope; sleep 0.1; echo after"));
+    let (run, log) = guest_log(sandbox.run("nope; sleep 0.1; echo after")).await;
     run.unwrap();
     // The shell says why on stderr.  The kernel's messages about it are
     // in Hyperlight's guest log, with where they come from, not in the
@@ -271,11 +277,10 @@ fn bash_pipes_and_substitutions() {
     // odd-length prefix the byte limit falls inside an 'é', and the cut
     // must back off to a whole character (else its first byte would be
     // sent as '?').
-    let (run, log) = guest_log(|| {
-        sandbox.run(
-            "p=/xy; i=0; while [ $i -lt 100 ]; do p=${p}\u{e9}; i=$((i+1)); done; $p; echo after",
-        )
-    });
+    let (run, log) = guest_log(sandbox.run(
+        "p=/xy; i=0; while [ $i -lt 100 ]; do p=${p}\u{e9}; i=$((i+1)); done; $p; echo after",
+    ))
+    .await;
     run.unwrap();
     assert!(
         log.iter()
@@ -285,7 +290,7 @@ fn bash_pipes_and_substitutions() {
     assert!(sandbox.drain_output().ends_with("after\n"));
     // Bytes that are not UTF-8 arrive as '?', not as a message the host
     // refuses.
-    let (run, log) = guest_log(|| sandbox.run("p=$(printf '/x\\377y'); $p; echo after"));
+    let (run, log) = guest_log(sandbox.run("p=$(printf '/x\\377y'); $p; echo after")).await;
     run.unwrap();
     assert!(log.iter().any(|l| l.contains("/x?y")), "{log:?}");
     assert!(sandbox.drain_output().ends_with("after\n"));
@@ -293,15 +298,15 @@ fn bash_pipes_and_substitutions() {
 
 /// The guest log level is the host's to choose: off, the kernel sends
 /// none of its messages.
-#[test]
-fn bash_guest_log_level_off_sends_nothing() {
+#[tokio::test]
+async fn bash_guest_log_level_off_sends_nothing() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .guest_log_level(tracing::level_filters::LevelFilter::OFF)
         .boot()
         .unwrap();
-    let (run, log) = guest_log(|| sandbox.run("nope; echo after"));
+    let (run, log) = guest_log(sandbox.run("nope; echo after")).await;
     run.unwrap();
     assert_eq!(log, Vec::<String>::new());
     assert!(!sandbox.drain_stderr().contains("ERR:"));
@@ -309,8 +314,8 @@ fn bash_guest_log_level_off_sends_nothing() {
 
 /// `exit` ends the shell, which is the runtime: the call ends with that
 /// status, and the next call starts a fresh shell.
-#[test]
-fn bash_exit_ends_the_call() {
+#[tokio::test]
+async fn bash_exit_ends_the_call() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -318,13 +323,14 @@ fn bash_exit_ends_the_call() {
         .unwrap();
     sandbox
         .run("echo leaving; exit 0; echo not reached")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "leaving\n");
     assert!(
-        sandbox.run("exit 3").is_err(),
+        sandbox.run("exit 3").await.is_err(),
         "exit 3 did not fail the call"
     );
-    sandbox.run("echo still here").unwrap();
+    sandbox.run("echo still here").await.unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 }
 
@@ -349,11 +355,11 @@ fn bash_read_past_end_of_input() {
 
 /// `call` on an image whose driver does not serve calls fails the call
 /// and runs nothing: the function name is not taken for code.
-#[test]
-fn bash_refuses_a_call() {
+#[tokio::test]
+async fn bash_refuses_a_call() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs).boot().unwrap();
-    let err = sandbox.call("echo ran-as-code", "{}").unwrap_err();
+    let err = sandbox.call("echo ran-as-code", "{}").await.unwrap_err();
     assert!(
         matches!(err, hyperlight_unikraft::Error::CallFailed { .. }),
         "{err}"
@@ -362,14 +368,14 @@ fn bash_refuses_a_call() {
     assert!(!output.contains("ran-as-code"), "{output}");
     assert!(output.contains("does not serve Call calls"), "{output}");
     // The driver serves the next call as usual.
-    sandbox.run("echo still-here").unwrap();
+    sandbox.run("echo still-here").await.unwrap();
 }
 
 /// Assigning RANDOM seeds $RANDOM, as in bash: a seed repeats its
 /// sequence, and RANDOM stays the generator's, not a plain variable,
 /// until export makes it one.  A subshell seeds its own from the kernel.
-#[test]
-fn bash_random_assignment_seeds() {
+#[tokio::test]
+async fn bash_random_assignment_seeds() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("bash"))
         .scratch_mb(256)
         .boot()
@@ -382,7 +388,7 @@ fn bash_random_assignment_seeds() {
              a=$(echo $RANDOM$RANDOM); b=$(echo $RANDOM$RANDOM); [ \"$a\" != \"$b\" ] && echo subshells\n\
              f() { local RANDOM=5; echo \"local $(echo $RANDOM)\"; }; f\n\
              export RANDOM=7; RANDOM=8; [ \"$RANDOM$RANDOM\" = 88 ] && echo variable",
-        )
+        ).await
         .unwrap();
     assert_eq!(
         sandbox.drain_output(),
@@ -392,28 +398,30 @@ fn bash_random_assignment_seeds() {
 
 /// An empty argument or environment string reaches a program, as on
 /// Linux: hush passes them when it re-executes itself for a pipeline.
-#[test]
-fn bash_empty_strings_reach_programs() {
+#[tokio::test]
+async fn bash_empty_strings_reach_programs() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("bash"))
         .scratch_mb(256)
         .boot()
         .unwrap();
     sandbox
         .run("sh -c 'echo \"[$1]\"' sh ''\nX=1; set | grep -q '^X=' && echo piped")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "[]\npiped\n");
 }
 
 /// Commands run back to back, with no pause for the guest to idle in, give
 /// their memory back as they end: a loop of thousands fits in a small guest.
-#[test]
-fn bash_commands_back_to_back_give_their_memory_back() {
+#[tokio::test]
+async fn bash_commands_back_to_back_give_their_memory_back() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("bash"))
         .scratch_mb(256)
         .boot()
         .unwrap();
     sandbox
         .run("for i in $(seq 3000); do /bin/true || echo \"failed at $i\"; done; echo loop-done")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "loop-done\n");
 }
@@ -422,8 +430,8 @@ fn bash_commands_back_to_back_give_their_memory_back() {
 /// over, not once per piece: the kernel grows a file by half at least.
 /// Grown to the exact size each time, 50 MB in 4 KiB pieces took minutes,
 /// and the guest ran nothing else meanwhile.
-#[test]
-fn bash_writing_a_file_in_pieces_is_not_quadratic() {
+#[tokio::test]
+async fn bash_writing_a_file_in_pieces_is_not_quadratic() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -432,10 +440,12 @@ fn bash_writing_a_file_in_pieces_is_not_quadratic() {
     let started = Instant::now();
     sandbox
         .run("yes 2>/dev/null | head -c 50000000 > /tmp/pieces")
+        .await
         .unwrap();
     let took = started.elapsed();
     sandbox
         .run("wc -c < /tmp/pieces; md5sum /tmp/pieces")
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -453,15 +463,15 @@ fn bash_writing_a_file_in_pieces_is_not_quadratic() {
 /// A file appended to between closes reads back whole: the room a write
 /// leaves past the file's end stays the file's, and the next open's append
 /// grows into it.
-#[test]
-fn bash_appends_between_closes_read_back_whole() {
+#[tokio::test]
+async fn bash_appends_between_closes_read_back_whole() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
     sandbox
-        .run("for i in $(seq 1 20000); do echo \"line $i of the log\" >> /tmp/log; done; wc -l < /tmp/log; md5sum /tmp/log")
+        .run("for i in $(seq 1 20000); do echo \"line $i of the log\" >> /tmp/log; done; wc -l < /tmp/log; md5sum /tmp/log").await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -472,15 +482,15 @@ fn bash_appends_between_closes_read_back_whole() {
 
 /// What a truncate cut off does not come back when the file grows again
 /// into the room it had, by a write or by a truncate: the gap reads as zeros.
-#[test]
-fn bash_a_file_grown_again_after_a_cut_reads_zeros_in_the_gap() {
+#[tokio::test]
+async fn bash_a_file_grown_again_after_a_cut_reads_zeros_in_the_gap() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
     sandbox
-        .run("printf aaaaaaaaaa > /tmp/t; truncate -s 5 /tmp/t; printf bbb >> /tmp/t; truncate -s 12 /tmp/t; printf ccc >> /tmp/t; od -An -c /tmp/t | tr -s ' '")
+        .run("printf aaaaaaaaaa > /tmp/t; truncate -s 5 /tmp/t; printf bbb >> /tmp/t; truncate -s 12 /tmp/t; printf ccc >> /tmp/t; od -An -c /tmp/t | tr -s ' '").await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -491,15 +501,15 @@ fn bash_a_file_grown_again_after_a_cut_reads_zeros_in_the_gap() {
 
 /// A file moved to another directory keeps growing as before: the record of
 /// how much of its buffer has memory behind it moves with the buffer.
-#[test]
-fn bash_a_file_moved_across_directories_grows_on() {
+#[tokio::test]
+async fn bash_a_file_moved_across_directories_grows_on() {
     let rootfs = require_rootfs("bash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
     sandbox
-        .run("mkdir -p /var/moved; printf x > /tmp/a; mv /tmp/a /var/moved/a; printf y >> /var/moved/a; yes 2>/dev/null | head -c 30000 >> /var/moved/a; mv /var/moved/a /tmp/b; printf z >> /tmp/b; head -c 2 /tmp/b; echo; wc -c < /tmp/b; tail -c 1 /tmp/b; echo")
+        .run("mkdir -p /var/moved; printf x > /tmp/a; mv /tmp/a /var/moved/a; printf y >> /var/moved/a; yes 2>/dev/null | head -c 30000 >> /var/moved/a; mv /var/moved/a /tmp/b; printf z >> /tmp/b; head -c 2 /tmp/b; echo; wc -c < /tmp/b; tail -c 1 /tmp/b; echo").await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(

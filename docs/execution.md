@@ -14,11 +14,11 @@ sequenceDiagram
     K->>T: run the scheduler
     T-->>K: every thread blocked (sleeping, or waiting on a socket)
     K->>H: Yield(ns until the next timer, the call's news) — VM halts
-    Note over H: parks in poll(2) on the guest's<br/>host sockets, at most ns — no CPU
+    Note over H: awaits shared host-call, timer and<br/>socket futures — VM halted, no polling loop
     H->>K: enter again (step)
 ```
 
-Guest memory persists across the halt: parked threads, scheduler queues, the application heap.  A snapshot taken at any boundary resumes exactly there.  The guest never spins waiting for the host; an idle guest costs nothing.
+Guest memory persists across the halt: parked threads, scheduler queues, the application heap. A snapshot captures that boundary, including outstanding async host calls; restore interrupts unfinished calls with `EINTR` without replaying them. The guest never spins waiting for the host; an idle guest costs nothing.
 
 The guest reports to the host through named host functions. Each is a VM exit, so an entry makes as few as it can: a call's start and return ride on the entry's final `Yield`, and a guest function call that returns in one entry costs that one exit.
 
@@ -30,24 +30,49 @@ The guest reports to the host through named host functions. Each is a VM exit, s
 | `CallRejected()` | A named call had no reader: it never ran. |
 | `Exited(status)` | The guest process ended; the kernel is shutting down. |
 
-One more host function, `HostCall(name, args)`, runs the embedder's function of that name for a driver and returns its reply ([calls.md](calls.md)).  The host folds the reports into one [`Yield`](../src/lib.rs) per entry: `Blocked { until }`, `CallDone`, `CallFailed { status }`, or `Exited { status }`.  A `Blocked` with no timer and no host socket that could wake the guest, while a call's return or a program's exit is still owed, is a deadlock: `step`, `run` and `join` return `Error::Deadlocked` rather than wait forever.
+One more host function, `HostCall(name, args)`, runs the embedder's function of that name for a driver and returns its reply ([calls.md](calls.md)).  The host folds the reports into one [`Yield`](../src/lib.rs) per entry: `Blocked { until }`, `CallDone`, `CallFailed { status }`, or `Exited { status }`.  A `Blocked` with no pending host call, timer or host socket that could wake the guest, while a call's return or a program's exit is still owed, is a deadlock: `step`, `run` and `join` return `Error::Deadlocked` rather than wait forever.
 
 ## The verbs
 
-Everything a caller does with an [`AppSandbox`](../src/lib.rs) is one of these.  `submit` delivers work; `step` is the primitive that advances the guest; `run` and `join` are loops over `step` with a stop condition.
+Everything a caller does with an [`AppSandbox`](../src/lib.rs) is one of these. `submit` delivers work; `step` is the primitive that advances the guest; `run` and `join` are loops over `step` with a stop condition. Driving is async and requires a Tokio runtime with time and I/O enabled (`enable_all()` for a manually built runtime). VM entries themselves remain synchronous.
 
 | Verb | Does |
 |---|---|
 | `SandboxBuilder::boot()` | Registers the host functions and brings the guest to its first boundary: evolves a fresh guest, or restores a snapshot and runs its `resume` entry. |
 | `submit(exec)` | Hands the driver a call and returns at the first boundary, without waiting for the call to finish. Example: `submit("import http.server … serve_forever()")` returns as soon as the server is parked in `accept()`; the embedder drives it with `step` from there, and `step` reports `CallDone` if the call ever returns. |
-| `step(timeout)` | Advances the guest by one boundary and returns control to the embedder. The host thread waits, with the VM halted, until the guest has something to do (a timer due, a socket ready) or `timeout` runs out. If the guest is due, the host enters the VM and the guest runs until every thread blocks again; `step` then returns why the guest stopped. If the timeout ran out first, nothing was entered and the last `Blocked` comes back.|
-| `run(exec)` | `submit`, then `step` until the call returns. |
-| `call(function, input)` | `run(Exec::Call { function, input })`, returning the result of a function the guest defined ([calls.md](calls.md)). |
-| `join()` | `step` until the process exits, and hand back its status. |
-| `snapshot()` / `snapshot_to(dir)` | Captures the guest at the current boundary, a call in flight included; `snapshot_to` also writes it to a directory. |
 | `snapshot_with_scratch_mb(mb)` | Like `snapshot()`, but with `mb` MiB of scratch, less or more than the sandbox booted with: the sandbox continues on `mb` MiB, and so does a sandbox restored from the snapshot. It refuses a size above hyperlight's maximum memory size or too small for the transport and page tables. A size too small for the kernel makes the sandbox's next entry, `restore`, or a boot from the snapshot fail. A guest function call that runs out of scratch ends with its process killed (status 137 with a single-process driver, such as python's) or the guest aborted, depending on what runs out first. A restore recovers the sandbox. |
 | `restore(snapshot)` / `restore_from(dir)` | Replaces the guest with the snapshot in place and runs its `resume` entry. The sandbox takes the snapshot's scratch size. |
 | `dirty_bytes()` | Bytes the guest has written since the last restore (a boot from a snapshot included) or snapshot, not counting the `resume` entry. After a snapshot, the kernel's own re-initialisation on the next entry is counted (a small call then counts about 1.3 MiB, against about 0.6 MiB after a restore). The guest controls the value, and it can be ahead of what the guest wrote by up to about 1 MiB, the kernel's frame allocator taking its memory a chunk at a time, and by more around a large allocation, whose chunk is several times its size. It stays near 0 on a freshly booted sandbox until its first snapshot or restore. |
+| `step().await` | Awaits a host-call completion, timer or socket readiness with the VM halted, then advances the guest to its next boundary. Ready events are coalesced before entering the VM. An idle driver with nothing to await returns `Blocked` immediately. |
+| `run(exec).await` | `submit`, then await `step` until the call returns. |
+| `call(function, input).await` | Await `run(Exec::Call { function, input })`, returning the result of a function the guest defined ([calls.md](calls.md)). |
+| `join().await` | Await `step` until the process exits, and hand back its status. |
+| `snapshot()` / `snapshot_to(dir)` | Captures the guest at the current boundary, including pending host calls; `snapshot_to` also writes it to a directory. Capture leaves original work untouched. Restore completes unfinished calls with `EINTR`, without invoking host handlers. |
+
+### Async-only driving and cancellation
+
+There is one driver: `run`, `call`, `join` and `step` are async. The temporary
+synchronous migration adapters have been removed.
+A synchronous application can create a Tokio runtime with `enable_all()` and
+call `runtime.block_on(sandbox.run(code))` at its outer boundary, outside any
+running async executor. The library never creates or nests a runtime.
+
+Boot, `submit` and restore still make one synchronous VM entry and return at a
+boundary. They may enqueue lazy host calls, including readiness and DNS policy
+checks, even without an active runtime. Those futures are driven only when an
+async driving method is subsequently polled. State inspection and snapshots
+remain synchronous too.
+
+`step` has **no timeout argument**. Dropping any polled, unfinished
+driving future poisons the sandbox and clears pending work; execution and
+snapshots then fail until an explicit restore. Therefore
+`tokio::time::timeout(..., sandbox.step())` is cancellation, not a safe bounded
+probe. Keep the future alive if it must resume later. Dropping an unpolled future
+does nothing. Executor timeouts cannot interrupt CPU-bound VM entries; use an
+interrupt handle from another thread.
+
+The previous `_async` method names are removed; see the
+[migration table](async-host-calls.md#migration).
 
 ## Three kinds of guest
 
@@ -124,7 +149,7 @@ sequenceDiagram
 
 ### `submit` + `step`
 
-`submit` delivers the same call but returns at the first boundary, here with the server parked in `accept()`.  From then on the embedder steps.  A client's request wakes the step at once: the host owns the listening socket, so the connection completes in the host OS, the listener becomes readable, the host's `poll(2)` returns and the guest is entered.
+`submit` delivers the same call but returns at the first boundary, here with the server parked in `accept()`. From then on the embedder awaits steps. A client's request wakes the step: the host owns the listening socket, so the connection completes in the host OS, Tokio reports readiness and the guest is entered.
 
 ```mermaid
 sequenceDiagram
@@ -136,9 +161,9 @@ sequenceDiagram
     S->>G: enter Exec(code)
     G-->>S: Yield(0, started) — the server is parked in accept()
     S-->>A: Ok(())
-    A->>S: step(200 ms)
-    Note over S: poll(2) on the listener
-    Note over A,S: a curl on the host connects:<br/>the listener is readable, poll returns
+    A->>S: step().await
+    Note over S: await listener readiness
+    Note over A,S: a curl on the host connects:<br/>the listener wakes the future
     S->>G: enter step
     G-->>S: Yield(0) — request served, back in accept()
     S-->>A: Blocked { until: None }
@@ -171,7 +196,7 @@ A server is the same: `join` parks on its listener between requests and returns 
 
 ## Snapshot and restore
 
-A snapshot can be taken at any boundary, and a restored guest continues from exactly there.  Two boundaries are worth naming.
+A snapshot can be taken at a boundary even with outstanding async host calls, and a restored guest continues from exactly there. Taking the snapshot leaves the original work untouched; restoration completes unfinished calls with `EINTR`. See [pending-call interruption](async-host-calls.md#restoring-pending-host-calls) for limitations and external-effect safety. Two boundaries are worth naming.
 
 **After boot, for a warm start.**  With a driver image, `boot()` returns once the runtime is initialised and the driver is parked: the interpreter is up, and in the `agent` image the heavy imports are already done.  A snapshot there is a warm image; every guest restored from it skips that work.  Booting needs room to unpack the rootfs, which guest function calls do not: `snapshot_with_scratch_mb` takes the warm image with less scratch, and every restore of it costs less.
 

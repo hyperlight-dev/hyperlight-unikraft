@@ -26,7 +26,7 @@ For a full description of Unikraft's process model and the syscalls available at
 
 ## Cooperative step model
 
-Between host entries the guest is never *running*: when every guest thread is blocked the kernel hands the vCPU back to the host with the time until its next timer, and the host parks (VM halted, in `poll(2)` on the guest's host sockets) until the guest could make progress. An idle guest costs no CPU; a blocking `accept()` or `sleep()` in the guest is served by the host waking it. Named calls (`Exec`) run on the runtime driver's own thread, and a guest whose entry point is a plain program is driven with [`AppSandbox::join`] instead. How the host drives a guest, the kinds of guest, `run`/`submit`/`step`/`join`, snapshots and restore are in [execution.md](execution.md); what a restore does to the clocks and the random source is in [clock.md](clock.md) and [random.md](random.md).
+Between host entries the guest is never *running*: when every guest thread is blocked the kernel hands the vCPU back to the host with the time until its next timer. The host awaits a shared set of host-call, timer and socket-readiness futures until the guest could make progress, with the VM halted. An idle guest costs no CPU; a blocking `accept()` or `sleep()` in the guest is served by the host waking it. Named calls (`Exec`) run on the runtime driver's own thread, and a guest whose entry point is a plain program is driven with `AppSandbox::join().await` instead. How the host drives a guest, the kinds of guest, `run`/`submit`/`step`/`join`, cancellation, snapshots and restore are in [execution.md](execution.md); what a restore does to the clocks and the random source is in [clock.md](clock.md) and [random.md](random.md).
 
 ## Threads
 

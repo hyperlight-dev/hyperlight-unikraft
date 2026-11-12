@@ -12,8 +12,8 @@ Python/Node app               hostnet.rs
   libc socket()               SocketTable
       │                       (fd → host socket, kind, peer)
   hostsock.c                       │
-  (POSIX socket driver)       rustix::net / rustix::event
-      │                       (real OS socket, one call per syscall)
+  (POSIX socket driver)       tokio::net + rustix
+      │                       (non-blocking I/O + POSIX compatibility)
   hl_hcall_int / vecbytes ──→ net_* host functions
 ```
 
@@ -22,7 +22,33 @@ Python/Node app               hostnet.rs
 1. The guest calls `socket()`, `connect()`, `send()`, etc. through the standard POSIX socket API.
 2. Unikraft's socket layer dispatches to **hostsock** — a kernel driver registered for `AF_INET` and `AF_INET6`.
 3. hostsock serialises the call into `hl_param` structs and makes a synchronous host call (`hl_hcall_int` for integer results, `hl_hcall_vecbytes` for variable-length data).
-4. The host's **hostnet** module looks up the virtual fd in a `SocketTable`, checks policy, and makes the matching [`rustix`](https://docs.rs/rustix) call — `rustix::net::connect`, `rustix::net::sendto`, `rustix::event::poll`, … — on the real OS socket.  rustix is a safe wrapper over the POSIX/WinSock socket API, so the host side is the same code on Linux, Windows and macOS.
+4. The host's **hostnet** module looks up the virtual fd in a `SocketTable` and checks policy before I/O. During async driving, ordinary bound/connected TCP/UDP sockets use Tokio's non-blocking `try_read`, `try_write`, `try_send`, `try_send_to` and `try_recv_from` methods. The same lazily cached Tokio handles serve readiness waits and address queries; registrations are replaced when the driving runtime changes.
+
+[`rustix`](https://docs.rs/rustix) remains the POSIX/WinSock compatibility layer:
+socket creation, bind/listen, immediate connect (`EINPROGRESS`), UDP disconnect,
+shutdown, socket options, non-TCP/UDP protocols and exact `poll` flags. A Tokio
+listener buffers one accepted connection during an async readiness wait;
+immediate accept still uses rustix when nothing is buffered. Fresh sockets
+(including an unbound UDP socket's first send) and immediate I/O during
+synchronous setup outside a Tokio runtime also use rustix. There is no separate
+blocking driver.
+
+Each socket-table entry owns its descriptor, policy metadata, readiness
+interests and optional Tokio registration, including any buffered accept.
+Readiness polls borrow these entries under the table lock without blocking;
+there are no separate socket watch lists or per-socket lifecycle wakers.
+One network waker handles changes to interests, socket replacement, close and
+reset. Pending waits retain only a weak reference to the network, so they cannot
+keep closed sockets or ports alive. Rebinding to another runtime preserves a
+buffered accepted connection or error.
+
+Tokio's cached readiness can lag the OS while the VM runs synchronously. If a
+Tokio transfer returns `WouldBlock`, the host attempts the non-blocking syscall
+before reporting `EAGAIN`; otherwise a guest that already observed readiness
+could spin without letting the reactor run. Other Tokio errors are returned
+directly. Exact readiness checks also remain necessary because immediate
+transfers can consume data outside Tokio. Neither backend
+waits for a peer during a synchronous host call.
 
 ### Host portability
 
@@ -34,7 +60,22 @@ A host function call is a synchronous VM exit — the guest vCPU is fully paused
 
 Two things prevent this.  hostsock uses a **check-ready pattern**: it polls with `net_poll(timeout=0)` first and returns `EAGAIN` instead of calling the host when the socket isn't ready.  And host sockets are **non-blocking**, so a call that would block anyway (a send larger than the free buffer space) also comes back as `-EAGAIN`.  Either way, Unikraft's POSIX socket layer then calls `uk_file_poll()`, which blocks *the current thread* (not the vCPU) and yields to the cooperative scheduler, so other guest threads can run.  `connect()` starts the handshake and returns `EINPROGRESS`; the socket layer parks the thread on writability and reads the outcome through `SO_ERROR`, the same way as on Linux.
 
-When all threads are blocked, the kernel yields the vCPU to the host, which parks in `poll(2)` on the real sockets the guest is waiting on (readability, and writability where a send was refused) and re-enters when one is ready; on every entry the kernel rescans them and wakes the waiting threads.  See [execution.md](execution.md).
+With async driving, one kernel readiness waiter submits `net_wait_async()` and
+parks through the ordinary async host-call protocol. Its future watches the
+current socket interests using Tokio and delivers a normal completion when the
+kernel should recheck readiness. The host never blocks the vCPU while waiting.
+Boot, submit and restore can enqueue this lazy wait without a runtime; the next
+async step drives it.
+On re-entry the kernel rescans sockets and wakes the waiting application threads.
+See [execution.md](execution.md).
+
+Snapshots always allow pending readiness calls, just like other async calls,
+including waits queued during
+submit or resume. On restore they receive `EINTR`; the kernel retries the
+readiness check against recreated sockets, not the original send or connect.
+Listeners can still be restored; established connections cannot. CLI manual and
+warm-cache snapshots use the same interruption behavior. See
+[pending-call snapshots](async-host-calls.md#restoring-pending-host-calls).
 
 This enables intra-guest networking — for example, a server and client can run in two threads inside the same guest (see [`examples/python/tcp_echo.py`](../examples/python/tcp_echo.py)).
 
