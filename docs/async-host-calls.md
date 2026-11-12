@@ -259,6 +259,61 @@ tests, including fresh-process pending-call interruption, and `cargo test --lib 
 --ignored` for guest parser and restore tests (which need a hypervisor and rootfs, unlike
 the ordinary library unit tests).
 
+### Driving performance baseline
+
+Run `cargo test --release --test driving_bench -- --ignored --nocapture` on a
+host with a hypervisor and the local Python rootfs. The ignored benchmark uses
+the existing test runner, with no extra benchmark dependencies. It measures
+the async driver twice to expose ordering and host-load effects. Boot and five
+warm-up calls are excluded; profiling is enabled throughout. A single
+current-thread Tokio runtime is reused.
+
+Each `BENCH drive` row reports median and p95 call latency, throughput, VM entries
+per call and total driving-thread CPU time for the measured samples. CPU time
+is available only on Linux, in 10 ms procfs ticks; `0.0` is below that resolution,
+not proof of zero work. Peer-thread CPU is not included.
+
+Workloads cover immediate guest calls, synchronous host functions, 5 ms guest
+timers, sixteen concurrent 5 ms host calls, a 500 ms idle wait and persistent
+TCP/UDP echo connections. The `tcp-wait` and `udp-wait` cases delay each peer reply
+by 2 ms to exercise readiness rather than only the already-ready fast path.
+Async host handlers overlap during fan-out.
+
+The benchmark asserts one VM entry for immediate/synchronous-host calls, two
+for timer/idle calls, and less than 100 ms of driving-thread CPU for the measured
+500 ms idle wait. Delayed-peer cases must include readiness wakes, not just
+single-entry calls with already-ready replies. Latencies are reported,
+not asserted: shared-host load and Tokio's millisecond timer granularity make
+universal timing thresholds flaky.
+Use repeated runs on the same host to assess regressions.
+
+#### Historical blocking/async comparison (2026-11-06)
+
+Linux x86_64/KVM, Intel Core i9-13900, release build, local Python rootfs.
+Recorded before removal of the blocking API. These are ranges of the two medians
+per mode in one ABBA run after lifecycle
+hardening, not confidence intervals or cross-machine performance guarantees:
+
+| Workload | Blocking median | Async median | VM entries/call, blocking / async |
+| --- | --- | --- | --- |
+| Immediate | 18.5-18.6 us | 18.5-19.5 us | 1 / 1 |
+| Synchronous host function | 31.6-31.9 us | 31.8-32.0 us | 1 / 1 |
+| 5 ms guest timer | 5.18-5.50 ms | 6.40-6.54 ms | 2 / 2 |
+| Sixteen 5 ms host calls | 89.36-89.49 ms | 11.18-11.21 ms | 1 / 2.00-2.05 |
+| TCP echo | 62.3-84.6 us | 59.4-62.8 us | 1.01-1.03 / 1.00-1.03 |
+| TCP echo, 2 ms peer delay | 2.77-2.94 ms | 2.42-2.79 ms | 2 / 2 |
+| UDP echo | 63.4-68.8 us | 63.8-65.9 us | 1.01 / 1.01-1.05 |
+| UDP echo, 2 ms peer delay | 2.75-2.76 ms | 2.44-2.82 ms | 2 / 2 |
+| 500 ms idle wait | 500.38-500.55 ms | 501.13-502.12 ms | 2 / 2 |
+
+Both idle paths measured below one 10 ms CPU tick. Immediate calls retained
+their single-entry fast path. Async fan-out was about eight times faster than
+serialized blocking handlers. Tokio's timer granularity adds roughly 1 ms to
+short sleeps here; it does not cause extra VM entries. Network latency tails
+varied between repetitions, so these samples do not establish a universal
+network speedup. The pre-hardening run had the same entry counts and comparable
+fan-out medians (89.50-89.56 ms blocking, 11.17-11.19 ms async).
+
 ### Lifecycle and portability coverage
 
 The ordinary unit tests now repeatedly fill all 1024 host-call slots, cancel and

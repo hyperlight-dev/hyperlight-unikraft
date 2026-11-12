@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Code coverage (#123): `coverage.yml` measures how much of the library and `hluk` the Rust tests cover, weekly on `main`, running them as tier 1's Linux test job does; `hluk` is measured where the integration tests run it as a program too. The run's page has the summary, per file, and its artifacts an HTML report, per line, and an LCOV file. `ci-report.yml` reports a failed run as it does a failed CI run on `main`. Locally, `just coverage-run` runs the tests instrumented, and `just coverage`, `just coverage-html` or `just coverage-lcov` reports on them (see [`docs/ci.md`](docs/ci.md)).
+- An opt-in async driving release benchmark, including
+  latency, throughput, CPU use and VM-entry counts for calls, timers, fan-out
+  and ready/delayed TCP and UDP peers.
 - Async host functions through `SandboxBuilder::async_host_function`, with
   `run`, `call`, `join` and `step` driving a bounded
   `FuturesUnordered` engine. Only the calling guest thread parks; replies are
