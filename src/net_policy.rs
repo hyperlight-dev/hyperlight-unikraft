@@ -61,8 +61,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::{fmt, io, thread};
 
 use tracing::debug;
@@ -72,9 +72,9 @@ use tracing::debug;
 /// would be refused addresses it was rightly told.
 const MAX_LEARNED_IPS: usize = 4096;
 
-/// The most a block list waits for its names to resolve at a TCP connect
-/// or UDP send.  The lookup runs while the VM is stopped inside the host call, so it is
-/// bounded; a name that has not answered by then counts as blocked.
+/// The deadline for a block-list refresh. Async driving waits between VM
+/// entries; synchronous compatibility calls wait on the resolver channel.
+/// A name that has not answered by the deadline counts as blocked.
 const LOOKUP_DEADLINE: Duration = Duration::from_millis(250);
 
 /// The most resolver threads a block list may have running at once, across
@@ -111,34 +111,49 @@ pub enum NetworkPolicy {
 }
 
 impl NetworkPolicy {
-    /// Whether the guest may reach `addr`, on a UDP socket or not.
-    pub(crate) fn allows(&self, addr: &SocketAddr, udp: bool) -> bool {
-        // An IPv4 address spelled as IPv4-mapped IPv6 (`::ffff:a.b.c.d`)
-        // reaches the same IPv4 destination through a dual-stack socket,
-        // so every rule below sees the IPv4 form.
+    /// `None` means a block-list hostname needs a fresh lookup.
+    pub(crate) fn allows_now(&self, addr: &SocketAddr, udp: bool) -> Option<bool> {
         let ip = canonical(addr.ip());
         if is_metadata(&ip) {
-            return false;
+            return Some(false);
         }
-
-        match self {
-            // AllowAll — no filtering (loopback permitted for intra-guest
-            // server+client patterns in the hostsock model).
-            NetworkPolicy::AllowAll => true,
-            // AllowList/BlockList/Filter — also block loopback.  Host
-            // services trust loopback without auth, and in the hostsock
-            // model a guest socket is a real host socket, so a guest
-            // connecting to 127.0.0.1 reaches host-only services.
-            NetworkPolicy::AllowList(al) => {
+        Some(match self {
+            Self::AllowAll => true,
+            Self::AllowList(al) => {
                 !is_host_local(&ip)
                     && (al.is_allowed(&ip)
                         || (udp && addr.port() == 53 && al.resolvers.contains(&ip)))
             }
-            NetworkPolicy::BlockList(bl) => !is_host_local(&ip) && !bl.blocks(&ip),
-            NetworkPolicy::Filter(f) => {
+            Self::BlockList(bl) => {
+                if is_host_local(&ip) || bl.blocked_ips.contains(&ip) {
+                    false
+                } else if bl.hostnames.is_empty() {
+                    true
+                } else {
+                    return None;
+                }
+            }
+            Self::Filter(f) => {
                 !is_host_local(&ip) && f.allows(SocketAddr::new(ip, addr.port()), udp)
             }
+        })
+    }
+
+    pub(crate) async fn allows_async(&self, addr: &SocketAddr, udp: bool) -> bool {
+        if let Some(allowed) = self.allows_now(addr, udp) {
+            return allowed;
         }
+        let Self::BlockList(list) = self else {
+            unreachable!()
+        };
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let Some(pending) = start_lookups(&list.hostnames, move |name, ips| {
+            // A cancelled or timed-out check no longer needs the answer.
+            let _ = tx.unbounded_send((name, ips));
+        }) else {
+            return false;
+        };
+        allow_after_lookups(rx, pending, canonical(addr.ip())).await
     }
 
     /// Whether the guest may send `data`, a DNS message bound for port 53.
@@ -558,7 +573,7 @@ impl fmt::Debug for Filter {
 ///
 /// Like [`AllowList`], stores both literal IPs and hostnames.  The
 /// hostnames decide which DNS questions the guest may not ask, and are
-/// looked up again at every TCP connect or UDP send (see [`BlockList::blocks`]) for the
+/// looked up asynchronously again at every TCP connect or UDP send for the
 /// guest that has an address without asking.
 #[derive(Clone, Debug)]
 pub struct BlockList {
@@ -577,30 +592,55 @@ impl BlockList {
             hostnames,
         })
     }
+}
 
-    /// Whether `ip` is blocked: listed or resolved at build time, or what
-    /// a blocked name resolves to now.  The lookup is bounded by
-    /// [`LOOKUP_DEADLINE`], and a name that fails to resolve or runs late
-    /// counts as blocked: when the list cannot tell, it refuses.
-    fn blocks(&self, ip: &IpAddr) -> bool {
-        if self.blocked_ips.contains(ip) {
-            return true;
+type LookupAnswer = (String, io::Result<HashSet<IpAddr>>);
+
+async fn allow_after_lookups(
+    mut rx: futures::channel::mpsc::UnboundedReceiver<LookupAnswer>,
+    mut pending: usize,
+    ip: IpAddr,
+) -> bool {
+    use futures::StreamExt;
+    let deadline = tokio::time::sleep(LOOKUP_DEADLINE);
+    tokio::pin!(deadline);
+    while pending > 0 {
+        tokio::select! {
+            result = rx.next() => match result {
+                Some((_, Ok(ips))) if ips.contains(&ip) => return false,
+                Some((_, Ok(_))) => pending -= 1,
+                Some((name, Err(e))) => {
+                    debug!(%name, error = %e, "block list: lookup failed; refusing");
+                    return false;
+                }
+                None => {
+                    debug!("block list: resolver disconnected; refusing");
+                    return false;
+                }
+            },
+            _ = &mut deadline => {
+                debug!("block list: lookup past its deadline; refusing");
+                return false;
+            }
         }
-        // No answer in time, or none at all: refuse.
-        resolves_to_now(&self.hostnames, ip).unwrap_or(true)
+    }
+    true
+}
+
+struct LookupSlot;
+
+impl Drop for LookupSlot {
+    fn drop(&mut self) {
+        INFLIGHT_LOOKUPS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// Whether one of `names` resolves to `ip` at this moment.  Every name is
-/// looked up at once, each on its own thread since the resolver has no
-/// deadline of its own, and the answer is `None` when any lookup fails or
-/// outlives [`LOOKUP_DEADLINE`].
-fn resolves_to_now(names: &[String], ip: &IpAddr) -> Option<bool> {
-    if names.is_empty() {
-        return Some(false);
-    }
-    let (tx, rx) = mpsc::channel();
-    let mut spawned = 0usize;
+fn start_lookups(
+    names: &[String],
+    send: impl Fn(String, io::Result<HashSet<IpAddr>>) + Send + Sync + 'static,
+) -> Option<usize> {
+    let send = Arc::new(send);
+    let mut spawned = 0;
     for name in names {
         // Bound the resolver threads a guest can have running at once.  A
         // lookup cannot be cancelled and runs to completion even after we
@@ -612,34 +652,22 @@ fn resolves_to_now(names: &[String], ip: &IpAddr) -> Option<bool> {
             debug!("block list: resolver thread cap reached; refusing");
             return None;
         }
-        let (tx, name) = (tx.clone(), name.clone());
-        thread::spawn(move || {
+        let slot = LookupSlot;
+        let (send, name) = (send.clone(), name.clone());
+        let result = thread::Builder::new().spawn(move || {
+            let _slot = slot;
             let ips = (name.as_str(), 0u16)
                 .to_socket_addrs()
                 .map(|addrs| addrs.map(|a| canonical(a.ip())).collect::<HashSet<_>>());
-            let _ = tx.send((name, ips));
-            INFLIGHT_LOOKUPS.fetch_sub(1, Ordering::Relaxed);
+            send(name, ips);
         });
+        if let Err(e) = result {
+            debug!(error = %e, "block list: cannot start resolver; refusing");
+            return None;
+        }
         spawned += 1;
     }
-    drop(tx);
-    let deadline = Instant::now() + LOOKUP_DEADLINE;
-    let mut pending = spawned;
-    while pending > 0 {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok((_, Ok(ips))) if ips.contains(ip) => return Some(true),
-            Ok((_, Ok(_))) => pending -= 1,
-            Ok((name, Err(e))) => {
-                debug!(%name, error = %e, "block list: lookup failed; refusing");
-                return None;
-            }
-            Err(_) => {
-                debug!("block list: lookup past its deadline; refusing");
-                return None;
-            }
-        }
-    }
-    Some(false)
+    Some(spawned)
 }
 
 // ── ListenPorts ────────────────────────────────────────────────────
@@ -922,25 +950,111 @@ fn dns_read_name(data: &[u8], pos: &mut usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
-    #[test]
-    fn allowall_permits_normal_address() {
-        let policy = NetworkPolicy::AllowAll;
-        let addr: SocketAddr = "93.184.216.34:80".parse().unwrap();
-        assert!(policy.allows(&addr, false));
+    #[tokio::test]
+    async fn asynchronous_policy_preserves_address_and_protocol_decisions() {
+        let policies = [
+            (NetworkPolicy::AllowAll, [true, true, true, false, true]),
+            (
+                NetworkPolicy::AllowList(AllowList::from_hosts(&["192.0.2.1"]).unwrap()),
+                [true, false, false, false, false],
+            ),
+            (
+                NetworkPolicy::BlockList(BlockList::from_hosts(&["192.0.2.1"]).unwrap()),
+                [false, true, false, false, false],
+            ),
+            (
+                NetworkPolicy::BlockList(BlockList::from_hosts(&["localhost"]).unwrap()),
+                [true, true, false, false, false],
+            ),
+        ];
+        for (policy, expected) in policies {
+            for (addr, expected) in [
+                "192.0.2.1:80",
+                "192.0.2.2:53",
+                "127.0.0.1:80",
+                "169.254.169.254:80",
+                "[::ffff:127.0.0.1]:80",
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                let addr = addr.parse().unwrap();
+                for udp in [false, true] {
+                    assert_eq!(policy.allows_async(&addr, udp).await, expected);
+                }
+            }
+        }
     }
 
-    #[test]
-    fn allowall_blocks_link_local() {
+    #[tokio::test]
+    async fn slow_lookup_deadline_does_not_block_other_futures() {
+        let (_tx, rx) = futures::channel::mpsc::unbounded();
+        let ip = "192.0.2.1".parse().unwrap();
+        let start = Instant::now();
+        let tick = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                start.elapsed() < LOOKUP_DEADLINE,
+                "resolver blocked the executor"
+            );
+        };
+        let (allowed, ()) = tokio::join!(allow_after_lookups(rx, 1, ip), tick);
+        assert!(!allowed);
+        assert!(start.elapsed() >= LOOKUP_DEADLINE);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn async_lookup_errors_matches_and_cancellation_fail_closed() {
+        use futures::FutureExt;
+        let ip = "192.0.2.1".parse().unwrap();
+        for answer in [
+            Err(io::Error::other("resolver failed")),
+            Ok(HashSet::from([ip])),
+        ] {
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            tx.unbounded_send(("test".into(), answer)).unwrap();
+            assert!(!allow_after_lookups(rx, 1, ip).await);
+        }
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        drop(tx);
+        assert!(!allow_after_lookups(rx, 1, ip).await);
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        assert!(allow_after_lookups(rx, 1, ip).now_or_never().is_none());
+        assert!(
+            tx.is_closed(),
+            "cancelled lookups must discard subsequent answers"
+        );
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        tx.unbounded_send((
+            "test".into(),
+            Ok(HashSet::from(["192.0.2.2".parse().unwrap()])),
+        ))
+        .unwrap();
+        assert!(allow_after_lookups(rx, 1, ip).await);
+    }
+
+    #[tokio::test]
+    async fn allowall_permits_normal_address() {
+        let policy = NetworkPolicy::AllowAll;
+        let addr: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        assert!(policy.allows_async(&addr, false).await);
+    }
+
+    #[tokio::test]
+    async fn allowall_blocks_link_local() {
         let policy = NetworkPolicy::AllowAll;
         let addr: SocketAddr = "169.254.169.254:80".parse().unwrap();
-        assert!(!policy.allows(&addr, false));
+        assert!(!policy.allows_async(&addr, false).await);
     }
 
     /// The metadata addresses, IPv4 and IPv6, under every policy.
-    #[test]
-    fn metadata_addresses_are_refused_under_every_policy() {
+    #[tokio::test]
+    async fn metadata_addresses_are_refused_under_every_policy() {
         let policies = [
             NetworkPolicy::AllowAll,
             NetworkPolicy::AllowList(AllowList::from_hosts(&["fd00:ec2::254"]).unwrap()),
@@ -950,7 +1064,7 @@ mod tests {
             let addr: SocketAddr = addr.parse().unwrap();
             for policy in &policies {
                 assert!(
-                    !policy.allows(&addr, false),
+                    !policy.allows_async(&addr, false).await,
                     "{addr} allowed under {policy:?}"
                 );
             }
@@ -1015,12 +1129,12 @@ mod tests {
     /// The allow list lets DNS through to a known resolver on port 53, but
     /// only on UDP: a TCP connection there would carry questions the
     /// question check does not read.
-    #[test]
-    fn dns_exemption_is_udp_only() {
+    #[tokio::test]
+    async fn dns_exemption_is_udp_only() {
         let al = NetworkPolicy::AllowList(AllowList::from_hosts(&["93.184.216.34"]).unwrap());
         let resolver: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        assert!(al.allows(&resolver, true));
-        assert!(!al.allows(&resolver, false));
+        assert!(al.allows_async(&resolver, true).await);
+        assert!(!al.allows_async(&resolver, false).await);
     }
 
     /// Under an allow list the guest may ask DNS about listed names only;
@@ -1052,46 +1166,55 @@ mod tests {
 
     /// The addresses an answer gives for a listed name are recorded, and
     /// only those: an answer for another name teaches nothing.
-    #[test]
-    fn allowlist_records_addresses_from_answers() {
+    #[tokio::test]
+    async fn allowlist_records_addresses_from_answers() {
         let al = NetworkPolicy::AllowList(AllowList::from_hosts(&["localhost"]).unwrap());
         let resolver: SocketAddr = "8.8.8.8:53".parse().unwrap();
         let stranger: SocketAddr = "198.51.100.1:53".parse().unwrap();
         let told: SocketAddr = "203.0.113.9:443".parse().unwrap();
         let other: SocketAddr = "[2001:db8::9]:443".parse().unwrap();
-        assert!(!al.allows(&told, false));
+        assert!(!al.allows_async(&told, false).await);
         // An answer from somewhere that is not a resolver teaches nothing.
         al.learn_from_dns_answer(stranger, &dns_answer("localhost", told.ip()));
-        assert!(!al.allows(&told, false));
+        assert!(!al.allows_async(&told, false).await);
         al.learn_from_dns_answer(resolver, &dns_answer("localhost", told.ip()));
-        assert!(al.allows(&told, false));
+        assert!(al.allows_async(&told, false).await);
         al.learn_from_dns_answer(resolver, &dns_answer("example.com", other.ip()));
-        assert!(!al.allows(&other, false));
+        assert!(!al.allows_async(&other, false).await);
         al.learn_from_dns_answer(resolver, &dns_answer("LOCALHOST", other.ip()));
-        assert!(al.allows(&other, false));
+        assert!(al.allows_async(&other, false).await);
         // A block list records nothing.
         let bl = NetworkPolicy::BlockList(BlockList::from_hosts(&["1.2.3.4"]).unwrap());
         bl.learn_from_dns_answer(resolver, &dns_answer("localhost", told.ip()));
-        assert!(bl.allows(&told, false));
+        assert!(bl.allows_async(&told, false).await);
     }
 
     /// A block list refuses what a blocked name resolves to now, for the
     /// guest that connects to an address without asking.
-    #[test]
-    fn blocklist_blocks_what_a_name_resolves_to_now() {
-        let bl = BlockList::from_hosts(&["localhost"]).unwrap();
-        assert!(bl.blocks(&"127.0.0.1".parse().unwrap()));
-        assert!(!bl.blocks(&"203.0.113.9".parse().unwrap()));
+    #[tokio::test]
+    async fn blocklist_blocks_what_a_name_resolves_to_now() {
+        let bl = NetworkPolicy::BlockList(BlockList::from_hosts(&["localhost"]).unwrap());
+        assert!(
+            !bl.allows_async(&"127.0.0.1:80".parse().unwrap(), false)
+                .await
+        );
+        assert!(
+            bl.allows_async(&"203.0.113.9:80".parse().unwrap(), false)
+                .await
+        );
     }
 
     /// When the lookup cannot answer, the block list refuses.
-    #[test]
-    fn blocklist_refuses_when_a_lookup_fails() {
-        let bl = BlockList {
+    #[tokio::test]
+    async fn blocklist_refuses_when_a_lookup_fails() {
+        let bl = NetworkPolicy::BlockList(BlockList {
             blocked_ips: HashSet::new(),
             hostnames: vec!["no-such-host.invalid".to_string()],
-        };
-        assert!(bl.blocks(&"203.0.113.9".parse().unwrap()));
+        });
+        assert!(
+            !bl.allows_async(&"203.0.113.9:80".parse().unwrap(), false)
+                .await
+        );
     }
 
     #[test]
@@ -1109,24 +1232,24 @@ mod tests {
 
     /// `::ffff:a.b.c.d` on a dual-stack socket reaches a.b.c.d, so every
     /// rule must see through it.
-    #[test]
-    fn ipv4_mapped_ipv6_is_checked_as_ipv4() {
+    #[tokio::test]
+    async fn ipv4_mapped_ipv6_is_checked_as_ipv4() {
         let metadata: SocketAddr = "[::ffff:169.254.169.254]:80".parse().unwrap();
         let loopback: SocketAddr = "[::ffff:127.0.0.1]:80".parse().unwrap();
         let blocked: SocketAddr = "[::ffff:10.0.0.5]:80".parse().unwrap();
         let allowed: SocketAddr = "[::ffff:93.184.216.34]:80".parse().unwrap();
 
-        assert!(!NetworkPolicy::AllowAll.allows(&metadata, false));
+        assert!(!NetworkPolicy::AllowAll.allows_async(&metadata, false).await);
 
         let bl = NetworkPolicy::BlockList(BlockList::from_hosts(&["10.0.0.5"]).unwrap());
-        assert!(!bl.allows(&metadata, false));
-        assert!(!bl.allows(&loopback, false));
-        assert!(!bl.allows(&blocked, false));
+        assert!(!bl.allows_async(&metadata, false).await);
+        assert!(!bl.allows_async(&loopback, false).await);
+        assert!(!bl.allows_async(&blocked, false).await);
 
         let al = NetworkPolicy::AllowList(AllowList::from_hosts(&["93.184.216.34"]).unwrap());
-        assert!(!al.allows(&metadata, false));
-        assert!(!al.allows(&loopback, false));
-        assert!(al.allows(&allowed, false));
+        assert!(!al.allows_async(&metadata, false).await);
+        assert!(!al.allows_async(&loopback, false).await);
+        assert!(al.allows_async(&allowed, false).await);
     }
 
     /// What a destination is compared with is IPv4 too when it is written
@@ -1134,105 +1257,105 @@ mod tests {
     /// logs an IPv4 client in), and an address a DNS answer gives.  A block
     /// list entry `::ffff:a.b.c.d` otherwise blocked nothing, since every
     /// destination is judged as `a.b.c.d`.
-    #[test]
-    fn ipv4_mapped_entries_are_ipv4() {
+    #[tokio::test]
+    async fn ipv4_mapped_entries_are_ipv4() {
         let v4: SocketAddr = "10.0.0.5:80".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.5]:80".parse().unwrap();
         let next: SocketAddr = "10.0.0.6:80".parse().unwrap();
 
         let bl = NetworkPolicy::BlockList(BlockList::from_hosts(&["::ffff:10.0.0.5"]).unwrap());
-        assert!(!bl.allows(&v4, false));
-        assert!(!bl.allows(&mapped, true));
-        assert!(bl.allows(&next, false));
+        assert!(!bl.allows_async(&v4, false).await);
+        assert!(!bl.allows_async(&mapped, true).await);
+        assert!(bl.allows_async(&next, false).await);
 
         let al = NetworkPolicy::AllowList(AllowList::from_hosts(&["::ffff:10.0.0.5"]).unwrap());
-        assert!(al.allows(&v4, false));
-        assert!(al.allows(&mapped, true));
-        assert!(!al.allows(&next, false));
+        assert!(al.allows_async(&v4, false).await);
+        assert!(al.allows_async(&mapped, true).await);
+        assert!(!al.allows_async(&next, false).await);
 
         // An AAAA answer that gives a listed name a mapped address.
         let al = NetworkPolicy::AllowList(AllowList::from_hosts(&["localhost"]).unwrap());
         let resolver: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        assert!(!al.allows(&v4, false));
+        assert!(!al.allows_async(&v4, false).await);
         al.learn_from_dns_answer(resolver, &dns_answer("localhost", mapped.ip()));
-        assert!(al.allows(&v4, false));
-        assert!(!al.allows(&next, false));
+        assert!(al.allows_async(&v4, false).await);
+        assert!(!al.allows_async(&next, false).await);
     }
 
-    #[test]
-    fn allowall_permits_loopback() {
+    #[tokio::test]
+    async fn allowall_permits_loopback() {
         // AllowAll permits loopback — needed for intra-guest server+client
         // in the hostsock model where all guest sockets are host sockets.
         let policy = NetworkPolicy::AllowAll;
         let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
-        assert!(policy.allows(&addr, false));
+        assert!(policy.allows_async(&addr, false).await);
     }
 
-    #[test]
-    fn allowall_permits_ipv6_loopback() {
+    #[tokio::test]
+    async fn allowall_permits_ipv6_loopback() {
         let policy = NetworkPolicy::AllowAll;
         let addr: SocketAddr = "[::1]:80".parse().unwrap();
-        assert!(policy.allows(&addr, false));
+        assert!(policy.allows_async(&addr, false).await);
     }
 
-    #[test]
-    fn allowlist_blocks_loopback() {
+    #[tokio::test]
+    async fn allowlist_blocks_loopback() {
         let al = AllowList::from_hosts(&["93.184.216.34"]).unwrap();
         let policy = NetworkPolicy::AllowList(al);
         let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
-        assert!(!policy.allows(&addr, false));
+        assert!(!policy.allows_async(&addr, false).await);
     }
 
-    #[test]
-    fn blocklist_blocks_loopback() {
+    #[tokio::test]
+    async fn blocklist_blocks_loopback() {
         let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
         let policy = NetworkPolicy::BlockList(bl);
         let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
-        assert!(!policy.allows(&addr, false));
+        assert!(!policy.allows_async(&addr, false).await);
     }
 
-    #[test]
-    fn allowlist_permits_listed_ip() {
+    #[tokio::test]
+    async fn allowlist_permits_listed_ip() {
         let al = AllowList::from_hosts(&["93.184.216.34"]).unwrap();
         let policy = NetworkPolicy::AllowList(al);
         let addr: SocketAddr = "93.184.216.34:80".parse().unwrap();
-        assert!(policy.allows(&addr, false));
+        assert!(policy.allows_async(&addr, false).await);
     }
 
-    #[test]
-    fn allowlist_blocks_unlisted_ip() {
+    #[tokio::test]
+    async fn allowlist_blocks_unlisted_ip() {
         let al = AllowList::from_hosts(&["93.184.216.34"]).unwrap();
         let policy = NetworkPolicy::AllowList(al);
         let addr: SocketAddr = "1.2.3.4:80".parse().unwrap();
-        assert!(!policy.allows(&addr, false));
+        assert!(!policy.allows_async(&addr, false).await);
     }
 
-    #[test]
-    fn allowlist_exempts_dns_on_port_53() {
+    #[tokio::test]
+    async fn allowlist_exempts_dns_on_port_53() {
         let al = AllowList::from_hosts(&["93.184.216.34"]).unwrap();
         let policy = NetworkPolicy::AllowList(al);
         // Google DNS on port 53, over UDP, should be exempted.
         let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        assert!(policy.allows(&addr, true));
+        assert!(policy.allows_async(&addr, true).await);
         // But not on other ports.
         let addr: SocketAddr = "8.8.8.8:80".parse().unwrap();
-        assert!(!policy.allows(&addr, true));
+        assert!(!policy.allows_async(&addr, true).await);
     }
 
-    #[test]
-    fn blocklist_blocks_listed_ip() {
+    #[tokio::test]
+    async fn blocklist_blocks_listed_ip() {
         let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
         let policy = NetworkPolicy::BlockList(bl);
         let addr: SocketAddr = "1.2.3.4:80".parse().unwrap();
-        assert!(!policy.allows(&addr, false));
+        assert!(!policy.allows_async(&addr, false).await);
     }
 
-    #[test]
-    fn blocklist_permits_unlisted_ip() {
+    #[tokio::test]
+    async fn blocklist_permits_unlisted_ip() {
         let bl = BlockList::from_hosts(&["1.2.3.4"]).unwrap();
         let policy = NetworkPolicy::BlockList(bl);
         let addr: SocketAddr = "93.184.216.34:80".parse().unwrap();
-        assert!(policy.allows(&addr, false));
+        assert!(policy.allows_async(&addr, false).await);
     }
 
     #[test]
@@ -1256,19 +1379,23 @@ mod tests {
         assert!(lp.allows(65535));
     }
 
-    #[test]
-    fn allowlist_exempts_the_guest_resolver_on_port_53() {
+    #[tokio::test]
+    async fn allowlist_exempts_the_guest_resolver_on_port_53() {
         let al = AllowList::from_hosts(&["93.184.216.34"]).unwrap();
         let resolver: SocketAddr = "10.96.0.10:53".parse().unwrap();
         let policy = NetworkPolicy::AllowList(al.clone());
-        assert!(!policy.allows(&resolver, true));
+        assert!(!policy.allows_async(&resolver, true).await);
         al.exempt_resolvers(resolv_conf_nameservers(
             "nameserver 10.96.0.10\nsearch default.svc.cluster.local\n",
         ));
-        assert!(policy.allows(&resolver, true));
+        assert!(policy.allows_async(&resolver, true).await);
         // Only as a resolver: not on other ports, not over TCP.
-        assert!(!policy.allows(&"10.96.0.10:80".parse().unwrap(), true));
-        assert!(!policy.allows(&resolver, false));
+        assert!(
+            !policy
+                .allows_async(&"10.96.0.10:80".parse().unwrap(), true)
+                .await
+        );
+        assert!(!policy.allows_async(&resolver, false).await);
     }
 
     #[test]
@@ -1361,8 +1488,8 @@ mod tests {
     /// An address is allowed by the names DNS gave it, on the filter's
     /// terms, here one port; answers from a stranger and for names the
     /// filter refuses teach nothing.
-    #[test]
-    fn filter_judges_addresses_by_the_names_dns_gave_them() {
+    #[tokio::test]
+    async fn filter_judges_addresses_by_the_names_dns_gave_them() {
         let policy = NetworkPolicy::Filter(Filter::from_arc(name_and_port(
             "api.example.com",
             443,
@@ -1372,38 +1499,42 @@ mod tests {
         let stranger: SocketAddr = "198.51.100.1:53".parse().unwrap();
         let told: SocketAddr = "203.0.113.9:443".parse().unwrap();
         let other: SocketAddr = "203.0.113.10:443".parse().unwrap();
-        assert!(!policy.allows(&told, false));
+        assert!(!policy.allows_async(&told, false).await);
         policy.learn_from_dns_answer(stranger, &dns_answer("api.example.com", told.ip()));
-        assert!(!policy.allows(&told, false));
+        assert!(!policy.allows_async(&told, false).await);
         policy.learn_from_dns_answer(resolver, &dns_answer("API.example.com", told.ip()));
-        assert!(policy.allows(&told, false));
+        assert!(policy.allows_async(&told, false).await);
         // The filter's port, not any port.
-        assert!(!policy.allows(&SocketAddr::new(told.ip(), 80), false));
+        assert!(
+            !policy
+                .allows_async(&SocketAddr::new(told.ip(), 80), false)
+                .await
+        );
         // A name the filter refuses is not credited with its addresses.
         policy.learn_from_dns_answer(resolver, &dns_answer("evil.example", other.ip()));
-        assert!(!policy.allows(&other, false));
+        assert!(!policy.allows_async(&other, false).await);
         // IPv4-mapped IPv6 is the IPv4 address.
         let mapped: SocketAddr = "[::ffff:203.0.113.9]:443".parse().unwrap();
-        assert!(policy.allows(&mapped, false));
+        assert!(policy.allows_async(&mapped, false).await);
     }
 
     /// What the filter allows is asked again at every connect, so a change
     /// takes effect at once, without a new policy.
-    #[test]
-    fn filter_changes_take_effect_at_the_next_connect() {
+    #[tokio::test]
+    async fn filter_changes_take_effect_at_the_next_connect() {
         let filter = name_and_port("api.example.com", 443, Some("192.0.2.7"));
         let policy = NetworkPolicy::Filter(Filter::from_arc(filter.clone()));
         let literal: SocketAddr = "192.0.2.7:5432".parse().unwrap();
-        assert!(policy.allows(&literal, false));
+        assert!(policy.allows_async(&literal, false).await);
         *filter.allowed.lock().unwrap() = false;
-        assert!(!policy.allows(&literal, false));
+        assert!(!policy.allows_async(&literal, false).await);
         assert!(!policy.allows_query(&dns_query(&["api.example.com"])));
     }
 
     /// Loopback and the metadata addresses are refused whatever the filter
     /// says; the exempt resolvers take questions on UDP only.
-    #[test]
-    fn filter_keeps_the_fixed_refusals_and_the_resolver_exemption() {
+    #[tokio::test]
+    async fn filter_keeps_the_fixed_refusals_and_the_resolver_exemption() {
         let filter = Filter::new(NameAndPort {
             name: String::new(),
             port: 0,
@@ -1428,12 +1559,15 @@ mod tests {
             "169.254.169.254:80",
             "[fd00:ec2::254]:80",
         ] {
-            assert!(!all.allows(&addr.parse().unwrap(), false), "{addr}");
+            assert!(
+                !all.allows_async(&addr.parse().unwrap(), false).await,
+                "{addr}"
+            );
         }
         for resolver in ["8.8.8.8:53", "192.0.2.53:53"] {
             let resolver: SocketAddr = resolver.parse().unwrap();
-            assert!(policy.allows(&resolver, true));
-            assert!(!policy.allows(&resolver, false));
+            assert!(policy.allows_async(&resolver, true).await);
+            assert!(!policy.allows_async(&resolver, false).await);
         }
     }
 
@@ -1456,8 +1590,8 @@ mod tests {
 
     /// A filter that panics refuses, and one that formats the policy while
     /// it answers does not wait on itself.
-    #[test]
-    fn filter_panics_refuse_and_formatting_inside_does_not_block() {
+    #[tokio::test]
+    async fn filter_panics_refuse_and_formatting_inside_does_not_block() {
         struct Panics;
         impl NetworkFilter for Panics {
             fn allows_name(&self, _: &str) -> bool {
@@ -1468,7 +1602,11 @@ mod tests {
             }
         }
         let policy = NetworkPolicy::Filter(Filter::new(Panics));
-        assert!(!policy.allows(&"203.0.113.9:443".parse().unwrap(), false));
+        assert!(
+            !policy
+                .allows_async(&"203.0.113.9:443".parse().unwrap(), false)
+                .await
+        );
         assert!(!policy.allows_query(&dns_query(&["example.com"])));
 
         struct Formats(std::sync::OnceLock<Filter>);
@@ -1488,13 +1626,17 @@ mod tests {
             "8.8.8.8:53".parse().unwrap(),
             &dns_answer("example.com", "203.0.113.9".parse().unwrap()),
         );
-        assert!(policy.allows(&"203.0.113.9:443".parse().unwrap(), false));
+        assert!(
+            policy
+                .allows_async(&"203.0.113.9:443".parse().unwrap(), false)
+                .await
+        );
     }
 
     /// The unspecified address reaches the host's loopback when connected
     /// to, so whatever refuses loopback refuses it too.
-    #[test]
-    fn the_unspecified_address_is_refused_with_loopback() {
+    #[tokio::test]
+    async fn the_unspecified_address_is_refused_with_loopback() {
         struct All;
         impl NetworkFilter for All {
             fn allows_name(&self, _: &str) -> bool {
@@ -1512,7 +1654,7 @@ mod tests {
         for policy in &policies {
             for addr in ["0.0.0.0:443", "[::]:443", "[::ffff:0.0.0.0]:443"] {
                 assert!(
-                    !policy.allows(&addr.parse().unwrap(), false),
+                    !policy.allows_async(&addr.parse().unwrap(), false).await,
                     "{policy:?} {addr}"
                 );
             }

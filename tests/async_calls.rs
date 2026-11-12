@@ -80,6 +80,66 @@ def echo(value):
     );
 }
 
+#[tokio::test]
+async fn blocklist_connect_and_sendto_share_completions_with_embedder_calls() {
+    let mut sandbox = python()
+        .network(NetworkPolicy::BlockList(
+            hyperlight_unikraft::BlockList::from_hosts(&["localhost"]).unwrap(),
+        ))
+        .profile(true)
+        .async_host_function("pause", |_| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok("7".into())
+        })
+        .boot()
+        .unwrap();
+    let script = r#"
+import socket, threading, hyperlight, errno
+errors = []
+def datagram():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            try:
+                assert s.sendto(b"probe", ("192.0.2.1", 9)) == 5
+            except OSError as e:
+                assert e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED), e
+    except BaseException as e:
+        errors.append(e)
+t = threading.Thread(target=datagram)
+t.start()
+assert hyperlight.call("pause") == 7
+with socket.socket() as s:
+    s.settimeout(0.05)
+    try:
+        s.connect(("192.0.2.1", 9))
+    except OSError as e:
+        assert e.errno not in (errno.EACCES, errno.EIO, errno.EOPNOTSUPP), e
+t.join()
+assert not errors, errors
+"#;
+    tokio::time::timeout(Duration::from_secs(5), sandbox.run_async(script))
+        .await
+        .unwrap()
+        .unwrap();
+    let report = sandbox.profile().report();
+    for label in [
+        "host net_connect_async ",
+        "host net_sendto_async ",
+        "host net_wait_async ",
+        "entry step_async ",
+    ] {
+        assert!(report.contains(label), "{report}");
+    }
+    sandbox.snapshot().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), sandbox.step_async())
+        .await
+        .unwrap()
+        .unwrap();
+    sandbox.snapshot().unwrap();
+    // A subsequent call can perform another deferred policy check.
+    sandbox.run_async("import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.connect(('192.0.2.1', 9))\ns.close()").await.unwrap();
+}
+
 #[test]
 fn synchronous_setup_and_restore_queue_network_waits_for_async_driving() {
     use hyperlight_unikraft::Yield;

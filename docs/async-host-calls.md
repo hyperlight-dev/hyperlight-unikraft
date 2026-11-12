@@ -182,6 +182,46 @@ when `run_async` returns. Snapshots can capture it without another `step_async`.
 The CLI uses the same interruption behavior for
 warm-cache and manual snapshots, preserving network-enabled warm-up.
 
+## Typed networking calls
+
+The kernel negotiates async support before starting the workload, including
+driverless entry binaries that can wait on networking before the first idle.
+It negotiates again with the restoring host on resume.
+
+The kernel uses `net_connect_async`, `net_send_async`, and `net_sendto_async` for operations that
+may need a fresh block-list DNS check. These carry the same arguments as their
+integer-returning predecessors, but return a byte-vector envelope:
+
+- tag 0 followed by a little-endian `i32` result (including negative Linux errno);
+- tag 2 followed by the request ID, exactly as for a pending `HostCall`.
+
+The existing completion batches deliver these typed results to the same guest
+waiter mechanism. Unlike an embedder `HostCall` result, the four bytes after tag
+0 are an integer, not UTF-8. Static policy decisions retain a single host call
+with an immediate reply, without allocating a future or parking a guest thread.
+
+During driving, fresh block-list
+lookups are driven outside VM entries in the shared futures set. Resolver
+failure or the 250 ms deadline denies access with `EACCES`; no TCP connect or
+datagram transmission is attempted before authorization. UDP connect sends
+nothing and is allowed without a policy check; each subsequent send checks its
+destination. A stream sendto uses its connected peer, not the supplied address.
+The existing process-wide limit of 32
+resolver threads remains in force. System resolver calls cannot be interrupted:
+cancellation discards their answers, and their slots remain occupied until the
+workers finish. Snapshot restore interruption and poison-on-drop apply to these
+pending typed calls just as to embedder calls. Restored typed calls fail with
+`EINTR`, just like unfinished embedder calls.
+Socket libraries, including Python's blocking socket operations, may retry
+`EINTR` themselves; that is distinct from the host engine replaying a future.
+
+Fresh DNS checks always use lazy async calls, including during boot, submit and
+resume. Older kernels using the legacy integer-returning network calls receive
+`EOPNOTSUPP` if authorization would
+require a live DNS lookup; they must be rebuilt to use the deferred path.
+Kernel binaries and the snapshot contract have changed, so existing snapshots
+must be recreated.
+
 ## Validation
 
 Build the kernels and Python runtime with `just build-kernel` and
@@ -235,7 +275,3 @@ Both paths drive the same pending-operation engine; a bounded synchronous step
 retains pending work when its timeout expires. Cancellation of an asynchronous
 drive still poisons the sandbox. Boot, submission, capture and restore stay
 synchronous.
-
-Typed connect and send replies use the new envelope but still finish their
-policy checks synchronously. Moving live DNS checks out of VM entries is a
-separate change.

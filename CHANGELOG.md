@@ -23,6 +23,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   16-byte transport header. Rebuild runtime images with the updated drivers;
   FlatBuffer-based images are incompatible. Both embedded kernels and the native
   test fixture are rebuilt, and snapshot contract 11 requires fresh snapshots.
+- Live block-list DNS checks run outside VM entries through typed async
+  connect/send/sendto replies. Static policy decisions remain immediate; UDP
+  connect sends nothing and each datagram send checks its destination. The
+  250 ms fail-closed deadline and process-wide resolver limit remain in force.
+  Boot, submission and restore queue lazy checks for the next driving step.
 - Socket descriptors, metadata, readiness interests and runtime-aware Tokio
   registrations have one owner per guest fd. TCP/UDP transfers use Tokio with
   immediate syscall fallback; POSIX setup, options and errno translation remain.

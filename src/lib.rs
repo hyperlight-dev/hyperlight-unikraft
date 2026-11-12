@@ -3729,6 +3729,76 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires a hypervisor and build-elfloader/python-rootfs.cpio"]
+    async fn pending_network_calls_are_interrupted_on_restore() {
+        let rootfs =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("build-elfloader/python-rootfs.cpio");
+        for (socket_type, setup, operation) in [
+            ("SOCK_STREAM", "", "s.connect(('192.0.2.1', 9))"),
+            ("SOCK_DGRAM", "", "s.sendto(b'data', ('192.0.2.1', 9))"),
+            (
+                "SOCK_DGRAM",
+                "s.connect(('192.0.2.1', 9))\n",
+                "s.send(b'data')",
+            ),
+        ] {
+            let mut app = SandboxBuilder::from_initrd(&rootfs)
+                .network(NetworkPolicy::BlockList(
+                    BlockList::from_hosts(&["localhost"]).unwrap(),
+                ))
+                .echo_output(false)
+                .boot()
+                .unwrap();
+            // Python retries interrupted sends; restored connected sockets are dead.
+            let completion = if socket_type == "SOCK_STREAM" || !setup.is_empty() {
+                let error = if setup.is_empty() { "EINTR" } else { "EPIPE" };
+                format!(
+                    "try:\n    {operation}\n    raise AssertionError('not interrupted')\n\
+                     except OSError as e:\n    assert e.errno == errno.{error}, e\n"
+                )
+            } else {
+                format!("assert {operation} == 4\n")
+            };
+            let code = format!(
+                "import socket, errno\ns = socket.socket(socket.AF_INET, socket.{socket_type})\n\
+                 s.setblocking(False)\n\
+                 {setup}{completion}s.close()\nprint('resumed')"
+            );
+            app.submit(code).unwrap();
+            assert!(app.async_calls.is_pending());
+            let snapshot = app.snapshot().unwrap();
+            app.restore(snapshot).unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match app.step_async().await.unwrap() {
+                        Yield::Blocked { .. } => {}
+                        result => break result,
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                result,
+                Yield::CallDone,
+                "{operation}\n{}{}",
+                app.drain_output(),
+                app.drain_stderr()
+            );
+            assert!(app.drain_output().contains("resumed"));
+            if app.async_calls.is_pending() {
+                app.snapshot().unwrap();
+                assert_eq!(
+                    app.step_async().await.unwrap(),
+                    Yield::Blocked { until: None }
+                );
+            }
+            assert!(!app.async_calls.is_pending());
+            app.snapshot().unwrap();
+        }
+    }
+
     #[test]
     #[ignore = "requires a hypervisor and build-elfloader/python-rootfs.cpio"]
     fn restore_discards_prepared_replies_and_checks_capability() {
