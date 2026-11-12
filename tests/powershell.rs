@@ -7,15 +7,15 @@ use std::path::PathBuf;
 use common::{require_rootfs, temp_dir};
 use hyperlight_unikraft::{Exec, SandboxBuilder};
 
-#[test]
-fn powershell_hello() {
+#[tokio::test]
+async fn powershell_hello() {
     let rootfs = require_rootfs("powershell");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/powershell/hello.ps1");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1024)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from PowerShell on Hyperlight"),
@@ -23,8 +23,8 @@ fn powershell_hello() {
     );
 }
 
-#[test]
-fn powershell_snapshot_round_trip() {
+#[tokio::test]
+async fn powershell_snapshot_round_trip() {
     let rootfs = require_rootfs("powershell");
     let snap_dir = temp_dir("powershell-snap");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs.clone())
@@ -39,6 +39,7 @@ fn powershell_snapshot_round_trip() {
         .unwrap();
     sandbox
         .run("[Console]::WriteLine('restored-pwsh-ok')")
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -47,8 +48,8 @@ fn powershell_snapshot_round_trip() {
     );
 }
 
-#[test]
-fn powershell_env_vars() {
+#[tokio::test]
+async fn powershell_env_vars() {
     let rootfs = require_rootfs("powershell");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1024)
@@ -63,6 +64,7 @@ fn powershell_env_vars() {
         .run(Exec::File(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/powershell/env_vars.ps1"),
         ))
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -82,8 +84,8 @@ fn powershell_env_vars() {
 /// Cmdlets run by name: PowerShell finds the modules that hold them only
 /// when its FileSystem provider resolves paths, which takes a mount at `/`
 /// in /proc/mounts (#138).
-#[test]
-fn powershell_cmdlets_are_found_by_name() {
+#[tokio::test]
+async fn powershell_cmdlets_are_found_by_name() {
     let rootfs = require_rootfs("powershell");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1024)
@@ -95,6 +97,7 @@ fn powershell_cmdlets_are_found_by_name() {
              Write-Output ('source=' + (Get-Command Write-Output).Source); \
              Write-Output ('opt=' + (Test-Path /opt))",
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -107,8 +110,8 @@ fn powershell_cmdlets_are_found_by_name() {
 
 /// A script's exit code is the call's status, as it is for an exec'd
 /// program: `exit 3` fails the call, and the next call runs as usual.
-#[test]
-fn powershell_exit_status_fails_the_call() {
+#[tokio::test]
+async fn powershell_exit_status_fails_the_call() {
     let rootfs = require_rootfs("powershell");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1024)
@@ -117,10 +120,14 @@ fn powershell_exit_status_fails_the_call() {
     assert!(
         sandbox
             .run("[Console]::WriteLine('leaving'); exit 3")
+            .await
             .is_err(),
         "a non-zero exit code did not fail the call"
     );
     assert!(sandbox.drain_output().contains("leaving"));
-    sandbox.run("[Console]::WriteLine('still here')").unwrap();
+    sandbox
+        .run("[Console]::WriteLine('still here')")
+        .await
+        .unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 }

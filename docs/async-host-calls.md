@@ -80,7 +80,7 @@ itself is boxed, not another async wrapper around cancellation.
 
 ## Lifetime and cancellation
 
-Dropping a polled, unfinished `step_async` or a higher-level driving future
+Dropping a polled, unfinished `step` or a higher-level driving future
 poisons the sandbox and drops its pending host futures and results. Execution
 and snapshots then fail with `PoisonedSandbox`; an explicit successful restore
 is the recovery path. Dropping an unpolled future does nothing. Cancellation
@@ -133,6 +133,34 @@ Updated kernels and snapshot contract 10 require fresh snapshots. Async handler
 registration rejects kernels without interruption-capability negotiation. This
 change needs no additional rootfs rebuild beyond the existing Python GIL fix.
 
+## Migration
+
+Driving is async-only, including when all registered handlers are
+synchronous:
+
+| Removed API | Async API |
+| --- | --- |
+| `run(exec)` / `run_async(exec).await` | `run(exec).await` |
+| `call(name, input)` / `call_async(name, input).await` | `call(name, input).await` |
+| `join()` / `join_async().await` | `join().await` |
+| `step(timeout)` / `step_async().await` | `step().await` |
+
+The `_async` public names have been removed. Boot, `submit`, snapshots and restore
+remain synchronous. Use Tokio with time and I/O enabled; the CLI now provides
+that runtime itself. Synchronous applications can use `runtime.block_on(...)`
+at their outer boundary, not inside a running async executor. The library has
+no blocking driver or internally created runtime. Boot, submit and resume can
+enqueue lazy host calls without an executor; subsequent async driving polls them.
+
+**A timeout is not a probe.** There is no bounded synchronous step or zero-timeout
+probe. `step` has no timeout argument: dropping a polled unfinished future, including through
+`tokio::time::timeout`, poisons the sandbox. To do other work while waiting,
+keep the driving future alive and poll it again rather than cancelling it.
+Completed steps are safe boundaries for accessing the sandbox.
+
+Only Rust API names change in this migration; the guest entry named
+`step_async` and snapshot compatibility are unchanged by the rename.
+
 ## Shared pending-operation engine
 
 The scheduler's earliest deadline, reported by the existing `Yield` host call,
@@ -159,8 +187,8 @@ kernel waiter per sandbox submits it and parks through the same guest waiter
 mechanism as other async calls. The kernel-only waiter has no Unikraft TLS, so it
 does not inherit a subprocess's descriptor table. Its host future polls the current socket
 interests; interest changes wake it, and cached Tokio registrations survive
-unchanged waits. No per-socket wait map, network completion variant or pruning
-path remains in the pending-operation engine. The future does not retain socket
+unchanged waits. The pending-operation engine needs no per-socket wait map, network completion
+variant or pruning path. The future does not retain socket
 handles between polls, so close/rebind still works within one VM entry.
 
 The reply is a normal tag-0 `i32`: 1 means recheck readiness and 0 means no interests.
@@ -178,7 +206,7 @@ operations and poll/select remain nonblocking in the driver; their POSIX layer
 still decides which guest threads park.
 
 After closing sockets, a final readiness completion may still be outstanding
-when `run_async` returns. Snapshots can capture it without another `step_async`.
+when `run` returns. Snapshots can capture it without another `step`.
 The CLI uses the same interruption behavior for
 warm-cache and manual snapshots, preserving network-enabled warm-up.
 
@@ -200,7 +228,7 @@ waiter mechanism. Unlike an embedder `HostCall` result, the four bytes after tag
 0 are an integer, not UTF-8. Static policy decisions retain a single host call
 with an immediate reply, without allocating a future or parking a guest thread.
 
-During driving, fresh block-list
+During `run`, `call`, `join` and `step`, fresh block-list
 lookups are driven outside VM entries in the shared futures set. Resolver
 failure or the 250 ms deadline denies access with `EACCES`; no TCP connect or
 datagram transmission is attempted before authorization. UDP connect sends
@@ -247,11 +275,13 @@ Existing tests retain coverage for backpressure, unread-data spinning, idle CPU,
 out-of-order replies, close/restore and batched timer/network wakes.
 
 There is one production `FuturesUnordered` driving the sandbox. Readiness tests
-and synchronous migration adapters use that same engine.
+use the shared engine. A DNS future's local answer/deadline `select!` is part of
+that one operation, not a second sandbox driver. There is no separate blocking
+socket waiter or step loop.
 
 | Platform | Validation available for this change |
 | --- | --- |
-| Linux x86_64 / KVM | Unit, guest, CLI/project and wire-parser execution |
+| Linux x86_64 / KVM | Unit, guest, CLI/project, wire-parser and release benchmark execution |
 | Linux x86_64 / MSHV | Feature-enabled library compiles; MSHV execution not performed |
 | Windows x86_64 / WHP | All test targets cross-compile; no Windows execution host available |
 | macOS arm64 / HVF; Linux arm64 | Native execution and cross-compilation not performed here |
@@ -264,14 +294,3 @@ Windows compile coverage uses
 for running the tests under WHP. MSHV compile coverage uses
 `cargo check --features mshv --lib`. Native macOS/arm64 validation remains a release
 gate on hosts with those hypervisors and matching guest fixtures.
-
-## Migrating callers
-
-The asynchronous entry points are `run_async`, `call_async`, `join_async` and
-`step_async`. Existing `run`, `call`, `join` and bounded `step(timeout)` callers
-remain supported during migration by a lazily created, sandbox-owned Tokio
-runtime. These adapters must not be called from within a Tokio runtime.
-Both paths drive the same pending-operation engine; a bounded synchronous step
-retains pending work when its timeout expires. Cancellation of an asynchronous
-drive still poisons the sandbox. Boot, submission, capture and restore stay
-synchronous.

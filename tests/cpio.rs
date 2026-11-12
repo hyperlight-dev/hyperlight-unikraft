@@ -7,8 +7,8 @@ mod common;
 
 use hyperlight_unikraft::{SandboxBuilder, cpio::from_tar};
 
-#[test]
-fn the_library_finds_the_driver_in_the_result() {
+#[tokio::test]
+async fn the_library_finds_the_driver_in_the_result() {
     let mut tar = tar::Builder::new(Vec::new());
     for (name, kind, data) in [
         ("usr/", tar::EntryType::Directory, &b""[..]),
@@ -40,7 +40,7 @@ fn the_library_finds_the_driver_in_the_result() {
     // the entry out of our archive, and the kernel found it in the
     // unpacked initrd.  An archive the host could not read would boot
     // nothing and say so differently.
-    let (_sandbox, log) = common::guest_log(|| {
+    let (_sandbox, log) = common::guest_log(async {
         // The driver's name would size the guest for node; booting is all
         // this needs.
         SandboxBuilder::from_initrd(&path)
@@ -48,7 +48,8 @@ fn the_library_finds_the_driver_in_the_result() {
             .guest_log_level(tracing::level_filters::LevelFilter::ERROR)
             .boot()
             .unwrap()
-    });
+    })
+    .await;
     assert!(
         log.iter()
             .any(|l| l.contains("/usr/local/bin/hl_nodedriver: Image format not recognized")),

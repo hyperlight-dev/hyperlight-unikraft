@@ -47,21 +47,21 @@ async fn the_sandbox_continues_on_its_resized_snapshots_scratch() {
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run_async(SCRIPT).await.unwrap();
+    sandbox.run(SCRIPT).await.unwrap();
 
     let small = sandbox.snapshot_with_scratch_mb(8).unwrap();
     assert_eq!(snapshot_scratch_mb(&small), Some(8));
     let plain = sandbox.snapshot().unwrap();
     assert_eq!(snapshot_scratch_mb(&plain), Some(8));
     let e = sandbox
-        .call_async("big", BIG)
+        .call("big", BIG)
         .await
         .expect_err("32 MiB must not fit 8 MiB");
     assert!(outgrew(&e), "{e}");
     // A plain snapshot of it is an 8 MiB snapshot, in a new sandbox too.
     let mut fresh = SandboxBuilder::from_snapshot(plain).boot().unwrap();
     let e = fresh
-        .call_async("big", BIG)
+        .call("big", BIG)
         .await
         .expect_err("32 MiB must not fit a fresh 8 MiB sandbox");
     assert!(outgrew(&e), "{e}");
@@ -70,7 +70,7 @@ async fn the_sandbox_continues_on_its_resized_snapshots_scratch() {
     sandbox.restore(small).unwrap();
     let grown = sandbox.snapshot_with_scratch_mb(512).unwrap();
     assert_eq!(snapshot_scratch_mb(&grown), Some(512));
-    let out = sandbox.call_async("big", HUGE).await.unwrap();
+    let out = sandbox.call("big", HUGE).await.unwrap();
     assert!(out.contains("335544320"), "{out}");
     assert_eq!(snapshot_scratch_mb(&sandbox.snapshot().unwrap()), Some(512));
 }
@@ -81,7 +81,7 @@ async fn a_resized_snapshot_restores_with_another_scratch_size() {
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run_async(SCRIPT).await.unwrap();
+    sandbox.run(SCRIPT).await.unwrap();
     let full = sandbox.snapshot().unwrap();
     assert_eq!(snapshot_scratch_mb(&full), Some(256));
     let same = sandbox.snapshot_with_scratch_mb(256).unwrap();
@@ -111,12 +111,12 @@ async fn a_resized_snapshot_restores_with_another_scratch_size() {
         "{e}"
     );
     assert_eq!(snapshot_scratch_mb(&sandbox.snapshot().unwrap()), Some(512));
-    let out = sandbox.call_async("handler", REQUEST).await.unwrap();
+    let out = sandbox.call("handler", REQUEST).await.unwrap();
     assert!(out.contains("redirected"), "{out}");
 
     for _ in 0..3 {
         sandbox.restore(small.clone()).unwrap();
-        let out = sandbox.call_async("handler", REQUEST).await.unwrap();
+        let out = sandbox.call("handler", REQUEST).await.unwrap();
         assert!(out.contains("redirected"), "{out}");
     }
 
@@ -124,7 +124,7 @@ async fn a_resized_snapshot_restores_with_another_scratch_size() {
     // and a restore recovers the sandbox.
     sandbox.restore(small.clone()).unwrap();
     let e = sandbox
-        .call_async("big", BIG)
+        .call("big", BIG)
         .await
         .expect_err("32 MiB must not fit 8 MiB");
     assert!(outgrew(&e), "{e}");
@@ -134,19 +134,19 @@ async fn a_resized_snapshot_restores_with_another_scratch_size() {
     let regrown = sandbox.snapshot_with_scratch_mb(64).unwrap();
     assert_eq!(snapshot_scratch_mb(&regrown), Some(64));
     sandbox.restore(regrown).unwrap();
-    let out = sandbox.call_async("big", BIG).await.unwrap();
+    let out = sandbox.call("big", BIG).await.unwrap();
     assert!(out.contains("33554432"), "{out}");
 
     // 320 MiB does not fit the 256 MiB the sandbox booted with, but fits
     // the grown snapshot.
     sandbox.restore(full.clone()).unwrap();
     let e = sandbox
-        .call_async("big", HUGE)
+        .call("big", HUGE)
         .await
         .expect_err("320 MiB must not fit 256 MiB");
     assert!(outgrew(&e), "{e}");
     sandbox.restore(grown).unwrap();
-    let out = sandbox.call_async("big", HUGE).await.unwrap();
+    let out = sandbox.call("big", HUGE).await.unwrap();
     assert!(out.contains("335544320"), "{out}");
 
     // The smallest whole MiB the host accepts is less than a MiB above its
@@ -163,7 +163,7 @@ async fn a_resized_snapshot_restores_with_another_scratch_size() {
         })
         .expect("a size the host accepts");
     let e = sandbox
-        .call_async("handler", REQUEST)
+        .call("handler", REQUEST)
         .await
         .expect_err("a guest function call on the tiny scratch must fail");
     assert!(matches!(e, Error::Hyperlight(GuestAborted(..))), "{e}");
@@ -179,7 +179,7 @@ async fn a_resized_snapshot_restores_with_another_scratch_size() {
     // Until a restore recovers it, the sandbox serves nothing: hluk has
     // forgotten the driver, and hyperlight has poisoned the sandbox.
     let e = sandbox
-        .call_async("handler", REQUEST)
+        .call("handler", REQUEST)
         .await
         .expect_err("a guest function call after a failed restore must fail");
     assert!(matches!(e, Error::Hyperlight(PoisonedSandbox)), "{e}");
@@ -194,7 +194,7 @@ async fn a_resized_snapshot_restores_with_another_scratch_size() {
         .expect("the tiny boot must fail");
     assert!(matches!(e, Error::Hyperlight(GuestAborted(..))), "{e}");
     sandbox.restore(full).unwrap();
-    let out = sandbox.call_async("handler", REQUEST).await.unwrap();
+    let out = sandbox.call("handler", REQUEST).await.unwrap();
     assert!(out.contains("redirected"), "{out}");
 
     // A saved resized snapshot keeps its size and its record, restored in
@@ -202,10 +202,10 @@ async fn a_resized_snapshot_restores_with_another_scratch_size() {
     let dir = temp_dir("resize");
     save_snapshot(&small, dir.path().join("small")).unwrap();
     sandbox.restore_from(dir.path().join("small")).unwrap();
-    let out = sandbox.call_async("handler", REQUEST).await.unwrap();
+    let out = sandbox.call("handler", REQUEST).await.unwrap();
     assert!(out.contains("redirected"), "{out}");
     let e = sandbox
-        .call_async("big", BIG)
+        .call("big", BIG)
         .await
         .expect_err("32 MiB must not fit 8 MiB");
     assert!(outgrew(&e), "{e}");
@@ -214,12 +214,12 @@ async fn a_resized_snapshot_restores_with_another_scratch_size() {
         .unwrap()
         .boot()
         .unwrap();
-    let out = fresh.call_async("handler", REQUEST).await.unwrap();
+    let out = fresh.call("handler", REQUEST).await.unwrap();
     assert!(out.contains("redirected"), "{out}");
     // A plain snapshot of the restored sandbox records the size it took.
     assert_eq!(snapshot_scratch_mb(&fresh.snapshot().unwrap()), Some(8));
     let e = fresh
-        .call_async("big", BIG)
+        .call("big", BIG)
         .await
         .expect_err("32 MiB must not fit a fresh 8 MiB sandbox");
     assert!(outgrew(&e), "{e}");

@@ -19,8 +19,9 @@ use hyperlight_unikraft::{Error, Exec, ListenPorts, NetworkPolicy, SandboxBuilde
 /// thread: each Hyperlight guest log message (target `hyperlight_guest`)
 /// as `[<library>] <message> (<file>:<line>)`.
 #[allow(dead_code)]
-pub fn guest_log<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+pub async fn guest_log<R>(f: impl std::future::Future<Output = R>) -> (R, Vec<String>) {
     use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
     use tracing_subscriber::layer::{Context, SubscriberExt};
 
     #[derive(Default)]
@@ -71,7 +72,7 @@ pub fn guest_log<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
 
     let lines = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(Keep(lines.clone()));
-    let result = tracing::subscriber::with_default(subscriber, f);
+    let result = f.with_subscriber(subscriber).await;
     let lines = std::mem::take(&mut *lines.lock().unwrap());
     (result, lines)
 }
@@ -229,7 +230,7 @@ pub const UNUSED_PORT: u16 = 19999;
 
 /// Helper: run the policy probe inside the guest and return the output.
 #[allow(dead_code)]
-pub fn net_probe(
+pub async fn net_probe(
     policy: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     host: &str,
@@ -248,7 +249,7 @@ pub fn net_probe(
         "HOST = {host:?}; PORT = {port}\n{}",
         include_str!("../../examples/python/net_policy_probe.py"),
     );
-    let _ = sandbox.run(&*code);
+    let _ = sandbox.run(&*code).await;
     sandbox.drain_output()
 }
 
@@ -266,7 +267,7 @@ pub fn net_probe(
 /// output, and a retry is a warning naming the example, so a guest that
 /// makes the service fail does not pass quietly.
 #[allow(dead_code)]
-pub fn run_http_get(builder: impl Fn() -> SandboxBuilder, exec: Exec) -> String {
+pub async fn run_http_get(builder: impl Fn() -> SandboxBuilder, exec: Exec) -> String {
     use std::fmt::Write as _;
     use std::io::Write as _;
 
@@ -278,7 +279,7 @@ pub fn run_http_get(builder: impl Fn() -> SandboxBuilder, exec: Exec) -> String 
             Ok(sandbox) => sandbox,
             Err(e) => panic!("the HTTP GET sandbox did not boot: {e:?}\n{output}"),
         };
-        let result = sandbox.run(exec.clone());
+        let result = sandbox.run(exec.clone()).await;
         let out = sandbox.drain_output();
         drop(sandbox);
         let _ = write!(output, "--- attempt {attempt} ---\n{out}");
@@ -324,7 +325,7 @@ pub fn run_http_get(builder: impl Fn() -> SandboxBuilder, exec: Exec) -> String 
             std::io::stderr(),
             "{prefix}{example}: HTTP GET attempt {attempt} of {ATTEMPTS} got a server error, trying again in {pause} s",
         );
-        std::thread::sleep(std::time::Duration::from_secs(pause));
+        tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
     }
     output
 }

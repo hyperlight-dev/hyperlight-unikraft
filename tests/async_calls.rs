@@ -15,30 +15,6 @@ fn python() -> SandboxBuilder {
         .echo_output(false)
 }
 
-#[test]
-fn bounded_sync_step_retains_pending_async_work() {
-    let mut sandbox = python()
-        .async_host_function("later", |_| async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok("7".into())
-        })
-        .boot()
-        .unwrap();
-    sandbox
-        .submit("import hyperlight; assert hyperlight.call('later') == 7")
-        .unwrap();
-    assert!(matches!(
-        sandbox.step(Duration::from_millis(1)).unwrap(),
-        hyperlight_unikraft::Yield::Blocked { .. }
-    ));
-    sandbox.snapshot().unwrap();
-    assert_eq!(
-        sandbox.step(Duration::from_secs(2)).unwrap(),
-        hyperlight_unikraft::Yield::CallDone
-    );
-    sandbox.run("print('still usable')").unwrap();
-}
-
 #[tokio::test]
 async fn async_values_errors_and_sync_fast_path() {
     let mut sandbox = python()
@@ -52,12 +28,12 @@ async fn async_values_errors_and_sync_fast_path() {
         .unwrap();
     // A synchronous call does not become async merely by registering an async handler.
     sandbox
-        .run_async("import hyperlight; assert hyperlight.call('sync') == 42")
+        .run("import hyperlight; assert hyperlight.call('sync') == 42")
         .await
         .unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
-        sandbox.run_async(
+        sandbox.run(
             r#"
 import hyperlight
 assert hyperlight.call("later", 7, "value") == [7, "value"]
@@ -75,7 +51,7 @@ def echo(value):
     .unwrap()
     .unwrap();
     assert_eq!(
-        sandbox.call_async("echo", r#""hello""#).await.unwrap(),
+        sandbox.call("echo", r#""hello""#).await.unwrap(),
         r#""hello""#
     );
 }
@@ -117,7 +93,7 @@ with socket.socket() as s:
 t.join()
 assert not errors, errors
 "#;
-    tokio::time::timeout(Duration::from_secs(5), sandbox.run_async(script))
+    tokio::time::timeout(Duration::from_secs(5), sandbox.run(script))
         .await
         .unwrap()
         .unwrap();
@@ -131,13 +107,13 @@ assert not errors, errors
         assert!(report.contains(label), "{report}");
     }
     sandbox.snapshot().unwrap();
-    tokio::time::timeout(Duration::from_secs(1), sandbox.step_async())
+    tokio::time::timeout(Duration::from_secs(1), sandbox.step())
         .await
         .unwrap()
         .unwrap();
     sandbox.snapshot().unwrap();
     // A subsequent call can perform another deferred policy check.
-    sandbox.run_async("import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.connect(('192.0.2.1', 9))\ns.close()").await.unwrap();
+    sandbox.run("import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.connect(('192.0.2.1', 9))\ns.close()").await.unwrap();
 }
 
 #[test]
@@ -182,7 +158,7 @@ fn synchronous_setup_and_restore_queue_network_waits_for_async_driving() {
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match sandbox.step_async().await.unwrap() {
+                match sandbox.step().await.unwrap() {
                     Yield::CallDone => break,
                     Yield::Blocked { .. } => {}
                     other => panic!("unexpected yield: {other:?}"),
@@ -210,14 +186,14 @@ async fn dropping_drive_future_poisons_and_drops_work() {
         .unwrap();
     let snapshot = sandbox.snapshot().unwrap();
     // An unpolled future has not started driving and must not poison.
-    drop(sandbox.run_async("print('never submitted')"));
+    drop(sandbox.run("print('never submitted')"));
     sandbox.snapshot().unwrap();
     sandbox
         .submit("import hyperlight; assert hyperlight.call('wait') == 7")
         .unwrap();
     sandbox.snapshot().unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(30), sandbox.step_async(),)
+        tokio::time::timeout(Duration::from_millis(30), sandbox.step(),)
             .await
             .is_err()
     );
@@ -238,11 +214,11 @@ async fn dropping_drive_future_poisons_and_drops_work() {
     }
     poisoned(sandbox.snapshot());
     poisoned(sandbox.snapshot_with_scratch_mb(512));
-    poisoned(sandbox.step_async().await);
+    poisoned(sandbox.step().await);
     poisoned(sandbox.submit("print('no')"));
-    poisoned(sandbox.join_async().await);
+    poisoned(sandbox.join().await);
     sandbox.restore(snapshot).unwrap();
-    sandbox.run_async("print('recovered')").await.unwrap();
+    sandbox.run("print('recovered')").await.unwrap();
     sandbox.snapshot().unwrap();
 }
 
@@ -299,7 +275,7 @@ assert not errors, errors
     });
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match sandbox.step_async().await.unwrap() {
+            match sandbox.step().await.unwrap() {
                 hyperlight_unikraft::Yield::CallDone => break,
                 hyperlight_unikraft::Yield::Blocked { .. } => {}
                 other => panic!("unexpected yield: {other:?}"),
@@ -326,14 +302,14 @@ async fn restore_discards_pending_operations_without_replaying() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(30),
-            sandbox.run_async("import hyperlight; hyperlight.call('wait')"),
+            sandbox.run("import hyperlight; hyperlight.call('wait')"),
         )
         .await
         .is_err()
     );
     sandbox.restore(snapshot.clone()).unwrap();
     assert!(send.is_canceled());
-    sandbox.run_async("print('restored')").await.unwrap();
+    sandbox.run("print('restored')").await.unwrap();
     assert!(sandbox.drain_output().contains("restored"));
     let mut fresh = SandboxBuilder::from_snapshot(snapshot)
         .async_host_function("wait", |_| async { Ok("42".into()) })
@@ -341,7 +317,7 @@ async fn restore_discards_pending_operations_without_replaying() {
         .boot()
         .unwrap();
     fresh
-        .run_async("import hyperlight; assert hyperlight.call('wait') == 42")
+        .run("import hyperlight; assert hyperlight.call('wait') == 42")
         .await
         .unwrap();
 }
@@ -384,7 +360,7 @@ assert results == [b"2", b"1"], results
 os.close(fd)
 "#
     );
-    tokio::time::timeout(Duration::from_secs(5), sandbox.run_async(code))
+    tokio::time::timeout(Duration::from_secs(5), sandbox.run(code))
         .await
         .unwrap()
         .unwrap();
@@ -418,7 +394,7 @@ assert len(results) == 32, len(results)
 os.close(fd)
 "#
     );
-    tokio::time::timeout(Duration::from_secs(5), sandbox.run_async(code))
+    tokio::time::timeout(Duration::from_secs(5), sandbox.run(code))
         .await
         .unwrap()
         .unwrap();
@@ -460,7 +436,7 @@ except hyperlight.HostError as e:
 os.close(fd)
 "#
     );
-    tokio::time::timeout(Duration::from_secs(5), sandbox.run_async(code))
+    tokio::time::timeout(Duration::from_secs(5), sandbox.run(code))
         .await
         .unwrap()
         .unwrap();
@@ -480,7 +456,7 @@ async fn multiple_sandboxes_share_one_executor() {
     let mut first = make();
     let mut second = make();
     let code = "import hyperlight; hyperlight.call('wait')";
-    let (a, b) = futures::join!(first.run_async(code), second.run_async(code));
+    let (a, b) = futures::join!(first.run(code), second.run(code));
     a.unwrap();
     b.unwrap();
 }
@@ -507,7 +483,7 @@ os.close(fd)
     );
     for _ in 0..3 {
         sandbox.profile().reset();
-        tokio::time::timeout(Duration::from_secs(5), sandbox.run_async(code.as_str()))
+        tokio::time::timeout(Duration::from_secs(5), sandbox.run(code.as_str()))
             .await
             .unwrap()
             .unwrap();
@@ -551,7 +527,7 @@ for t in threads: t.join()
     );
     for _ in 0..8 {
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), sandbox.run_async(code.as_str()))
+            tokio::time::timeout(Duration::from_millis(20), sandbox.run(code.as_str()))
                 .await
                 .is_err()
         );
@@ -565,7 +541,7 @@ for t in threads: t.join()
             ))
         ));
         sandbox.restore(snapshot.clone()).unwrap();
-        sandbox.run_async("pass").await.unwrap();
+        sandbox.run("pass").await.unwrap();
         sandbox.snapshot().unwrap();
     }
 }
@@ -577,7 +553,7 @@ async fn dropping_run_with_only_a_guest_timer_also_poisons() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(25),
-            sandbox.run_async("import time; time.sleep(60)")
+            sandbox.run("import time; time.sleep(60)")
         )
         .await
         .is_err()
@@ -589,7 +565,7 @@ async fn dropping_run_with_only_a_guest_timer_also_poisons() {
         ))
     ));
     sandbox.restore(snapshot).unwrap();
-    sandbox.run_async("print('sync recovery')").await.unwrap();
+    sandbox.run("print('sync recovery')").await.unwrap();
 }
 
 #[tokio::test]
@@ -602,7 +578,7 @@ async fn ready_completions_share_an_entry_and_sync_calls_do_not_yield() {
         .unwrap();
     sandbox.profile().reset();
     sandbox
-        .run_async("import hyperlight\nfor _ in range(10): hyperlight.call('sync')")
+        .run("import hyperlight\nfor _ in range(10): hyperlight.call('sync')")
         .await
         .unwrap();
     let sync = sandbox.profile().report();
@@ -627,7 +603,7 @@ assert results == [b"2", b"2"], results
 os.close(fd)
 "#
     );
-    sandbox.run_async(code).await.unwrap();
+    sandbox.run(code).await.unwrap();
     let profile = sandbox.profile().report();
     let entries = profile
         .lines()
@@ -695,7 +671,7 @@ sock.close()
 os.close(fd)
 "#
     );
-    tokio::time::timeout(Duration::from_secs(5), sandbox.run_async(code))
+    tokio::time::timeout(Duration::from_secs(5), sandbox.run(code))
         .await
         .unwrap()
         .unwrap();
@@ -745,7 +721,7 @@ listener.close()
             assert_eq!(&response, b"pong");
             recv
         });
-        tokio::time::timeout(Duration::from_secs(5), sandbox.run_async(server))
+        tokio::time::timeout(Duration::from_secs(5), sandbox.run(server))
             .await
             .unwrap()
             .unwrap();
@@ -754,34 +730,31 @@ listener.close()
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), sandbox.run_async(server))
+        tokio::time::timeout(Duration::from_millis(100), sandbox.run(server))
             .await
             .is_err()
     );
     let port = recv.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(matches!(
-        sandbox.step_async().await,
+        sandbox.step().await,
         Err(Error::Hyperlight(
             hyperlight_unikraft::hyperlight_host::HyperlightError::PoisonedSandbox
         ))
     ));
     sandbox.restore(snapshot).unwrap();
     let _rebound = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-    sandbox.run_async("print('recovered')").await.unwrap();
+    sandbox.run("print('recovered')").await.unwrap();
 }
 
 #[tokio::test]
 async fn join_async_preserves_exit_and_idle_driver_semantics() {
     let mut sandbox = python().boot().unwrap();
-    assert!(matches!(
-        sandbox.join_async().await,
-        Err(Error::NothingToJoin)
-    ));
+    assert!(matches!(sandbox.join().await, Err(Error::NothingToJoin)));
     sandbox
         .submit("import time, os; time.sleep(0.01); os._exit(7)")
         .unwrap();
-    assert_eq!(sandbox.join_async().await.unwrap(), 7);
-    assert_eq!(sandbox.join_async().await.unwrap(), 7);
+    assert_eq!(sandbox.join().await.unwrap(), 7);
+    assert_eq!(sandbox.join().await.unwrap(), 7);
 }
 
 #[test]
@@ -802,12 +775,12 @@ async fn scheduler_timers_keep_stable_entry_and_exit_counts() {
     let mut sandbox = python().profile(true).boot().unwrap();
     let script = "import time\nfor _ in range(3): time.sleep(0.02)";
     // Populate the guest's environment cache before comparing VM exits.
-    sandbox.run_async("import time").await.unwrap();
+    sandbox.run("import time").await.unwrap();
     sandbox.profile().reset();
-    sandbox.run_async(script).await.unwrap();
+    sandbox.run(script).await.unwrap();
     let first = sandbox.profile().report();
     sandbox.profile().reset();
-    sandbox.run_async(script).await.unwrap();
+    sandbox.run(script).await.unwrap();
     let asynchronous = sandbox.profile().report();
     let counts = |report: &str| {
         ["entry Exec ", "entry step ", "host Yield "].map(|prefix| {
@@ -844,21 +817,21 @@ async fn timer_snapshots_restore_between_async_steps() {
         .submit("import time; time.sleep(0.03); print('first'); time.sleep(0.1); print('second')")
         .unwrap();
     assert!(matches!(
-        sandbox.step_async().await.unwrap(),
+        sandbox.step().await.unwrap(),
         Yield::Blocked { .. }
     ));
     assert!(sandbox.drain_output().contains("first"));
     // A scheduler timer alone must not trigger the async host-call snapshot restriction.
     let sleeping = sandbox.snapshot().unwrap();
-    assert_eq!(sandbox.step_async().await.unwrap(), Yield::CallDone);
+    assert_eq!(sandbox.step().await.unwrap(), Yield::CallDone);
     assert!(sandbox.drain_output().contains("second"));
     sandbox.restore(sleeping).unwrap();
-    assert_eq!(sandbox.step_async().await.unwrap(), Yield::CallDone);
+    assert_eq!(sandbox.step().await.unwrap(), Yield::CallDone);
     assert!(sandbox.drain_output().contains("second"));
     sandbox.restore(idle).unwrap();
     assert_eq!(
-        sandbox.step_async().await.unwrap(),
+        sandbox.step().await.unwrap(),
         Yield::Blocked { until: None }
     );
-    sandbox.run_async("print('new timeline')").await.unwrap();
+    sandbox.run("print('new timeline')").await.unwrap();
 }

@@ -7,15 +7,15 @@ use std::path::PathBuf;
 use common::{require_rootfs, temp_dir};
 use hyperlight_unikraft::{Exec, SandboxBuilder};
 
-#[test]
-fn python_shell_hello() {
+#[tokio::test]
+async fn python_shell_hello() {
     let rootfs = require_rootfs("python-shell");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/hello.py");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from the Hyperlight agent"),
@@ -23,8 +23,8 @@ fn python_shell_hello() {
     );
 }
 
-#[test]
-fn python_shell_ssl_available() {
+#[tokio::test]
+async fn python_shell_ssl_available() {
     let rootfs = require_rootfs("python-shell");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -42,6 +42,7 @@ import ctypes
 print('ctypes-ok')
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -62,15 +63,15 @@ print('ctypes-ok')
     );
 }
 
-#[test]
-fn python_shell_shell_subprocess() {
+#[tokio::test]
+async fn python_shell_shell_subprocess() {
     let rootfs = require_rootfs("python-shell");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/shell_commands.py");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from hush shell!"),
@@ -78,8 +79,8 @@ fn python_shell_shell_subprocess() {
     );
 }
 
-#[test]
-fn python_shell_no_numpy() {
+#[tokio::test]
+async fn python_shell_no_numpy() {
     let rootfs = require_rootfs("python-shell");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -96,6 +97,7 @@ except ImportError:
     print('numpy-missing-ok')
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -104,8 +106,8 @@ except ImportError:
     );
 }
 
-#[test]
-fn python_shell_snapshot_round_trip() {
+#[tokio::test]
+async fn python_shell_snapshot_round_trip() {
     let rootfs = require_rootfs("python-shell");
     let snap_dir = temp_dir("python-shell-snap");
 
@@ -122,7 +124,7 @@ fn python_shell_snapshot_round_trip() {
         .boot()
         .unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/hello.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello from the Hyperlight agent"),
@@ -132,8 +134,8 @@ fn python_shell_snapshot_round_trip() {
 
 /// A pipe and a `$(...)` through `subprocess.run(..., shell=True)`: hush
 /// starts each process with vfork, whose child runs on its parent's TLS.
-#[test]
-fn python_shell_subprocess_pipe() {
+#[tokio::test]
+async fn python_shell_subprocess_pipe() {
     let rootfs = require_rootfs("python-shell");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -146,7 +148,7 @@ import subprocess
 r = subprocess.run('echo hello | tr a-z A-Z; echo "n=$(echo abc | wc -c)"', shell=True, capture_output=True, text=True)
 print(repr(r.stdout), r.returncode)
 "#,
-        )
+        ).await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -157,14 +159,14 @@ print(repr(r.stdout), r.returncode)
     // A program that fails to execute, then a blocking call: the vfork
     // child that failed must not have freed the parent's stack.
     sandbox
-        .run("import subprocess, time\ntry:\n    subprocess.run(['/nope/x'])\nexcept OSError:\n    print('oserror')\ntime.sleep(0.2)\nprint('after')")
+        .run("import subprocess, time\ntry:\n    subprocess.run(['/nope/x'])\nexcept OSError:\n    print('oserror')\ntime.sleep(0.2)\nprint('after')").await
         .unwrap();
     assert!(sandbox.drain_output().ends_with("oserror\nafter\n"));
 
     // From a thread, whose stack its caller made: the child's program
     // still gets a stack of its own.
     sandbox
-        .run("import subprocess, threading\nr = []\nt = threading.Thread(target=lambda: r.append(subprocess.run(['echo', 'from-thread'], capture_output=True, text=True).stdout))\nt.start()\nt.join()\nprint(repr(r))")
+        .run("import subprocess, threading\nr = []\nt = threading.Thread(target=lambda: r.append(subprocess.run(['echo', 'from-thread'], capture_output=True, text=True).stdout))\nt.start()\nt.join()\nprint(repr(r))").await
         .unwrap();
     assert!(sandbox.drain_output().ends_with("['from-thread\\n']\n"));
 }
@@ -182,8 +184,8 @@ const INITRD_MAP_BASE: u64 = 0x1_0000_0000;
 /// read the same after the new mappings are written.  HotSpot's 4
 /// GiB-aligned hints would otherwise land on the arm64 initrd, at 4 GiB,
 /// and replace the pages under libzip.so.
-#[test]
-fn python_shell_mmap_hint_avoids_the_initrd() {
+#[tokio::test]
+async fn python_shell_mmap_hint_avoids_the_initrd() {
     let rootfs = require_rootfs("python-shell");
     let len = std::fs::metadata(&rootfs).unwrap().len();
     // A hint below the initrd whose 16 MiB run into it, then its first,
@@ -250,6 +252,7 @@ moved = all([clear(mapped_at(hint)) for hint in {hints:?}])
 print('honoured', honoured, 'moved', moved, 'files', digest() == before)
 "#
         ))
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(

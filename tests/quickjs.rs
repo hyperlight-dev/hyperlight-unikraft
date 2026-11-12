@@ -20,28 +20,30 @@ fn boot() -> hyperlight_unikraft::AppSandbox {
         .unwrap()
 }
 
-#[test]
-fn quickjs_hello() {
+#[tokio::test]
+async fn quickjs_hello() {
     let mut sandbox = boot();
     sandbox
         .run("console.log('Hello from QuickJS', 6 * 7)")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "Hello from QuickJS 42");
 }
 
 /// What a script declares is a global the next call can use: a handler
 /// defined once and called many times.
-#[test]
-fn quickjs_state_is_kept_across_calls() {
+#[tokio::test]
+async fn quickjs_state_is_kept_across_calls() {
     let mut sandbox = boot();
     sandbox
-        .run("function handler(event) { return { greeting: 'Hello, ' + event.name }; }; var calls = 0;")
+        .run("function handler(event) { return { greeting: 'Hello, ' + event.name }; }; var calls = 0;").await
         .unwrap();
     for name in ["a", "b"] {
         sandbox
             .run(format!(
                 "calls++; console.log(JSON.stringify(handler({{ name: '{name}' }})), calls)"
             ))
+            .await
             .unwrap();
     }
     assert_eq!(
@@ -52,8 +54,8 @@ fn quickjs_state_is_kept_across_calls() {
 
 /// Code with `import` runs as a module, with top-level await; the call
 /// returns once the timers it started have fired.
-#[test]
-fn quickjs_modules_timers_and_promises() {
+#[tokio::test]
+async fn quickjs_modules_timers_and_promises() {
     let mut sandbox = boot();
     sandbox
         .run(
@@ -63,12 +65,13 @@ fn quickjs_modules_timers_and_promises() {
              Promise.resolve().then(() => console.log('job'));\n\
              console.log('module');",
         )
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "module\njob\ntimer\n");
 }
 
-#[test]
-fn quickjs_errors_fail_the_call_and_the_engine_serves_on() {
+#[tokio::test]
+async fn quickjs_errors_fail_the_call_and_the_engine_serves_on() {
     let mut sandbox = boot();
     for code in [
         "throw new TypeError('script boom')",
@@ -76,7 +79,10 @@ fn quickjs_errors_fail_the_call_and_the_engine_serves_on() {
         "Promise.reject(new Error('rejected'))",
     ] {
         assert!(
-            matches!(sandbox.run(code), Err(Error::CallFailed { status: 1 })),
+            matches!(
+                sandbox.run(code).await,
+                Err(Error::CallFailed { status: 1 })
+            ),
             "{code} did not fail the call"
         );
     }
@@ -84,12 +90,12 @@ fn quickjs_errors_fail_the_call_and_the_engine_serves_on() {
     for text in ["script boom", "module boom", "rejected"] {
         assert_eq!(output.matches(text).count(), 1, "{text} in: {output}");
     }
-    sandbox.run("console.log('still here')").unwrap();
+    sandbox.run("console.log('still here')").await.unwrap();
     assert_eq!(sandbox.drain_output().trim(), "still here");
 }
 
-#[test]
-fn quickjs_file_env_and_mounts() {
+#[tokio::test]
+async fn quickjs_file_env_and_mounts() {
     let data = temp_dir("quickjs-data");
     std::fs::write(data.path().join("input.txt"), "one two three\n").unwrap();
     std::fs::write(
@@ -107,17 +113,18 @@ fn quickjs_file_env_and_mounts() {
     sandbox.set_env_vars(&[("GREETING", "hi")]);
     sandbox
         .run(Exec::Guest("/mnt/data/main.mjs x y".into()))
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "x,y hi 3");
 }
 
 /// Two restores of one snapshot draw different numbers: Math.random is
 /// reseeded from the kernel, which reseeds on every restore.
-#[test]
-fn quickjs_snapshot_clones_draw_their_own_random_numbers() {
+#[tokio::test]
+async fn quickjs_snapshot_clones_draw_their_own_random_numbers() {
     let snap_dir = temp_dir("quickjs-snap");
     let mut sandbox = boot();
-    sandbox.run("var seen = 'kept'").unwrap();
+    sandbox.run("var seen = 'kept'").await.unwrap();
     sandbox.snapshot_to(&snap_dir).unwrap();
 
     let mut draws = Vec::new();
@@ -128,6 +135,7 @@ fn quickjs_snapshot_clones_draw_their_own_random_numbers() {
             .unwrap();
         clone
             .run("console.log(seen, Math.random(), Math.random())")
+            .await
             .unwrap();
         let output = clone.drain_output();
         assert!(output.starts_with("kept "), "{output}");
@@ -138,47 +146,49 @@ fn quickjs_snapshot_clones_draw_their_own_random_numbers() {
 
 /// A handler defined once and called many times with JSON in and out, as
 /// hyperlight-js runs one; a promise it returns is awaited.
-#[test]
-fn quickjs_calls_a_handler_with_json() {
+#[tokio::test]
+async fn quickjs_calls_a_handler_with_json() {
     let mut sandbox = boot();
     sandbox
         .run(
             "function greet(event) { return { message: 'Hello, ' + event.name, n: ++greet.count } }\n\
              greet.count = 0;\n\
              async function later(event) { return event.x * 2 }",
-        )
+        ).await
         .unwrap();
     assert_eq!(
-        sandbox.call("greet", r#"{"name":"World"}"#).unwrap(),
+        sandbox.call("greet", r#"{"name":"World"}"#).await.unwrap(),
         r#"{"message":"Hello, World","n":1}"#
     );
     assert_eq!(
-        sandbox.call("greet", r#"{"name":"again"}"#).unwrap(),
+        sandbox.call("greet", r#"{"name":"again"}"#).await.unwrap(),
         r#"{"message":"Hello, again","n":2}"#
     );
-    assert_eq!(sandbox.call("later", r#"{"x":21}"#).unwrap(), "42");
+    assert_eq!(sandbox.call("later", r#"{"x":21}"#).await.unwrap(), "42");
     // Empty input is no argument at all.
     sandbox
         .run("function count(...args) { return args.length }")
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("count", "").unwrap(), "0");
-    assert_eq!(sandbox.call("count", "1").unwrap(), "1");
+    assert_eq!(sandbox.call("count", "").await.unwrap(), "0");
+    assert_eq!(sandbox.call("count", "1").await.unwrap(), "1");
     // A handler that throws fails the call; one that is not there too.
     sandbox
         .run("function bad() { throw new Error('handler boom') }")
+        .await
         .unwrap();
     assert!(matches!(
-        sandbox.call("bad", "{}"),
+        sandbox.call("bad", "{}").await,
         Err(Error::CallFailed { status: 1 })
     ));
-    assert!(sandbox.call("missing", "{}").is_err());
+    assert!(sandbox.call("missing", "{}").await.is_err());
     assert!(sandbox.drain_output().contains("handler boom"));
 }
 
 /// The embedder's functions, as `host.call` and as `host:` module
 /// imports; a host error is a JavaScript exception.
-#[test]
-fn quickjs_calls_host_functions() {
+#[tokio::test]
+async fn quickjs_calls_host_functions() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("quickjs"))
         .scratch_mb(SCRATCH_MB)
         .host_function("math.add", |args| {
@@ -199,6 +209,7 @@ fn quickjs_calls_host_functions() {
              console.log(add(2, 3), host.call('greet', 'js').hello);\n\
              try { fail() } catch (e) { console.log('caught', e.message) }",
         )
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "5 js\ncaught no can do\n");
     // A name that is not UTF-8 (a lone surrogate), or the empty one the
@@ -209,34 +220,50 @@ fn quickjs_calls_host_functions() {
                try { host.call(n); console.log('no throw') } catch (e) { console.log('threw') }\n\
              }",
         )
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "threw\nthrew\n");
     // A long host error arrives whole.
     sandbox
         .run("try { host.call('math.verbose') } catch (e) { console.log(e.message.length) }")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "1000");
     // A handler can call the host too.
     sandbox
         .run("function total(event) { return host.call('math.add', ...event.values) }")
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("total", r#"{"values":[1,2,3]}"#).unwrap(), "6");
+    assert_eq!(
+        sandbox
+            .call("total", r#"{"values":[1,2,3]}"#)
+            .await
+            .unwrap(),
+        "6"
+    );
     // A module of no host functions is an import error.
-    assert!(sandbox.run("import * as x from 'host:nothing'").is_err());
+    assert!(
+        sandbox
+            .run("import * as x from 'host:nothing'")
+            .await
+            .is_err()
+    );
 }
 
 /// A rejection nobody handles fails the call even when another promise
 /// is handled later; a result larger than a host call carries fails the
 /// call rather than come back empty.
-#[test]
-fn quickjs_rejections_and_oversized_results_fail_the_call() {
+#[tokio::test]
+async fn quickjs_rejections_and_oversized_results_fail_the_call() {
     let mut sandbox = boot();
     assert!(matches!(
-        sandbox.run(
-            "const a = Promise.reject(new Error('lost'));\n\
+        sandbox
+            .run(
+                "const a = Promise.reject(new Error('lost'));\n\
              const b = Promise.reject(1);\n\
              b.catch(() => {});"
-        ),
+            )
+            .await,
         Err(Error::CallFailed { status: 1 })
     ));
     assert!(sandbox.drain_output().contains("lost"));
@@ -245,19 +272,22 @@ fn quickjs_rejections_and_oversized_results_fail_the_call() {
     // leaves nothing pending for the next call.
     sandbox
         .run("Object.defineProperty(globalThis, 'g', { get() { throw new Error('getter') } })")
+        .await
         .unwrap();
-    assert!(sandbox.call("g", "{}").is_err());
+    assert!(sandbox.call("g", "{}").await.is_err());
     assert!(sandbox.drain_output().contains("getter"));
     // `import (` with a space is a dynamic import: the script stays one.
     sandbox
         .run("function dyn() { return 7 }\nif (false) import ('./x.js');")
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("dyn", "").unwrap(), "7");
+    assert_eq!(sandbox.call("dyn", "").await.unwrap(), "7");
 
     sandbox
         .run("function big(n) { return 'x'.repeat(n) }")
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("big", "10").unwrap().len(), 12);
+    assert_eq!(sandbox.call("big", "10").await.unwrap().len(), 12);
     // Past the call buffer (the driver refuses it), and between what a
     // host call carries and the buffer (the kernel does).  With hluk's
     // virtqueue pools: a host call carries 69,620 bytes (half the G2H
@@ -265,18 +295,18 @@ fn quickjs_rejections_and_oversized_results_fail_the_call() {
     // less a message header).
     for n in ["1100000", "71000"] {
         assert!(
-            sandbox.call("big", n).is_err(),
+            sandbox.call("big", n).await.is_err(),
             "a {n}-byte result did not fail the call"
         );
     }
-    sandbox.call("big", "10").unwrap();
+    sandbox.call("big", "10").await.unwrap();
 }
 
 /// A dotfile opened relative to the working directory, in a directory
 /// below the root of a mount: the kernel used to glue the name onto the
 /// directory (`/mnt/data/sub.dot`).
-#[test]
-fn quickjs_opens_a_dotfile_relative_to_the_working_directory() {
+#[tokio::test]
+async fn quickjs_opens_a_dotfile_relative_to_the_working_directory() {
     let data = temp_dir("quickjs-dot");
     std::fs::create_dir(data.path().join("sub")).unwrap();
     std::fs::write(data.path().join("sub/.dot"), "hidden").unwrap();
@@ -291,26 +321,29 @@ fn quickjs_opens_a_dotfile_relative_to_the_working_directory() {
              os.chdir('/mnt/data/sub');\n\
              console.log(std.loadFile('.dot'));",
         )
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "hidden");
 }
 
 /// A failed `host:` import leaves nothing behind for a later one to find;
 /// a failed call has no result; a name the protocol reserves is refused.
-#[test]
-fn quickjs_failed_imports_and_calls_leave_nothing_behind() {
+#[tokio::test]
+async fn quickjs_failed_imports_and_calls_leave_nothing_behind() {
     let mut sandbox = boot();
-    assert!(sandbox.run("import * as db from 'host:db'").is_err());
+    assert!(sandbox.run("import * as db from 'host:db'").await.is_err());
     assert!(
         sandbox
             .run("import * as db from 'host:db'; console.log(Object.keys(db).length)")
+            .await
             .is_err(),
         "a second import of a module with no functions succeeded"
     );
     sandbox
         .run("function half(e) { Promise.reject(new Error('later')); return { ok: 1 } }")
+        .await
         .unwrap();
-    assert!(sandbox.call("half", "{}").is_err());
+    assert!(sandbox.call("half", "{}").await.is_err());
     assert_eq!(sandbox.take_result(), None);
 
     for name in ["", "a\nb"] {
@@ -329,49 +362,54 @@ fn quickjs_failed_imports_and_calls_leave_nothing_behind() {
 /// A call that fails before its function runs still finishes what it
 /// started, so nothing is left to fail the next call; a name is looked up
 /// whole, embedded NUL included; `import"x"` with no space is a module.
-#[test]
-fn quickjs_calls_are_self_contained() {
+#[tokio::test]
+async fn quickjs_calls_are_self_contained() {
     let mut sandbox = boot();
     sandbox
         .run(
             "function greet() { return 'hi' }\n\
              Object.defineProperty(globalThis, 'notfn', { get() { Promise.reject(new Error('stray')); return 5 } })",
-        )
+        ).await
         .unwrap();
-    assert!(sandbox.call("notfn", "{}").is_err());
+    assert!(sandbox.call("notfn", "{}").await.is_err());
     let output = sandbox.drain_output();
     assert!(output.contains("stray"), "{output}");
-    sandbox.run("console.log('next call is clean')").unwrap();
+    sandbox
+        .run("console.log('next call is clean')")
+        .await
+        .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "next call is clean");
 
-    assert!(sandbox.call("greet\0admin", "{}").is_err());
-    assert_eq!(sandbox.call("greet", "{}").unwrap(), "\"hi\"");
+    assert!(sandbox.call("greet\0admin", "{}").await.is_err());
+    assert_eq!(sandbox.call("greet", "{}").await.unwrap(), "\"hi\"");
     sandbox.drain_output();
 
     // Top-level await only parses in a module.
     sandbox
         .run("import\"qjs:std\";\nawait 0;\nconsole.log('module')")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "module");
 }
 
 /// An awaited promise nothing can settle fails the call rather than spin
 /// the guest; an exception a job throws while the call awaits fails it.
-#[test]
-fn quickjs_awaits_that_cannot_settle_or_throw_fail_the_call() {
+#[tokio::test]
+async fn quickjs_awaits_that_cannot_settle_or_throw_fail_the_call() {
     let mut sandbox = boot();
     let started = std::time::Instant::now();
     assert!(
         sandbox
             .run("export {}; await new Promise(() => {})")
+            .await
             .is_err()
     );
     sandbox
         .run("function never() { return new Promise(() => {}) }\n\
-              async function boom() { queueMicrotask(() => { throw new Error('in a job') }); await 0; return 1 }")
+              async function boom() { queueMicrotask(() => { throw new Error('in a job') }); await 0; return 1 }").await
         .unwrap();
-    assert!(sandbox.call("never", "").is_err());
-    assert!(sandbox.call("boom", "").is_err());
+    assert!(sandbox.call("never", "").await.is_err());
+    assert!(sandbox.call("boom", "").await.is_err());
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),
         "an unsettled await took {:?}",
@@ -381,14 +419,14 @@ fn quickjs_awaits_that_cannot_settle_or_throw_fail_the_call() {
     assert!(output.contains("can never settle"), "{output}");
     assert!(output.contains("in a job"), "{output}");
     // The engine serves on.
-    sandbox.run("console.log('ok')").unwrap();
+    sandbox.run("console.log('ok')").await.unwrap();
 }
 
 /// An uncaught error ends the call and cancels the timers it started, as
 /// it would end Node's process: nothing runs in, or fails, the next call,
 /// and a timer that keeps throwing cannot hold the call.
-#[test]
-fn quickjs_an_uncaught_error_ends_what_the_call_started() {
+#[tokio::test]
+async fn quickjs_an_uncaught_error_ends_what_the_call_started() {
     let mut sandbox = boot();
     assert!(
         sandbox
@@ -397,12 +435,13 @@ fn quickjs_an_uncaught_error_ends_what_the_call_started() {
                  queueMicrotask(() => { throw 1 });\n\
                  os.setTimeout(() => { console.log('late ran') }, 0);"
             )
+            .await
             .is_err()
     );
     let started = std::time::Instant::now();
     assert!(
         sandbox
-            .run("import * as os from 'qjs:os'; os.setInterval(() => { throw new Error('again') }, 1)")
+            .run("import * as os from 'qjs:os'; os.setInterval(() => { throw new Error('again') }, 1)").await
             .is_err()
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
@@ -415,9 +454,10 @@ fn quickjs_an_uncaught_error_ends_what_the_call_started() {
                  Promise.resolve().then(() => os.setInterval(() => console.log('leaked'), 1));\n\
                  throw new Error('fail');"
             )
+            .await
             .is_err()
     );
-    sandbox.run("console.log('hi')").unwrap();
+    sandbox.run("console.log('hi')").await.unwrap();
     let output = sandbox.drain_output();
     assert!(!output.contains("leaked"), "{output}");
     assert!(!output.contains("late ran"), "{output}");
@@ -427,15 +467,17 @@ fn quickjs_an_uncaught_error_ends_what_the_call_started() {
 
 /// A rejection nobody handles fails the call even when an earlier one was
 /// handled late; a thenable a handler returns is awaited, as `await` does.
-#[test]
-fn quickjs_every_rejection_counts_and_thenables_are_awaited() {
+#[tokio::test]
+async fn quickjs_every_rejection_counts_and_thenables_are_awaited() {
     let mut sandbox = boot();
     assert!(matches!(
-        sandbox.run(
-            "const b = Promise.reject(1);\n\
+        sandbox
+            .run(
+                "const b = Promise.reject(1);\n\
              const a = Promise.reject(new Error('second one'));\n\
              b.catch(() => {});"
-        ),
+            )
+            .await,
         Err(Error::CallFailed { status: 1 })
     ));
     assert!(sandbox.drain_output().contains("second one"));
@@ -448,6 +490,7 @@ fn quickjs_every_rejection_counts_and_thenables_are_awaited() {
                  os.setInterval(() => {}, 5);\n\
                  Promise.reject(new Error('while ticking'));"
             )
+            .await
             .is_err()
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
@@ -460,12 +503,14 @@ fn quickjs_every_rejection_counts_and_thenables_are_awaited() {
              globalThis.slow = () => { Promise.reject(new Error('meanwhile')); \
                 return new Promise((r) => os.setTimeout(r, 60000)); };",
         )
+        .await
         .unwrap();
-    assert!(sandbox.call("slow", "").is_err());
+    assert!(sandbox.call("slow", "").await.is_err());
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert!(sandbox.drain_output().contains("meanwhile"));
     sandbox
         .run("function thenable() { return { then(resolve) { resolve(42) } } }")
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("thenable", "").unwrap(), "42");
+    assert_eq!(sandbox.call("thenable", "").await.unwrap(), "42");
 }

@@ -14,13 +14,13 @@ use common::{BIN_MOUNT, require_bin, require_rootfs, temp_dir};
 use hyperlight_unikraft::{Exec, Mount, SandboxBuilder};
 
 /// [`two_clones_with`], with no mounts.
-fn two_clones(builder: SandboxBuilder, warm: Exec, draw: Exec) -> [String; 2] {
-    two_clones_with(builder, Vec::new(), warm, draw)
+async fn two_clones(builder: SandboxBuilder, warm: Exec, draw: Exec) -> [String; 2] {
+    two_clones_with(builder, Vec::new(), warm, draw).await
 }
 
 /// Boot `builder`, run `warm`, snapshot, and run `draw` in two restores
 /// of the snapshot, with `mounts`: what each printed.
-fn two_clones_with(
+async fn two_clones_with(
     builder: SandboxBuilder,
     mounts: Vec<Mount>,
     warm: Exec,
@@ -28,19 +28,20 @@ fn two_clones_with(
 ) -> [String; 2] {
     let snap_dir = temp_dir("snapshot-random");
     let mut sandbox = builder.mounts(mounts.clone()).boot().unwrap();
-    sandbox.run(warm).unwrap();
+    sandbox.run(warm).await.unwrap();
     sandbox.drain_output();
     sandbox.snapshot_to(&snap_dir).unwrap();
     drop(sandbox);
-    [0, 1].map(|_| {
+    let restore_and_draw = async || {
         let mut clone = SandboxBuilder::from_snapshot_dir(&snap_dir)
             .unwrap()
             .mounts(mounts.clone())
             .boot()
             .unwrap();
-        clone.run(draw.clone()).unwrap();
+        clone.run(draw.clone()).await.unwrap();
         clone.drain_output()
-    })
+    };
+    [restore_and_draw().await, restore_and_draw().await]
 }
 
 /// Each line of the two clones' output differs: one generator a line.
@@ -56,8 +57,8 @@ fn assert_each_line_differs(outputs: &[String; 2], generators: &[&str]) {
 
 /// Python's random module, OpenSSL (ssl.RAND_bytes), SQLite's random()
 /// and tempfile's names, each used before the snapshot.
-#[test]
-fn python_shell_clones_draw_their_own() {
+#[tokio::test]
+async fn python_shell_clones_draw_their_own() {
     let builder = SandboxBuilder::from_initrd(require_rootfs("python-shell")).scratch_mb(256);
     let outputs = two_clones(
         builder,
@@ -75,53 +76,56 @@ fn python_shell_clones_draw_their_own() {
              print(next(tempfile._get_candidate_names()))\n"
                 .into(),
         ),
-    );
+    )
+    .await;
     assert_each_line_differs(&outputs, &["random", "OpenSSL", "SQLite", "tempfile"]);
 }
 
 /// A seed code gave random before the snapshot is not kept across it: a
 /// restore draws anew, as from a seed of the kernel's.
-#[test]
-fn python_reseeds_once_per_restore_not_per_call() {
+#[tokio::test]
+async fn python_reseeds_once_per_restore_not_per_call() {
     let snap_dir = temp_dir("snapshot-random-once");
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
         .scratch_mb(256)
         .boot()
         .unwrap();
     // Within one guest a seed set in one call holds for the next.
-    sandbox.run("import random; random.seed(42)").unwrap();
-    sandbox.run("print(random.random())").unwrap();
+    sandbox.run("import random; random.seed(42)").await.unwrap();
+    sandbox.run("print(random.random())").await.unwrap();
     let mut expected = SandboxBuilder::from_initrd(require_rootfs("python"))
         .scratch_mb(256)
         .boot()
         .unwrap();
     expected
         .run("import random; random.seed(42); print(random.random())")
+        .await
         .unwrap();
     let seeded = expected.drain_output();
     assert_eq!(sandbox.drain_output(), seeded);
     sandbox.snapshot_to(&snap_dir).unwrap();
     drop(sandbox);
-    let draws = [0, 1].map(|_| {
+    let restore_and_draw = async || {
         let mut clone = SandboxBuilder::from_snapshot_dir(&snap_dir)
             .unwrap()
             .boot()
             .unwrap();
-        clone.run("print(random.random())").unwrap();
+        clone.run("print(random.random())").await.unwrap();
         let draw = clone.drain_output();
         // Reseeded once, by the first call: a seed set after it holds.
-        clone.run("random.seed(42)").unwrap();
-        clone.run("print(random.random())").unwrap();
+        clone.run("random.seed(42)").await.unwrap();
+        clone.run("print(random.random())").await.unwrap();
         assert_eq!(clone.drain_output(), seeded);
         draw
-    });
+    };
+    let draws = [restore_and_draw().await, restore_and_draw().await];
     assert_ne!(draws[0], draws[1], "two clones drew the same: {draws:?}");
 }
 
 /// NumPy's legacy global generator (np.random.rand and the like) and
 /// cryptography's own OpenSSL, both in the agent image.
-#[test]
-fn agent_clones_draw_their_own() {
+#[tokio::test]
+async fn agent_clones_draw_their_own() {
     let builder = SandboxBuilder::from_initrd(require_rootfs("agent")).scratch_mb(1536);
     let outputs = two_clones(
         builder,
@@ -138,14 +142,14 @@ fn agent_clones_draw_their_own() {
              print(key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex())\n"
                 .into(),
         ),
-    );
+    ).await;
     assert_each_line_differs(&outputs, &["numpy", "cryptography"]);
 }
 
 /// Math.random, OpenSSL (crypto.randomBytes) and the bytes randomUUID()
 /// and randomInt() keep ahead, each used before the snapshot.
-#[test]
-fn node_clones_draw_their_own() {
+#[tokio::test]
+async fn node_clones_draw_their_own() {
     let builder = SandboxBuilder::from_initrd(require_rootfs("node")).scratch_mb(512);
     let outputs = two_clones(
         builder,
@@ -163,7 +167,7 @@ fn node_clones_draw_their_own() {
              console.log(c.randomInt(2 ** 40));"
                 .into(),
         ),
-    );
+    ).await;
     assert_each_line_differs(
         &outputs,
         &[
@@ -177,8 +181,8 @@ fn node_clones_draw_their_own() {
 }
 
 /// Math.random keeps what Math.random promises: a double in [0, 1).
-#[test]
-fn node_math_random_stays_in_range() {
+#[tokio::test]
+async fn node_math_random_stays_in_range() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("node"))
         .scratch_mb(512)
         .boot()
@@ -188,7 +192,7 @@ fn node_math_random_stays_in_range() {
             "let ok = true, sum = 0;\n\
              for (let i = 0; i < 100000; i++) { const x = Math.random(); ok = ok && x >= 0 && x < 1; sum += x; }\n\
              console.log(ok, Math.abs(sum / 100000 - 0.5) < 0.01, Math.random.name, Math.random.length);",
-        )
+        ).await
         .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "true true random 0");
 }
@@ -197,13 +201,14 @@ fn node_math_random_stays_in_range() {
 /// runtime seeds (Go's math/rand from AT_RANDOM, Rust's HashMap keys from
 /// getrandom) seeds from the kernel, reseeded: nothing for a driver to
 /// do, but checked.
-#[test]
-fn go_and_rust_clones_draw_their_own() {
+#[tokio::test]
+async fn go_and_rust_clones_draw_their_own() {
     for (runtime, bin, scratch) in [("go", "random", 128), ("rust", "random", 64)] {
         let bins = require_bin(runtime, bin);
         let builder = SandboxBuilder::from_initrd(require_rootfs(runtime)).scratch_mb(scratch);
         let run = Exec::Guest(format!("{BIN_MOUNT}/{bin}"));
-        let outputs = two_clones_with(builder, vec![Mount::ro(&bins, BIN_MOUNT)], run.clone(), run);
+        let outputs =
+            two_clones_with(builder, vec![Mount::ro(&bins, BIN_MOUNT)], run.clone(), run).await;
         assert_each_line_differs(&outputs, &[runtime]);
     }
 }
@@ -211,21 +216,23 @@ fn go_and_rust_clones_draw_their_own() {
 /// The shell's $RANDOM, used before the snapshot, and a RANDOM the code
 /// made a variable of its own, which the reseed leaves alone.  The
 /// reseed keeps the code's line numbers.
-#[test]
-fn bash_clones_draw_their_own() {
+#[tokio::test]
+async fn bash_clones_draw_their_own() {
     let builder = SandboxBuilder::from_initrd(require_rootfs("bash")).scratch_mb(256);
     let outputs = two_clones(
         builder,
         Exec::Code("echo $RANDOM >/dev/null".into()),
         Exec::Code("echo $RANDOM$RANDOM".into()),
-    );
+    )
+    .await;
     assert_each_line_differs(&outputs, &["$RANDOM"]);
     let builder = SandboxBuilder::from_initrd(require_rootfs("bash")).scratch_mb(256);
     let outputs = two_clones(
         builder,
         Exec::Code("export RANDOM=7".into()),
         Exec::Code("echo $RANDOM $LINENO".into()),
-    );
+    )
+    .await;
     assert_eq!(outputs, ["7 1\n", "7 1\n"].map(String::from));
 
     // A first call that does not parse still finds $RANDOM reseeded.
@@ -234,19 +241,20 @@ fn bash_clones_draw_their_own() {
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run("echo $RANDOM >/dev/null").unwrap();
+    sandbox.run("echo $RANDOM >/dev/null").await.unwrap();
     sandbox.snapshot_to(&snap_dir).unwrap();
     drop(sandbox);
-    let draws = [0, 1].map(|_| {
+    let restore_and_draw = async || {
         let mut clone = SandboxBuilder::from_snapshot_dir(&snap_dir)
             .unwrap()
             .boot()
             .unwrap();
-        let _ = clone.run("echo \"unterminated");
+        let _ = clone.run("echo \"unterminated").await;
         clone.drain_output();
-        clone.run("echo $RANDOM$RANDOM").unwrap();
+        clone.run("echo $RANDOM$RANDOM").await.unwrap();
         clone.drain_output()
-    });
+    };
+    let draws = [restore_and_draw().await, restore_and_draw().await];
     assert_ne!(draws[0], draws[1], "two clones drew the same: {draws:?}");
 }
 
@@ -254,8 +262,8 @@ fn bash_clones_draw_their_own() {
 /// RandomGenerator.getDefault(), Collections.shuffle, UUID.randomUUID and
 /// the seeders every DRBG and SHA1PRNG draw from, each used before the
 /// snapshot.
-#[test]
-fn java_clones_draw_their_own() {
+#[tokio::test]
+async fn java_clones_draw_their_own() {
     let builder = SandboxBuilder::from_initrd(require_rootfs("java")).scratch_mb(512);
     let outputs = two_clones(
         builder,
@@ -281,7 +289,8 @@ fn java_clones_draw_their_own() {
              System.out.println(java.security.SecureRandom.getInstance(\"SHA1PRNG\").nextLong());"
                 .into(),
         ),
-    );
+    )
+    .await;
     assert_each_line_differs(
         &outputs,
         &[
@@ -300,34 +309,36 @@ fn java_clones_draw_their_own() {
 
 /// PHP's mt_rand and random_bytes, used before the snapshot (a seed code
 /// gave mt_srand() stays, tests/php.rs).
-#[test]
-fn php_clones_draw_their_own() {
+#[tokio::test]
+async fn php_clones_draw_their_own() {
     let builder = SandboxBuilder::from_initrd(require_rootfs("php")).scratch_mb(128);
     let outputs = two_clones(
         builder,
         Exec::Code("mt_rand(); random_bytes(4);".into()),
         Exec::Code("echo mt_rand(), \"\\n\", bin2hex(random_bytes(8)), \"\\n\";".into()),
-    );
+    )
+    .await;
     assert_each_line_differs(&outputs, &["mt_rand", "random_bytes"]);
 }
 
 /// QuickJS's Math.random, used before the snapshot.
-#[test]
-fn quickjs_clones_draw_their_own() {
+#[tokio::test]
+async fn quickjs_clones_draw_their_own() {
     let builder = SandboxBuilder::from_initrd(require_rootfs("quickjs")).scratch_mb(64);
     let outputs = two_clones(
         builder,
         Exec::Code("Math.random();".into()),
         Exec::Code("console.log(Math.random());".into()),
-    );
+    )
+    .await;
     assert_each_line_differs(&outputs, &["Math.random"]);
 }
 
 /// Random.Shared, new Random(), RandomNumberGenerator (OpenSSL's),
 /// Guid.NewGuid and RandomNumberGenerator.GetInt32, each used before the
 /// snapshot.
-#[test]
-fn dotnet_clones_draw_their_own() {
+#[tokio::test]
+async fn dotnet_clones_draw_their_own() {
     let builder = SandboxBuilder::from_initrd(require_rootfs("dotnet-jit")).scratch_mb(768);
     let outputs = two_clones(
         builder,
@@ -349,7 +360,7 @@ fn dotnet_clones_draw_their_own() {
              Console.WriteLine(RandomNumberGenerator.GetInt32(int.MaxValue));"
                 .into(),
         ),
-    );
+    ).await;
     assert_each_line_differs(
         &outputs,
         &[
@@ -367,8 +378,8 @@ fn dotnet_clones_draw_their_own() {
 /// snapshot has, not on a thread of its own as run code does: Java's
 /// ThreadLocalRandom and .NET's Random.Shared there, each used before the
 /// snapshot, through a guest function call.
-#[test]
-fn guest_function_calls_draw_their_own() {
+#[tokio::test]
+async fn guest_function_calls_draw_their_own() {
     let cases = [
         (
             "java",
@@ -390,17 +401,18 @@ fn guest_function_calls_draw_their_own() {
             .scratch_mb(scratch)
             .boot()
             .unwrap();
-        sandbox.run(define).unwrap();
-        sandbox.call(function, "").unwrap();
+        sandbox.run(define).await.unwrap();
+        sandbox.call(function, "").await.unwrap();
         sandbox.snapshot_to(&snap_dir).unwrap();
         drop(sandbox);
-        let draws = [0, 1].map(|_| {
+        let restore_and_draw = async || {
             let mut clone = SandboxBuilder::from_snapshot_dir(&snap_dir)
                 .unwrap()
                 .boot()
                 .unwrap();
-            clone.call(function, "").unwrap()
-        });
+            clone.call(function, "").await.unwrap()
+        };
+        let draws = [restore_and_draw().await, restore_and_draw().await];
         assert_ne!(
             draws[0], draws[1],
             "two {runtime} clones drew the same: {draws:?}"

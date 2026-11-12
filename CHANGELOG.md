@@ -7,16 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Async host functions through `SandboxBuilder::async_host_function`, with
-  `run_async`, `call_async`, `join_async` and `step_async` driving a bounded
+  `run`, `call`, `join` and `step` driving a bounded
   `FuturesUnordered` engine. Only the calling guest thread parks; replies are
   batched. Scheduler timers and Tokio socket readiness share the same engine.
-  Existing synchronous driving methods remain as migration adapters.
 - Pending-call snapshots, including resized and saved snapshots. Capture leaves
   original work unchanged; restore interrupts unfinished and undelivered calls
   with `EINTR`, without serializing futures, replaying handlers or undoing effects.
 
 ### Changed
 
+- **Breaking:** `AppSandbox::run`, `call`, `join` and `step` are async-only.
+  The migration's `_async` names are consolidated into these methods and the
+  synchronous adapters are removed. `step()` has no timeout argument:
+  cancelling an unfinished drive poisons the sandbox rather than acting as a
+  bounded probe. The CLI, examples and embedding callers use the same async API.
 - Live block-list DNS checks run outside VM entries through typed async
   connect/send/sendto replies. Static policy decisions remain immediate; UDP
   connect sends nothing and each datagram send checks its destination. The

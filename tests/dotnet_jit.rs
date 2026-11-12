@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use common::{hluk_with_stdin_scratch, require_rootfs, run_http_get, temp_dir};
 use hyperlight_unikraft::{Exec, Mount, SandboxBuilder};
 
-#[test]
-fn dotnet_jit_inline_code() {
+#[tokio::test]
+async fn dotnet_jit_inline_code() {
     let rootfs = require_rootfs("dotnet-jit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
@@ -17,6 +17,7 @@ fn dotnet_jit_inline_code() {
         .unwrap();
     sandbox
         .run("Console.WriteLine(\"hluk-dotnet-ok\");")
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -25,15 +26,15 @@ fn dotnet_jit_inline_code() {
     );
 }
 
-#[test]
-fn dotnet_jit_exec_file() {
+#[tokio::test]
+async fn dotnet_jit_exec_file() {
     let rootfs = require_rootfs("dotnet-jit");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dotnet-jit/Hello.cs");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello"),
@@ -41,8 +42,8 @@ fn dotnet_jit_exec_file() {
     );
 }
 
-#[test]
-fn dotnet_jit_snapshot_round_trip() {
+#[tokio::test]
+async fn dotnet_jit_snapshot_round_trip() {
     let rootfs = require_rootfs("dotnet-jit");
     let snap_dir = temp_dir("dotnet-jit-snap");
 
@@ -58,6 +59,7 @@ fn dotnet_jit_snapshot_round_trip() {
         .unwrap();
     sandbox
         .run("Console.WriteLine(\"restored-dotnet-ok\");")
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -66,22 +68,28 @@ fn dotnet_jit_snapshot_round_trip() {
     );
 }
 
-#[test]
-fn dotnet_jit_multiple_runs() {
+#[tokio::test]
+async fn dotnet_jit_multiple_runs() {
     let rootfs = require_rootfs("dotnet-jit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
         .boot()
         .unwrap();
 
-    sandbox.run("Console.WriteLine(\"run1-ok\");").unwrap();
+    sandbox
+        .run("Console.WriteLine(\"run1-ok\");")
+        .await
+        .unwrap();
     let output1 = sandbox.drain_output();
     assert!(
         output1.contains("run1-ok"),
         "expected 'run1-ok' from first dispatch, got: {output1:?}"
     );
 
-    sandbox.run("Console.WriteLine($\"x={1 + 1}\");").unwrap();
+    sandbox
+        .run("Console.WriteLine($\"x={1 + 1}\");")
+        .await
+        .unwrap();
     let output2 = sandbox.drain_output();
     assert!(
         output2.contains("x=2"),
@@ -89,15 +97,15 @@ fn dotnet_jit_multiple_runs() {
     );
 }
 
-#[test]
-fn dotnet_jit_math() {
+#[tokio::test]
+async fn dotnet_jit_math() {
     let rootfs = require_rootfs("dotnet-jit");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dotnet-jit/Math.cs");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("=== .NET Math Demo ==="),
@@ -128,8 +136,8 @@ fn dotnet_jit_stdin_piped() {
     );
 }
 
-#[test]
-fn dotnet_jit_env_vars() {
+#[tokio::test]
+async fn dotnet_jit_env_vars() {
     let rootfs = require_rootfs("dotnet-jit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
@@ -144,6 +152,7 @@ fn dotnet_jit_env_vars() {
         .run(Exec::File(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dotnet-jit/EnvVars.cs"),
         ))
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -160,8 +169,8 @@ fn dotnet_jit_env_vars() {
     );
 }
 
-#[test]
-fn dotnet_jit_fs() {
+#[tokio::test]
+async fn dotnet_jit_fs() {
     let rootfs = require_rootfs("dotnet-jit");
     let mount_dir = temp_dir("dotnet-jit-fs");
 
@@ -172,7 +181,7 @@ fn dotnet_jit_fs() {
         .boot()
         .unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dotnet-jit/FsOps.cs");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
 
     assert!(
@@ -187,15 +196,15 @@ fn dotnet_jit_fs() {
     assert!(mount_dir.path().join("dotnet_fs.txt").exists());
 }
 
-#[test]
-fn dotnet_jit_threading() {
+#[tokio::test]
+async fn dotnet_jit_threading() {
     let rootfs = require_rootfs("dotnet-jit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
         .boot()
         .unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dotnet-jit/Threads.cs");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
 
     assert!(
@@ -208,14 +217,15 @@ fn dotnet_jit_threading() {
     );
 }
 
-#[test]
-fn dotnet_jit_http_get() {
+#[tokio::test]
+async fn dotnet_jit_http_get() {
     let rootfs = require_rootfs("dotnet-jit");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dotnet-jit/HttpGet.cs");
     let output = run_http_get(
         || SandboxBuilder::from_initrd(rootfs.clone()).scratch_mb(768),
         Exec::File(script),
-    );
+    )
+    .await;
 
     assert!(
         output.contains("Status: 200"),
@@ -227,8 +237,8 @@ fn dotnet_jit_http_get() {
 /// microseconds; one that sleeps past the first second is around when the
 /// runtime first signals its threads, which exercises the alternate signal
 /// stacks the runtime installs per thread.
-#[test]
-fn dotnet_jit_worker_that_waits() {
+#[tokio::test]
+async fn dotnet_jit_worker_that_waits() {
     let rootfs = require_rootfs("dotnet-jit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
@@ -238,7 +248,7 @@ fn dotnet_jit_worker_that_waits() {
         .run(concat!(
             "var t = new System.Threading.Thread(() => { System.Threading.Thread.Sleep(1500); Console.WriteLine(\"slept\"); });\n",
             "t.Start(); t.Join(); Console.WriteLine(\"joined\"); Console.Out.Flush();\n",
-        ))
+        )).await
         .unwrap();
     let out = sandbox.drain_output();
     assert!(out.contains("slept") && out.contains("joined"), "{out:?}");
@@ -247,8 +257,8 @@ fn dotnet_jit_worker_that_waits() {
 /// A call ends when its top-level statements return; a thread it started
 /// is left behind and makes progress on the steps that follow, and the
 /// next call finds the runtime intact.
-#[test]
-fn dotnet_jit_thread_runs_between_calls() {
+#[tokio::test]
+async fn dotnet_jit_thread_runs_between_calls() {
     let rootfs = require_rootfs("dotnet-jit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
@@ -258,7 +268,7 @@ fn dotnet_jit_thread_runs_between_calls() {
         .run(concat!(
             "var t = new System.Threading.Thread(() => { for (int i = 1; i <= 5; i++) { System.Threading.Thread.Sleep(300); Console.WriteLine($\"tick {i}\"); Console.Out.Flush(); } });\n",
             "t.Start(); Console.WriteLine(\"started\"); Console.Out.Flush();\n",
-        ))
+        )).await
         .unwrap();
     // Judged by output, not the clock: a slow host may take longer to JIT
     // the call than the thread takes to finish.
@@ -272,7 +282,7 @@ fn dotnet_jit_thread_runs_between_calls() {
     // 120 s, not 30: the nightly's nested-virt arm64 runner needs many steps to reach tick 5.
     let deadline = Instant::now() + Duration::from_secs(120);
     while !out.contains("tick 5") && Instant::now() < deadline {
-        sandbox.step(Duration::from_millis(500)).unwrap();
+        sandbox.step().await.unwrap();
         out.push_str(&sandbox.drain_output());
     }
     assert!(
@@ -281,6 +291,7 @@ fn dotnet_jit_thread_runs_between_calls() {
     );
     sandbox
         .run("Console.WriteLine(\"again\"); Console.Out.Flush();")
+        .await
         .unwrap();
     assert!(sandbox.drain_output().contains("again"));
 }
@@ -288,18 +299,21 @@ fn dotnet_jit_thread_runs_between_calls() {
 /// `Environment.Exit()` ends the .NET process, which is the runtime: the
 /// call ends with that status, and the next call starts a fresh one, in
 /// the image's memory (768 MiB): the old runtime gave its own back.
-#[test]
-fn dotnet_jit_environment_exit_ends_the_call() {
+#[tokio::test]
+async fn dotnet_jit_environment_exit_ends_the_call() {
     let rootfs = require_rootfs("dotnet-jit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs.clone())
         .scratch_mb(768)
         .boot()
         .unwrap();
     sandbox
-        .run("Console.WriteLine(\"leaving\"); Environment.Exit(0); Console.WriteLine(\"not reached\");")
+        .run("Console.WriteLine(\"leaving\"); Environment.Exit(0); Console.WriteLine(\"not reached\");").await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "leaving\n");
-    sandbox.run("Console.WriteLine(\"still here\");").unwrap();
+    sandbox
+        .run("Console.WriteLine(\"still here\");")
+        .await
+        .unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 
     // A non-zero code fails the call.
@@ -308,7 +322,7 @@ fn dotnet_jit_environment_exit_ends_the_call() {
         .boot()
         .unwrap();
     assert!(
-        sandbox.run("Environment.Exit(3);").is_err(),
+        sandbox.run("Environment.Exit(3);").await.is_err(),
         "Environment.Exit(3) did not fail the call"
     );
 }
@@ -316,8 +330,8 @@ fn dotnet_jit_environment_exit_ends_the_call() {
 /// The GC's hard limit is a share of the memory the kernel reports, so an
 /// allocation that cannot be served is an OutOfMemoryException the code
 /// can catch, not a page fault the kernel cannot serve.
-#[test]
-fn dotnet_jit_out_of_memory_is_an_exception() {
+#[tokio::test]
+async fn dotnet_jit_out_of_memory_is_an_exception() {
     let rootfs = require_rootfs("dotnet-jit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
@@ -331,7 +345,7 @@ fn dotnet_jit_out_of_memory_is_an_exception() {
             "try { while (true) keep.Add(new byte[1 << 20]); }\n",
             "catch (OutOfMemoryException) { Console.WriteLine($\"oom after {keep.Count}\"); }\n",
             "keep = null; GC.Collect();\n",
-        ))
+        )).await
         .unwrap();
     let out = sandbox.drain_output();
     let limit_mb: u64 = out
@@ -347,15 +361,18 @@ fn dotnet_jit_out_of_memory_is_an_exception() {
         out.contains("oom after"),
         "no OutOfMemoryException: {out:?}"
     );
-    sandbox.run("Console.WriteLine(\"still here\");").unwrap();
+    sandbox
+        .run("Console.WriteLine(\"still here\");")
+        .await
+        .unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 }
 
 /// A public static method of a snippet run earlier, called with JSON in
 /// and out: a snippet of only definitions loads as a library, statics
 /// persist, a task is awaited, and a newer definition wins.
-#[test]
-fn dotnet_jit_calls_a_guest_function() {
+#[tokio::test]
+async fn dotnet_jit_calls_a_guest_function() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("dotnet-jit"))
         .scratch_mb(768)
         .boot()
@@ -370,26 +387,27 @@ fn dotnet_jit_calls_a_guest_function() {
                  public static void Nothing() => Console.WriteLine(\"ran\");\n\
                  public static int Bad(JsonElement e) => throw new InvalidOperationException(\"handler boom\");\n\
              }",
-        )
+        ).await
         .unwrap();
     assert_eq!(
-        sandbox.call("Greet", r#"{"name":"World"}"#).unwrap(),
+        sandbox.call("Greet", r#"{"name":"World"}"#).await.unwrap(),
         r#"{"greeting":"Hello, World!","calls":1}"#
     );
     assert_eq!(
         sandbox
             .call("Handlers.Greet", r#"{"name":"again"}"#)
+            .await
             .unwrap(),
         r#"{"greeting":"Hello, again!","calls":2}"#
     );
-    assert_eq!(sandbox.call("Later", r#"{"x":21}"#).unwrap(), "42");
-    assert_eq!(sandbox.call("Nothing", "").unwrap(), "");
+    assert_eq!(sandbox.call("Later", r#"{"x":21}"#).await.unwrap(), "42");
+    assert_eq!(sandbox.call("Nothing", "").await.unwrap(), "");
     assert!(matches!(
-        sandbox.call("Bad", "{}"),
+        sandbox.call("Bad", "{}").await,
         Err(hyperlight_unikraft::Error::CallFailed { status: 1 })
     ));
-    assert!(sandbox.call("Missing", "{}").is_err());
-    assert!(sandbox.call("Greet", "not json").is_err());
+    assert!(sandbox.call("Missing", "{}").await.is_err());
+    assert!(sandbox.call("Greet", "not json").await.is_err());
     let output = sandbox.drain_output();
     assert!(output.contains("ran"), "{output}");
     assert!(output.contains("handler boom"), "{output}");
@@ -399,15 +417,15 @@ fn dotnet_jit_calls_a_guest_function() {
     );
     // A snippet with statements still runs, and its definitions are found.
     sandbox
-        .run("Console.WriteLine(\"statements\");\npublic static class More { public static string Greet(JsonElement e) => \"newer\"; }")
+        .run("Console.WriteLine(\"statements\");\npublic static class More { public static string Greet(JsonElement e) => \"newer\"; }").await
         .unwrap();
-    assert_eq!(sandbox.call("Greet", "{}").unwrap(), r#""newer""#);
+    assert_eq!(sandbox.call("Greet", "{}").await.unwrap(), r#""newer""#);
 }
 
 /// The embedder's functions through `Host.Call`; a host error is a
 /// `HostException`.
-#[test]
-fn dotnet_jit_calls_host_functions() {
+#[tokio::test]
+async fn dotnet_jit_calls_host_functions() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("dotnet-jit"))
         .scratch_mb(768)
         .host_function("math.add", |args| {
@@ -426,20 +444,20 @@ fn dotnet_jit_calls_host_functions() {
             "Console.WriteLine(Host.Call<int>(\"math.add\", 2, 3));\n\
              Console.WriteLine(Host.Call(\"db.lookup\", 7)?.GetProperty(\"name\"));\n\
              try { Host.Call(\"math.fail\"); } catch (HostException e) { Console.WriteLine($\"caught {e.Message}\"); }",
-        )
+        ).await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "5\nAda\ncaught no can do\n");
     sandbox
-        .run("public static class H { public static double Total(double[] v) => Host.Call<double>(\"math.add\", v.Cast<object>().ToArray()); }")
+        .run("public static class H { public static double Total(double[] v) => Host.Call<double>(\"math.add\", v.Cast<object>().ToArray()); }").await
         .unwrap();
-    assert_eq!(sandbox.call("Total", "[1,2,3]").unwrap(), "6");
+    assert_eq!(sandbox.call("Total", "[1,2,3]").await.unwrap(), "6");
 }
 
 /// A host function call from a thread the guest function left behind,
 /// after the call ended, is refused rather than interleaved with the
 /// next call on the pipe.
-#[test]
-fn dotnet_jit_host_call_after_the_call_is_refused() {
+#[tokio::test]
+async fn dotnet_jit_host_call_after_the_call_is_refused() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("dotnet-jit"))
         .scratch_mb(768)
         .host_function("log", |_| Ok(String::new()))
@@ -456,33 +474,43 @@ fn dotnet_jit_host_call_after_the_call_is_refused() {
                  public static int Echo(int x) => x;\n\
              }",
         )
+        .await
         .unwrap();
-    sandbox.call("Start", "").unwrap();
+    sandbox.call("Start", "").await.unwrap();
     // Calls go on working while the background thread tries the host.
     for i in 0..5 {
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(sandbox.call("Echo", &i.to_string()).unwrap(), i.to_string());
+        assert_eq!(
+            sandbox.call("Echo", &i.to_string()).await.unwrap(),
+            i.to_string()
+        );
     }
-    sandbox.run("Thread.Sleep(100);").unwrap();
+    sandbox.run("Thread.Sleep(100);").await.unwrap();
     let output = sandbox.drain_output();
     assert!(!output.contains("bg: called"), "{output}");
 }
 
 /// `examples/dotnet-jit/Handler.cs`: loaded once, called twice, its state carried over.
-#[test]
-fn dotnet_jit_handler_example() {
+#[tokio::test]
+async fn dotnet_jit_handler_example() {
     let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dotnet-jit/Handler.cs");
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("dotnet-jit"))
         .scratch_mb(768)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(example)).unwrap();
+    sandbox.run(Exec::File(example)).await.unwrap();
     assert_eq!(
-        sandbox.call("Handler", r#"{"name":"World"}"#).unwrap(),
+        sandbox
+            .call("Handler", r#"{"name":"World"}"#)
+            .await
+            .unwrap(),
         r#"{"greeting":"Hello, World!","calls":1}"#
     );
     assert_eq!(
-        sandbox.call("Handler", r#"{"name":"again"}"#).unwrap(),
+        sandbox
+            .call("Handler", r#"{"name":"again"}"#)
+            .await
+            .unwrap(),
         r#"{"greeting":"Hello, again!","calls":2}"#
     );
 }

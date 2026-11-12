@@ -28,21 +28,21 @@ fn hello_wat(text: &str) -> String {
     )
 }
 
-#[test]
-fn wasmtime_runs_webassembly_text() {
+#[tokio::test]
+async fn wasmtime_runs_webassembly_text() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
         .boot()
         .unwrap();
-    sandbox.run(hello_wat("Hello from Wasmtime")).unwrap();
+    sandbox.run(hello_wat("Hello from Wasmtime")).await.unwrap();
     assert_eq!(sandbox.drain_output().trim(), "Hello from Wasmtime");
     // The engine serves the next call too.
-    sandbox.run(hello_wat("again")).unwrap();
+    sandbox.run(hello_wat("again")).await.unwrap();
     assert_eq!(sandbox.drain_output().trim(), "again");
 }
 
-#[test]
-fn wasmtime_exit_code_is_the_call_status() {
+#[tokio::test]
+async fn wasmtime_exit_code_is_the_call_status() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
         .boot()
@@ -51,26 +51,26 @@ fn wasmtime_exit_code_is_the_call_status() {
   (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
   (memory (export "memory") 1)
   (func (export "_start") (call $exit (i32.const 7))))"#;
-    match sandbox.run(exit) {
+    match sandbox.run(exit).await {
         Err(Error::CallFailed { status }) => assert_eq!(status, 7),
         other => panic!("expected the call to fail with 7, got {other:?}"),
     }
     // A trap fails the call; the engine is still there.
     let trap = r#"(module (func (export "_start") unreachable))"#;
     assert!(matches!(
-        sandbox.run(trap),
+        sandbox.run(trap).await,
         Err(Error::CallFailed { status: 1 })
     ));
     assert!(sandbox.drain_output().contains("unreachable"));
-    sandbox.run(hello_wat("still here")).unwrap();
+    sandbox.run(hello_wat("still here")).await.unwrap();
 }
 
 /// The WASI program as a module and as a component: arguments, the host's
 /// environment, and a file read and written through a mount (which needs
 /// the kernel to resolve a path relative to the preopened `/` across the
 /// mount point).
-#[test]
-fn wasmtime_runs_wasi_modules_and_components_from_a_mount() {
+#[tokio::test]
+async fn wasmtime_runs_wasi_modules_and_components_from_a_mount() {
     let data = temp_dir("wasmtime-data");
     std::fs::write(data.path().join("input.txt"), "one two three\n").unwrap();
     for program in ["hello-p1.wasm", "hello-p2.wasm"] {
@@ -85,6 +85,7 @@ fn wasmtime_runs_wasi_modules_and_components_from_a_mount() {
         sandbox.set_env_vars(&[("GREETING", "hi there")]);
         sandbox
             .run(Exec::Guest(format!("{BIN_MOUNT}/{program} world")))
+            .await
             .unwrap();
         let output = sandbox.drain_output();
         assert!(
@@ -111,15 +112,18 @@ fn wasmtime_runs_wasi_modules_and_components_from_a_mount() {
                 .windows(14)
                 .any(|name| name == b"exit-with-code");
         let want = if own_code { 3 } else { 1 };
-        match sandbox.run(Exec::Guest(format!("{BIN_MOUNT}/{program} fail"))) {
+        match sandbox
+            .run(Exec::Guest(format!("{BIN_MOUNT}/{program} fail")))
+            .await
+        {
             Err(Error::CallFailed { status }) => assert_eq!(status, want, "{program}"),
             other => panic!("{program}: expected a failed call, got {other:?}"),
         }
     }
 }
 
-#[test]
-fn wasmtime_snapshot_round_trip() {
+#[tokio::test]
+async fn wasmtime_snapshot_round_trip() {
     let snap_dir = temp_dir("wasmtime-snap");
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
@@ -131,14 +135,17 @@ fn wasmtime_snapshot_round_trip() {
         .unwrap()
         .boot()
         .unwrap();
-    sandbox.run(hello_wat("restored-wasmtime-ok")).unwrap();
+    sandbox
+        .run(hello_wat("restored-wasmtime-ok"))
+        .await
+        .unwrap();
     assert_eq!(sandbox.drain_output().trim(), "restored-wasmtime-ok");
 }
 
 /// A library module, loaded once and called many times, its state kept
 /// between calls; an import outside WASI is the embedder's function.
-#[test]
-fn wasmtime_calls_a_loaded_module_and_the_host() {
+#[tokio::test]
+async fn wasmtime_calls_a_loaded_module_and_the_host() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
         .host_function("math.mul", |args| {
@@ -160,29 +167,30 @@ fn wasmtime_calls_a_loaded_module_and_the_host() {
   (func (export "calls") (result i32) (global.get $calls))
   (func (export "half") (param f64) (result f64) (f64.mul (local.get 0) (f64.const 0.5))))"#,
         )
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("add", "[2, 3]").unwrap(), "5");
-    assert_eq!(sandbox.call("add", "[40, 2]").unwrap(), "42");
-    assert_eq!(sandbox.call("calls", "").unwrap(), "2");
-    assert_eq!(sandbox.call("mul_plus_one", "[6, 7]").unwrap(), "43");
-    assert_eq!(sandbox.call("half", "[3]").unwrap(), "1.5");
+    assert_eq!(sandbox.call("add", "[2, 3]").await.unwrap(), "5");
+    assert_eq!(sandbox.call("add", "[40, 2]").await.unwrap(), "42");
+    assert_eq!(sandbox.call("calls", "").await.unwrap(), "2");
+    assert_eq!(sandbox.call("mul_plus_one", "[6, 7]").await.unwrap(), "43");
+    assert_eq!(sandbox.call("half", "[3]").await.unwrap(), "1.5");
     // An i32 takes a signed or an unsigned 32-bit number, never a wider
     // one cut down to fit.
-    assert_eq!(sandbox.call("add", "[4294967295, 1]").unwrap(), "0");
-    assert!(sandbox.call("add", "[4294967297, 1]").is_err());
-    assert!(sandbox.call("add", "[1e20, 1]").is_err());
+    assert_eq!(sandbox.call("add", "[4294967295, 1]").await.unwrap(), "0");
+    assert!(sandbox.call("add", "[4294967297, 1]").await.is_err());
+    assert!(sandbox.call("add", "[1e20, 1]").await.is_err());
     // Wrong arguments, a missing export: the call fails, the module stays.
-    assert!(sandbox.call("add", "[1]").is_err());
-    assert!(sandbox.call("nope", "[]").is_err());
+    assert!(sandbox.call("add", "[1]").await.is_err());
+    assert!(sandbox.call("nope", "[]").await.is_err());
     // Three adds ran; the refused calls never reached the module.
-    assert_eq!(sandbox.call("calls", "").unwrap(), "3");
+    assert_eq!(sandbox.call("calls", "").await.unwrap(), "3");
 }
 
 /// A component: a function it exports, lifted from core code that calls
 /// a function of an imported interface, which the embedder provides as
 /// `math.mul`.
-#[test]
-fn wasmtime_calls_a_component_and_its_host_interface() {
+#[tokio::test]
+async fn wasmtime_calls_a_component_and_its_host_interface() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
         .host_function("math.mul", |args| {
@@ -209,19 +217,20 @@ fn wasmtime_calls_a_component_and_its_host_interface() {
   (func (export "is-even") (param "n" u32) (result bool)
     (canon lift (core func $i "is-even"))))"#,
         )
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("mul-plus-one", "[6, 7]").unwrap(), "43");
-    assert_eq!(sandbox.call("is-even", "[4]").unwrap(), "true");
-    assert_eq!(sandbox.call("is-even", "[5]").unwrap(), "false");
+    assert_eq!(sandbox.call("mul-plus-one", "[6, 7]").await.unwrap(), "43");
+    assert_eq!(sandbox.call("is-even", "[4]").await.unwrap(), "true");
+    assert_eq!(sandbox.call("is-even", "[5]").await.unwrap(), "false");
     // A u32 cannot be negative: the argument is refused, not wrapped.
-    assert!(sandbox.call("is-even", "[-1]").is_err());
+    assert!(sandbox.call("is-even", "[-1]").await.is_err());
 }
 
 /// Two clones of one warm snapshot, with a library loaded in it, draw
 /// different WASI random bytes: the generator is the kernel's, which
 /// reseeds on every restore, not one captured with the library.
-#[test]
-fn wasmtime_snapshot_clones_draw_their_own_random_bytes() {
+#[tokio::test]
+async fn wasmtime_snapshot_clones_draw_their_own_random_bytes() {
     let snap_dir = temp_dir("wasmtime-random-snap");
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
@@ -236,23 +245,23 @@ fn wasmtime_snapshot_clones_draw_their_own_random_bytes() {
     (drop (call $random_get (i32.const 0) (i32.const 8)))
     (i64.load (i32.const 0))))"#,
         )
+        .await
         .unwrap();
     sandbox.snapshot_to(&snap_dir).unwrap();
-    let draws: Vec<String> = (0..2)
-        .map(|_| {
-            let mut clone = SandboxBuilder::from_snapshot_dir(&snap_dir)
-                .unwrap()
-                .boot()
-                .unwrap();
-            clone.call("draw", "").unwrap()
-        })
-        .collect();
+    let mut draws = Vec::new();
+    for _ in 0..2 {
+        let mut clone = SandboxBuilder::from_snapshot_dir(&snap_dir)
+            .unwrap()
+            .boot()
+            .unwrap();
+        draws.push(clone.call("draw", "").await.unwrap());
+    }
     assert_ne!(draws[0], draws[1], "two clones drew the same bytes");
 }
 
 /// A module may import the same function more than once.
-#[test]
-fn wasmtime_loads_a_module_importing_a_host_function_twice() {
+#[tokio::test]
+async fn wasmtime_loads_a_module_importing_a_host_function_twice() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
         .host_function("math.double", |args| {
@@ -268,14 +277,15 @@ fn wasmtime_loads_a_module_importing_a_host_function_twice() {
   (import "math" "double" (func $b (param i32) (result i32)))
   (func (export "quad") (param i32) (result i32) (call $b (call $a (local.get 0)))))"#,
         )
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("quad", "[5]").unwrap(), "20");
+    assert_eq!(sandbox.call("quad", "[5]").await.unwrap(), "20");
 }
 
 /// A WASI 0.3 command (`examples/wasmtime/hello-p3`): an async `run`,
 /// stdout written as a stream, and two timers awaited at once.
-#[test]
-fn wasmtime_runs_a_wasi_0_3_command() {
+#[tokio::test]
+async fn wasmtime_runs_a_wasi_0_3_command() {
     require_bin("wasmtime", "hello-p3.wasm");
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
@@ -289,6 +299,7 @@ fn wasmtime_runs_a_wasi_0_3_command() {
     for _ in 0..3 {
         sandbox
             .run(Exec::Guest(format!("{BIN_MOUNT}/hello-p3.wasm world")))
+            .await
             .unwrap();
         let output = sandbox.drain_output();
         assert!(output.contains("Hello, world, from WASI 0.3!"), "{output}");
@@ -310,8 +321,8 @@ fn wasmtime_runs_a_wasi_0_3_command() {
 /// A WASI 0.3 library (`examples/wasmtime/calculator`): a plain export and
 /// an async one, both calling the embedder's function through the WIT
 /// interface the component imports.
-#[test]
-fn wasmtime_calls_an_async_export() {
+#[tokio::test]
+async fn wasmtime_calls_an_async_export() {
     require_bin("wasmtime", "calculator.wasm");
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
@@ -324,14 +335,21 @@ fn wasmtime_calls_an_async_export() {
         .unwrap();
     sandbox
         .run(Exec::Guest(format!("{BIN_MOUNT}/calculator.wasm")))
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("sum-of-squares", "[3, 4]").unwrap(), "25");
     assert_eq!(
-        sandbox.call("slow-sum-of-squares", "[5, 12, 10]").unwrap(),
+        sandbox.call("sum-of-squares", "[3, 4]").await.unwrap(),
+        "25"
+    );
+    assert_eq!(
+        sandbox
+            .call("slow-sum-of-squares", "[5, 12, 10]")
+            .await
+            .unwrap(),
         "169"
     );
     // The instance carries on after an async call.
-    assert_eq!(sandbox.call("sum-of-squares", "[1, 1]").unwrap(), "2");
+    assert_eq!(sandbox.call("sum-of-squares", "[1, 1]").await.unwrap(), "2");
 
     // A snapshot taken with the library loaded and the async runtime
     // started serves the same calls once restored.
@@ -347,15 +365,18 @@ fn wasmtime_calls_an_async_export() {
         .boot()
         .unwrap();
     assert_eq!(
-        sandbox.call("slow-sum-of-squares", "[3, 4, 10]").unwrap(),
+        sandbox
+            .call("slow-sum-of-squares", "[3, 4, 10]")
+            .await
+            .unwrap(),
         "25"
     );
 }
 
 /// An async export needs no WASI 0.3 import (it uses the component
 /// model's own builtins), and is still called asynchronously.
-#[test]
-fn wasmtime_calls_an_async_export_without_wasi() {
+#[tokio::test]
+async fn wasmtime_calls_an_async_export_without_wasi() {
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("wasmtime"))
         .scratch_mb(SCRATCH_MB)
         .boot()
@@ -374,6 +395,7 @@ fn wasmtime_calls_an_async_export_without_wasi() {
   (func (export "inc") async (param "x" u32) (result u32)
     (canon lift (core func $i "inc") async (callback (core func $i "cb")))))"#,
         )
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("inc", "[41]").unwrap(), "42");
+    assert_eq!(sandbox.call("inc", "[41]").await.unwrap(), "42");
 }

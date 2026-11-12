@@ -559,7 +559,7 @@ impl Call {
 /// program (`--entry /bin/server`): drive it to its exit the way a
 /// container runtime would, and exit with its status, as running it
 /// directly would.
-fn drive(
+async fn drive(
     sandbox: &mut AppSandbox,
     no_workload: bool,
     exec: Exec,
@@ -578,7 +578,7 @@ fn drive(
         );
     }
     let plain_entry = no_workload && call.is_none() && !sandbox.has_driver();
-    let result = drive_inner(sandbox, no_workload, exec, call, t);
+    let result = drive_inner(sandbox, no_workload, exec, call, t).await;
     // An entry point that wrote nothing at all (one that could not start,
     // say) has only the kernel's messages to say what happened.
     let output = sandbox.take_output();
@@ -597,7 +597,7 @@ fn drive(
 }
 
 /// The entry program's exit status when it is driven to its exit, else 0.
-fn drive_inner(
+async fn drive_inner(
     sandbox: &mut AppSandbox,
     no_workload: bool,
     exec: Exec,
@@ -606,11 +606,11 @@ fn drive_inner(
 ) -> CliResult<i32> {
     if let Some(call) = call {
         if !no_workload {
-            run_workload(sandbox, exec)?;
+            run_workload(sandbox, exec).await?;
             info!(elapsed_ms = elapsed_ms(t), "exec");
         }
         let t = Instant::now();
-        let result = kernel_tail::workload(sandbox.call(&call.function, &call.input))?;
+        let result = kernel_tail::workload(sandbox.call(&call.function, &call.input).await)?;
         info!(elapsed_ms = elapsed_ms(t), "call");
         if !result.is_empty() {
             println!("{result}");
@@ -619,22 +619,22 @@ fn drive_inner(
     }
     if no_workload && !sandbox.has_driver() {
         info!("no driver in the guest; driving its entry point to exit");
-        let status = sandbox.join()?;
+        let status = sandbox.join().await?;
         info!(elapsed_ms = elapsed_ms(t), status, "exec");
         return Ok(status);
     }
-    run_workload(sandbox, exec)?;
+    run_workload(sandbox, exec).await?;
     info!(elapsed_ms = elapsed_ms(t), "exec");
     Ok(0)
 }
 
 /// Run the workload.  A script too large for a call was refused when it
 /// was read ([`script_exec`]).
-fn run_workload(sandbox: &mut AppSandbox, exec: Exec) -> CliResult<()> {
-    Ok(kernel_tail::workload(sandbox.run(exec))?)
+async fn run_workload(sandbox: &mut AppSandbox, exec: Exec) -> CliResult<()> {
+    Ok(kernel_tail::workload(sandbox.run(exec).await)?)
 }
 
-fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
+async fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
     let mounts = parse_mounts(&args.mounts)?;
     let (policy, listen) =
         parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?;
@@ -682,7 +682,7 @@ fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
         if !sandbox.has_driver() {
             return Err("--warm-exec needs a runtime driver in the rootfs".into());
         }
-        kernel_tail::workload(sandbox.run(code.as_str()))?;
+        kernel_tail::workload(sandbox.run(code.as_str()).await)?;
     }
 
     let t = Instant::now();
@@ -703,7 +703,7 @@ fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
     Ok(())
 }
 
-fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
+async fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
     // Precedence: host script / --exec code; else --guest-exec; else the
     // rootfs's conventional entrypoint.  A script is read before the
     // snapshot is loaded.
@@ -758,6 +758,7 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
         exec,
         Call::new(args.call, args.input),
     )
+    .await
 }
 
 // ── Bench helpers ────────────────────────────────────────────────
@@ -855,7 +856,7 @@ fn print_rss(label: &str) {
 // ── Bench commands ───────────────────────────────────────────────
 
 /// Cold start: fresh boot + dispatch, N independent samples.
-fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
+async fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
     let mounts = parse_mounts(&args.mounts)?;
     let mut boots = Vec::with_capacity(args.samples);
@@ -873,7 +874,7 @@ fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
         let boot_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
-        sandbox.run(source.as_str())?;
+        sandbox.run(source.as_str()).await?;
         let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -893,7 +894,7 @@ fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
 }
 
 /// Cold snapshot: load from disk + restore + dispatch, N independent samples.
-fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
+async fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
     let mounts = parse_mounts(&args.mounts)?;
     let mut loads = Vec::with_capacity(args.samples);
@@ -911,7 +912,7 @@ fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
         let restore_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
-        sandbox.run(source.as_str())?;
+        sandbox.run(source.as_str()).await?;
         let exec_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -935,7 +936,7 @@ fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
 }
 
 /// Warm with restore: load snapshot once, then loop dispatch + restore.
-fn bench_warm_restore(args: BenchSnapArgs) -> CliResult<()> {
+async fn bench_warm_restore(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
     let mounts = parse_mounts(&args.mounts)?;
 
@@ -950,7 +951,7 @@ fn bench_warm_restore(args: BenchSnapArgs) -> CliResult<()> {
 
     for i in 0..args.samples {
         let t1 = Instant::now();
-        sandbox.run(source.as_str())?;
+        sandbox.run(source.as_str()).await?;
         let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
@@ -970,7 +971,7 @@ fn bench_warm_restore(args: BenchSnapArgs) -> CliResult<()> {
 }
 
 /// Warm stateful: load snapshot once, then loop dispatch without restore.
-fn bench_warm_stateful(args: BenchSnapArgs) -> CliResult<()> {
+async fn bench_warm_stateful(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
     let mounts = parse_mounts(&args.mounts)?;
 
@@ -984,7 +985,7 @@ fn bench_warm_stateful(args: BenchSnapArgs) -> CliResult<()> {
 
     for i in 0..args.samples {
         let t1 = Instant::now();
-        sandbox.run(source.as_str())?;
+        sandbox.run(source.as_str()).await?;
         let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         println!("BENCH warm-stateful sample={i} exec_ms={exec_ms:.3}");
@@ -1017,6 +1018,10 @@ fn bench_parallel(args: BenchParallelArgs) -> CliResult<()> {
 
             std::thread::spawn(move || -> Result<Vec<f64>, String> {
                 barrier.wait();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
                 let vm_start = Instant::now();
 
                 let mut sandbox = boot(SandboxBuilder::from_snapshot(snap.clone()).mounts(mounts))
@@ -1025,7 +1030,9 @@ fn bench_parallel(args: BenchParallelArgs) -> CliResult<()> {
 
                 for iter in 0..iterations {
                     let t = Instant::now();
-                    sandbox.run(source.as_str()).map_err(|e| e.to_string())?;
+                    runtime
+                        .block_on(sandbox.run(source.as_str()))
+                        .map_err(|e| e.to_string())?;
                     let exec_ms = t.elapsed().as_secs_f64() * 1000.0;
 
                     let t = Instant::now();
@@ -1082,10 +1089,14 @@ fn bench_parallel(args: BenchParallelArgs) -> CliResult<()> {
 // ── Main ─────────────────────────────────────────────────────────
 
 fn main() {
-    let Err(e) = cli_main() else { return };
-    // What the guest kernel said last may be why hluk failed: it stays out
-    // of the guest's output, so it has not been shown.  A workload's own
-    // failure has forgotten it already (kernel_tail::workload).
+    let result = (|| -> CliResult<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(cli_main())
+    })();
+    let Err(e) = result else { return };
+    // Workload failures have already cleared their kernel diagnostics.
     kernel_tail::print();
     // A script that failed has said why in the guest's output, and its
     // status is the command's, as when running it directly; a guest that
@@ -1241,7 +1252,7 @@ pub(crate) mod kernel_tail {
     }
 }
 
-fn cli_main() -> CliResult<()> {
+async fn cli_main() -> CliResult<()> {
     let cli = Cli::parse();
 
     // Not for the benchmarks, whose guests run side by side: one buffer
@@ -1280,24 +1291,24 @@ fn cli_main() -> CliResult<()> {
 
     match cli.command {
         Command::Init(args) => cli::init(args),
-        Command::Run(args) => cli::run(args),
+        Command::Run(args) => cli::run(args).await,
         Command::Build(args) => cli::build(args),
         Command::Pull(args) => cli::pull(args),
         Command::Templates => cli::templates(),
         Command::Cache(args) => cli::cache(args),
         Command::Snapshot(cmd) => match cmd {
-            SnapshotCommand::Save(args) => cmd_snapshot_save(args),
-            SnapshotCommand::Run(args) => cmd_snapshot_run(args),
+            SnapshotCommand::Save(args) => cmd_snapshot_save(args).await,
+            SnapshotCommand::Run(args) => cmd_snapshot_run(args).await,
             SnapshotCommand::Key => {
                 println!("{}", hyperlight_unikraft::SNAPSHOT_KEY);
                 Ok(())
             }
         },
         Command::Bench(cmd) => match cmd {
-            BenchCommand::Cold(args) => bench_cold(args),
-            BenchCommand::ColdSnap(args) => bench_cold_snap(args),
-            BenchCommand::WarmRestore(args) => bench_warm_restore(args),
-            BenchCommand::WarmStateful(args) => bench_warm_stateful(args),
+            BenchCommand::Cold(args) => bench_cold(args).await,
+            BenchCommand::ColdSnap(args) => bench_cold_snap(args).await,
+            BenchCommand::WarmRestore(args) => bench_warm_restore(args).await,
+            BenchCommand::WarmStateful(args) => bench_warm_stateful(args).await,
             BenchCommand::Parallel(args) => bench_parallel(args),
         },
     }

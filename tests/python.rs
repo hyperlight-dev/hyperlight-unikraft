@@ -7,14 +7,14 @@ use std::path::PathBuf;
 use common::{hluk_with_stdin, require_rootfs, run_http_get, temp_dir};
 use hyperlight_unikraft::{Error, Exec, ListenPorts, Mount, NetworkPolicy, SandboxBuilder};
 
-#[test]
-fn python_inline_code() {
+#[tokio::test]
+async fn python_inline_code() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run("print('hluk-test-ok')").unwrap();
+    sandbox.run("print('hluk-test-ok')").await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("hluk-test-ok"),
@@ -24,15 +24,15 @@ fn python_inline_code() {
 
 /// The image has its users and groups, so the user, its home and `~`
 /// resolve as on Linux (getpass.getuser() used to raise KeyError).
-#[test]
-fn python_knows_its_user() {
+#[tokio::test]
+async fn python_knows_its_user() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
     sandbox
-        .run("import getpass, os, pwd; print(getpass.getuser(), pwd.getpwuid(os.getuid()).pw_dir, os.path.expanduser('~'))")
+        .run("import getpass, os, pwd; print(getpass.getuser(), pwd.getpwuid(os.getuid()).pw_dir, os.path.expanduser('~'))").await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(output.contains("root /root /root"), "got: {output:?}");
@@ -41,8 +41,8 @@ fn python_knows_its_user() {
 /// link() that fails, across file systems or of a directory, fails with
 /// Linux's errno, and the guest goes on (the kernel used to crash on
 /// those error paths).
-#[test]
-fn python_failed_links_return_their_errno() {
+#[tokio::test]
+async fn python_failed_links_return_their_errno() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -59,7 +59,7 @@ fn python_failed_links_return_their_errno() {
             "    except OSError as e:\n",
             "        print(errno.errorcode[e.errno])\n",
             "print('alive')\n",
-        ))
+        )).await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -73,8 +73,8 @@ fn python_failed_links_return_their_errno() {
 /// to drop all but the first 4 KiB).  How the host joins a character
 /// split between writes is covered by `python_non_utf8_output_...` and
 /// the `GuestOutput` unit test.
-#[test]
-fn python_long_line_is_printed_whole() {
+#[tokio::test]
+async fn python_long_line_is_printed_whole() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -82,6 +82,7 @@ fn python_long_line_is_printed_whole() {
         .unwrap();
     sandbox
         .run("import sys; sys.stdout.write('x' + 'é' * 100000 + 'end\\n'); sys.stdout.flush()")
+        .await
         .unwrap();
     // The leading 'x' puts the 69,620-byte marks inside an 'é', so the
     // kernel has to back the cuts off to where a character starts.
@@ -96,8 +97,8 @@ fn python_long_line_is_printed_whole() {
 /// Output that is not UTF-8, or that ends a write inside a character,
 /// is still output: the call goes on, and the text reads as it would on
 /// a terminal (it used to fail the whole call).
-#[test]
-fn python_non_utf8_output_does_not_fail_the_call() {
+#[tokio::test]
+async fn python_non_utf8_output_does_not_fail_the_call() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -110,19 +111,20 @@ fn python_non_utf8_output_does_not_fail_the_call() {
              for chunk in (b'ol\\xc3', b'\\xa9 \\xff', b'!\\n'):\n\
              \x20   out.write(chunk); out.flush()",
         )
+        .await
         .unwrap();
     assert!(sandbox.drain_output().contains("olé \u{fffd}!"));
 }
 
-#[test]
-fn python_exec_file() {
+#[tokio::test]
+async fn python_exec_file() {
     let rootfs = require_rootfs("python");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/hello.py");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Hello"),
@@ -130,8 +132,8 @@ fn python_exec_file() {
     );
 }
 
-#[test]
-fn python_snapshot_round_trip() {
+#[tokio::test]
+async fn python_snapshot_round_trip() {
     let rootfs = require_rootfs("python");
     let snap_dir = temp_dir("py-snap");
 
@@ -147,7 +149,7 @@ fn python_snapshot_round_trip() {
         .unwrap()
         .boot()
         .unwrap();
-    sandbox.run("print('restored-ok')").unwrap();
+    sandbox.run("print('restored-ok')").await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("restored-ok"),
@@ -155,21 +157,21 @@ fn python_snapshot_round_trip() {
     );
 }
 
-#[test]
-fn python_multiple_runs() {
+#[tokio::test]
+async fn python_multiple_runs() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run("x = 1 + 1").unwrap();
-    sandbox.run("print(f'x={x}')").unwrap();
+    sandbox.run("x = 1 + 1").await.unwrap();
+    sandbox.run("print(f'x={x}')").await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("x=2"),
         "expected 'x=2' after multiple runs, got: {output:?}",
     );
-    sandbox.run("import sys; print(sys.version)").unwrap();
+    sandbox.run("import sys; print(sys.version)").await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("3.12"),
@@ -177,8 +179,8 @@ fn python_multiple_runs() {
     );
 }
 
-#[test]
-fn python_env_vars() {
+#[tokio::test]
+async fn python_env_vars() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -193,6 +195,7 @@ fn python_env_vars() {
         .run(Exec::File(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/env_vars.py"),
         ))
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -209,8 +212,8 @@ fn python_env_vars() {
     );
 }
 
-#[test]
-fn python_env_vars_inline() {
+#[tokio::test]
+async fn python_env_vars_inline() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -219,6 +222,7 @@ fn python_env_vars_inline() {
     sandbox.set_env_vars(&[("SECRET", "42")]);
     sandbox
         .run("import os; print(os.environ['SECRET'])")
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -227,8 +231,8 @@ fn python_env_vars_inline() {
     );
 }
 
-#[test]
-fn python_env_vars_snapshot_restore() {
+#[tokio::test]
+async fn python_env_vars_snapshot_restore() {
     let rootfs = require_rootfs("python");
     let snap_dir = temp_dir("py-env-snap");
 
@@ -253,6 +257,7 @@ v = os.environ.get('RESTORED_VAR', 'NOT_FOUND')
 print(f'RESTORED_VAR={v}')
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     eprintln!("snapshot env output: {output:?}");
@@ -263,8 +268,8 @@ print(f'RESTORED_VAR={v}')
 }
 
 /// Env vars are stateful across dispatches without restore.
-#[test]
-fn python_env_vars_stateful_across_dispatches() {
+#[tokio::test]
+async fn python_env_vars_stateful_across_dispatches() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -280,6 +285,7 @@ v = os.environ.get('STATEFUL_VAR', 'NOT_FOUND')
 print(f'step1: STATEFUL_VAR={v}')
 "#,
         )
+        .await
         .unwrap();
     let out1 = sandbox.drain_output();
     assert!(
@@ -297,6 +303,7 @@ v = os.environ.get('STATEFUL_VAR', 'NOT_FOUND')
 print(f'step2: STATEFUL_VAR={v}')
 "#,
         )
+        .await
         .unwrap();
     let out2 = sandbox.drain_output();
     assert!(
@@ -313,6 +320,7 @@ v = os.environ.get('STATEFUL_VAR', 'NOT_FOUND')
 print(f'step3: STATEFUL_VAR={v}')
 "#,
         )
+        .await
         .unwrap();
     let out3 = sandbox.drain_output();
     assert!(
@@ -448,8 +456,8 @@ fn python_stdin_empty_piped() {
 
 /// `os.chmod` on a mount reaches the host file, its permission bits only.
 #[cfg(unix)]
-#[test]
-fn python_chmod_reaches_the_host() {
+#[tokio::test]
+async fn python_chmod_reaches_the_host() {
     use std::os::unix::fs::PermissionsExt;
 
     let rootfs = require_rootfs("python");
@@ -464,7 +472,7 @@ fn python_chmod_reaches_the_host() {
     sandbox
         .run(
             "import os\nos.chmod('/mnt/host/f', 0o600)\nos.chmod('/mnt/host/g', 0o6755)\nprint('changed')",
-        )
+        ).await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(output.contains("changed"), "got: {output:?}");
@@ -483,8 +491,8 @@ fn python_chmod_reaches_the_host() {
 /// A path that is not UTF-8 fails the syscall, not the guest function
 /// call: the host cannot take it as a string, and the kernel refuses it
 /// before sending (it used to fail the whole call).
-#[test]
-fn python_non_utf8_path_fails_the_syscall_only() {
+#[tokio::test]
+async fn python_non_utf8_path_fails_the_syscall_only() {
     let rootfs = require_rootfs("python");
     let mount_dir = temp_dir("fs-non-utf8");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -501,6 +509,7 @@ fn python_non_utf8_path_fails_the_syscall_only() {
              \x20   print('refused', errno.errorcode.get(e.errno))\n\
              print('still running')",
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(output.contains("refused EILSEQ"), "got: {output:?}");
@@ -513,8 +522,8 @@ fn python_non_utf8_path_fails_the_syscall_only() {
 /// 1,100 bytes deep in the temporary directory, are past the path limits
 /// of macOS (1,024 bytes) and Windows.
 #[cfg(target_os = "linux")]
-#[test]
-fn python_long_host_path_is_refused() {
+#[tokio::test]
+async fn python_long_host_path_is_refused() {
     let rootfs = require_rootfs("python");
     let mount_dir = temp_dir("fs-long-path");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -533,6 +542,7 @@ fn python_long_host_path_is_refused() {
              except OSError as e:\n\
              \x20   print('refused at', i, errno.errorcode.get(e.errno))",
         )
+        .await
         .unwrap();
     // 200-byte names: five make 1,004 bytes below the mount (1,005 with
     // the NUL), which fits; six make 1,205, which does not.
@@ -545,8 +555,8 @@ fn python_long_host_path_is_refused() {
     assert_eq!(std::fs::read_dir(&deepest).unwrap().count(), 0);
 }
 
-#[test]
-fn python_fs_ops() {
+#[tokio::test]
+async fn python_fs_ops() {
     let rootfs = require_rootfs("python");
     let mount_dir = temp_dir("fs-ops");
 
@@ -558,7 +568,7 @@ fn python_fs_ops() {
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/fs_ops.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Cleanup done"),
@@ -583,8 +593,8 @@ fn python_fs_ops() {
     );
 }
 
-#[test]
-fn python_fs_large_file() {
+#[tokio::test]
+async fn python_fs_large_file() {
     let rootfs = require_rootfs("python");
     let mount_dir = temp_dir("fs-large");
 
@@ -596,7 +606,7 @@ fn python_fs_large_file() {
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/fs_large.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("large file round-trip OK"),
@@ -611,8 +621,8 @@ fn python_fs_large_file() {
     );
 }
 
-#[test]
-fn python_guest_fs_ops() {
+#[tokio::test]
+async fn python_guest_fs_ops() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -620,7 +630,7 @@ fn python_guest_fs_ops() {
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/guest_fs.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Guest filesystem tests passed"),
@@ -628,8 +638,8 @@ fn python_guest_fs_ops() {
     );
 }
 
-#[test]
-fn python_asyncio() {
+#[tokio::test]
+async fn python_asyncio() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -639,7 +649,7 @@ fn python_asyncio() {
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/asyncio_demo.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("asyncio demo passed"),
@@ -647,8 +657,8 @@ fn python_asyncio() {
     );
 }
 
-#[test]
-fn python_threading() {
+#[tokio::test]
+async fn python_threading() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -657,7 +667,7 @@ fn python_threading() {
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/threading_demo.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Threading demo passed"),
@@ -665,8 +675,8 @@ fn python_threading() {
     );
 }
 
-#[test]
-fn python_subprocess() {
+#[tokio::test]
+async fn python_subprocess() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -675,7 +685,7 @@ fn python_subprocess() {
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/subprocess_demo.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Subprocess demo passed"),
@@ -683,8 +693,8 @@ fn python_subprocess() {
     );
 }
 
-#[test]
-fn python_tcp_echo() {
+#[tokio::test]
+async fn python_tcp_echo() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -693,7 +703,7 @@ fn python_tcp_echo() {
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/tcp_echo.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("TCP echo test passed"),
@@ -701,8 +711,8 @@ fn python_tcp_echo() {
     );
 }
 
-#[test]
-fn python_tcp_bidir() {
+#[tokio::test]
+async fn python_tcp_bidir() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -712,7 +722,7 @@ fn python_tcp_bidir() {
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/tcp_bidir.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Bidirectional TCP test passed"),
@@ -720,8 +730,8 @@ fn python_tcp_bidir() {
     );
 }
 
-#[test]
-fn python_http_server_client() {
+#[tokio::test]
+async fn python_http_server_client() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -732,7 +742,7 @@ fn python_http_server_client() {
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/http_server_client.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("HTTP server+client test passed"),
@@ -740,22 +750,23 @@ fn python_http_server_client() {
     );
 }
 
-#[test]
-fn python_http_get() {
+#[tokio::test]
+async fn python_http_get() {
     let rootfs = require_rootfs("python");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/http_get.py");
     let output = run_http_get(
         || SandboxBuilder::from_initrd(rootfs.clone()).scratch_mb(256),
         Exec::File(script),
-    );
+    )
+    .await;
     assert!(
         output.contains("Status: 200"),
         "expected http_get.py to get Status: 200, got:\n{output}",
     );
 }
 
-#[test]
-fn python_threaded_select() {
+#[tokio::test]
+async fn python_threaded_select() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -766,7 +777,7 @@ fn python_threaded_select() {
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/threaded_select.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Threaded select() test passed"),
@@ -776,8 +787,8 @@ fn python_threaded_select() {
 
 /// `sys.exit()` ends the call the way it ends a script: its code is the
 /// call's status, and the interpreter is still there for the next call.
-#[test]
-fn python_sys_exit_ends_the_call() {
+#[tokio::test]
+async fn python_sys_exit_ends_the_call() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -785,37 +796,38 @@ fn python_sys_exit_ends_the_call() {
         .unwrap();
     sandbox
         .run("import sys\nprint('leaving')\nsys.exit(0)\nprint('not reached')")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "leaving\n");
     assert!(
-        sandbox.run("import sys\nsys.exit(3)").is_err(),
+        sandbox.run("import sys\nsys.exit(3)").await.is_err(),
         "a non-zero exit code did not fail the call"
     );
     assert!(
-        sandbox.run("import sys\nsys.exit('bye')").is_err(),
+        sandbox.run("import sys\nsys.exit('bye')").await.is_err(),
         "a message exit did not fail the call"
     );
     assert!(
         sandbox.drain_output().contains("bye"),
         "the exit message was not printed"
     );
-    sandbox.run("print('still here')").unwrap();
+    sandbox.run("print('still here')").await.unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 }
 
 /// `sys.exit` ends the call, not the interpreter, so the guest can still be
 /// snapshotted afterwards and the restored clone takes calls.
-#[test]
-fn python_sys_exit_then_snapshot_restore() {
+#[tokio::test]
+async fn python_sys_exit_then_snapshot_restore() {
     let rootfs = require_rootfs("python");
     let snap_dir = temp_dir("py-exit-snap");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run("kept = 'yes'").unwrap();
+    sandbox.run("kept = 'yes'").await.unwrap();
     assert!(
-        sandbox.run("import sys\nsys.exit(3)").is_err(),
+        sandbox.run("import sys\nsys.exit(3)").await.is_err(),
         "a non-zero exit code did not fail the call"
     );
     sandbox.snapshot_to(&snap_dir).unwrap();
@@ -824,7 +836,7 @@ fn python_sys_exit_then_snapshot_restore() {
         .unwrap()
         .boot()
         .unwrap();
-    restored.run("print('kept =', kept)").unwrap();
+    restored.run("print('kept =', kept)").await.unwrap();
     assert_eq!(restored.drain_output(), "kept = yes\n");
 }
 
@@ -832,8 +844,8 @@ fn python_sys_exit_then_snapshot_restore() {
 /// `listdir` with `EOVERFLOW`, and the sandbox goes on; before, the call
 /// failed inside the hypervisor and poisoned the sandbox.  A listing's
 /// other errors arrive as themselves, not as `EIO`.
-#[test]
-fn python_huge_directory_listing_fails_cleanly() {
+#[tokio::test]
+async fn python_huge_directory_listing_fails_cleanly() {
     let rootfs = require_rootfs("python");
     let dir = temp_dir("huge-dir");
     for i in 0..5000 {
@@ -857,11 +869,12 @@ fn python_huge_directory_listing_fails_cleanly() {
             "except OSError as e:\n",
             "    print('missing errno', e.errno == errno.ENOENT)\n",
         ))
+        .await
         .unwrap();
     let out = sandbox.drain_output();
     assert!(out.contains("listdir errno True"), "{out:?}");
     assert!(out.contains("missing errno True"), "{out:?}");
-    sandbox.run("print('still here')").unwrap();
+    sandbox.run("print('still here')").await.unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 }
 
@@ -900,8 +913,8 @@ fn python_stdin_past_the_end() {
 
 /// A function defined in `__main__`, called with JSON in and out; a
 /// coroutine is awaited, an exception fails the call.
-#[test]
-fn python_calls_a_function_with_json() {
+#[tokio::test]
+async fn python_calls_a_function_with_json() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -923,43 +936,44 @@ fn python_calls_a_function_with_json() {
              def leave(event):\n    \
                  raise SystemExit(3)\n",
         )
+        .await
         .unwrap();
     assert_eq!(
-        sandbox.call("greet", r#"{"name":"World"}"#).unwrap(),
+        sandbox.call("greet", r#"{"name":"World"}"#).await.unwrap(),
         r#"{"message": "Hello, World", "n": 1}"#
     );
     assert_eq!(
-        sandbox.call("greet", r#"{"name":"again"}"#).unwrap(),
+        sandbox.call("greet", r#"{"name":"again"}"#).await.unwrap(),
         r#"{"message": "Hello, again", "n": 2}"#
     );
-    assert_eq!(sandbox.call("later", r#"{"x":21}"#).unwrap(), "42");
+    assert_eq!(sandbox.call("later", r#"{"x":21}"#).await.unwrap(), "42");
     // No input, no argument; None, no result.
-    assert_eq!(sandbox.call("nothing", "").unwrap(), "");
+    assert_eq!(sandbox.call("nothing", "").await.unwrap(), "");
     assert!(matches!(
-        sandbox.call("bad", "{}"),
+        sandbox.call("bad", "{}").await,
         Err(Error::CallFailed { status: 1 })
     ));
     assert!(matches!(
-        sandbox.call("leave", "{}"),
+        sandbox.call("leave", "{}").await,
         Err(Error::CallFailed { status: 3 })
     ));
-    assert!(sandbox.call("missing", "{}").is_err());
-    assert!(sandbox.call("greet", "not json").is_err());
+    assert!(sandbox.call("missing", "{}").await.is_err());
+    assert!(sandbox.call("greet", "not json").await.is_err());
     let output = sandbox.drain_output();
     assert!(output.contains("ran"), "{output}");
     assert!(output.contains("handler boom"), "{output}");
     assert!(output.contains("no function 'missing'"), "{output}");
     // The interpreter serves on, its state intact.
     assert_eq!(
-        sandbox.call("greet", r#"{"name":"x"}"#).unwrap(),
+        sandbox.call("greet", r#"{"name":"x"}"#).await.unwrap(),
         r#"{"message": "Hello, x", "n": 3}"#
     );
 }
 
 /// The embedder's functions, as `hyperlight.call` and through
 /// `hyperlight.host`; a host error is a `hyperlight.HostError`.
-#[test]
-fn python_calls_host_functions() {
+#[tokio::test]
+async fn python_calls_host_functions() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -986,6 +1000,7 @@ fn python_calls_host_functions() {
                  except Exception as e:\n        \
                      print('threw', type(e).__name__)\n",
         )
+        .await
         .unwrap();
     assert_eq!(
         sandbox.drain_output(),
@@ -994,8 +1009,15 @@ fn python_calls_host_functions() {
     // A handler can call the host too.
     sandbox
         .run("def total(event):\n    return host.math.add(*event['values'])\n")
+        .await
         .unwrap();
-    assert_eq!(sandbox.call("total", r#"{"values":[1,2,3]}"#).unwrap(), "6");
+    assert_eq!(
+        sandbox
+            .call("total", r#"{"values":[1,2,3]}"#)
+            .await
+            .unwrap(),
+        "6"
+    );
     // Another thread cannot: only the one running the call can reach the
     // host (see hl_host_call).
     sandbox
@@ -1010,14 +1032,15 @@ fn python_calls_host_functions() {
              t.start()\n\
              t.join()\n",
         )
+        .await
         .unwrap();
     assert!(sandbox.drain_output().contains("refused:"));
 }
 
 /// A function defined by the file `--guest-exec` ran can be called:
 /// runpy runs it in a module of its own, not `__main__`.
-#[test]
-fn python_calls_a_function_from_a_guest_exec_file() {
+#[tokio::test]
+async fn python_calls_a_function_from_a_guest_exec_file() {
     let dir = temp_dir("py-guest-exec-call");
     std::fs::write(
         dir.path().join("handler.py"),
@@ -1029,28 +1052,37 @@ fn python_calls_a_function_from_a_guest_exec_file() {
         .mount(Mount::ro(dir.path(), "/app"))
         .boot()
         .unwrap();
-    sandbox.run(Exec::Guest("/app/handler.py".into())).unwrap();
+    sandbox
+        .run(Exec::Guest("/app/handler.py".into()))
+        .await
+        .unwrap();
     assert_eq!(
-        sandbox.call("handler", r#"{"name":"py"}"#).unwrap(),
+        sandbox.call("handler", r#"{"name":"py"}"#).await.unwrap(),
         r#"{"hi": "py"}"#
     );
 }
 
 /// `examples/python/handler.py`: loaded once, called twice, its state carried over.
-#[test]
-fn python_handler_example() {
+#[tokio::test]
+async fn python_handler_example() {
     let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/handler.py");
     let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run(Exec::File(example)).unwrap();
+    sandbox.run(Exec::File(example)).await.unwrap();
     assert_eq!(
-        sandbox.call("handler", r#"{"name":"World"}"#).unwrap(),
+        sandbox
+            .call("handler", r#"{"name":"World"}"#)
+            .await
+            .unwrap(),
         r#"{"greeting": "Hello, World!", "calls": 1}"#
     );
     assert_eq!(
-        sandbox.call("handler", r#"{"name":"again"}"#).unwrap(),
+        sandbox
+            .call("handler", r#"{"name":"again"}"#)
+            .await
+            .unwrap(),
         r#"{"greeting": "Hello, again!", "calls": 2}"#
     );
 }
@@ -1058,34 +1090,35 @@ fn python_handler_example() {
 /// The kernel keeps the environment it last fetched and refetches only
 /// when the host changed it: every change reaches the next call, whether
 /// or not a snapshot restore came in between.
-#[test]
-fn python_environment_changes_reach_every_call() {
+#[tokio::test]
+async fn python_environment_changes_reach_every_call() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    let read = |sandbox: &mut hyperlight_unikraft::AppSandbox| {
+    let read = async |sandbox: &mut hyperlight_unikraft::AppSandbox| {
         sandbox
             .run("import os; print(os.environ.get('VERSIONED', '-'))")
+            .await
             .unwrap();
         sandbox.drain_output().trim().to_string()
     };
     sandbox.set_env_vars(&[("VERSIONED", "one")]);
-    assert_eq!(read(&mut sandbox), "one");
-    assert_eq!(read(&mut sandbox), "one");
+    assert_eq!(read(&mut sandbox).await, "one");
+    assert_eq!(read(&mut sandbox).await, "one");
     sandbox.set_env_vars(&[("VERSIONED", "two")]);
-    assert_eq!(read(&mut sandbox), "two");
+    assert_eq!(read(&mut sandbox).await, "two");
     let snapshot = sandbox.snapshot().unwrap();
     sandbox.set_env_vars(&[("VERSIONED", "three")]);
-    assert_eq!(read(&mut sandbox), "three");
+    assert_eq!(read(&mut sandbox).await, "three");
     // Restored to a snapshot whose kernel copy says "two": the host's
     // "three" still wins.
     sandbox.restore(snapshot.clone()).unwrap();
-    assert_eq!(read(&mut sandbox), "three");
+    assert_eq!(read(&mut sandbox).await, "three");
     sandbox.restore(snapshot).unwrap();
     sandbox.set_env_vars(&[("VERSIONED", "four")]);
-    assert_eq!(read(&mut sandbox), "four");
+    assert_eq!(read(&mut sandbox).await, "four");
 }
 
 /// Files extracted from the initrd reference it rather than a copy, so the
@@ -1093,8 +1126,8 @@ fn python_environment_changes_reach_every_call() {
 /// the snapshot load after a restore, in place and in a new sandbox, and a
 /// rootfs file changed after the snapshot is back to its contents on the
 /// next restore.
-#[test]
-fn python_rootfs_reads_after_restore() {
+#[tokio::test]
+async fn python_rootfs_reads_after_restore() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1107,23 +1140,23 @@ fn python_rootfs_reads_after_restore() {
                 with open(p, 'a') as f: f.write('# changed')\n\
                 print('rootfs-ok', '# changed' not in before,\n\
                       open(p).read() == before + '# changed')";
-    let run = |sandbox: &mut hyperlight_unikraft::AppSandbox| {
-        sandbox.run(code).unwrap();
+    let run = async |sandbox: &mut hyperlight_unikraft::AppSandbox| {
+        sandbox.run(code).await.unwrap();
         sandbox.drain_output().trim().to_string()
     };
     sandbox.restore(snapshot.clone()).unwrap();
-    assert_eq!(run(&mut sandbox), "rootfs-ok True True");
+    assert_eq!(run(&mut sandbox).await, "rootfs-ok True True");
     sandbox.restore(snapshot.clone()).unwrap();
-    assert_eq!(run(&mut sandbox), "rootfs-ok True True");
+    assert_eq!(run(&mut sandbox).await, "rootfs-ok True True");
     let mut fresh = SandboxBuilder::from_snapshot(snapshot).boot().unwrap();
-    assert_eq!(run(&mut fresh), "rootfs-ok True True");
+    assert_eq!(run(&mut fresh).await, "rootfs-ok True True");
 }
 
 /// One write larger than a host call carries arrives whole: the kernel
 /// sends it in pieces (it used to keep the first 4 KiB and report the
 /// rest written), cut between characters, never inside one.
-#[test]
-fn python_large_write_arrives_whole() {
+#[tokio::test]
+async fn python_large_write_arrives_whole() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1131,12 +1164,14 @@ fn python_large_write_arrives_whole() {
         .unwrap();
     sandbox
         .run("import sys\nsys.stdout.write('x' * 100000)\nsys.stdout.flush()")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "x".repeat(100_000));
 
     // Three bytes a character: 4096 falls inside one.
     sandbox
         .run("import sys\nsys.stdout.write('\u{20ac}' * 3000)\nsys.stdout.flush()")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "\u{20ac}".repeat(3000));
 }
@@ -1144,8 +1179,8 @@ fn python_large_write_arrives_whole() {
 /// Standard error is a stream of its own: `drain_stderr` has it alone,
 /// `drain_output` both, in the order written, and newlines arrive as the
 /// program wrote them.
-#[test]
-fn python_stderr_apart_from_stdout() {
+#[tokio::test]
+async fn python_stderr_apart_from_stdout() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1154,17 +1189,19 @@ fn python_stderr_apart_from_stdout() {
         .unwrap();
     sandbox
         .run("import sys\nprint('out')\nprint('err', file=sys.stderr)\nprint('out again')")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_stderr(), "err\n");
     assert_eq!(sandbox.drain_output(), "out\nerr\nout again\n");
 
-    assert!(sandbox.run("1 / 0").is_err());
+    assert!(sandbox.run("1 / 0").await.is_err());
     let stderr = sandbox.drain_stderr();
     assert!(stderr.contains("ZeroDivisionError"), "{stderr:?}");
 
     // Multi-byte characters, well past a page: they arrive whole.
     sandbox
         .run("import sys\nsys.stderr.write('\u{20ac}' * 3000)\nsys.stderr.flush()")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_stderr(), "\u{20ac}".repeat(3000));
 
@@ -1172,7 +1209,7 @@ fn python_stderr_apart_from_stdout() {
     // is one; /dev/stdout keeps newlines as written too.
     sandbox.drain_output();
     sandbox
-        .run("import os\nprint(os.fstat(1).st_ino != os.fstat(2).st_ino, os.isatty(2))\nf = open('/dev/stdout', 'w')\nf.write('a\\nb\\n')\nf.close()")
+        .run("import os\nprint(os.fstat(1).st_ino != os.fstat(2).st_ino, os.isatty(2))\nf = open('/dev/stdout', 'w')\nf.write('a\\nb\\n')\nf.close()").await
         .unwrap();
     use std::io::IsTerminal;
     let terminal = if std::io::stderr().is_terminal() {
@@ -1185,8 +1222,8 @@ fn python_stderr_apart_from_stdout() {
 
 /// A host without `HostWriteErr` gets standard error through `HostWrite`,
 /// all of it, as before the stream had its own.
-#[test]
-fn python_stderr_reaches_a_host_without_host_write_err() {
+#[tokio::test]
+async fn python_stderr_reaches_a_host_without_host_write_err() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1194,7 +1231,7 @@ fn python_stderr_reaches_a_host_without_host_write_err() {
         .boot()
         .unwrap();
     sandbox
-        .run("import sys\nprint('out')\nprint('err', file=sys.stderr)\nsys.stderr.write('e' * 10000 + '\\n')\nsys.stderr.flush()\nprint('out again')")
+        .run("import sys\nprint('out')\nprint('err', file=sys.stderr)\nsys.stderr.write('e' * 10000 + '\\n')\nsys.stderr.flush()\nprint('out again')").await
         .unwrap();
     assert_eq!(
         sandbox.drain_output(),
@@ -1207,30 +1244,34 @@ fn python_stderr_reaches_a_host_without_host_write_err() {
 /// original `sys.__stdout__` once `sys.stdout` is replaced, and what was
 /// written before an exception (ahead of its traceback) or a
 /// `SystemExit`, for code, a guest file and a guest function call alike.
-#[test]
-fn python_unflushed_output_reaches_the_host() {
+#[tokio::test]
+async fn python_unflushed_output_reaches_the_host() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    sandbox.run("print('a', end='')").unwrap();
+    sandbox.run("print('a', end='')").await.unwrap();
     assert_eq!(sandbox.drain_output(), "a");
     sandbox
         .run("import sys\nsys.stdout.buffer.write(b'bytes')")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "bytes");
     sandbox
         .run("import io, sys\nsys.__stdout__.write('original')\nsys.stdout = io.StringIO()")
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "original");
     sandbox
         .run("import sys\nsys.stdout = sys.__stdout__")
+        .await
         .unwrap();
 
     assert!(
         sandbox
             .run("import sys\nsys.stdout.write('before')\n1 / 0")
+            .await
             .is_err()
     );
     let output = sandbox.drain_output();
@@ -1238,6 +1279,7 @@ fn python_unflushed_output_reaches_the_host() {
     assert!(
         sandbox
             .run("import sys\nsys.stdout.write('out')\nsys.stderr.write('e')\nsys.exit(3)")
+            .await
             .is_err()
     );
     let stderr = sandbox.drain_stderr();
@@ -1247,25 +1289,29 @@ fn python_unflushed_output_reaches_the_host() {
 
     sandbox
         .run("open('/tmp/unflushed.py', 'w').write(\"print('guest file', end='')\")")
+        .await
         .unwrap();
     sandbox.drain_output();
     sandbox
         .run(Exec::Guest("/tmp/unflushed.py".into()))
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "guest file");
 
     sandbox
         .run("def quiet():\n    print('q', end='')\n")
+        .await
         .unwrap();
     sandbox.drain_output();
-    assert_eq!(sandbox.call("quiet", "").unwrap(), "");
+    assert_eq!(sandbox.call("quiet", "").await.unwrap(), "");
     assert_eq!(sandbox.drain_output(), "q");
 
     sandbox
         .run("def fails():\n    print('x', end='')\n    1 / 0\n")
+        .await
         .unwrap();
     sandbox.drain_output();
-    assert!(sandbox.call("fails", "").is_err());
+    assert!(sandbox.call("fails", "").await.is_err());
     let output = sandbox.drain_output();
     assert!(output.starts_with("xTraceback"), "{output:?}");
 }
@@ -1273,8 +1319,8 @@ fn python_unflushed_output_reaches_the_host() {
 /// The issue's program: 4 MiB written 1 KiB at a time keeps the first
 /// 64 KiB on the host and counts the rest, however the guest writes it,
 /// reopening `/dev/stdout` included.  The next call starts a new budget.
-#[test]
-fn python_output_limit() {
+#[tokio::test]
+async fn python_output_limit() {
     const LIMIT: usize = 64 * 1024;
     const WRITTEN: u64 = 4096 * 1024;
     let rootfs = require_rootfs("python");
@@ -1290,22 +1336,22 @@ fn python_output_limit() {
         "import os\nfor _ in range(4096): os.write(1, b'X' * 1024)",
         "f = open('/dev/stdout', 'wb', buffering=0)\nfor _ in range(4096): f.write(b'X' * 1024)",
     ] {
-        sandbox.run(code).unwrap();
+        sandbox.run(code).await.unwrap();
         let output = sandbox.take_output();
         assert_eq!(output.text.len(), LIMIT, "{code}");
         assert!(output.text.bytes().all(|b| b == b'X'), "{code}");
         assert_eq!(output.omitted, WRITTEN - LIMIT as u64, "{code}");
     }
 
-    sandbox.run("print('next')").unwrap();
+    sandbox.run("print('next')").await.unwrap();
     let output = sandbox.take_output();
     assert_eq!(output.text, "next\n");
     assert!(!output.truncated());
 }
 
 /// Standard error has a budget of its own, and `take_output` clears it.
-#[test]
-fn python_output_limit_stderr() {
+#[tokio::test]
+async fn python_output_limit_stderr() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1317,6 +1363,7 @@ fn python_output_limit_stderr() {
 
     sandbox
         .run("import os\nos.write(2, b'E' * 300)\nos.write(1, b'O' * 10)")
+        .await
         .unwrap();
     let stderr = sandbox.take_stderr();
     assert_eq!(stderr.text, "E".repeat(100));
@@ -1325,14 +1372,17 @@ fn python_output_limit_stderr() {
     assert_eq!(output.text, "E".repeat(100));
     assert_eq!(output.omitted, 210);
 
-    sandbox.run("import os\nos.write(2, b'E' * 300)").unwrap();
+    sandbox
+        .run("import os\nos.write(2, b'E' * 300)")
+        .await
+        .unwrap();
     sandbox.drain_output();
     assert_eq!(sandbox.take_stderr(), Default::default());
 }
 
 /// A restored guest gets the limit of the builder that restores it.
-#[test]
-fn python_output_limit_after_restore() {
+#[tokio::test]
+async fn python_output_limit_after_restore() {
     let rootfs = require_rootfs("python");
     let snap_dir = temp_dir("py-output-limit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -1348,7 +1398,7 @@ fn python_output_limit_after_restore() {
         .boot()
         .unwrap();
     sandbox.drain_output();
-    sandbox.run("print('0123456789abcdef')").unwrap();
+    sandbox.run("print('0123456789abcdef')").await.unwrap();
     let output = sandbox.take_output();
     assert_eq!(output.text, "0123456789");
     assert_eq!(output.omitted, 7);
@@ -1358,8 +1408,8 @@ fn python_output_limit_after_restore() {
 /// and stderr; on, the default, each stream reaches its own.  The test
 /// harness captures what a test prints, so each case runs in a child, this
 /// test again, uncaptured.
-#[test]
-fn python_echo_output() {
+#[tokio::test]
+async fn python_echo_output() {
     if let Ok(echo) = std::env::var("HLUK_TEST_ECHO") {
         let mut builder = SandboxBuilder::from_initrd(require_rootfs("python")).scratch_mb(256);
         // "on" is the default, left as it is.
@@ -1369,6 +1419,7 @@ fn python_echo_output() {
         let mut sandbox = builder.boot().unwrap();
         sandbox
             .run("import os\nos.write(1, b'marker-out')\nos.write(2, b'marker-err')")
+            .await
             .unwrap();
         // Captured either way.
         assert_eq!(sandbox.drain_stderr(), "marker-err");
@@ -1402,8 +1453,8 @@ fn python_echo_output() {
 /// process groups: what an agent's command runner does with processes.
 /// Over thirty Pythons, one after another, in the image's 256 MiB: each
 /// gives its memory back when it ends.
-#[test]
-fn python_processes() {
+#[tokio::test]
+async fn python_processes() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1411,7 +1462,7 @@ fn python_processes() {
         .unwrap();
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/process_demo.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Process demo passed"),
@@ -1421,8 +1472,8 @@ fn python_processes() {
 
 /// select() on host sockets reports only what is there, so a server's
 /// shutdown() returns.
-#[test]
-fn python_server_shutdown() {
+#[tokio::test]
+async fn python_server_shutdown() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1432,7 +1483,7 @@ fn python_server_shutdown() {
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/python/server_shutdown.py");
-    sandbox.run(Exec::File(script)).unwrap();
+    sandbox.run(Exec::File(script)).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("Server shutdown demo passed"),
@@ -1442,8 +1493,8 @@ fn python_server_shutdown() {
 
 /// PYTHONPATH given after the interpreter started (a restored guest) is on
 /// sys.path for the call, in place of the one before it, and gone with it.
-#[test]
-fn python_pythonpath_follows_the_environment() {
+#[tokio::test]
+async fn python_pythonpath_follows_the_environment() {
     let rootfs = require_rootfs("python");
     let snap_dir = temp_dir("py-pythonpath");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -1458,11 +1509,11 @@ fn python_pythonpath_follows_the_environment() {
         .unwrap();
     let probe = "import sys; print('path', [p for p in sys.path if p.startswith('/lib-')])";
     sandbox.set_env_vars(&[("PYTHONPATH", "/lib-a:/lib-b")]);
-    sandbox.run(probe).unwrap();
+    sandbox.run(probe).await.unwrap();
     sandbox.set_env_vars(&[("PYTHONPATH", "/lib-c")]);
-    sandbox.run(probe).unwrap();
+    sandbox.run(probe).await.unwrap();
     sandbox.set_env_vars(&[]);
-    sandbox.run(probe).unwrap();
+    sandbox.run(probe).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("path ['/lib-a', '/lib-b']")
@@ -1474,14 +1525,14 @@ fn python_pythonpath_follows_the_environment() {
 
 /// A guest out of memory kills the program that asked, as Linux's OOM
 /// killer would, rather than taking the kernel down with a fault.
-#[test]
-fn python_out_of_memory_is_a_kill() {
+#[tokio::test]
+async fn python_out_of_memory_is_a_kill() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
         .boot()
         .unwrap();
-    match sandbox.run("b = b'x' * (400 << 20)") {
+    match sandbox.run("b = b'x' * (400 << 20)").await {
         Err(Error::GuestExited { status: 137 }) => {}
         other => panic!("expected the guest to exit with 137, got {other:?}"),
     }
@@ -1490,8 +1541,8 @@ fn python_out_of_memory_is_a_kill() {
 /// The memory of a large file goes back to programs once the file is
 /// deleted: after three 40 MiB files came and went, a child can allocate
 /// 120 MiB (the kernel kept about three times a file's size before).
-#[test]
-fn python_deleted_file_memory_is_reused() {
+#[tokio::test]
+async fn python_deleted_file_memory_is_reused() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1508,6 +1559,7 @@ fn python_deleted_file_memory_is_reused() {
              r = subprocess.run([sys.executable, '-c', 'b = bytearray(120 << 20)'])\n\
              print('child', r.returncode)",
         )
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "child 0\n");
 }
@@ -1517,8 +1569,8 @@ fn python_deleted_file_memory_is_reused() {
 /// with no memory left; the parent can still kill the child, and the write
 /// works once it is gone. The buffer written is made before the child fills
 /// memory, so that the write, not the parent's own page fault, runs out.
-#[test]
-fn python_full_guest_fails_the_write_not_the_guest() {
+#[tokio::test]
+async fn python_full_guest_fails_the_write_not_the_guest() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1549,7 +1601,7 @@ fn python_full_guest_fails_the_write_not_the_guest() {
              hog.kill()\n\
              print('killed:', hog.wait())\n\
              print('after:', write())",
-        )
+        ).await
         .unwrap();
     assert_eq!(
         sandbox.drain_output(),
@@ -1559,8 +1611,8 @@ fn python_full_guest_fails_the_write_not_the_guest() {
 
 /// An epoll instance cannot watch itself (EINVAL, as on Linux); closing it
 /// after the attempt used to crash the guest.
-#[test]
-fn python_epoll_refuses_itself() {
+#[tokio::test]
+async fn python_epoll_refuses_itself() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs).boot().unwrap();
     sandbox
@@ -1575,14 +1627,15 @@ fn python_epoll_refuses_itself() {
              ep.close()\n\
              print('closed')",
         )
+        .await
         .unwrap();
     assert_eq!(sandbox.drain_output(), "Invalid argument\nclosed\n");
 }
 
 /// A variable the guest had and the host set over it for a while has the
 /// guest's own value again once the host stops sending it.
-#[test]
-fn python_env_var_taken_back_restores_the_guests_own() {
+#[tokio::test]
+async fn python_env_var_taken_back_restores_the_guests_own() {
     let rootfs = require_rootfs("python");
     let snap_dir = temp_dir("py-env-own");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -1596,12 +1649,12 @@ fn python_env_var_taken_back_restores_the_guests_own() {
         .boot()
         .unwrap();
     let probe = "import os; print('PATH=' + os.environ.get('PATH', '<unset>'))";
-    sandbox.run(probe).unwrap();
+    sandbox.run(probe).await.unwrap();
     let own = sandbox.drain_output();
     sandbox.set_env_vars(&[("PATH", "/opt/bin")]);
-    sandbox.run(probe).unwrap();
+    sandbox.run(probe).await.unwrap();
     sandbox.set_env_vars(&[]);
-    sandbox.run(probe).unwrap();
+    sandbox.run(probe).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         own.contains("PATH=/usr/local/bin")
@@ -1613,8 +1666,8 @@ fn python_env_var_taken_back_restores_the_guests_own() {
 
 /// A variable the host gave at boot and then stops sending is unset: it
 /// was the host's, not the guest's own.
-#[test]
-fn python_env_var_given_at_boot_can_be_taken_away() {
+#[tokio::test]
+async fn python_env_var_given_at_boot_can_be_taken_away() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1624,9 +1677,9 @@ fn python_env_var_given_at_boot_can_be_taken_away() {
     let probe = "import os, sys; print(os.environ.get('PYTHONPATH'), '/boot-lib' in sys.path)";
     // Changed before the first call, then taken away: still the host's.
     sandbox.set_env_vars(&[("PYTHONPATH", "/other")]);
-    sandbox.run(probe).unwrap();
+    sandbox.run(probe).await.unwrap();
     sandbox.set_env_vars(&[]);
-    sandbox.run(probe).unwrap();
+    sandbox.run(probe).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.starts_with("/other False") && output.contains("None False"),
@@ -1636,8 +1689,8 @@ fn python_env_var_given_at_boot_can_be_taken_away() {
 
 /// The driver's own PATH stays the guest's when the host gives the same
 /// value at boot: taking the host's away leaves PATH set, not unset.
-#[test]
-fn python_path_given_at_boot_as_the_drivers_is_kept() {
+#[tokio::test]
+async fn python_path_given_at_boot_as_the_drivers_is_kept() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1646,7 +1699,7 @@ fn python_path_given_at_boot_as_the_drivers_is_kept() {
         .unwrap();
     let probe = "import os; print('PATH=' + os.environ.get('PATH', '<unset>'))";
     sandbox.set_env_vars(&[]);
-    sandbox.run(probe).unwrap();
+    sandbox.run(probe).await.unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("PATH=/usr/local/bin:/usr/bin:/bin"),
@@ -1658,8 +1711,8 @@ fn python_path_given_at_boot_as_the_drivers_is_kept() {
 /// startup; and a standard directory a PYTHONPATH moved to the front goes
 /// back where it was once that PYTHONPATH is gone, also when the next one
 /// moves another.
-#[test]
-fn python_pythonpath_keeps_empty_entries_and_the_standard_order() {
+#[tokio::test]
+async fn python_pythonpath_keeps_empty_entries_and_the_standard_order() {
     let rootfs = require_rootfs("python");
     let snap_dir = temp_dir("py-pythonpath-order");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -1673,7 +1726,7 @@ fn python_pythonpath_keeps_empty_entries_and_the_standard_order() {
         .boot()
         .unwrap();
     sandbox
-        .run("import sys, sysconfig; print('site', sysconfig.get_paths()['purelib']); print('start', sys.path)")
+        .run("import sys, sysconfig; print('site', sysconfig.get_paths()['purelib']); print('start', sys.path)").await
         .unwrap();
     let start = sandbox.drain_output();
     let site = start
@@ -1690,6 +1743,7 @@ fn python_pythonpath_keeps_empty_entries_and_the_standard_order() {
     sandbox.set_env_vars(&[("PYTHONPATH", "/lib-a:")]);
     sandbox
         .run("import os, sys; print('cwd', os.path.abspath('') in sys.path)")
+        .await
         .unwrap();
     let dynload = start
         .split('\'')
@@ -1697,13 +1751,17 @@ fn python_pythonpath_keeps_empty_entries_and_the_standard_order() {
         .expect("lib-dynload")
         .to_owned();
     sandbox.set_env_vars(&[("PYTHONPATH", dynload.as_str())]);
-    sandbox.run("pass").unwrap();
+    sandbox.run("pass").await.unwrap();
     sandbox.set_env_vars(&[("PYTHONPATH", site.as_str())]);
     sandbox
         .run("import sys; print('front', sys.path[0])")
+        .await
         .unwrap();
     sandbox.set_env_vars(&[]);
-    sandbox.run("import sys; print('end', sys.path)").unwrap();
+    sandbox
+        .run("import sys; print('end', sys.path)")
+        .await
+        .unwrap();
     let output = sandbox.drain_output();
     assert!(
         output.contains("cwd True")
@@ -1716,8 +1774,8 @@ fn python_pythonpath_keeps_empty_entries_and_the_standard_order() {
 /// A mounted file's mode and times are the host's, and chmod and utime
 /// change them there: the mode used to be 755 for every file, the times
 /// the epoch and utime did nothing.
-#[test]
-fn python_mount_modes_and_times() {
+#[tokio::test]
+async fn python_mount_modes_and_times() {
     let rootfs = require_rootfs("python");
     let mount_dir = temp_dir("fs-modes-times");
     let file = mount_dir.path().join("f.txt");
@@ -1753,7 +1811,7 @@ fn python_mount_modes_and_times() {
              except OSError as e:\n\
              \x20   print('before 1970', e.errno)\n\
              print('changed')",
-        )
+        ).await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(output.contains("mtime 1500000000250000000"), "{output}");
@@ -1779,8 +1837,8 @@ fn python_mount_modes_and_times() {
 /// mkdir and rmdir take a directory with trailing slashes, as busybox's
 /// `mkdir -p` passes it, on the host's directories and the guest's own;
 /// the working directory at a mount's root has no trailing slash.
-#[test]
-fn python_trailing_slashes() {
+#[tokio::test]
+async fn python_trailing_slashes() {
     let rootfs = require_rootfs("python");
     let mount_dir = temp_dir("fs-trailing-slash");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -1800,6 +1858,7 @@ fn python_trailing_slashes() {
              os.chdir('/mnt/host')\n\
              print('cwd', repr(os.getcwd()))",
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(output.contains("/mnt/host ['b']"), "{output}");
@@ -1810,8 +1869,8 @@ fn python_trailing_slashes() {
 
 /// A guest whose output is captured, not printed to a terminal, has no
 /// terminal for its console: programs must not color it or prompt.
-#[test]
-fn python_captured_console_is_not_a_terminal() {
+#[tokio::test]
+async fn python_captured_console_is_not_a_terminal() {
     let rootfs = require_rootfs("python");
     // Allowed a terminal, but with nothing echoed there is none to see
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
@@ -1829,6 +1888,7 @@ fn python_captured_console_is_not_a_terminal() {
              except termios.error as e:\n\
              \x20   print('tcgetattr', e.args[0])",
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(output.contains("[False, False, False]"), "{output}");
@@ -1839,8 +1899,8 @@ fn python_captured_console_is_not_a_terminal() {
 /// A script past what a host call carries runs; one past what a guest
 /// function call carries is refused before it is sent, and the guest
 /// serves on.
-#[test]
-fn python_large_script() {
+#[tokio::test]
+async fn python_large_script() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1848,22 +1908,25 @@ fn python_large_script() {
         .boot()
         .unwrap();
     let padding = format!("# {}\n", "x".repeat(97)).repeat(5_000);
-    sandbox.run(format!("{padding}print('large ok')")).unwrap();
+    sandbox
+        .run(format!("{padding}print('large ok')"))
+        .await
+        .unwrap();
     assert!(sandbox.drain_output().contains("large ok"));
     let too_large = "#".repeat(hyperlight_unikraft::CALL_PAYLOAD_MAX + 1);
     assert!(matches!(
-        sandbox.run(too_large),
+        sandbox.run(too_large).await,
         Err(Error::CallTooLarge { bytes }) if bytes == hyperlight_unikraft::CALL_PAYLOAD_MAX + 1
     ));
-    sandbox.run("print('still serving')").unwrap();
+    sandbox.run("print('still serving')").await.unwrap();
     assert!(sandbox.drain_output().contains("still serving"));
 }
 
 /// What a failed program says is its own: no kernel messages for an exec
 /// that failed as a PATH search does, no driver message after a call that
 /// exited with a status.
-#[test]
-fn python_failures_print_only_their_own_words() {
+#[tokio::test]
+async fn python_failures_print_only_their_own_words() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1878,12 +1941,13 @@ fn python_failures_print_only_their_own_words() {
              except FileNotFoundError:\n\
              \x20   print('not found')",
         )
+        .await
         .unwrap();
     // Standard error first: draining the output clears it too
     assert_eq!(sandbox.drain_stderr(), "");
     assert!(sandbox.drain_output().contains("not found"));
     assert!(matches!(
-        sandbox.run("import sys; sys.exit(3)"),
+        sandbox.run("import sys; sys.exit(3)").await,
         Err(Error::CallFailed { status: 3 })
     ));
     assert_eq!(sandbox.drain_stderr(), "");
@@ -1892,8 +1956,8 @@ fn python_failures_print_only_their_own_words() {
 /// A write far past the end of a file fails, as on Linux, not a crash: cut
 /// short where an offset ends, it is ENOSPC for a file no memory holds, and
 /// EFBIG at the end itself. The file is left as it was.
-#[test]
-fn python_write_far_past_the_end_fails_cleanly() {
+#[tokio::test]
+async fn python_write_far_past_the_end_fails_cleanly() {
     let rootfs = require_rootfs("python");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(256)
@@ -1919,6 +1983,7 @@ except OSError as e:
 print("size", os.fstat(fd).st_size)
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(

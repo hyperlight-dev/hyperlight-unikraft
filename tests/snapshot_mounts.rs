@@ -8,7 +8,6 @@
 mod common;
 
 use std::path::Path;
-use std::time::Duration;
 
 use common::{require_rootfs, temp_dir};
 use hyperlight_unikraft::{Mount, SandboxBuilder, Yield};
@@ -23,8 +22,8 @@ fn save_snapshot(dir: &Path, mounts: Vec<Mount>) {
     sandbox.snapshot_to(dir).unwrap();
 }
 
-#[test]
-fn restore_adds_a_mount_the_snapshot_lacked() {
+#[tokio::test]
+async fn restore_adds_a_mount_the_snapshot_lacked() {
     let tmp = temp_dir("mount-added");
     let snap = tmp.path().join("snap");
     let share = tmp.path().join("share");
@@ -46,6 +45,7 @@ with open('/mnt/share/out.txt', 'w') as f:
     f.write('from the guest\n')
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -59,8 +59,8 @@ with open('/mnt/share/out.txt', 'w') as f:
     );
 }
 
-#[test]
-fn restore_adds_several_mounts_and_keeps_them_apart() {
+#[tokio::test]
+async fn restore_adds_several_mounts_and_keeps_them_apart() {
     let tmp = temp_dir("mounts-added");
     let snap = tmp.path().join("snap");
     let a = tmp.path().join("a");
@@ -88,6 +88,7 @@ except OSError as e:
     print('a: errno', e.errno)
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -101,8 +102,8 @@ except OSError as e:
     );
 }
 
-#[test]
-fn restore_drops_a_mount_the_host_no_longer_serves() {
+#[tokio::test]
+async fn restore_drops_a_mount_the_host_no_longer_serves() {
     let tmp = temp_dir("mount-dropped");
     let snap = tmp.path().join("snap");
     let share = tmp.path().join("share");
@@ -116,6 +117,7 @@ fn restore_drops_a_mount_the_host_no_longer_serves() {
         .unwrap();
     sandbox
         .run("import os; print('present:', os.path.exists('/mnt/share/in.txt'))")
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -124,8 +126,8 @@ fn restore_drops_a_mount_the_host_no_longer_serves() {
     );
 }
 
-#[test]
-fn restore_changes_a_mount_to_read_only() {
+#[tokio::test]
+async fn restore_changes_a_mount_to_read_only() {
     let tmp = temp_dir("mount-ro");
     let snap = tmp.path().join("snap");
     let share = tmp.path().join("share");
@@ -147,6 +149,7 @@ except OSError as e:
     print('write: errno', e.errno)
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -159,8 +162,8 @@ except OSError as e:
     );
 }
 
-#[test]
-fn restore_serves_another_directory_behind_the_same_mount() {
+#[tokio::test]
+async fn restore_serves_another_directory_behind_the_same_mount() {
     let tmp = temp_dir("mount-swapped");
     let snap = tmp.path().join("snap");
     let a = tmp.path().join("a");
@@ -180,6 +183,7 @@ fn restore_serves_another_directory_behind_the_same_mount() {
         .unwrap();
     sandbox
         .run("print('who:', open('/mnt/share/who').read())")
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -188,8 +192,8 @@ fn restore_serves_another_directory_behind_the_same_mount() {
     );
 }
 
-#[test]
-fn restore_in_place_keeps_the_mounts_of_the_sandbox() {
+#[tokio::test]
+async fn restore_in_place_keeps_the_mounts_of_the_sandbox() {
     let tmp = temp_dir("mount-in-place");
     let snap = tmp.path().join("snap");
     let share = tmp.path().join("share");
@@ -203,19 +207,21 @@ fn restore_in_place_keeps_the_mounts_of_the_sandbox() {
         .unwrap();
     sandbox
         .run("open('/mnt/share/first.txt', 'w').write('1')")
+        .await
         .unwrap();
     // An in-place restore of the mount-less image resumes it against this
     // sandbox's mounts, so the mount is back before the next call.
     sandbox.restore_from(&snap).unwrap();
     sandbox
         .run("open('/mnt/share/second.txt', 'w').write('2')")
+        .await
         .unwrap();
     assert!(share.join("first.txt").exists());
     assert!(share.join("second.txt").exists());
 }
 
-#[test]
-fn restore_keeps_a_busy_mount_the_host_no_longer_serves() {
+#[tokio::test]
+async fn restore_keeps_a_busy_mount_the_host_no_longer_serves() {
     let tmp = temp_dir("mount-busy");
     let share = tmp.path().join("share");
     std::fs::create_dir(&share).unwrap();
@@ -247,7 +253,7 @@ except OSError as e:
     // refuses the unmount and the mount stays, its host calls failing.
     let mut sandbox = SandboxBuilder::from_snapshot(snap).boot().unwrap();
     loop {
-        match sandbox.step(Duration::from_secs(5)).unwrap() {
+        match sandbox.step().await.unwrap() {
             Yield::CallDone | Yield::CallFailed { .. } => break,
             Yield::Blocked { .. } => {}
             exited @ Yield::Exited { .. } => panic!("guest exited: {exited:?}"),
@@ -260,12 +266,12 @@ except OSError as e:
         "expected the write through the vanished mount to fail, got: {output:?}",
     );
     // The guest goes on.
-    sandbox.run("print('alive')").unwrap();
+    sandbox.run("print('alive')").await.unwrap();
     assert!(sandbox.drain_output().contains("alive"));
 }
 
-#[test]
-fn a_busy_mount_never_reaches_the_directory_that_took_its_index() {
+#[tokio::test]
+async fn a_busy_mount_never_reaches_the_directory_that_took_its_index() {
     // The stale mount was index 0; the restore's mount is index 0 too.
     // The open file's write must fail, and never land in the new mount.
     let tmp = temp_dir("mount-busy-index");
@@ -301,7 +307,7 @@ except OSError as e:
         .boot()
         .unwrap();
     loop {
-        match sandbox.step(Duration::from_secs(5)).unwrap() {
+        match sandbox.step().await.unwrap() {
             Yield::CallDone | Yield::CallFailed { .. } => break,
             Yield::Blocked { .. } => {}
             exited @ Yield::Exited { .. } => panic!("guest exited: {exited:?}"),
@@ -325,12 +331,13 @@ except OSError as e:
     // The new mount at that index works.
     sandbox
         .run("open('/mnt/b/ok.txt', 'w').write('ok')")
+        .await
         .unwrap();
     assert!(b.join("ok.txt").exists());
 }
 
-#[test]
-fn snapshot_of_a_restored_guest_carries_its_mounts_forward() {
+#[tokio::test]
+async fn snapshot_of_a_restored_guest_carries_its_mounts_forward() {
     // A guest restored with mounts, snapshotted again and restored with
     // others: the second restore starts from the first restore's table.
     let tmp = temp_dir("mount-chained");
@@ -351,6 +358,7 @@ fn snapshot_of_a_restored_guest_carries_its_mounts_forward() {
         .unwrap();
     sandbox
         .run("print('first:', open('/mnt/a/who').read())")
+        .await
         .unwrap();
     assert!(sandbox.drain_output().contains("first: a"));
     sandbox.snapshot_to(&second).unwrap();
@@ -369,6 +377,7 @@ print('a present:', os.path.exists('/mnt/a/who'))
 print('second:', open('/mnt/b/who').read())
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(
@@ -377,8 +386,8 @@ print('second:', open('/mnt/b/who').read())
     );
 }
 
-#[test]
-fn restore_unmounts_a_mount_nested_under_another() {
+#[tokio::test]
+async fn restore_unmounts_a_mount_nested_under_another() {
     // Unmounting the outer one first would fail: the inner mount point
     // pins it.  The pass repeats until both are gone.
     let tmp = temp_dir("mount-nested");
@@ -407,6 +416,7 @@ import os
 print('inner present:', os.path.exists('/mnt/outer/inner/who'))
 "#,
         )
+        .await
         .unwrap();
     let output = sandbox.drain_output();
     assert!(

@@ -33,21 +33,22 @@ fn python() -> SandboxBuilder {
 }
 
 /// A sandbox booted from `builder`, and a snapshot of it idle.
-fn warm(builder: SandboxBuilder) -> (AppSandbox, Arc<Snapshot>) {
+async fn warm(builder: SandboxBuilder) -> (AppSandbox, Arc<Snapshot>) {
     let mut sandbox = builder.boot().unwrap();
-    sandbox.run("print('warm')").unwrap();
+    sandbox.run("print('warm')").await.unwrap();
     let idle = sandbox.snapshot().unwrap();
     (sandbox, idle)
 }
 
 /// [`warm`] with networking, and a snapshot of the sandbox in a call that
 /// spins once the connection it waits on reads EOF.
-fn snapshots(port: u16) -> (AppSandbox, Arc<Snapshot>, Arc<Snapshot>) {
+async fn snapshots(port: u16) -> (AppSandbox, Arc<Snapshot>, Arc<Snapshot>) {
     let (mut sandbox, idle) = warm(
         python()
             .network(NetworkPolicy::AllowAll)
             .listen_ports(ListenPorts::from_ports([port])),
-    );
+    )
+    .await;
 
     sandbox
         .submit(format!(
@@ -70,7 +71,10 @@ while True:
     let mut out = String::new();
     while !out.contains("waiting") {
         assert!(started.elapsed() < Duration::from_secs(30), "{out:?}");
-        let y = sandbox.step(Duration::from_millis(50)).unwrap();
+        let y = tokio::time::timeout(Duration::from_secs(30), sandbox.step())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(y, Yield::Blocked { .. }), "{y:?}: {out:?}");
         out.push_str(&sandbox.drain_output());
     }
@@ -149,10 +153,10 @@ fn is_cancelled(e: &Error) -> bool {
     )
 }
 
-#[test]
-fn a_spinning_resume_is_cancelled_through_the_handle() {
+#[tokio::test]
+async fn a_spinning_resume_is_cancelled_through_the_handle() {
     const PORT: u16 = 18101;
-    let (sandbox, _, spinning) = snapshots(PORT);
+    let (sandbox, _, spinning) = snapshots(PORT).await;
     drop(sandbox);
     let dir = common::temp_dir("interrupt-resume");
     hyperlight_unikraft::save_snapshot(&spinning, &dir).unwrap();
@@ -182,10 +186,10 @@ fn a_spinning_resume_is_cancelled_through_the_handle() {
 /// `restore` and `restore_from` run their resume entry on a sandbox whose
 /// handle the caller already holds; a kill fails them, and a later
 /// restore recovers the sandbox.
-#[test]
-fn restore_is_cancelled_through_the_sandbox_handle() {
+#[tokio::test]
+async fn restore_is_cancelled_through_the_sandbox_handle() {
     const PORT: u16 = 18102;
-    let (sandbox, idle, spinning) = snapshots(PORT);
+    let (sandbox, idle, spinning) = snapshots(PORT).await;
     let spinning_dir = common::temp_dir("interrupt-restore-spinning");
     hyperlight_unikraft::save_snapshot(&spinning, &spinning_dir).unwrap();
     let idle_dir = common::temp_dir("interrupt-restore-idle");
@@ -193,12 +197,12 @@ fn restore_is_cancelled_through_the_sandbox_handle() {
 
     let mut sandbox = restore_killed(sandbox, move |s| s.restore(spinning));
     sandbox.restore(idle).unwrap();
-    runs_again(&mut sandbox);
+    runs_again(&mut sandbox).await;
 
     let path = spinning_dir.path().to_path_buf();
     let mut sandbox = restore_killed(sandbox, move |s| s.restore_from(path));
     sandbox.restore_from(&idle_dir).unwrap();
-    runs_again(&mut sandbox);
+    runs_again(&mut sandbox).await;
 }
 
 /// Run `restore` on `sandbox` while killing through its handle, check it
@@ -218,14 +222,14 @@ fn restore_killed(
     sandbox
 }
 
-fn runs_again(sandbox: &mut AppSandbox) {
+async fn runs_again(sandbox: &mut AppSandbox) {
     sandbox.drain_output();
-    sandbox.run("print('again')").unwrap();
+    sandbox.run("print('again')").await.unwrap();
     assert!(sandbox.drain_output().contains("again"));
 }
 
-#[test]
-fn a_fresh_boot_hands_over_the_handle() {
+#[tokio::test]
+async fn a_fresh_boot_hands_over_the_handle() {
     let slot: Arc<Mutex<Option<Handle>>> = Arc::default();
     let kept = slot.clone();
     let mut sandbox = python()
@@ -236,22 +240,28 @@ fn a_fresh_boot_hands_over_the_handle() {
 
     // The guest boots as without the option...
     sandbox.drain_output();
-    sandbox.run("print('booted')").unwrap();
+    sandbox.run("print('booted')").await.unwrap();
     assert!(sandbox.drain_output().contains("booted"));
 
     // ...and the handle is the sandbox's.
     let (tx, rx) = mpsc::channel();
     tx.send(handle).unwrap();
-    let result = while_killing(rx, move || sandbox.run("while True:\n    pass\n"));
+    let result = while_killing(rx, move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(sandbox.run("while True:\n    pass\n"))
+    });
     let err = result.expect_err("a killed call returned");
     assert!(is_cancelled(&err), "{err:?}");
 }
 
 /// A boot from a snapshot with the option set runs as without it; a kill
 /// made in `f`, before the `resume` entry's guest call starts, is dropped.
-#[test]
-fn a_boot_from_a_snapshot_runs_as_without_the_option() {
-    let (sandbox, idle) = warm(python());
+#[tokio::test]
+async fn a_boot_from_a_snapshot_runs_as_without_the_option() {
+    let (sandbox, idle) = warm(python()).await;
     drop(sandbox);
     let called = Arc::new(AtomicBool::new(false));
     let seen = called.clone();
@@ -265,6 +275,6 @@ fn a_boot_from_a_snapshot_runs_as_without_the_option() {
         .unwrap();
     assert!(called.load(Ordering::Acquire), "not called during boot");
     sandbox.drain_output();
-    sandbox.run("print('restored')").unwrap();
+    sandbox.run("print('restored')").await.unwrap();
     assert!(sandbox.drain_output().contains("restored"));
 }

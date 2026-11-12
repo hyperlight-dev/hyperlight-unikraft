@@ -17,17 +17,17 @@ fn boot(resolv_conf: Option<&str>) -> AppSandbox {
     builder.boot().expect("boot")
 }
 
-fn show(sandbox: &mut AppSandbox) -> String {
-    sandbox.run(SHOW).expect("read /etc/resolv.conf");
+async fn show(sandbox: &mut AppSandbox) -> String {
+    sandbox.run(SHOW).await.expect("read /etc/resolv.conf");
     sandbox.drain_output()
 }
 
 /// The file handed to the host is what the guest reads, with the socket
 /// layer's `single-request` quirk added.
-#[test]
-fn resolv_conf_is_written_at_boot() {
+#[tokio::test]
+async fn resolv_conf_is_written_at_boot() {
     let mut sandbox = boot(Some(HERE));
-    let out = show(&mut sandbox);
+    let out = show(&mut sandbox).await;
     assert!(
         out.contains("nameserver 192.0.2.53")
             && out.contains("search example.test")
@@ -37,10 +37,10 @@ fn resolv_conf_is_written_at_boot() {
 }
 
 /// Without one, the rootfs's own file stands.
-#[test]
-fn rootfs_resolv_conf_stands_without_one() {
+#[tokio::test]
+async fn rootfs_resolv_conf_stands_without_one() {
     let mut sandbox = boot(None);
-    let out = show(&mut sandbox);
+    let out = show(&mut sandbox).await;
     assert!(
         out.contains("nameserver") && !out.contains("192.0.2.53"),
         "got {out:?}"
@@ -49,11 +49,11 @@ fn rootfs_resolv_conf_stands_without_one() {
 
 /// A restored guest resolves names where it now runs: the file is
 /// rewritten on resume, and an options line of the caller's is kept as is.
-#[test]
-fn resolv_conf_is_rewritten_on_restore() {
+#[tokio::test]
+async fn resolv_conf_is_rewritten_on_restore() {
     let dir = temp_dir("resolv-restore");
     let mut sandbox = boot(Some(HERE));
-    assert!(show(&mut sandbox).contains("192.0.2.53"));
+    assert!(show(&mut sandbox).await.contains("192.0.2.53"));
     sandbox.snapshot_to(dir.path()).expect("snapshot");
     drop(sandbox);
 
@@ -62,7 +62,7 @@ fn resolv_conf_is_rewritten_on_restore() {
         .resolv_conf(THERE)
         .boot()
         .expect("restore");
-    let out = show(&mut restored);
+    let out = show(&mut restored).await;
     assert!(
         out.contains("nameserver 198.51.100.53")
             && out.contains("search other.test")
