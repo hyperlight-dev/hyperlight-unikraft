@@ -17,9 +17,9 @@
 //! driver checks readiness with `net_poll(timeout=0)` first, and a call
 //! that would block anyway returns `-EAGAIN`, which the guest's socket
 //! layer already treats as "yield and retry". Connect returns EINPROGRESS
-//! during the handshake. The kernel's readiness waiter uses an ordinary
-//! typed async host call. Network operations use typed replies too; policy
-//! checks still complete synchronously before the operation.
+//! during the handshake. During async driving, live block-list DNS checks
+//! and the kernel's readiness waiter use ordinary typed async host calls.
+//! Both share request IDs, completions and restore-time interruption.
 //!
 //! ## Return conventions
 //!
@@ -660,7 +660,13 @@ impl Net {
         let Some(policy) = &self.policy else {
             return Err(errno::EACCES);
         };
-        let allowed = policy.allows(addr, udp);
+        let allowed = match policy.allows_now(addr, udp) {
+            Some(allowed) => allowed,
+            None => {
+                tracing::warn!("legacy network call cannot defer a block-list lookup");
+                return Err(errno::EOPNOTSUPP);
+            }
+        };
         if allowed { Ok(()) } else { Err(errno::EACCES) }
     }
 
@@ -668,17 +674,36 @@ impl Net {
         self: &Arc<Self>,
         addr: SocketAddr,
         udp: bool,
-        _inbox: &Arc<Mutex<crate::async_calls::Inbox>>,
+        inbox: &Arc<Mutex<crate::async_calls::Inbox>>,
         operation: impl FnOnce(&Self) -> i32 + Send + 'static,
     ) -> Vec<u8> {
         let Some(policy) = &self.policy else {
             return int_reply(-errno::EACCES);
         };
-        int_reply(if policy.allows(&addr, udp) {
-            operation(self)
-        } else {
-            -errno::EACCES
-        })
+        let allowed = policy.allows_now(&addr, udp);
+        if let Some(allowed) = allowed {
+            return int_reply(if allowed {
+                operation(self)
+            } else {
+                -errno::EACCES
+            });
+        }
+        let policy = policy.clone();
+        let net = self.clone();
+        let reply = async move {
+            int_reply(if policy.allows_async(&addr, udp).await {
+                operation(&net)
+            } else {
+                -errno::EACCES
+            })
+        };
+        match inbox.lock().unwrap().submit_reply(reply) {
+            Ok(id) => crate::async_calls::pending_reply(id),
+            Err(error) => {
+                tracing::warn!(%error, "cannot queue asynchronous network policy check");
+                int_reply(-errno::ENOBUFS)
+            }
+        }
     }
 
     fn connect_reply(
@@ -1912,6 +1937,44 @@ mod tests {
     }
 
     #[test]
+    fn setup_defers_policy_checks_without_a_runtime() {
+        use crate::net_policy::BlockList;
+
+        let net = Arc::new(Net::new(
+            NetworkPolicy::BlockList(BlockList::from_hosts(&["localhost"]).unwrap()),
+            None,
+        ));
+        let mut engine = PendingCalls::default();
+        engine.inbox.lock().unwrap().negotiated = true;
+        let called = Arc::new(AtomicBool::new(false));
+        let operation = called.clone();
+        let reply = net.authorized_reply(
+            "192.0.2.1:9".parse().unwrap(),
+            true,
+            &engine.inbox,
+            move |_| {
+                operation.store(true, Ordering::Relaxed);
+                7
+            },
+        );
+        assert_eq!(reply[0], 2);
+        assert!(!called.load(Ordering::Relaxed));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                assert_eq!(
+                    poll_fn(|cx| engine.poll_batch(cx)).await.unwrap(),
+                    Wake::Calls
+                );
+            });
+        assert!(called.load(Ordering::Relaxed));
+        assert_eq!(&engine.take_batch()[20..], int_reply(7));
+        engine.delivered();
+    }
+
+    #[test]
     fn immediate_io_only_uses_syscalls_without_tokio_or_on_would_block() {
         use std::io::ErrorKind;
         for (result, expected, fallback) in [
@@ -2289,6 +2352,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_policy_checks_use_typed_completions_and_cancel_before_side_effects() {
+        use crate::net_policy::BlockList;
+        let net = Arc::new(Net::new(
+            NetworkPolicy::BlockList(BlockList::from_hosts(&["localhost"]).unwrap()),
+            None,
+        ));
+        let addr = "192.0.2.1:9".parse().unwrap();
+        let mut engine = PendingCalls::default();
+        engine.inbox.lock().unwrap().negotiated = true;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert_eq!(net.allow_outbound(&addr, true), Err(errno::EOPNOTSUPP));
+        for cancel in [true, false] {
+            let called = calls.clone();
+            let reply = net.authorized_reply(addr, true, &engine.inbox, move |_| {
+                called.fetch_add(1, Ordering::Relaxed);
+                42
+            });
+            assert_eq!(reply.len(), 9);
+            assert_eq!(reply[0], 2);
+            assert!(engine.is_pending());
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            if cancel {
+                engine.clear();
+                assert!(poll_fn(|cx| engine.poll_batch(cx)).now_or_never().is_none());
+            } else {
+                assert_eq!(
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        poll_fn(|cx| engine.poll_batch(cx))
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                    Wake::Calls
+                );
+                let batch = engine.take_batch();
+                assert_eq!(&batch[20..], int_reply(42));
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+                engine.delivered();
+            }
+        }
+        assert!(!engine.is_pending());
+    }
+
+    #[tokio::test]
+    async fn connected_datagram_sends_defer_policy_and_recheck_the_peer() {
+        use crate::net_policy::BlockList;
+
+        let net = Arc::new(Net::new(
+            NetworkPolicy::BlockList(BlockList::from_hosts(&["localhost"]).unwrap()),
+            None,
+        ));
+        let mut engine = PendingCalls::default();
+        engine.inbox.lock().unwrap().negotiated = true;
+        let addr = "192.0.2.1:9".parse().unwrap();
+        for close in [false, true] {
+            let fd = udp(&net);
+            assert_eq!(net.connect_reply(fd, addr, &engine.inbox), int_reply(0));
+            let reply = net.send_reply(fd, b"blocked".to_vec(), &engine.inbox);
+            assert_eq!(reply[0], 2);
+            let error = if close {
+                net.close(fd).unwrap();
+                errno::EBADF
+            } else {
+                assert_eq!(
+                    net.connect_reply(fd, loopback(9), &engine.inbox),
+                    int_reply(0)
+                );
+                errno::EACCES
+            };
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), poll_fn(|cx| engine.poll_batch(cx)),)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Wake::Calls
+            );
+            assert_eq!(&engine.take_batch()[20..], int_reply(-error));
+            engine.delivered();
+            if !close {
+                net.close(fd).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn typed_network_calls_reject_closed_fds_before_authorization() {
         let net = open_net();
@@ -2308,6 +2458,46 @@ mod tests {
             int_reply(-errno::EBADF)
         );
         assert!(!inbox.lock().unwrap().is_pending());
+    }
+
+    #[tokio::test]
+    async fn network_policy_fast_paths_and_closed_fd_errors_keep_their_shape() {
+        use crate::net_policy::BlockList;
+        let inbox = Arc::new(Mutex::new(crate::async_calls::Inbox::default()));
+        inbox.lock().unwrap().negotiated = true;
+        let net = open_net();
+
+        assert_eq!(
+            net.authorized_reply(loopback(9), true, &inbox, |_| 1),
+            int_reply(1)
+        );
+        assert!(!inbox.lock().unwrap().is_pending());
+
+        let net = Arc::new(Net::new(
+            NetworkPolicy::BlockList(BlockList::from_hosts(&["localhost"]).unwrap()),
+            None,
+        ));
+        let fd = udp(&net);
+
+        assert_eq!(
+            net.authorized_reply(loopback(9), true, &inbox, |_| panic!("denied")),
+            int_reply(-errno::EACCES)
+        );
+        let addr = "192.0.2.1:9".parse().unwrap();
+        assert_eq!(
+            net.authorized_reply(addr, true, &inbox, move |net| {
+                ret(net.connect_allowed(fd, addr), |()| 0)
+            })[0],
+            2
+        );
+        net.close(fd).unwrap();
+        let mut engine = PendingCalls::new(inbox);
+        assert_eq!(
+            poll_fn(|cx| engine.poll_batch(cx)).await.unwrap(),
+            Wake::Calls
+        );
+        assert_eq!(&engine.take_batch()[20..], int_reply(-errno::EBADF));
+        engine.delivered();
     }
 
     #[tokio::test]

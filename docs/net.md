@@ -122,6 +122,15 @@ host-loopback services or to any unlisted destination.
 
 **The destination.**  An allow list allows an address that was listed, resolved when the list was built, or recorded from an answer, and nothing else: the host resolves nothing on the guest's behalf, so an address the guest was never given is refused.  A block list refuses an address that was listed or resolved at build time, and whatever a blocked name resolves to now, looked up at the TCP connect or UDP send with a 250 ms deadline; a lookup that fails or runs late counts as blocked.  So every TCP connect and UDP send under a block list pays a bounded lookup per blocked name, and a blocked name that stops resolving refuses each until it resolves again or is removed.
 
+Live block-list lookups for `connect`, `send` and `sendto` park only the calling
+guest thread and run through the shared futures engine; other guest threads and
+host futures can progress. Static decisions remain immediate. At most 32 system
+resolver threads run process-wide; cancellation discards their results but
+cannot interrupt a system lookup already running. Boot, submission and restore
+can queue these checks without a runtime; the next driving step polls them.
+See [typed networking calls](async-host-calls.md#typed-networking-calls) for the
+kernel compatibility and completion protocol.
+
 **What that promises.**  An allow list refuses everything it was not told about.  A block list refuses the name in every question and every address the name is known to have; it cannot refuse an address the guest obtained some other way that the name is not currently shown to have, which no name-based rule can.  An embedder who needs a guarantee lists what is allowed.
 
 Both lists take names and addresses, `AllowList::from_hosts(&["example.com", "10.0.0.5"])?`; a name that does not resolve when the list is built is a `ResolveError`.
