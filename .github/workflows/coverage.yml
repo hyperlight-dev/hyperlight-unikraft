@@ -1,0 +1,131 @@
+name: Coverage
+
+# The host side's coverage by the Rust tests, weekly on main (docs/ci.md):
+# the library and hluk, which the integration tests also run as a program,
+# measured as ci.yml's Linux test job runs the tests.  The guest (the kernel
+# and the drivers) is not measured.  The summary is on the run's page, and
+# an HTML and an LCOV report are its artifacts.  `just coverage-run`, then
+# `just coverage` or `just coverage-html`, do the same locally (justfile).
+# Instrumented, the tests run slower than CI's, so this blocks nothing: a
+# pull request runs it only when it changes this file.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "29 5 * * 1"
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/coverage.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    # ci.yml's rootfs job and test job, one after the other, instrumented
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      # ci.yml's rootfs job, from its key to its build: the cache entry
+      # either saves is the one the other restores.  Keep them in step.
+      - name: Cache key
+        id: key
+        run: echo "key=rootfs-${{ hashFiles('rust-toolchain.toml', 'drivers/**', 'conformance/python/**', 'examples/agent/custom/Dockerfile', 'examples/c/**', 'examples/rust/**', 'examples/go/**', 'examples/wasmtime/**', 'examples/dotnet-aot/**', 'examples/autonomous/**', 'examples/http-server/**', 'examples/agent-framework/local.Dockerfile', 'demos/pptx-gen/Dockerfile.rootfs') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache guest images and test binaries
+        id: rootfs-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build-elfloader
+          key: ${{ steps.key.outputs.key }}
+          # As ci.yml saves it: the flag is part of the cache's version
+          enableCrossOsArchive: true
+
+      - name: Install cpio
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends cpio
+
+      - name: Install .NET SDK
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Install Go
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Build rootfs images, conformance image and test binaries
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: |
+          just build-all-rootfs
+          just build-conformance python
+          just build-test-bins
+          just build-demos
+
+      # The images are in build-elfloader now.  This runner builds the
+      # tests next, which ci.yml's rootfs job leaves to another.
+      - name: Free the disk the image builds took
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: docker system prune --all --force
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Run the tests and report their coverage
+        run: just coverage-ci --locked
+
+      - name: Coverage summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '## Coverage'
+            echo ''
+            if [ -f target/coverage/summary.txt ]; then
+              echo '```text'
+              cat target/coverage/summary.txt
+              echo '```'
+              echo ''
+              echo 'Per line, in the **coverage-html** artifact below.'
+            else
+              echo 'No report: a test failed, or the tests did not finish.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the HTML report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-html
+          path: target/coverage/html/
+          if-no-files-found: error
+
+      - name: Upload the LCOV report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: target/coverage/lcov.info
+          if-no-files-found: error
