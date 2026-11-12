@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The Hyperlight Authors.
 
-//! Host networking — `net_*` host functions backed by [`rustix`].
+//! Host networking — Tokio I/O with a [`rustix`] POSIX compatibility layer.
 //!
 //! The guest driver (`hostsock.c`) speaks the POSIX socket API, one host
-//! call per syscall.  rustix is a safe, cross-platform (Linux; Windows
-//! via WinSock and `WSAPoll`) wrapper over exactly that API, so every
-//! host function here is one library call plus wire encoding.  Policy —
+//! call per syscall. Async driving uses Tokio for ordinary TCP/UDP transfers
+//! and readiness. rustix handles socket setup, options, exact POSIX polling
+//! and immediate setup I/O on Linux, Windows and macOS. Policy —
 //! [`NetworkPolicy`] for outbound, [`ListenPorts`] for bind — is checked
 //! before the corresponding syscall that transmits: TCP connect, and
 //! every UDP send.  UDP connect only selects a peer and source address.
@@ -16,9 +16,10 @@
 //! the same guest.  Host sockets are therefore non-blocking: the guest
 //! driver checks readiness with `net_poll(timeout=0)` first, and a call
 //! that would block anyway returns `-EAGAIN`, which the guest's socket
-//! layer already treats as "yield and retry".  The one exception is
-//! `connect`, whose peer is never the guest itself: it waits for the
-//! handshake to finish, as a blocking `connect` would.
+//! layer already treats as "yield and retry". Connect returns EINPROGRESS
+//! during the handshake. The kernel's readiness waiter uses an ordinary
+//! typed async host call. Network operations use typed replies too; policy
+//! checks still complete synchronously before the operation.
 //!
 //! ## Return conventions
 //!
@@ -30,15 +31,17 @@
 //! Errno values are Linux errnos (see [`crate::errno`]) — the guest is a
 //! Linux-ABI unikernel whatever the host OS is.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use hyperlight_host::func::Registerable;
 use rustix::event::{PollFd, PollFlags, Timespec};
-use rustix::fd::OwnedFd;
+use rustix::fd::{AsFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::net::{
     self, AddressFamily, Protocol, RecvFlags, SendFlags, Shutdown, SocketFlags, SocketType, sockopt,
@@ -49,6 +52,130 @@ use crate::errno::{self, from_rustix};
 use crate::net_policy::{ListenPorts, NetworkPolicy};
 
 const MAX_SOCKETS: usize = 1024;
+
+type Accepted = (OwnedFd, Option<SocketAddr>);
+
+enum AsyncSocketIo {
+    Stream(tokio::net::TcpStream),
+    Datagram(tokio::net::UdpSocket),
+    Listener {
+        io: tokio::net::TcpListener,
+        accepted: Option<std::io::Result<Accepted>>,
+    },
+}
+
+/// Keep the syscall handle separate from the lazily registered Tokio handle.
+/// Duplicating once lets synchronous callers keep using the same socket before
+/// and after async driving, without unsafe borrowed ownership conversions.
+struct AsyncSocket {
+    runtime: tokio::runtime::Id,
+    io: AsyncSocketIo,
+}
+
+impl AsyncSocket {
+    fn new(socket: &OwnedFd, meta: SockMeta, runtime: tokio::runtime::Id) -> std::io::Result<Self> {
+        let owned = socket.try_clone()?;
+        let io = if meta.listening {
+            AsyncSocketIo::Listener {
+                io: tokio::net::TcpListener::from_std(owned.into())?,
+                accepted: None,
+            }
+        } else if meta.udp {
+            AsyncSocketIo::Datagram(tokio::net::UdpSocket::from_std(owned.into())?)
+        } else {
+            AsyncSocketIo::Stream(tokio::net::TcpStream::from_std(owned.into())?)
+        };
+        Ok(Self { runtime, io })
+    }
+
+    fn has_accepted(&self) -> bool {
+        match &self.io {
+            AsyncSocketIo::Listener { accepted, .. } => accepted.is_some(),
+            _ => false,
+        }
+    }
+
+    fn take_accepted(&mut self) -> Option<std::io::Result<Accepted>> {
+        match &mut self.io {
+            AsyncSocketIo::Listener { accepted, .. } => accepted.take(),
+            _ => None,
+        }
+    }
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>, events: PollFlags) -> Poll<std::io::Result<()>> {
+        let interest = if events == PollFlags::IN {
+            tokio::io::Interest::READABLE
+        } else {
+            tokio::io::Interest::WRITABLE
+        };
+        // Guest syscalls can drain readiness outside Tokio. Only clear its
+        // cached readiness after checking the actual OS state for this interest.
+        fn check(socket: &impl AsFd, events: PollFlags) -> std::io::Result<()> {
+            let mut fds = [PollFd::new(socket, events)];
+            rustix::event::poll(
+                &mut fds,
+                Some(&Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                }),
+            )
+            .map_err(std::io::Error::from)?;
+            if fds[0].revents().is_empty() {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(())
+            }
+        }
+        loop {
+            let result = match &mut self.io {
+                AsyncSocketIo::Stream(io) => {
+                    if events == PollFlags::IN {
+                        ready!(io.poll_read_ready(cx))?;
+                    } else {
+                        ready!(io.poll_write_ready(cx))?;
+                    }
+                    io.try_io(interest, || check(io, events))
+                }
+                AsyncSocketIo::Datagram(io) => {
+                    if events == PollFlags::IN {
+                        ready!(io.poll_recv_ready(cx))?;
+                    } else {
+                        ready!(io.poll_send_ready(cx))?;
+                    }
+                    io.try_io(interest, || check(io, events))
+                }
+                AsyncSocketIo::Listener { io, accepted } => {
+                    if events != PollFlags::IN {
+                        // The guest polls listeners for both directions, but a
+                        // listening socket never becomes writable.
+                        return Poll::Pending;
+                    }
+                    if accepted.is_none() {
+                        let result = ready!(io.poll_accept(cx))
+                            .and_then(|(stream, peer)| Ok((stream.into_std()?.into(), Some(peer))));
+                        // Guest accept consumes errors as well as sockets.
+                        *accepted = Some(result);
+                    }
+                    Ok(())
+                }
+            };
+            match result {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
+            }
+        }
+    }
+}
+
+struct NetworkWait(Weak<Net>);
+
+impl Drop for NetworkWait {
+    fn drop(&mut self) {
+        if let Some(net) = self.0.upgrade() {
+            net.async_waiting.store(false, Ordering::Relaxed);
+        }
+    }
+}
 
 /// What `net_recvfrom`'s reply carries besides the data: its length (4
 /// bytes) and the packed source address (at most 7 + 16).  The kernel
@@ -165,6 +292,20 @@ fn send_flags() -> SendFlags {
     }
 }
 
+/// Tokio may report WouldBlock without a syscall when its reactor has not
+/// observed readiness yet. The guest can already have seen OS readiness in
+/// net_poll, so check the socket directly rather than make it spin until the
+/// synchronous VM entry ends. Other Tokio errors must reach the guest unchanged.
+fn immediate_io<T>(result: Option<std::io::Result<T>>, syscall: impl FnOnce() -> Res<T>) -> Res<T> {
+    match result {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(error)) if error.kind() != std::io::ErrorKind::WouldBlock => {
+            Err(errno::from_io(&error))
+        }
+        _ => syscall(),
+    }
+}
+
 // ── SocketTable ─────────────────────────────────────────────────────
 
 /// What the policy needs to know about a socket beyond its address: a
@@ -182,17 +323,14 @@ struct SockMeta {
     /// neither dissolve its association nor connect it a second time (see
     /// [`SocketTable::renew`]): its family and protocol (`None` for an
     /// accepted socket), and the address the guest bound it to.
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     origin: Option<(AddressFamily, Option<Protocol>)>,
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     bound: Option<SocketAddr>,
 }
 
-/// Guest fd → host socket.  Dropping the fd closes the socket.
-struct SocketTable {
-    sockets: HashMap<i32, Arc<OwnedFd>>,
-    meta: HashMap<i32, SockMeta>,
-    next_fd: i32,
+struct Socket {
+    handle: OwnedFd,
+    meta: SockMeta,
+    registration: Option<AsyncSocket>,
     /// What the guest is parked on, as learnt from its `net_poll` answers:
     /// a socket it asked about and was told "not readable" / "not
     /// writable".  The inter-step wait watches exactly these, for exactly
@@ -200,32 +338,62 @@ struct SocketTable {
     /// by the wait itself); a socket nobody in the guest is waiting on is
     /// not watched, or unread data on it would make every wait return at
     /// once and spin the step loop.
-    want_readable: HashSet<i32>,
-    want_writable: HashSet<i32>,
+    interests: PollFlags,
+}
+
+impl Socket {
+    fn register(&mut self, runtime: tokio::runtime::Id) -> std::io::Result<&mut AsyncSocket> {
+        if self
+            .registration
+            .as_ref()
+            .is_none_or(|s| s.runtime != runtime)
+        {
+            let mut registered = AsyncSocket::new(&self.handle, self.meta, runtime)?;
+            if let AsyncSocketIo::Listener { accepted, .. } = &mut registered.io {
+                *accepted = self
+                    .registration
+                    .as_mut()
+                    .and_then(AsyncSocket::take_accepted);
+            }
+            self.registration = Some(registered);
+        }
+        Ok(self.registration.as_mut().unwrap())
+    }
+
+    fn has_accepted(&self) -> bool {
+        self.registration
+            .as_ref()
+            .is_some_and(AsyncSocket::has_accepted)
+    }
+}
+
+/// Guest fd → host socket. Dropping an entry releases all its socket state.
+struct SocketTable {
+    sockets: HashMap<i32, Socket>,
+    next_fd: i32,
 }
 
 impl SocketTable {
     fn new() -> Self {
         Self {
             sockets: HashMap::new(),
-            meta: HashMap::new(),
             next_fd: 3, // skip stdin/stdout/stderr
-            want_readable: HashSet::new(),
-            want_writable: HashSet::new(),
         }
     }
 
     /// Record the outcome of a send on `fd` for the inter-step wait.
-    fn note_send(&mut self, fd: i32, result: &Res<usize>) {
+    fn note_send(&mut self, fd: i32, result: &Res<usize>) -> Res<()> {
+        let socket = self.entry_mut(fd)?;
         match result {
             Err(e) if *e == errno::EAGAIN => {
-                self.want_writable.insert(fd);
+                socket.interests.insert(PollFlags::OUT);
             }
             Ok(_) => {
-                self.want_writable.remove(&fd);
+                socket.interests.remove(PollFlags::OUT);
             }
             Err(_) => {}
         }
+        Ok(())
     }
 
     fn insert(
@@ -239,46 +407,30 @@ impl SocketTable {
         }
         let fd = self.next_fd;
         self.next_fd = self.next_fd.wrapping_add(1);
-        self.sockets.insert(fd, Arc::new(sock));
-        self.meta.insert(
+        self.sockets.insert(
             fd,
-            SockMeta {
-                udp,
-                peer: None,
-                listening: false,
-                origin,
-                bound: None,
+            Socket {
+                handle: sock,
+                meta: SockMeta {
+                    udp,
+                    peer: None,
+                    listening: false,
+                    origin,
+                    bound: None,
+                },
+                registration: None,
+                interests: PollFlags::empty(),
             },
         );
         Ok(fd)
     }
 
     fn meta(&self, fd: i32) -> Res<SockMeta> {
-        self.meta.get(&fd).copied().ok_or(errno::EBADF)
+        self.sockets.get(&fd).map(|s| s.meta).ok_or(errno::EBADF)
     }
 
-    fn set_peer(&mut self, fd: i32, peer: SocketAddr) {
-        if let Some(m) = self.meta.get_mut(&fd) {
-            m.peer = Some(peer);
-        }
-    }
-
-    fn clear_peer(&mut self, fd: i32) {
-        if let Some(m) = self.meta.get_mut(&fd) {
-            m.peer = None;
-        }
-    }
-
-    fn set_listening(&mut self, fd: i32) {
-        if let Some(m) = self.meta.get_mut(&fd) {
-            m.listening = true;
-        }
-    }
-
-    fn set_bound(&mut self, fd: i32, addr: SocketAddr) {
-        if let Some(m) = self.meta.get_mut(&fd) {
-            m.bound = Some(addr);
-        }
+    fn entry_mut(&mut self, fd: i32) -> Res<&mut Socket> {
+        self.sockets.get_mut(&fd).ok_or(errno::EBADF)
     }
 
     /// A fresh datagram socket like `fd`'s, with the options the guest can
@@ -307,8 +459,10 @@ impl SocketTable {
         let (sock, _) = self.fresh_dgram(fd)?;
         // Replacing the old socket closes it, which frees the port for the
         // new one: binding first would fail with EADDRINUSE.
-        self.sockets.insert(fd, Arc::new(sock));
-        self.clear_peer(fd);
+        let entry = self.entry_mut(fd)?;
+        entry.registration = None;
+        entry.handle = sock;
+        entry.meta.peer = None;
         if let Some(addr) = bound {
             net::bind(self.get(fd)?, &addr).map_err(from_rustix)?;
         }
@@ -345,22 +499,18 @@ impl SocketTable {
         }
         let _ = sockopt::set_socket_reuseport(&sock, reuse);
         // Replacing the old socket closes it.
-        self.sockets.insert(fd, Arc::new(sock));
-        self.set_peer(fd, addr);
+        let entry = self.entry_mut(fd)?;
+        entry.registration = None;
+        entry.handle = sock;
+        entry.meta.peer = Some(addr);
         Ok(())
     }
 
     fn get(&self, fd: i32) -> Res<&OwnedFd> {
-        self.sockets
-            .get(&fd)
-            .map(|s| s.as_ref())
-            .ok_or(errno::EBADF)
+        self.sockets.get(&fd).map(|s| &s.handle).ok_or(errno::EBADF)
     }
 
-    fn remove(&mut self, fd: i32) -> Res<Arc<OwnedFd>> {
-        self.want_readable.remove(&fd);
-        self.want_writable.remove(&fd);
-        self.meta.remove(&fd);
+    fn remove(&mut self, fd: i32) -> Res<Socket> {
         self.sockets.remove(&fd).ok_or(errno::EBADF)
     }
 }
@@ -428,6 +578,14 @@ pub(crate) struct Net {
     /// guest can call.
     policy: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    async_waiting: AtomicBool,
+    waiter: futures::task::AtomicWaker,
+}
+
+impl Drop for Net {
+    fn drop(&mut self) {
+        self.waiter.wake();
+    }
 }
 
 impl Net {
@@ -445,6 +603,8 @@ impl Net {
             table: Mutex::new(SocketTable::new()),
             policy: Some(policy),
             listen_ports,
+            async_waiting: AtomicBool::new(false),
+            waiter: futures::task::AtomicWaker::new(),
         }
     }
 
@@ -455,6 +615,8 @@ impl Net {
             table: Mutex::new(SocketTable::new()),
             policy: None,
             listen_ports: None,
+            async_waiting: AtomicBool::new(false),
+            waiter: futures::task::AtomicWaker::new(),
         }
     }
 
@@ -462,13 +624,118 @@ impl Net {
         self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn socket_io<'a>(&self, table: &'a mut SocketTable, fd: i32) -> Res<Option<&'a AsyncSocketIo>> {
+        // Boot, submit and restore can enter the guest outside a runtime.
+        // They do immediate I/O only; queued futures wait for the next step.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return Ok(None);
+        };
+        let entry = table.entry_mut(fd)?;
+        let meta = entry.meta;
+        let protocol = if meta.udp {
+            net::ipproto::UDP
+        } else {
+            net::ipproto::TCP
+        };
+        let standard = meta
+            .origin
+            .is_none_or(|(_, p)| p.is_none_or(|p| p == protocol));
+        // Keep fresh/unbound sockets and non-TCP/UDP protocols on the syscall
+        // path. In particular, reactor registration must not precede UDP's
+        // implicit bind on its first send.
+        let established =
+            meta.peer.is_some() || (meta.udp && meta.bound.is_some()) || meta.origin.is_none();
+        if !standard || meta.listening || (!established && entry.registration.is_none()) {
+            return Ok(None);
+        }
+        let socket = entry.register(runtime.id()).map_err(|error| {
+            tracing::warn!(%error, fd, "cannot register socket for asynchronous I/O");
+            errno::from_io(&error)
+        })?;
+        Ok(Some(&socket.io))
+    }
+
     /// Outbound policy (TCP connect, UDP send/sendto).
     fn allow_outbound(&self, addr: &SocketAddr, udp: bool) -> Res<()> {
-        if self.policy.as_ref().is_some_and(|p| p.allows(addr, udp)) {
-            Ok(())
+        let Some(policy) = &self.policy else {
+            return Err(errno::EACCES);
+        };
+        let allowed = policy.allows(addr, udp);
+        if allowed { Ok(()) } else { Err(errno::EACCES) }
+    }
+
+    fn authorized_reply(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        udp: bool,
+        _inbox: &Arc<Mutex<crate::async_calls::Inbox>>,
+        operation: impl FnOnce(&Self) -> i32 + Send + 'static,
+    ) -> Vec<u8> {
+        let Some(policy) = &self.policy else {
+            return int_reply(-errno::EACCES);
+        };
+        int_reply(if policy.allows(&addr, udp) {
+            operation(self)
         } else {
-            Err(errno::EACCES)
+            -errno::EACCES
+        })
+    }
+
+    fn connect_reply(
+        self: &Arc<Self>,
+        fd: i32,
+        addr: SocketAddr,
+        inbox: &Arc<Mutex<crate::async_calls::Inbox>>,
+    ) -> Vec<u8> {
+        let meta = match self.table().meta(fd) {
+            Ok(meta) => meta,
+            Err(e) => return int_reply(-e),
+        };
+        if !meta.udp {
+            return self.authorized_reply(addr, false, inbox, move |net| {
+                ret(net.connect_allowed(fd, addr), |()| 0)
+            });
         }
+        int_reply(ret(self.connect_allowed(fd, addr), |()| 0))
+    }
+
+    fn send_reply(
+        self: &Arc<Self>,
+        fd: i32,
+        data: Vec<u8>,
+        inbox: &Arc<Mutex<crate::async_calls::Inbox>>,
+    ) -> Vec<u8> {
+        let meta = match self.table().meta(fd) {
+            Ok(meta) => meta,
+            Err(e) => return int_reply(-e),
+        };
+        if meta.udp
+            && let Some(peer) = meta.peer
+        {
+            return self.authorized_reply(peer, true, inbox, move |net| {
+                ret(net.send_allowed(fd, &data, meta), |sent| sent as i32)
+            });
+        }
+        int_reply(ret(self.send_allowed(fd, &data, meta), |sent| sent as i32))
+    }
+
+    fn sendto_reply(
+        self: &Arc<Self>,
+        fd: i32,
+        data: Vec<u8>,
+        addr: SocketAddr,
+        inbox: &Arc<Mutex<crate::async_calls::Inbox>>,
+    ) -> Vec<u8> {
+        let udp = match self.table().meta(fd) {
+            Ok(meta) => meta.udp,
+            Err(e) => return int_reply(-e),
+        };
+        if !udp {
+            return self.send_reply(fd, data, inbox);
+        }
+        self.authorized_reply(addr, true, inbox, move |net| {
+            ret(net.sendto_allowed(fd, &data, addr), |sent| sent as i32)
+        })
     }
 
     /// Inbound policy (bind).  Ephemeral binds (port 0) are always
@@ -527,25 +794,40 @@ impl Net {
         self.allow_bind(&addr)?;
         let mut tbl = self.table();
         net::bind(tbl.get(fd)?, &addr).map_err(from_rustix)?;
-        tbl.set_bound(fd, addr);
+        tbl.entry_mut(fd)?.meta.bound = Some(addr);
         Ok(())
     }
 
     fn listen(&self, fd: i32, backlog: i32) -> Res<()> {
         let mut tbl = self.table();
         net::listen(tbl.get(fd)?, backlog).map_err(from_rustix)?;
-        tbl.set_listening(fd);
+        let socket = tbl.entry_mut(fd)?;
+        if !socket.meta.listening {
+            socket.registration = None;
+            socket.meta.listening = true;
+            self.waiter.wake();
+        }
         Ok(())
     }
 
     fn accept(&self, fd: i32) -> Res<(i32, Option<SocketAddr>)> {
         let mut tbl = self.table();
-        let (conn, peer) =
-            net::acceptfrom_with(tbl.get(fd)?, socket_flags()).map_err(from_rustix)?;
+        let buffered = tbl
+            .entry_mut(fd)?
+            .registration
+            .as_mut()
+            .and_then(AsyncSocket::take_accepted);
+        let (conn, peer) = match buffered {
+            Some(accepted) => accepted.map_err(|e| errno::from_io(&e))?,
+            None => {
+                let (conn, peer) =
+                    net::acceptfrom_with(tbl.get(fd)?, socket_flags()).map_err(from_rustix)?;
+                (conn, peer.and_then(|a| SocketAddr::try_from(a).ok()))
+            }
+        };
         #[cfg(target_vendor = "apple")]
         apple_socket_setup(&conn)?;
         rustix::io::ioctl_fionbio(&conn, true).map_err(from_rustix)?;
-        let peer = peer.and_then(|a| SocketAddr::try_from(a).ok());
         // No peer is recorded: only a socket the guest itself aimed at port
         // 53 carries its DNS questions, and a remote client may pick any
         // source port, 53 included.
@@ -566,6 +848,12 @@ impl Net {
         if !meta.udp {
             self.allow_outbound(&addr, false)?;
         }
+        self.connect_allowed(fd, addr)
+    }
+
+    fn connect_allowed(&self, fd: i32, addr: SocketAddr) -> Res<()> {
+        #[cfg(target_vendor = "apple")]
+        let meta = self.table().meta(fd)?;
         let mut tbl = self.table();
         {
             let sock = tbl.get(fd)?;
@@ -583,7 +871,9 @@ impl Net {
         // macOS answers EISCONN, so a fresh socket takes the new peer.
         #[cfg(target_vendor = "apple")]
         if meta.udp && meta.peer.is_some() {
-            return tbl.reconnect(fd, addr);
+            let result = tbl.reconnect(fd, addr);
+            self.waiter.wake();
+            return result;
         }
         let r = match net::connect(tbl.get(fd)?, &addr) {
             Ok(()) => Ok(()),
@@ -594,7 +884,7 @@ impl Net {
         // at port 53 they are DNS questions, checked by name in `send`.  A
         // connect that failed leaves the socket's association as it was.
         if r.is_ok() || r == Err(errno::EINPROGRESS) {
-            tbl.set_peer(fd, addr);
+            tbl.entry_mut(fd)?.meta.peer = Some(addr);
         }
         r
     }
@@ -615,8 +905,12 @@ impl Net {
             net::connect_unspec(sock).map_err(from_rustix)?;
         }
         #[cfg(target_vendor = "apple")]
-        tbl.renew(fd)?;
-        tbl.clear_peer(fd);
+        {
+            let result = tbl.renew(fd);
+            self.waiter.wake();
+            result?;
+        }
+        tbl.entry_mut(fd)?.meta.peer = None;
         Ok(())
     }
 
@@ -630,6 +924,10 @@ impl Net {
         {
             self.allow_outbound(&peer, true)?;
         }
+        self.send_allowed(fd, data, meta)
+    }
+
+    fn send_allowed(&self, fd: i32, data: &[u8], meta: SockMeta) -> Res<usize> {
         if meta.peer.is_some_and(|p| p.port() == 53)
             && !self
                 .policy
@@ -643,8 +941,17 @@ impl Net {
         if tbl.meta(fd)?.peer != meta.peer {
             return Err(errno::EACCES);
         }
-        let r = net::send(tbl.get(fd)?, data, send_flags()).map_err(from_rustix);
-        tbl.note_send(fd, &r);
+        let result = match self.socket_io(&mut tbl, fd)? {
+            Some(AsyncSocketIo::Stream(io)) => Some(io.try_write(data)),
+            Some(AsyncSocketIo::Datagram(io)) => Some(io.try_send(data)),
+            _ => None,
+        };
+        let r = immediate_io(result, || {
+            net::send(tbl.get(fd)?, data, send_flags()).map_err(from_rustix)
+        });
+        tbl.note_send(fd, &r)?;
+        drop(tbl);
+        self.waiter.wake();
         r
     }
 
@@ -659,6 +966,11 @@ impl Net {
             return self.send(fd, data);
         }
         self.allow_outbound(&addr, udp)?;
+        self.sendto_allowed(fd, data, addr)
+    }
+
+    fn sendto_allowed(&self, fd: i32, data: &[u8], addr: SocketAddr) -> Res<usize> {
+        let udp = self.table().meta(fd)?.udp;
         // A DNS question sent unconnected: the same name check as `send`.
         if addr.port() == 53
             && !self
@@ -668,17 +980,30 @@ impl Net {
         {
             return Err(errno::EACCES);
         }
-        let mut tbl = self.table();
         // macOS refuses sendto() on a connected socket (EISCONN) even to its
         // own peer, which Linux accepts.
         #[cfg(target_vendor = "apple")]
-        if udp && tbl.meta(fd)?.peer == Some(addr) {
-            let r = net::send(tbl.get(fd)?, data, send_flags()).map_err(from_rustix);
-            tbl.note_send(fd, &r);
-            return r;
+        {
+            let meta = self.table().meta(fd)?;
+            if udp && meta.peer == Some(addr) {
+                return self.send_allowed(fd, data, meta);
+            }
         }
-        let r = net::sendto(tbl.get(fd)?, data, send_flags(), &addr).map_err(from_rustix);
-        tbl.note_send(fd, &r);
+        let mut tbl = self.table();
+        let result = if udp {
+            match self.socket_io(&mut tbl, fd)? {
+                Some(AsyncSocketIo::Datagram(io)) => Some(io.try_send_to(data, addr)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let r = immediate_io(result, || {
+            net::sendto(tbl.get(fd)?, data, send_flags(), &addr).map_err(from_rustix)
+        });
+        tbl.note_send(fd, &r)?;
+        drop(tbl);
+        self.waiter.wake();
         r
     }
 
@@ -688,18 +1013,27 @@ impl Net {
     /// ([`RECVFROM_HDR`]); the guest asks for at most that anyway.
     fn recvfrom(&self, fd: i32, len: usize) -> Res<(Vec<u8>, Option<SocketAddr>)> {
         let mut buf = vec![0u8; len.min(HOST_CALL_MAX - RECVFROM_HDR)];
-        let tbl = self.table();
+        let mut tbl = self.table();
+        let result = match self.socket_io(&mut tbl, fd)? {
+            Some(AsyncSocketIo::Stream(io)) => Some(io.try_read(&mut buf).map(|n| (n, None))),
+            Some(AsyncSocketIo::Datagram(io)) => {
+                Some(io.try_recv_from(&mut buf).map(|(n, from)| (n, Some(from))))
+            }
+            _ => None,
+        };
         let fd = tbl.get(fd)?;
-        let received = net::recvfrom(fd, &mut buf[..], RecvFlags::empty());
-        // Classified with the socket still held; the answer is learned
-        // from after the table is unlocked, as that may ask the filter.
-        let (n, _, from) = match received {
+        let result = immediate_io(result, || {
+            net::recvfrom(fd, &mut buf[..], RecvFlags::empty())
+                .map(|(n, _, from)| (n, from.and_then(|a| SocketAddr::try_from(a).ok())))
+                .map_err(from_rustix)
+        });
+        let (n, from) = match result {
             Ok(r) => r,
             // Windows surfaces an earlier ICMP "port unreachable" on a UDP
             // socket as a reset.  Linux reports that as ECONNREFUSED on a
             // connected socket and not at all on an unconnected one.
             #[cfg(windows)]
-            Err(Errno::CONNRESET)
+            Err(errno::ECONNRESET)
                 if sockopt::socket_type(fd).is_ok_and(|t| t == SocketType::DGRAM) =>
             {
                 return Err(match net::getpeername(fd) {
@@ -707,11 +1041,10 @@ impl Net {
                     _ => errno::EAGAIN,
                 });
             }
-            Err(e) => return Err(from_rustix(e)),
+            Err(e) => return Err(e),
         };
         drop(tbl);
         buf.truncate(n);
-        let from = from.and_then(|a| SocketAddr::try_from(a).ok());
         // A DNS answer: under an allow list, the addresses it gives for a
         // listed name are recorded, so the connect that follows is known.
         if let (Some(src), Some(policy)) = (from, &self.policy) {
@@ -730,18 +1063,50 @@ impl Net {
     }
 
     fn close(&self, fd: i32) -> Res<()> {
-        self.table().remove(fd).map(drop)
+        let result = self.table().remove(fd).map(drop);
+        self.waiter.wake();
+        result
     }
 
     fn peer_addr(&self, fd: i32) -> Res<SocketAddr> {
-        net::getpeername(self.table().get(fd)?)
+        let tbl = self.table();
+        match tbl
+            .sockets
+            .get(&fd)
+            .and_then(|s| s.registration.as_ref())
+            .map(|s| &s.io)
+        {
+            Some(AsyncSocketIo::Stream(io)) => {
+                return io.peer_addr().map_err(|e| errno::from_io(&e));
+            }
+            Some(AsyncSocketIo::Datagram(io)) => {
+                return io.peer_addr().map_err(|e| errno::from_io(&e));
+            }
+            _ => {}
+        }
+        net::getpeername(tbl.get(fd)?)
             .map_err(from_rustix)?
             .and_then(|a| SocketAddr::try_from(a).ok())
             .ok_or(errno::ENOTCONN)
     }
 
     fn local_addr(&self, fd: i32) -> Res<SocketAddr> {
-        let addr = net::getsockname(self.table().get(fd)?).map_err(from_rustix)?;
+        let tbl = self.table();
+        let result = match tbl
+            .sockets
+            .get(&fd)
+            .and_then(|s| s.registration.as_ref())
+            .map(|s| &s.io)
+        {
+            Some(AsyncSocketIo::Stream(io)) => Some(io.local_addr()),
+            Some(AsyncSocketIo::Datagram(io)) => Some(io.local_addr()),
+            Some(AsyncSocketIo::Listener { io, .. }) => Some(io.local_addr()),
+            None => None,
+        };
+        if let Some(result) = result {
+            return result.map_err(|e| errno::from_io(&e));
+        }
+        let addr = net::getsockname(tbl.get(fd)?).map_err(from_rustix)?;
         SocketAddr::try_from(addr).map_err(|_| errno::EAFNOSUPPORT)
     }
 
@@ -881,7 +1246,10 @@ impl Net {
         // return at once, whatever the timeout.  Otherwise a wait inside a
         // host call would freeze the vCPU and the embedder's thread with no
         // way to interrupt either; waiting is the host's job between
-        // entries (see wait_ready), so an indefinite timeout is refused.
+        // entries (see poll_ready), so an indefinite timeout is refused.
+        let buffered = entries.iter().any(|&(fd, events)| {
+            events & POLLIN != 0 && tbl.sockets.get(&fd).is_some_and(Socket::has_accepted)
+        });
         let timeout_ms = if invalid > 0 {
             0
         } else {
@@ -890,6 +1258,7 @@ impl Net {
                 Err(_) => return (-errno::EINVAL, revents),
             }
         };
+        let timeout_ms = if buffered { 0 } else { timeout_ms };
         let timeout = Timespec {
             tv_sec: (timeout_ms / 1000) as _,
             tv_nsec: ((timeout_ms % 1000) * 1_000_000) as _,
@@ -899,7 +1268,7 @@ impl Net {
             std::thread::sleep(Duration::from_millis(timeout_ms));
             return (invalid, revents);
         }
-        let ready = match rustix::event::poll(&mut fds, Some(&timeout)) {
+        let mut ready = match rustix::event::poll(&mut fds, Some(&timeout)) {
             Ok(ready) => {
                 for (pfd, &i) in fds.iter().zip(&index) {
                     revents[i] = linux_revents(pfd.revents());
@@ -909,28 +1278,39 @@ impl Net {
             Err(e) => -from_rustix(e),
         };
         drop(fds);
+        if ready >= 0 {
+            for (i, &(fd, events)) in entries.iter().enumerate() {
+                if events & POLLIN != 0 && tbl.sockets.get(&fd).is_some_and(Socket::has_accepted) {
+                    if revents[i] == 0 {
+                        ready += 1;
+                    }
+                    revents[i] |= POLLIN;
+                }
+            }
+        }
         // This is where the guest learns what it must wait for: hostsock
         // asks before every accept/recv/send and, told "not yet", parks
         // the thread on that condition.  Watch the socket for exactly
         // that in the inter-step wait; a condition reported ready (or an
         // error) needs no watching.
         for (i, &(fd, events)) in entries.iter().enumerate() {
+            let Some(socket) = tbl.sockets.get_mut(&fd) else {
+                continue;
+            };
             let err = revents[i] & (POLLERR | POLLHUP | POLLNVAL) != 0;
             if events & POLLIN != 0 {
-                if revents[i] & POLLIN == 0 && !err {
-                    tbl.want_readable.insert(fd);
-                } else {
-                    tbl.want_readable.remove(&fd);
-                }
+                socket
+                    .interests
+                    .set(PollFlags::IN, revents[i] & POLLIN == 0 && !err);
             }
             if events & POLLOUT != 0 {
-                if revents[i] & POLLOUT == 0 && !err {
-                    tbl.want_writable.insert(fd);
-                } else {
-                    tbl.want_writable.remove(&fd);
-                }
+                socket
+                    .interests
+                    .set(PollFlags::OUT, revents[i] & POLLOUT == 0 && !err);
             }
         }
+        drop(tbl);
+        self.waiter.wake();
         (ready, revents)
     }
 
@@ -940,84 +1320,76 @@ impl Net {
     pub(crate) fn reset(&self) {
         let mut tbl = self.table();
         tbl.sockets.clear();
-        tbl.meta.clear();
-        tbl.want_readable.clear();
-        tbl.want_writable.clear();
+        drop(tbl);
+        self.waiter.wake();
     }
 
     /// Whether the guest is parked on any socket: something the
     /// inter-step wait could wake it for.
     pub(crate) fn has_waitable(&self) -> bool {
-        let tbl = self.table();
-        tbl.want_readable
-            .iter()
-            .chain(&tbl.want_writable)
-            .any(|fd| tbl.sockets.contains_key(fd))
+        self.table()
+            .sockets
+            .values()
+            .any(|s| !s.interests.is_empty())
     }
 
-    /// Block until a socket the guest is parked on becomes ready or
-    /// `timeout` elapses (`None`: no limit).  Returns whether one fired.
-    ///
-    /// The inter-step wait of the cooperative step model: a guest parked
-    /// in `accept`/`recv`/`send` yielded the vCPU, and this is how the
-    /// host learns it is worth re-entering.  Each socket is watched for
-    /// the condition the guest was refused (see [`Net::poll`]) and for
-    /// nothing else.  With nothing to watch, a bounded wait is a plain
-    /// sleep and an unbounded one returns at once (nothing could end it).
-    pub(crate) fn wait_ready(&self, timeout: Option<Duration>) -> bool {
-        // Copy out what to watch and release the table: the closures never
-        // run while the VM is halted, but nothing else should have to wait
-        // behind a poll either.
-        let wanted: Vec<(i32, Arc<OwnedFd>, PollFlags)> = {
-            let tbl = self.table();
-            tbl.sockets
-                .iter()
-                .filter_map(|(&fd, sock)| {
-                    let mut flags = PollFlags::empty();
-                    if tbl.want_readable.contains(&fd) {
-                        flags |= PollFlags::IN;
-                    }
-                    if tbl.want_writable.contains(&fd) {
-                        flags |= PollFlags::OUT;
-                    }
-                    (!flags.is_empty()).then(|| (fd, sock.clone(), flags))
-                })
-                .collect()
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.waiter.register(cx.waker());
+        let mut table = self.table();
+        let mut sockets = table
+            .sockets
+            .values_mut()
+            .filter(|s| !s.interests.is_empty())
+            .peekable();
+        if sockets.peek().is_none() {
+            return Poll::Ready(Ok(()));
+        }
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(std::io::Error::other)?
+            .id();
+        // Every poll is non-blocking; registrations cannot outlive or race
+        // replacement of their owning entry while the table is locked.
+        for socket in sockets {
+            for events in [PollFlags::IN, PollFlags::OUT] {
+                if socket.interests.contains(events)
+                    && let Poll::Ready(result) = socket.register(runtime)?.poll_ready(cx, events)
+                {
+                    socket.interests.remove(events);
+                    return Poll::Ready(result);
+                }
+            }
+        }
+        Poll::Pending
+    }
+
+    pub(crate) fn needs_async_wait(&self) -> bool {
+        self.has_waitable() && !self.async_waiting.load(Ordering::Relaxed)
+    }
+
+    fn wait_reply(self: &Arc<Self>, inbox: &Arc<Mutex<crate::async_calls::Inbox>>) -> Vec<u8> {
+        if !self.has_waitable() {
+            return int_reply(0);
+        }
+        if self.async_waiting.swap(true, Ordering::Relaxed) {
+            tracing::warn!("duplicate asynchronous network wait");
+            return int_reply(-errno::EBUSY);
+        }
+        let wait = NetworkWait(Arc::downgrade(self));
+        let reply = async move {
+            futures::future::poll_fn(|cx| match wait.0.upgrade() {
+                Some(net) => net.poll_ready(cx),
+                None => Poll::Ready(Ok(())),
+            })
+            .await?;
+            Ok(int_reply(1))
         };
-        if wanted.is_empty() {
-            if let Some(timeout) = timeout {
-                std::thread::sleep(timeout);
-            }
-            return false;
-        }
-        let mut fds: Vec<PollFd<'_>> = wanted
-            .iter()
-            .map(|(_, sock, flags)| PollFd::new(sock, *flags))
-            .collect();
-        let ts = timeout.map(|t| Timespec {
-            tv_sec: t.as_secs() as _,
-            tv_nsec: t.subsec_nanos() as _,
-        });
-        let fired = matches!(rustix::event::poll(&mut fds, ts.as_ref()), Ok(n) if n > 0);
-        // A condition was delivered: the guest's next poll decides whether
-        // it needs watching again.
-        let delivered: Vec<(i32, PollFlags)> = wanted
-            .iter()
-            .zip(&fds)
-            .map(|((fd, _, _), p)| (*fd, p.revents()))
-            .collect();
-        drop(fds);
-        let mut tbl = self.table();
-        for (fd, revents) in delivered {
-            let err = revents.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL);
-            if err || revents.contains(PollFlags::IN) {
-                tbl.want_readable.remove(&fd);
-            }
-            if err || revents.contains(PollFlags::OUT) {
-                tbl.want_writable.remove(&fd);
+        match inbox.lock().unwrap().submit_fallible_reply(reply) {
+            Ok(id) => crate::async_calls::pending_reply(id),
+            Err(error) => {
+                tracing::warn!(%error, "cannot queue asynchronous network wait");
+                int_reply(-errno::ENOBUFS)
             }
         }
-        fired
     }
 }
 
@@ -1104,6 +1476,12 @@ fn ret_vec(r: Res<Vec<u8>>) -> Vec<u8> {
     r.unwrap_or_else(|e| (-e).to_le_bytes().to_vec())
 }
 
+fn int_reply(value: i32) -> Vec<u8> {
+    let mut reply = vec![crate::HOST_CALL_OK];
+    reply.extend_from_slice(&value.to_le_bytes());
+    reply
+}
+
 /// Register all `net_*` host functions.
 ///
 /// `net` carries the policy (which outbound destinations are allowed,
@@ -1114,8 +1492,63 @@ pub(crate) fn register(
     target: &mut impl Registerable,
     net: &Arc<Net>,
     profile: &Arc<crate::profile::Profile>,
+    inbox: &Arc<Mutex<crate::async_calls::Inbox>>,
 ) -> hyperlight_host::Result<()> {
     let net = net.clone();
+
+    let n = net.clone();
+    let pending = inbox.clone();
+    let prof = profile.clone();
+    target.register_host_function(
+        "net_wait_async",
+        move || -> hyperlight_host::Result<Vec<u8>> {
+            let _profile = prof.host("net_wait_async");
+            Ok(n.wait_reply(&pending))
+        },
+    )?;
+
+    let n = net.clone();
+    let pending = inbox.clone();
+    let prof = profile.clone();
+    target.register_host_function(
+        "net_connect_async",
+        move |fd: i32, family: i32, addr: String, port: i32| -> hyperlight_host::Result<Vec<u8>> {
+            let _profile = prof.host("net_connect_async");
+            let Some(addr) = parse_addr(family, &addr, port) else {
+                return Ok(int_reply(-errno::EINVAL));
+            };
+            Ok(n.connect_reply(fd, addr, &pending))
+        },
+    )?;
+    let n = net.clone();
+    let pending = inbox.clone();
+    let prof = profile.clone();
+    target.register_host_function(
+        "net_sendto_async",
+        move |fd: i32,
+              data: Vec<u8>,
+              family: i32,
+              addr: String,
+              port: i32|
+              -> hyperlight_host::Result<Vec<u8>> {
+            let _profile = prof.host("net_sendto_async");
+            let Some(addr) = parse_addr(family, &addr, port) else {
+                return Ok(int_reply(-errno::EINVAL));
+            };
+            Ok(n.sendto_reply(fd, data, addr, &pending))
+        },
+    )?;
+
+    let n = net.clone();
+    let pending = inbox.clone();
+    let prof = profile.clone();
+    target.register_host_function(
+        "net_send_async",
+        move |fd: i32, data: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
+            let _profile = prof.host("net_send_async");
+            Ok(n.send_reply(fd, data, &pending))
+        },
+    )?;
 
     // net_socket(family, type, protocol) -> fd or -errno
     let n = net.clone();
@@ -1406,10 +1839,53 @@ fn addr_result(sa: &SocketAddr) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_calls::{PendingCalls, Wake};
     use crate::net_policy::AllowList;
+    use futures::{FutureExt, future::poll_fn};
+    use rustix::fd::{AsRawFd, RawFd};
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
 
-    fn open_net() -> Net {
-        Net::new(NetworkPolicy::AllowAll, None)
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn registrations(net: &Net) -> HashMap<i32, (tokio::runtime::Id, RawFd)> {
+        net.table()
+            .sockets
+            .iter()
+            .filter_map(|(&fd, s)| {
+                let registered = s.registration.as_ref()?;
+                let handle = match &registered.io {
+                    AsyncSocketIo::Stream(io) => io.as_fd(),
+                    AsyncSocketIo::Datagram(io) => io.as_fd(),
+                    AsyncSocketIo::Listener { io, .. } => io.as_fd(),
+                };
+                Some((fd, (registered.runtime, handle.as_raw_fd())))
+            })
+            .collect()
+    }
+
+    fn cached_readable(net: &Net, fd: i32) -> Option<std::io::Result<()>> {
+        let table = net.table();
+        match &table.sockets[&fd].registration.as_ref().unwrap().io {
+            AsyncSocketIo::Stream(io) => io.readable().now_or_never(),
+            AsyncSocketIo::Datagram(io) => io.readable().now_or_never(),
+            AsyncSocketIo::Listener { .. } => panic!("expected a stream or datagram"),
+        }
+    }
+
+    fn open_net() -> Arc<Net> {
+        Arc::new(Net::new(NetworkPolicy::AllowAll, None))
     }
 
     fn loopback(port: u16) -> SocketAddr {
@@ -1422,6 +1898,842 @@ mod tests {
 
     fn udp(net: &Net) -> i32 {
         net.socket(AF_INET, SOCK_DGRAM, 0).unwrap()
+    }
+
+    async fn wait_network(net: &Arc<Net>) -> std::io::Result<()> {
+        poll_fn(|cx| net.poll_ready(cx)).await
+    }
+
+    fn queue_network(net: &Arc<Net>, engine: &PendingCalls) {
+        engine.inbox.lock().unwrap().negotiated = true;
+
+        assert_eq!(net.wait_reply(&engine.inbox)[0], 2);
+        assert!(net.async_waiting.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn immediate_io_only_uses_syscalls_without_tokio_or_on_would_block() {
+        use std::io::ErrorKind;
+        for (result, expected, fallback) in [
+            (Some(Ok(7)), Ok(7), false),
+            (
+                Some(Err(ErrorKind::PermissionDenied.into())),
+                Err(errno::EACCES),
+                false,
+            ),
+            (Some(Err(ErrorKind::WouldBlock.into())), Ok(9), true),
+            (None, Ok(9), true),
+        ] {
+            let mut called = false;
+            assert_eq!(
+                immediate_io(result, || {
+                    called = true;
+                    Ok(9)
+                }),
+                expected
+            );
+            assert_eq!(called, fallback);
+        }
+        assert_eq!(
+            immediate_io(Some(Err(std::io::ErrorKind::WouldBlock.into())), || {
+                Err::<usize, _>(errno::EPIPE)
+            }),
+            Err(errno::EPIPE)
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_transfers_progress_without_yielding_to_the_reactor() {
+        let net = open_net();
+
+        let srv = tcp(&net);
+        net.bind(srv, loopback(0)).unwrap();
+        net.listen(srv, 1).unwrap();
+        let cli = net.socket(AF_INET, SOCK_STREAM, 6).unwrap();
+        connect_blocking(&net, cli, net.local_addr(srv).unwrap()).unwrap();
+        wait(&net, srv, POLLIN);
+        let (conn, _) = net.accept(srv).unwrap();
+        for _ in 0..2 {
+            assert_eq!(net.send(cli, b"ping"), Ok(4));
+            wait(&net, conn, POLLIN);
+            assert_eq!(net.recvfrom(conn, 4).unwrap(), (b"ping".to_vec(), None));
+            assert_eq!(net.send(conn, b"pong"), Ok(4));
+            wait(&net, cli, POLLIN);
+            assert_eq!(net.recvfrom(cli, 4).unwrap().0, b"pong");
+        }
+        assert_eq!(registrations(&net).len(), 2);
+        assert_eq!(net.peer_addr(cli).unwrap(), net.local_addr(conn).unwrap());
+        assert_eq!(net.peer_addr(conn).unwrap(), net.local_addr(cli).unwrap());
+        net.shutdown(cli, SHUT_WR).unwrap();
+        wait(&net, conn, POLLIN);
+        assert!(net.recvfrom(conn, 1).unwrap().0.is_empty());
+        assert!(
+            registrations(&net)
+                .values()
+                .all(|(runtime, _)| *runtime == tokio::runtime::Handle::current().id())
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_transfers_preserve_addresses_empty_datagrams_and_cached_readiness() {
+        let net = open_net();
+
+        let fd = net.socket(AF_INET, SOCK_DGRAM, 17).unwrap();
+        net.bind(fd, loopback(0)).unwrap();
+        let addr = net.local_addr(fd).unwrap();
+        let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        assert_eq!(net.sendto(fd, b"ping", peer_addr), Ok(4));
+        let mut buf = [0; 4];
+        assert_eq!(peer.recv_from(&mut buf).unwrap(), (4, addr));
+        assert_eq!(&buf, b"ping");
+        peer.send_to(b"pong", addr).unwrap();
+        wait(&net, fd, POLLIN);
+        assert_eq!(
+            net.recvfrom(fd, 4).unwrap(),
+            (b"pong".to_vec(), Some(peer_addr))
+        );
+
+        assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 0);
+        peer.send_to(b"ready", addr).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), wait_network(&net))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cached_readable(&net, fd).unwrap().is_ok());
+        assert_eq!(net.recvfrom(fd, 8).unwrap().0, b"ready");
+        assert_eq!(net.recvfrom(fd, 8), Err(errno::EAGAIN));
+        assert!(
+            cached_readable(&net, fd).is_none(),
+            "Tokio I/O must clear stale readiness"
+        );
+
+        peer.send_to(b"", addr).unwrap();
+        wait(&net, fd, POLLIN);
+        assert_eq!(net.recvfrom(fd, 0).unwrap(), (Vec::new(), Some(peer_addr)));
+        assert_eq!(net.recvfrom(fd, 8), Err(errno::EAGAIN));
+        net.connect(fd, peer_addr).unwrap();
+        assert_eq!(net.peer_addr(fd).unwrap(), peer_addr);
+        assert_eq!(net.send(fd, b""), Ok(0));
+        assert_eq!(peer.recv_from(&mut buf).unwrap(), (0, addr));
+        assert_eq!(net.sendto(fd, b"same", peer_addr), Ok(4));
+        assert_eq!(peer.recv_from(&mut buf).unwrap(), (4, addr));
+        assert_eq!(&buf, b"same");
+        net.disconnect(fd).unwrap();
+        assert_eq!(net.peer_addr(fd), Err(errno::ENOTCONN));
+        assert_eq!(net.sendto(fd, b"free", peer_addr), Ok(4));
+        assert_eq!(
+            peer.recv_from(&mut buf).unwrap(),
+            (4, net.local_addr(fd).unwrap())
+        );
+        assert_eq!(&buf, b"free");
+
+        let unbound = udp(&net);
+        assert_eq!(net.sendto(unbound, b"auto", peer_addr), Ok(4));
+        let source = peer.recv_from(&mut buf).unwrap().1;
+        assert_eq!(source.port(), net.local_addr(unbound).unwrap().port());
+        assert!(!registrations(&net).contains_key(&unbound));
+    }
+
+    #[test]
+    fn setup_io_survives_runtime_changes_without_driving_futures() {
+        let net = open_net();
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let mut buf = [0; 4];
+        for _ in 0..2 {
+            let old = registrations(&net).get(&fd).copied();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                assert_eq!(net.sendto(fd, b"data", peer_addr), Ok(4));
+                assert_eq!(registrations(&net)[&fd].0, runtime.handle().id());
+                assert_eq!(peer.recv_from(&mut buf).unwrap().0, 4);
+                assert_eq!(&buf, b"data");
+            });
+            assert!(old.is_none_or(|old| old.1 != registrations(&net)[&fd].1));
+            drop(runtime);
+            assert_eq!(net.sendto(fd, b"sync", peer_addr), Ok(4));
+            assert_eq!(peer.recv_from(&mut buf).unwrap().0, 4);
+            assert_eq!(&buf, b"sync");
+            peer.send_to(b"back", net.local_addr(fd).unwrap()).unwrap();
+            wait(&net, fd, POLLIN);
+            assert_eq!(net.recvfrom(fd, 4).unwrap().0, b"back");
+        }
+    }
+
+    #[tokio::test]
+    async fn tokio_transfers_keep_policy_checks_ahead_of_io() {
+        let net = Arc::new(Net::new(NetworkPolicy::AllowList(AllowList::empty()), None));
+
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        assert_eq!(net.sendto(fd, b"denied", loopback(9)), Err(errno::EACCES));
+        assert!(registrations(&net).is_empty());
+        // Establish a DNS association without the outbound-address check to
+        // exercise the separate payload policy in connected send.
+        net.connect_allowed(fd, loopback(53)).unwrap();
+        assert_eq!(net.send(fd, b"not a DNS question"), Err(errno::EACCES));
+        assert!(registrations(&net).is_empty());
+    }
+
+    #[test]
+    fn readiness_io_errors_use_the_shared_failure_path() {
+        let net = open_net();
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        net.poll(&[(fd, POLLIN)], 0);
+        let mut engine = PendingCalls::default();
+        queue_network(&net, &engine);
+        assert!(
+            poll_fn(|cx| engine.poll_batch(cx))
+                .now_or_never()
+                .unwrap()
+                .is_err()
+        );
+        assert!(!net.async_waiting.load(Ordering::Relaxed));
+        engine.clear();
+        assert!(!engine.is_pending());
+    }
+
+    #[tokio::test]
+    async fn pending_readiness_observes_new_socket_interests() {
+        let net = open_net();
+        let first = udp(&net);
+        net.bind(first, loopback(0)).unwrap();
+        net.poll(&[(first, POLLIN)], 0);
+        let pending = net.clone();
+        let wait = tokio::spawn(async move { wait_network(&pending).await });
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+        assert!(registrations(&net).contains_key(&first));
+        let second = udp(&net);
+        net.bind(second, loopback(0)).unwrap();
+        net.poll(&[(second, POLLIN)], 0);
+        let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        peer.send_to(b"new", net.local_addr(second).unwrap())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(net.recvfrom(second, 3).unwrap().0, b"new");
+    }
+
+    #[tokio::test]
+    async fn listening_replaces_stream_registration_and_wakes_the_waiter() {
+        let net = open_net();
+        let srv = tcp(&net);
+        net.bind(srv, loopback(0)).unwrap();
+        net.table()
+            .entry_mut(srv)
+            .unwrap()
+            .interests
+            .insert(PollFlags::IN);
+        let wakes = Arc::new(WakeCount::default());
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(net.poll_ready(&mut cx).is_pending());
+        assert!(registrations(&net).contains_key(&srv));
+        wakes.0.store(0, Ordering::Relaxed);
+
+        net.listen(srv, 1).unwrap();
+        assert!(wakes.0.load(Ordering::Relaxed) > 0);
+        assert!(!registrations(&net).contains_key(&srv));
+        assert!(net.has_waitable());
+        assert!(net.poll_ready(&mut cx).is_pending());
+        let peer = std::net::TcpStream::connect(net.local_addr(srv).unwrap()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(net.table().sockets[&srv].has_accepted());
+        assert_eq!(net.accept(srv).unwrap().1, Some(peer.local_addr().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn pending_readiness_survives_udp_reconnect_and_disconnect() {
+        let net = Arc::new(Net::new(NetworkPolicy::AllowAll, Some(ListenPorts::all())));
+        let fd = udp(&net);
+        let reservation = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        net.bind(fd, addr).unwrap();
+        let first = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        let second = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        net.connect(fd, first.local_addr().unwrap()).unwrap();
+
+        for reconnect in [true, false] {
+            assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 0);
+            let wakes = Arc::new(WakeCount::default());
+            let waker = std::task::Waker::from(wakes.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(net.poll_ready(&mut cx).is_pending());
+            wakes.0.store(0, Ordering::Relaxed);
+            if reconnect {
+                net.connect(fd, second.local_addr().unwrap()).unwrap();
+            } else {
+                net.disconnect(fd).unwrap();
+            }
+            #[cfg(target_vendor = "apple")]
+            assert!(wakes.0.load(Ordering::Relaxed) > 0);
+            assert!(net.has_waitable());
+            assert_eq!(net.local_addr(fd).unwrap(), addr);
+            second.send_to(b"new", addr).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(net.recvfrom(fd, 3).unwrap().0, b"new");
+            assert_eq!(net.recvfrom(fd, 3), Err(errno::EAGAIN));
+        }
+    }
+
+    #[test]
+    fn readiness_submission_is_bounded_and_cancellation_releases_the_wait() {
+        let net = open_net();
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        net.poll(&[(fd, POLLIN)], 0);
+        let mut engine = PendingCalls::default();
+        queue_network(&net, &engine);
+
+        assert_eq!(net.wait_reply(&engine.inbox), int_reply(-errno::EBUSY));
+        engine.clear();
+        assert!(!net.async_waiting.load(Ordering::Relaxed));
+        let mut count = 0;
+        while engine
+            .inbox
+            .lock()
+            .unwrap()
+            .submit_reply(std::future::pending())
+            .is_ok()
+        {
+            count += 1;
+            assert!(count <= 1024);
+        }
+        assert_eq!(count, 1024);
+        assert_eq!(net.wait_reply(&engine.inbox), int_reply(-errno::ENOBUFS));
+        assert!(!net.async_waiting.load(Ordering::Relaxed));
+        engine.clear();
+    }
+
+    #[test]
+    fn socket_churn_across_runtimes_releases_old_registrations() {
+        let net = Arc::new(Net::new(NetworkPolicy::AllowAll, Some(ListenPorts::all())));
+        let mut sockets: Vec<_> = (0..32)
+            .map(|_| {
+                let fd = udp(&net);
+                net.bind(fd, loopback(0)).unwrap();
+                (fd, net.local_addr(fd).unwrap())
+            })
+            .collect();
+        let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        for turn in 0..8u8 {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let old = registrations(&net);
+                let interests: Vec<_> = sockets.iter().map(|(fd, _)| (*fd, POLLIN)).collect();
+                assert_eq!(net.poll(&interests, 0).0, 0);
+                assert!(wait_network(&net).now_or_never().is_none());
+                let current = registrations(&net);
+                assert!(current.values().all(|s| s.0 == runtime.handle().id()));
+                assert!(old.iter().all(|(fd, s)| s.1 != current[fd].1));
+                for (fd, addr) in sockets.iter_mut().step_by(2) {
+                    net.close(*fd).unwrap();
+                    assert!(!net.table().sockets.contains_key(fd));
+                    *fd = udp(&net);
+                    net.bind(*fd, *addr).unwrap();
+                }
+                let interests: Vec<_> = sockets.iter().map(|(fd, _)| (*fd, POLLIN)).collect();
+                assert_eq!(net.poll(&interests, 0).0, 0);
+                assert!(wait_network(&net).now_or_never().is_none());
+                assert_eq!(registrations(&net).len(), sockets.len());
+                for (_, addr) in &sockets {
+                    assert_eq!(peer.send_to(&[turn], addr).unwrap(), 1);
+                }
+                let mut remaining: HashSet<_> = sockets.iter().map(|(fd, _)| *fd).collect();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !remaining.is_empty() {
+                        wait_network(&net).await.unwrap();
+                        remaining.retain(|fd| match net.recvfrom(*fd, 1) {
+                            Ok((bytes, _)) => {
+                                assert_eq!(bytes, [turn]);
+                                false
+                            }
+                            Err(e) if e == errno::EAGAIN => true,
+                            Err(e) => panic!("recv failed: errno {e}"),
+                        });
+                    }
+                })
+                .await
+                .unwrap();
+                net.poll(&interests, 0);
+                assert!(wait_network(&net).now_or_never().is_none());
+            });
+        }
+        net.reset();
+        assert!(net.table().sockets.is_empty());
+        for (_, addr) in sockets {
+            let _rebound = std::net::UdpSocket::bind(addr).unwrap();
+        }
+    }
+
+    #[test]
+    fn typed_network_calls_reject_closed_fds_before_authorization() {
+        let net = open_net();
+        let inbox = Arc::new(Mutex::new(crate::async_calls::Inbox::default()));
+        let fd = udp(&net);
+        net.close(fd).unwrap();
+        assert_eq!(
+            net.connect_reply(fd, loopback(9), &inbox),
+            int_reply(-errno::EBADF)
+        );
+        assert_eq!(
+            net.send_reply(fd, vec![1], &inbox),
+            int_reply(-errno::EBADF)
+        );
+        assert_eq!(
+            net.sendto_reply(fd, vec![1], loopback(9), &inbox),
+            int_reply(-errno::EBADF)
+        );
+        assert!(!inbox.lock().unwrap().is_pending());
+    }
+
+    #[tokio::test]
+    async fn readiness_calls_share_batches_with_embedder_calls_and_timers() {
+        let net = open_net();
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 0);
+        let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        let mut engine = PendingCalls::default();
+        engine.inbox.lock().unwrap().negotiated = true;
+        queue_network(&net, &engine);
+        assert!(poll_fn(|cx| engine.poll_batch(cx)).now_or_never().is_none());
+        let registration = registrations(&net)[&fd];
+        for _ in 0..3 {
+            assert_eq!(registration, registrations(&net)[&fd]);
+            engine
+                .inbox
+                .lock()
+                .unwrap()
+                .submit(
+                    "ready".into(),
+                    String::new(),
+                    crate::closure_handler(|_| futures::future::ready(Ok("7".into())).boxed()),
+                )
+                .unwrap();
+            assert_eq!(
+                poll_fn(|cx| engine.poll_batch(cx)).await.unwrap(),
+                Wake::Calls
+            );
+            engine.delivered();
+            assert_eq!(registration, registrations(&net)[&fd]);
+        }
+        peer.send_to(b"data", net.local_addr(fd).unwrap()).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        engine.set_timer(Some(std::time::Instant::now() - Duration::from_secs(1)));
+        engine
+            .inbox
+            .lock()
+            .unwrap()
+            .submit(
+                "ready".into(),
+                String::new(),
+                crate::closure_handler(|_| futures::future::ready(Ok("7".into())).boxed()),
+            )
+            .unwrap();
+        assert_eq!(
+            poll_fn(|cx| engine.poll_batch(cx)).await.unwrap(),
+            Wake::Calls
+        );
+        let batch = engine.take_batch();
+        assert_eq!(u32::from_le_bytes(batch[4..8].try_into().unwrap()), 2);
+        assert_eq!(
+            batch.len(),
+            39,
+            "readiness uses an ordinary typed completion"
+        );
+        engine.delivered();
+        assert!(!net.has_waitable());
+        assert!(!engine.is_pending());
+        assert!(poll_fn(|cx| engine.poll_batch(cx)).now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn readiness_rechecks_changed_interests_and_rearms_each_direction() {
+        let net = open_net();
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        for _ in 0..2 {
+            assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 0);
+            let mut wait = Box::pin(wait_network(&net));
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            peer.send_to(b"data", net.local_addr(fd).unwrap()).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // A synchronous guest poll/recv consumes the interest before the
+            // shared engine observes its queued readiness.
+            assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 1);
+            assert_eq!(net.recvfrom(fd, 16).unwrap().0, b"data");
+            assert!(wait.now_or_never().unwrap().is_ok());
+
+            net.table()
+                .entry_mut(fd)
+                .unwrap()
+                .interests
+                .insert(PollFlags::OUT);
+            tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!net.has_waitable());
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_waits_do_not_retain_closed_reset_or_dropped_sockets() {
+        for action in 0..3 {
+            let net = open_net();
+            let fd = udp(&net);
+            net.bind(fd, loopback(0)).unwrap();
+            let addr = net.local_addr(fd).unwrap();
+            net.poll(&[(fd, POLLIN)], 0);
+            let mut engine = PendingCalls::default();
+            queue_network(&net, &engine);
+            let wakes = Arc::new(WakeCount::default());
+            let waker = std::task::Waker::from(wakes.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(engine.poll_batch(&mut cx).is_pending());
+            assert!(registrations(&net).contains_key(&fd));
+            wakes.0.store(0, Ordering::Relaxed);
+            match action {
+                0 => net.close(fd).unwrap(),
+                1 => net.reset(),
+                _ => drop(net),
+            }
+            // No intervening engine poll or prune: close/rebind can happen
+            // during one guest entry while its old future is still retained.
+            assert!(wakes.0.load(Ordering::Relaxed) > 0);
+            let _rebound = std::net::UdpSocket::bind(addr).unwrap();
+            assert_eq!(
+                engine.poll_batch(&mut cx).map(Result::unwrap),
+                Poll::Ready(Wake::Calls)
+            );
+            engine.clear();
+        }
+    }
+
+    #[test]
+    fn readiness_reports_io_errors_and_rebinds_after_runtime_changes() {
+        let net = open_net();
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        net.poll(&[(fd, POLLIN)], 0);
+        assert!(
+            wait_network(&net).now_or_never().unwrap().is_err(),
+            "missing runtime must be an error"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(wait_network(&net).now_or_never().is_none());
+        });
+        drop(runtime);
+        assert!(wait_network(&net).now_or_never().unwrap().is_err());
+        net.poll(&[(fd, POLLIN)], 0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(wait_network(&net).now_or_never().is_none());
+            let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+            peer.send_to(b"data", net.local_addr(fd).unwrap()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn clearing_shared_waits_keeps_live_sockets_but_discards_their_wakes() {
+        let net = open_net();
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        net.poll(&[(fd, POLLIN)], 0);
+        let mut engine = PendingCalls::default();
+        queue_network(&net, &engine);
+        assert!(poll_fn(|cx| engine.poll_batch(cx)).now_or_never().is_none());
+        engine.clear();
+        assert!(!net.async_waiting.load(Ordering::Relaxed));
+        let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        peer.send_to(b"data", net.local_addr(fd).unwrap()).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(poll_fn(|cx| engine.poll_batch(cx)).now_or_never().is_none());
+        queue_network(&net, &engine);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), poll_fn(|cx| engine.poll_batch(cx)))
+                .await
+                .unwrap()
+                .unwrap(),
+            Wake::Calls
+        );
+        assert_eq!(net.recvfrom(fd, 16).unwrap().0, b"data");
+    }
+
+    #[tokio::test]
+    async fn async_readiness_rearms_without_stale_events_and_releases_sockets() {
+        let net = open_net();
+
+        let fd = udp(&net);
+        net.bind(fd, loopback(0)).unwrap();
+        let peer = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        let addr = net.local_addr(fd).unwrap();
+        for _ in 0..2 {
+            assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 0);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), wait_network(&net))
+                    .await
+                    .is_err()
+            );
+            peer.send_to(b"data", addr).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!net.has_waitable());
+            assert_eq!(net.recvfrom(fd, 16).unwrap().0, b"data");
+        }
+        assert_eq!(registrations(&net).len(), 1);
+        net.table().remove(fd).unwrap();
+        assert!(net.table().sockets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_listener_preserves_accepts_across_wait_cancellation_and_guest_polling() {
+        let net = open_net();
+        let srv = tcp(&net);
+        net.bind(srv, loopback(0)).unwrap();
+        net.listen(srv, 4).unwrap();
+        for _ in 0..2 {
+            assert_eq!(net.poll(&[(srv, POLLIN | POLLOUT)], 0), (0, vec![0]));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), wait_network(&net))
+                    .await
+                    .is_err()
+            );
+            let peer = std::net::TcpStream::connect(net.local_addr(srv).unwrap()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(net.table().sockets[&srv].has_accepted());
+            // A second wait must not consume another connection or overwrite
+            // the first. Its writable interest must not wake spuriously.
+            net.table()
+                .entry_mut(srv)
+                .unwrap()
+                .interests
+                .insert(PollFlags::IN);
+            wait_network(&net).await.unwrap();
+            assert_eq!(net.poll(&[(srv, POLLIN | POLLOUT)], 0), (1, vec![POLLIN]));
+            let (fd, addr) = net.accept(srv).unwrap();
+            assert_eq!(addr, Some(peer.local_addr().unwrap()));
+            assert_eq!(net.recvfrom(fd, 1), Err(errno::EAGAIN));
+            net.close(fd).unwrap();
+        }
+        net.close(srv).unwrap();
+        assert!(net.table().sockets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_stream_connect_read_rearm_and_eof() {
+        use std::io::Write;
+        let net = open_net();
+
+        let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let fd = tcp(&net);
+        let result = net.connect(fd, listener.local_addr().unwrap());
+        assert!(
+            result == Ok(()) || result == Err(errno::EINPROGRESS),
+            "{result:?}"
+        );
+        let (mut peer, _) = listener.accept().unwrap();
+        net.table()
+            .entry_mut(fd)
+            .unwrap()
+            .interests
+            .insert(PollFlags::OUT);
+        tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(net.getsockopt(fd, SOL_SOCKET, SO_ERROR).unwrap(), 0);
+        for _ in 0..2 {
+            assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 0);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), wait_network(&net))
+                    .await
+                    .is_err()
+            );
+            peer.write_all(b"ping").unwrap();
+            tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(net.recvfrom(fd, 4).unwrap().0, b"ping");
+            assert_eq!(net.recvfrom(fd, 4), Err(errno::EAGAIN));
+            assert!(cached_readable(&net, fd).is_none());
+        }
+        assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 0);
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(net.recvfrom(fd, 1).unwrap().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_stream_writability_recovers_after_backpressure() {
+        use std::io::Read;
+        let net = open_net();
+
+        let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let fd = tcp(&net);
+        connect_blocking(&net, fd, listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        net.setsockopt(fd, SOL_SOCKET, SO_SNDBUF, 4096).unwrap();
+        let chunk = [1u8; 65536];
+        let mut sent = 0;
+        loop {
+            match net.send(fd, &chunk) {
+                Ok(n) => sent += n,
+                Err(e) if e == errno::EAGAIN => break,
+                Err(e) => panic!("send failed: {e}"),
+            }
+            assert!(sent < 16 * 1024 * 1024, "failed to fill the send buffer");
+        }
+        assert_eq!(net.poll(&[(fd, POLLOUT)], 0).0, 0);
+        let reader = std::thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut data = vec![0; sent];
+            peer.read_exact(&mut data).unwrap();
+            peer
+        });
+        tokio::time::timeout(Duration::from_secs(5), wait_network(&net))
+            .await
+            .unwrap()
+            .unwrap();
+        let _peer = reader.join().unwrap();
+        assert!(net.send(fd, b"more").unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn closing_or_resetting_sockets_wakes_pending_readiness_and_releases_ports() {
+        use futures::{FutureExt, poll};
+        for reset in [false, true] {
+            let net = open_net();
+            let fd = udp(&net);
+            net.bind(fd, loopback(0)).unwrap();
+            let addr = net.local_addr(fd).unwrap();
+            assert_eq!(net.poll(&[(fd, POLLIN)], 0).0, 0);
+            let mut wait = wait_network(&net).boxed();
+            assert!(poll!(&mut wait).is_pending());
+            if reset {
+                net.reset();
+            } else {
+                net.close(fd).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(1), wait)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(net.table().sockets.is_empty());
+            assert!(!net.has_waitable());
+            let _rebound = std::net::UdpSocket::bind(addr).unwrap();
+        }
+    }
+
+    #[test]
+    fn async_registration_moves_between_runtimes_without_losing_accepts() {
+        let net = open_net();
+        let srv = tcp(&net);
+        net.bind(srv, loopback(0)).unwrap();
+        net.listen(srv, 1).unwrap();
+        assert_eq!(net.poll(&[(srv, POLLIN)], 0).0, 0);
+        let peer = std::net::TcpStream::connect(net.local_addr(srv).unwrap()).unwrap();
+        for _ in 0..2 {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                net.table()
+                    .entry_mut(srv)
+                    .unwrap()
+                    .interests
+                    .insert(PollFlags::IN);
+                tokio::time::timeout(Duration::from_secs(1), wait_network(&net))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(registrations(&net)[&srv].0, runtime.handle().id());
+                assert!(net.table().sockets[&srv].has_accepted());
+            });
+        }
+        assert_eq!(net.poll(&[(srv, POLLIN)], 0), (1, vec![POLLIN]));
+        assert_eq!(net.accept(srv).unwrap().1, Some(peer.local_addr().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn buffered_listener_errors_reach_guest_accept_and_poll_counts_each_entry() {
+        let net = open_net();
+        let srv = tcp(&net);
+        net.bind(srv, loopback(0)).unwrap();
+        net.listen(srv, 1).unwrap();
+        assert_eq!(net.poll(&[(srv, POLLIN)], 0).0, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), wait_network(&net))
+                .await
+                .is_err()
+        );
+        {
+            let mut table = net.table();
+            let AsyncSocketIo::Listener { accepted, .. } = &mut table
+                .entry_mut(srv)
+                .unwrap()
+                .registration
+                .as_mut()
+                .unwrap()
+                .io
+            else {
+                panic!("listener registered as a stream");
+            };
+            *accepted = Some(Err(std::io::ErrorKind::ConnectionAborted.into()));
+        }
+        assert_eq!(
+            net.poll(&[(srv, POLLIN), (srv, POLLIN), (-1, POLLOUT)], 1000),
+            (3, vec![POLLIN, POLLIN, POLLNVAL])
+        );
+        assert_eq!(net.poll(&[(srv, POLLIN)], -1).0, -errno::EINVAL);
+        assert_eq!(net.accept(srv), Err(errno::ECONNABORTED));
+        assert_eq!(net.poll(&[(srv, POLLIN)], 0).0, 0);
     }
 
     /// Wait until `fd` reports `events` (bounded), returning revents.
@@ -1798,7 +3110,8 @@ mod tests {
     #[test]
     fn stream_sendto_goes_to_and_is_judged_by_the_peer() {
         use std::io::Read as _;
-        let net = Net::new(NetworkPolicy::AllowAll, None);
+        let net = Arc::new(Net::new(NetworkPolicy::AllowAll, None));
+        let inbox = Arc::new(Mutex::new(crate::async_calls::Inbox::default()));
         let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
         let s = tcp(&net);
         match net.connect(s, listener.local_addr().unwrap()) {
@@ -1811,6 +3124,12 @@ mod tests {
         let metadata: SocketAddr = "169.254.169.254:80".parse().unwrap();
         assert_eq!(net.sendto(s, b"hi", metadata), Ok(2));
         let mut got = [0u8; 2];
+        peer.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hi");
+        assert_eq!(
+            net.sendto_reply(s, b"hi".to_vec(), metadata, &inbox),
+            int_reply(2)
+        );
         peer.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"hi");
     }
@@ -1847,7 +3166,8 @@ mod tests {
             NetworkPolicy::Filter(Filter::new(DenyAll)),
         ];
         for policy in policies {
-            let net = Net::new(policy, None);
+            let net = Arc::new(Net::new(policy, None));
+            let inbox = Arc::new(Mutex::new(crate::async_calls::Inbox::default()));
             let first = UdpSocket::bind(loopback(0)).unwrap();
             let second = UdpSocket::bind(loopback(0)).unwrap();
             first.set_nonblocking(true).unwrap();
@@ -1856,6 +3176,7 @@ mod tests {
             for peer in [&first, &second] {
                 let addr = peer.local_addr().unwrap();
                 net.connect(s, addr).unwrap();
+                assert_eq!(net.connect_reply(s, addr, &inbox), int_reply(0));
                 assert_eq!(net.peer_addr(s).unwrap(), addr);
                 assert_eq!(net.table().meta(s).unwrap().peer, Some(addr));
                 assert!(net.local_addr(s).unwrap().ip().is_loopback());
@@ -1863,6 +3184,14 @@ mod tests {
                 assert_eq!(net.send(s, b"blocked"), Err(errno::EACCES));
                 assert_eq!(net.send(s, b""), Err(errno::EACCES));
                 assert_eq!(net.sendto(s, b"blocked", addr), Err(errno::EACCES));
+                assert_eq!(
+                    net.send_reply(s, b"blocked".to_vec(), &inbox),
+                    int_reply(-errno::EACCES)
+                );
+                assert_eq!(
+                    net.sendto_reply(s, b"blocked".to_vec(), addr, &inbox),
+                    int_reply(-errno::EACCES)
+                );
                 assert_eq!(net.recvfrom(s, 64), Err(errno::EAGAIN));
             }
             let previous = net.peer_addr(s).unwrap();

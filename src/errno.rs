@@ -114,7 +114,6 @@ pub const ESOCKTNOSUPPORT: i32 = 94;
 pub const EPFNOSUPPORT: i32 = 96;
 #[cfg(any(windows, target_vendor = "apple"))]
 pub const ENETRESET: i32 = 102;
-#[cfg(any(windows, target_vendor = "apple"))]
 pub const ENOBUFS: i32 = 105;
 #[cfg(any(windows, target_vendor = "apple"))]
 pub const EHOSTDOWN: i32 = 112;

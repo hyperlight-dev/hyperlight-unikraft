@@ -76,6 +76,37 @@ pub fn guest_log<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
     (result, lines)
 }
 
+// Python's high-level helper only accepts its driver thread. Exercise
+// independent guest waiters through the same driver ioctl ABI.
+#[allow(dead_code)]
+pub const RAW_HOST_CALL: &str = r#"
+import array, fcntl, os, struct, threading
+fd = os.open("/dev/hlcall", os.O_RDWR)
+def raw_call(name, args=b"[]", capacity=1024):
+    name = array.array("B", name.encode())
+    args = array.array("B", args)
+    out = array.array("B", b"\0" * capacity)
+    request = bytearray(struct.pack("=7Q", name.buffer_info()[0], len(name),
+                        args.buffer_info()[0], len(args), out.buffer_info()[0], len(out), 0))
+    fcntl.ioctl(fd, 0xc0384803, request)
+    n = struct.unpack("=7Q", request)[6]
+    result = out.tobytes()[:n]
+    assert result[0] == 0, result
+    return result[1:]
+"#;
+
+/// Calling-thread CPU time, quantized to Linux USER_HZ (10 ms) ticks.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub fn thread_cpu_time() -> std::time::Duration {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("procfs");
+    let rest = &stat[stat.rfind(')').expect("stat format") + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // utime/stime are fields 14/15; the suffix starts at field 3.
+    let ticks = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+    std::time::Duration::from_millis(ticks * 10)
+}
+
 #[allow(dead_code)]
 pub fn rootfs(runtime: &str) -> Option<PathBuf> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

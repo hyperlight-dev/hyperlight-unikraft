@@ -7,14 +7,21 @@
 //! ```no_run
 //! use hyperlight_unikraft::SandboxBuilder;
 //!
-//! let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
-//!     .scratch_mb(256)
-//!     .boot()?;
-//! sandbox.run("print('hello')")?;
-//! let output = sandbox.drain_output();
-//! assert!(output.contains("hello"));
-//! # Ok::<(), hyperlight_unikraft::Error>(())
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() -> hyperlight_unikraft::Result<()> {
+//!     let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
+//!         .scratch_mb(256)
+//!         .boot()?;
+//!     sandbox.run_async("print('hello')").await?;
+//!     let output = sandbox.drain_output();
+//!     assert!(output.contains("hello"));
+//!     Ok(())
+//! }
 //! ```
+//!
+//! Driving methods are async and require Tokio's time and I/O drivers.
+//! Synchronous driving methods remain as migration adapters. Boot, submission, snapshots and
+//! restore remain synchronous and may enqueue work for the next async step.
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -37,6 +44,7 @@ pub use hyperlight_host::{HostFunctions, sandbox::snapshot::Snapshot};
 
 use tracing::{debug, info};
 
+mod async_calls;
 mod cgroup;
 #[cfg(feature = "cpio")]
 pub mod cpio;
@@ -64,6 +72,12 @@ pub use profile::Profile;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// This kernel does not negotiate async calls and restore interruption.
+    #[error("the kernel does not support async host calls with restore interruption")]
+    AsyncHostCallsUnsupported,
+    /// A host readiness wait failed.
+    #[error("waiting for guest I/O: {0}")]
+    Wait(#[source] std::io::Error),
     /// The driver reported the call failed, with the status it gave (see
     /// [`Yield::CallFailed`]).  The guest is alive; its output has the
     /// details.
@@ -83,7 +97,7 @@ pub enum Error {
     )]
     Deadlocked,
     /// The guest has no driver to serve calls: its entry point is a plain
-    /// program, driven with [`AppSandbox::join`].
+    /// program, driven with [`AppSandbox::join_async`].
     #[error(
         "the guest has no driver to serve calls: its entry point is a plain program (drive it \
          with join)"
@@ -93,7 +107,7 @@ pub enum Error {
     #[error("a call is already in flight; step until it is done first")]
     CallInFlight,
     /// Nothing in the guest can exit: its driver is waiting for a call
-    /// (use [`AppSandbox::run`] or [`AppSandbox::submit`], not `join`).
+    /// (use [`AppSandbox::run_async`] or [`AppSandbox::submit`], not `join`).
     #[error(
         "nothing in the guest can exit: its driver is waiting for a call (use run or submit \
          instead of join)"
@@ -185,8 +199,21 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type HostFunction =
     Arc<dyn Fn(&str) -> std::result::Result<String, String> + Send + Sync + 'static>;
 
+fn closure_handler<F, Fut>(function: F) -> async_calls::Handler
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<String, String>> + Send + 'static,
+{
+    Arc::new(move |args| Box::pin(function(args)))
+}
+
 /// The host functions a sandbox offers, by name.
-type HostFunctionTable = Arc<std::collections::BTreeMap<String, HostFunction>>;
+enum RegisteredHostFunction {
+    Sync(HostFunction),
+    Async(async_calls::Handler),
+}
+
+type HostFunctionTable = Arc<std::collections::BTreeMap<String, RegisteredHostFunction>>;
 
 /// The function [`SandboxBuilder::on_interrupt_handle`] stores.  The mutex
 /// keeps the builder `Sync` without asking that of the function, which is
@@ -203,7 +230,12 @@ const HOST_CALL_ERR: u8 = 1;
 /// empty name, which no function can have, lists the registered names one
 /// per line: how a driver learns what to offer before anything is called
 /// (the quickjs driver builds its `host:` modules from it).
-fn dispatch_host_call(table: &HostFunctionTable, name: &str, args: &[u8]) -> Vec<u8> {
+fn dispatch_host_call(
+    table: &HostFunctionTable,
+    inbox: &Mutex<async_calls::Inbox>,
+    name: &str,
+    args: &[u8],
+) -> Vec<u8> {
     // The name is the guest's: quoted in an error, it is cut short, so a
     // long one cannot push the reply past what the guest can take.
     let shown = || name.chars().take(128).collect::<String>();
@@ -215,11 +247,28 @@ fn dispatch_host_call(table: &HostFunctionTable, name: &str, args: &[u8]) -> Vec
             .join("\n"))
     } else {
         match (table.get(name), std::str::from_utf8(args)) {
-            (Some(f), Ok(args)) => f(args),
+            (Some(RegisteredHostFunction::Sync(f)), Ok(args)) => f(args),
+            (Some(RegisteredHostFunction::Async(f)), Ok(args)) => {
+                match inbox
+                    .lock()
+                    .unwrap()
+                    .submit(name.into(), args.into(), f.clone())
+                {
+                    Ok(id) => {
+                        return async_calls::pending_reply(id);
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             (Some(_), Err(_)) => Err(format!("{}: the arguments are not UTF-8 text", shown())),
             (None, _) => Err(format!("no host function {:?}", shown())),
         }
     };
+    encode_host_reply(name, reply)
+}
+
+fn encode_host_reply(name: &str, reply: std::result::Result<String, String>) -> Vec<u8> {
+    let shown = || name.chars().take(128).collect::<String>();
     let (tag, text) = match reply {
         Ok(text) => (HOST_CALL_OK, text),
         Err(message) => (HOST_CALL_ERR, message),
@@ -471,10 +520,6 @@ const H2G_POOL_PAGES: usize = H2G_BUFFERS * H2G_BUFFER_SIZE / PAGE_SIZE;
 /// ([`Error::CallTooLarge`]).
 pub const CALL_PAYLOAD_MAX: usize = GUEST_CALL_MAX - 4096;
 
-// Hyperlight keeps one H2G buffer spare for a call with byte parameters;
-// hluk's guest functions (`step`, `Exec`, `Call`, ...) take strings and
-// integers only, and the kernel serves no other, so every buffer is the
-// call's.
 const _: () = {
     assert!(HOST_CALL_MAX >= 64 * 1024);
     // A guest function call can be as large as a host call's whole
@@ -953,11 +998,14 @@ impl Mount {
     /// # use std::sync::Arc;
     /// # use hyperlight_unikraft::{FsBackend, Mount, SandboxBuilder};
     /// # fn quota_backend() -> Arc<dyn FsBackend> { unimplemented!() }
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> hyperlight_unikraft::Result<()> {
     /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
     ///     .mount(Mount::backend(quota_backend(), "/output", false))
     ///     .boot()?;
-    /// sandbox.run("open('/output/result.txt', 'w').write('42')")?;
+    /// sandbox.run_async("open('/output/result.txt', 'w').write('42')").await?;
     /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// # }
     /// ```
     pub fn backend(
         backend: Arc<dyn FsBackend>,
@@ -975,7 +1023,7 @@ impl Mount {
 
 // ── Cooperative step ────────────────────────────────────────────────────
 
-/// Why [`AppSandbox::step`] handed control back.
+/// Why [`AppSandbox::step_async`] handed control back.
 ///
 /// The guest runs its scheduler only until every thread is blocked, then
 /// yields the vCPU with a report; the host waits for what the report says
@@ -999,7 +1047,7 @@ pub enum Yield {
     /// Every guest thread is blocked.  `until` is the guest's next timer,
     /// or `None` when only I/O on one of its host sockets can wake it.
     ///
-    /// [`AppSandbox::step`] returns this in two cases it does not tell
+    /// [`AppSandbox::step_async`] returns this in two cases it does not tell
     /// apart: the guest ran and blocked again, or the timeout ran out and
     /// the VM was never entered (then `until` is the last one heard).
     /// TODO: a distinct variant if a caller ever needs to know whether
@@ -1251,6 +1299,7 @@ pub(crate) struct GuestConfig {
     result: Arc<Mutex<Option<Vec<u8>>>>,
     /// The embedder's functions, served through `HostCall`.
     host_functions: HostFunctionTable,
+    async_inbox: Arc<Mutex<async_calls::Inbox>>,
     /// Whether to register `HostWriteErr`; off only to test a host
     /// without it ([`SandboxBuilder::without_host_write_err`]).
     host_write_err: bool,
@@ -1299,6 +1348,7 @@ impl GuestConfig {
             events: Arc::new(Mutex::new(Vec::new())),
             result: Arc::new(Mutex::new(None)),
             host_functions: HostFunctionTable::default(),
+            async_inbox: Arc::default(),
             host_write_err: true,
             guest: Mutex::new(Guest::default()),
             profile: profile::Profile::new(),
@@ -1354,7 +1404,7 @@ impl GuestConfig {
     /// # use hyperlight_unikraft::SandboxBuilder;
     /// let sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio").boot().unwrap();
     /// sandbox.set_env_vars(&[("MY_VAR", "hello"), ("DEBUG", "1")]);
-    /// // the next sandbox.run(…) observes them
+    /// // the next sandbox.run_async(…) observes them
     /// ```
     pub fn set_env_vars(&self, vars: &[(&str, &str)]) {
         let mut s = String::new();
@@ -1741,12 +1791,37 @@ impl GuestConfig {
         // The embedder's functions, all behind one name: the kernel
         // forwards a driver's HLCALL_IOC_HOSTCALL here as it is.
         let table = self.host_functions.clone();
+        let inbox = self.async_inbox.clone();
         let prof = self.profile.clone();
         target.register_host_function(
             "HostCall",
             move |name: String, args: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
                 let _profile = prof.host("HostCall");
-                Ok(dispatch_host_call(&table, &name, &args))
+                Ok(dispatch_host_call(&table, &inbox, &name, &args))
+            },
+        )?;
+        let inbox = self.async_inbox.clone();
+        target.register_host_function(
+            "AsyncHostCallVersion",
+            move || -> hyperlight_host::Result<u64> {
+                inbox.lock().unwrap().negotiated = true;
+                Ok(async_calls::VERSION)
+            },
+        )?;
+        let inbox = self.async_inbox.clone();
+        target.register_host_function(
+            "AsyncHostCallInterruptVersion",
+            move || -> hyperlight_host::Result<u64> {
+                inbox.lock().unwrap().interrupt_supported = true;
+                Ok(1)
+            },
+        )?;
+        let inbox = self.async_inbox.clone();
+        target.register_host_function(
+            "CancelAsyncHostCall",
+            move |id: u64| -> hyperlight_host::Result<i32> {
+                inbox.lock().unwrap().cancel(id);
+                Ok(0)
             },
         )?;
         let events = self.events.clone();
@@ -1784,8 +1859,13 @@ impl GuestConfig {
         // to use the network.
         hostfs::register(target, &self.mounts, &self.profile)?;
         match &self.net {
-            Some(net) => hostnet::register(target, net, &self.profile)?,
-            None => hostnet::register(target, &Arc::new(hostnet::Net::disabled()), &self.profile)?,
+            Some(net) => hostnet::register(target, net, &self.profile, &self.async_inbox)?,
+            None => hostnet::register(
+                target,
+                &Arc::new(hostnet::Net::disabled()),
+                &self.profile,
+                &self.async_inbox,
+            )?,
         }
 
         Ok(())
@@ -1900,35 +1980,6 @@ impl GuestConfig {
     /// could watch, will ever change its state.
     fn can_wake(&self) -> bool {
         self.next_wakeup_at().is_some() || self.net.as_ref().is_some_and(|n| n.has_waitable())
-    }
-
-    /// Park the host until the guest may be runnable again: its next timer
-    /// is due, or one of its host sockets is ready.  Waits at most `cap`,
-    /// or without limit for `None`.  Returns `false` if the cap ran out
-    /// first, or if there was nothing to wait for.
-    ///
-    /// The VM is halted throughout; the host thread sits in `poll(2)` on
-    /// the guest's sockets (a plain sleep when it has none).
-    fn wait_runnable(&self, cap: Option<Duration>) -> bool {
-        let deadline = self.next_wakeup_at();
-        let to_timer = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        let dur = match (to_timer, cap) {
-            (Some(t), Some(c)) => Some(t.min(c)),
-            (Some(t), None) => Some(t),
-            (None, Some(c)) => Some(c),
-            (None, None) => None,
-        };
-        let woke_on_io = match (dur, &self.net) {
-            (Some(d), _) if d.is_zero() => false,
-            (_, Some(net)) => net.wait_ready(dur),
-            (Some(d), None) => {
-                std::thread::sleep(d);
-                false
-            }
-            // No timer, no cap, no sockets: nothing could end the wait.
-            (None, None) => false,
-        };
-        woke_on_io || deadline.is_some_and(|d| Instant::now() >= d)
     }
 }
 
@@ -2241,14 +2292,17 @@ fn assemble_sandbox(
 /// ```no_run
 /// use hyperlight_unikraft::{SandboxBuilder, Mount, NetworkPolicy};
 ///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> hyperlight_unikraft::Result<()> {
 /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
 ///     .scratch_mb(256)
 ///     .mount(Mount::ro("/data", "/mnt/data"))
 ///     .network(NetworkPolicy::AllowAll)
 ///     .env("GREETING", "hi")
 ///     .boot()?;
-/// sandbox.run("import os; print(os.environ['GREETING'])")?;
-/// # Ok::<(), hyperlight_unikraft::Error>(())
+/// sandbox.run_async("import os; print(os.environ['GREETING'])").await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct SandboxBuilder {
     kernel: Option<PathBuf>,
@@ -2264,7 +2318,7 @@ pub struct SandboxBuilder {
     listen_ports: Option<ListenPorts>,
     env_vars: Vec<(String, String)>,
     resolv_conf: Option<String>,
-    host_functions: std::collections::BTreeMap<String, HostFunction>,
+    host_functions: std::collections::BTreeMap<String, RegisteredHostFunction>,
     profile: Option<bool>,
     host_write_err: bool,
     output_limit: usize,
@@ -2442,24 +2496,27 @@ impl SandboxBuilder {
     /// code in the sandbox one capability rather than a directory or the
     /// network.  It takes the guest's argument text and returns its result
     /// text, or an error message the guest raises; the drivers pass JSON.
-    /// JavaScript calls it as `host.call(name, ...args)` (quickjs, node),
+    /// JavaScript calls it as `host.call_async(name, ...args)` (quickjs, node),
     /// and in quickjs `a.b` is also the export `b` of the module `host:a`;
-    /// Python as `hyperlight.call(name, *args)` or `hyperlight.host.a.b()`
+    /// Python as `hyperlight.call_async(name, *args)` or `hyperlight.host.a.b()`
     /// (python, python-shell, agent); C# as `Host.Call(name, args)`
-    /// (dotnet-jit); Java as `Host.call(name, args)` (java); PHP as
+    /// (dotnet-jit); Java as `Host.call_async(name, args)` (java); PHP as
     /// `Hyperlight\call($name, ...$args)` (php); the wasmtime image
     /// satisfies a module's or a component's import `a.b` with it.
     ///
     /// ```no_run
     /// # use hyperlight_unikraft::SandboxBuilder;
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> hyperlight_unikraft::Result<()> {
     /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/quickjs.cpio")
     ///     .host_function("math.add", |args| {
     ///         let [a, b]: [f64; 2] = serde_json::from_str(args).map_err(|e| e.to_string())?;
     ///         Ok((a + b).to_string())
     ///     })
     ///     .boot()?;
-    /// sandbox.run("import { add } from 'host:math'; console.log(add(2, 3))")?;
-    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// sandbox.run_async("import { add } from 'host:math'; console.log(add(2, 3))").await?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// Registered with the sandbox, not the guest, so a guest restored from
@@ -2468,7 +2525,46 @@ impl SandboxBuilder {
     where
         F: Fn(&str) -> std::result::Result<String, String> + Send + Sync + 'static,
     {
-        self.host_functions.insert(name.into(), Arc::new(function));
+        self.host_functions.insert(
+            name.into(),
+            RegisteredHostFunction::Sync(Arc::new(function)),
+        );
+        self
+    }
+
+    /// Register a host function whose work runs outside the VM entry.
+    ///
+    /// Arguments and results have the same JSON convention as
+    /// [`host_function`](Self::host_function). Only the calling guest
+    /// thread parks. Await [`AppSandbox::run_async`] or
+    /// [`AppSandbox::step_async`] to drive its future. The factory is
+    /// invoked lazily by the executor, so it may construct Tokio timers.
+    /// Sync and async registrations share a namespace; the last wins.
+    /// Restoring a pending-call snapshot interrupts unfinished calls with
+    /// EINTR; the host never invokes their factories again automatically.
+    ///
+    /// ```no_run
+    /// use hyperlight_unikraft::SandboxBuilder;
+    /// #[tokio::main(flavor = "current_thread")]
+    /// async fn main() -> hyperlight_unikraft::Result<()> {
+    ///     let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
+    ///         .async_host_function("later", |args| async move {
+    ///             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    ///             Ok(args)
+    ///         })
+    ///         .boot()?;
+    ///     sandbox.run_async("import hyperlight; hyperlight.call('later', 42)").await
+    /// }
+    /// ```
+    pub fn async_host_function<F, Fut>(mut self, name: impl Into<String>, function: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<String, String>> + Send + 'static,
+    {
+        self.host_functions.insert(
+            name.into(),
+            RegisteredHostFunction::Async(closure_handler(function)),
+        );
         self
     }
 
@@ -2489,16 +2585,19 @@ impl SandboxBuilder {
     ///
     /// ```no_run
     /// # use hyperlight_unikraft::SandboxBuilder;
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> hyperlight_unikraft::Result<()> {
     /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
     ///     .output_limit(1 << 20)
     ///     .echo_output(false)
     ///     .boot()?;
     /// sandbox.drain_output(); // the boot's
-    /// sandbox.run("print('x' * (2 << 20))")?;
+    /// sandbox.run_async("print('x' * (2 << 20))").await?;
     /// let output = sandbox.take_output();
     /// assert_eq!(output.text.len(), 1 << 20);
     /// assert!(output.truncated());
-    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn output_limit(mut self, bytes: usize) -> Self {
         self.output_limit = bytes;
@@ -2585,6 +2684,8 @@ impl SandboxBuilder {
     /// A fresh guest ([`from_initrd`](Self::from_initrd) /
     /// [`from_kernel`](Self::from_kernel)) is evolved (booted); a
     /// [`from_snapshot`](Self::from_snapshot) source is restored.
+    /// The entry itself needs no executor. Host calls queued during boot
+    /// or resume are driven by subsequent async driving methods.
     pub fn boot(self) -> Result<AppSandbox> {
         let Self {
             kernel,
@@ -2757,10 +2858,13 @@ impl SandboxBuilder {
         };
         let mut app = AppSandbox {
             sandbox,
+            async_calls: async_calls::PendingCalls::new(cfg.async_inbox.clone()),
             config: cfg,
             exited,
             pending: None,
             clean_scratch_bytes: 0,
+            async_poisoned: false,
+            blocking_runtime: None,
         };
         if restored {
             // Put the image right for this host before anyone can observe
@@ -2770,6 +2874,7 @@ impl SandboxBuilder {
         } else {
             app.mark_clean()?;
         }
+        app.check_async_support()?;
         Ok(app)
     }
 }
@@ -2835,7 +2940,7 @@ pub enum Exec {
     /// as JSON and its return
     /// value (awaited) serialized back; in the wasmtime image an export of
     /// the module or component the guest has loaded, `input` a JSON array
-    /// of its arguments.  Other images fail the call.  [`AppSandbox::call`] waits for the result;
+    /// of its arguments.  Other images fail the call.  [`AppSandbox::call_async`] waits for the result;
     /// [`AppSandbox::take_result`] collects it after a
     /// [`submit`](AppSandbox::submit).
     Call { function: String, input: String },
@@ -2867,11 +2972,11 @@ impl From<String> for Exec {
 /// Two kinds of workload:
 ///
 /// * A *driver* image (the Python, Node, … rootfs) boots a runtime that
-///   waits for calls.  [`run`](Self::run) dispatches one and waits for it;
+///   waits for calls.  [`run`](Self::run_async) dispatches one and waits for it;
 ///   [`submit`](Self::submit) dispatches one and hands the boundaries in
-///   between to the caller through [`step`](Self::step).
+///   between to the caller through [`step`](Self::step_async).
 /// * An *entry-point* image (`--entry /bin/server`) is the workload
-///   itself.  There is nothing to dispatch; [`join`](Self::join) keeps it
+///   itself.  There is nothing to dispatch; [`join`](Self::join_async) keeps it
 ///   going until it exits.
 ///
 /// A guest restored from a snapshot is announced to the kernel with a
@@ -2894,70 +2999,298 @@ pub struct AppSandbox {
     /// every later step reports it again.
     exited: Option<Yield>,
     /// A terminal result produced while delivering a call, handed out by
-    /// the next [`step`](Self::step).
+    /// the next [`step`](Self::step_async).
     pending: Option<Yield>,
     /// hyperlight's scratch allocation count when the guest was last made
     /// clean ([`dirty_bytes`](Self::dirty_bytes)): after the resume entry,
     /// so that what the kernel writes to resume is not the guest's.
     clean_scratch_bytes: u64,
+    async_calls: async_calls::PendingCalls,
+    async_poisoned: bool,
+    blocking_runtime: Option<Arc<BlockingRuntime>>,
+}
+
+struct BlockingRuntime(Option<tokio::runtime::Runtime>);
+
+impl Drop for BlockingRuntime {
+    fn drop(&mut self) {
+        self.0.take().unwrap().shutdown_background();
+    }
+}
+
+struct AsyncDriveDropGuard<'a> {
+    sandbox: &'a mut AppSandbox,
+    finished: bool,
+}
+
+impl Drop for AsyncDriveDropGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.sandbox.async_poisoned = true;
+            self.sandbox.async_calls.clear();
+            self.sandbox.config.console.finish();
+            tracing::warn!("unfinished async drive dropped; sandbox poisoned (restore to recover)");
+        }
+    }
 }
 
 impl AppSandbox {
-    /// Execute code or a script file in the guest and wait for it to finish.
-    ///
-    /// Accepts inline code (`"print('hi')"`), a file path
-    /// (`Exec::File("hello.py".into())`) or a guest command
-    /// ([`Exec::Guest`]).  The call is served by the guest's driver on its
-    /// own thread; meanwhile the host parks on the guest's timers and
-    /// sockets, costing no CPU, until the driver reports the call done.
-    ///
-    /// ```no_run
-    /// # use hyperlight_unikraft::SandboxBuilder;
-    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio").boot()?;
-    /// sandbox.run("import time; time.sleep(2); print('later')")?;  // ~2 s, VM halted meanwhile
-    /// assert!(sandbox.drain_output().contains("later"));
-    /// # Ok::<(), hyperlight_unikraft::Error>(())
-    /// ```
-    ///
-    /// Errors if the guest has no driver ([`Error::NoDriver`]), if the
-    /// driver reports the call failed ([`Error::CallFailed`], an uncaught
-    /// exception say), if the guest exits before the call returns
-    /// ([`Error::GuestExited`]), or if the guest deadlocks
-    /// ([`Error::Deadlocked`]): every thread blocked, no timer pending and
-    /// no host socket that could wake it.
+    fn blocking_runtime(&mut self) -> Result<Arc<BlockingRuntime>> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(Error::Wait(std::io::Error::other(
+                "use async driving methods inside a Tokio runtime",
+            )));
+        }
+        if self.blocking_runtime.is_none() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(Error::Wait)?;
+            self.blocking_runtime = Some(Arc::new(BlockingRuntime(Some(runtime))));
+        }
+        Ok(self.blocking_runtime.as_ref().unwrap().clone())
+    }
+
+    /// Execute a guest call synchronously. Prefer [`Self::run_async`] in async code.
     pub fn run(&mut self, exec: impl Into<Exec>) -> Result<()> {
+        let runtime = self.blocking_runtime()?;
+        runtime.0.as_ref().unwrap().block_on(self.run_async(exec))
+    }
+
+    /// Call a guest function synchronously. Prefer [`Self::call_async`] in async code.
+    pub fn call(&mut self, function: &str, input: &str) -> Result<String> {
+        let runtime = self.blocking_runtime()?;
+        runtime
+            .0
+            .as_ref()
+            .unwrap()
+            .block_on(self.call_async(function, input))
+    }
+
+    /// Wait synchronously for guest exit. Prefer [`Self::join_async`] in async code.
+    pub fn join(&mut self) -> Result<i32> {
+        let runtime = self.blocking_runtime()?;
+        runtime.0.as_ref().unwrap().block_on(self.join_async())
+    }
+
+    /// Advance synchronously, retaining pending work if the timeout expires.
+    pub fn step(&mut self, timeout: Duration) -> Result<Yield> {
+        self.check_ready()?;
+        let runtime = self.blocking_runtime()?;
+        runtime.0.as_ref().unwrap().block_on(async {
+            if self.pending.is_none()
+                && self.exited.is_none()
+                && !self.async_calls.is_pending()
+                && !self.config.can_wake()
+                && !self.config.call_in_flight()
+                && self.has_driver()
+            {
+                tokio::time::sleep(timeout).await;
+                return Ok(Yield::Blocked { until: None });
+            }
+            let mut drive = AsyncDriveDropGuard {
+                sandbox: self,
+                finished: false,
+            };
+            let result = match tokio::time::timeout(timeout, drive.sandbox.step_inner()).await {
+                Ok(result) => result,
+                Err(_) => Ok(Yield::Blocked {
+                    until: drive.sandbox.config.next_wakeup_at(),
+                }),
+            };
+            drive.finished = result.is_ok();
+            result
+        })
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        if self.sandbox.status().is_unrecoverable() {
+            return Err(HyperlightError::UnrecoverableSandbox.into());
+        }
+        if self.async_poisoned || self.sandbox.status().is_poisoned() {
+            return Err(HyperlightError::PoisonedSandbox.into());
+        }
+
+        Ok(())
+    }
+
+    fn check_async_support(&self) -> Result<()> {
+        if self
+            .config
+            .host_functions
+            .values()
+            .any(|f| matches!(f, RegisteredHostFunction::Async(_)))
+            && {
+                let inbox = self.config.async_inbox.lock().unwrap();
+                !inbox.negotiated || !inbox.interrupt_supported
+            }
+        {
+            return Err(Error::AsyncHostCallsUnsupported);
+        }
+        Ok(())
+    }
+
+    /// Execute a call while driving async host functions, timers and I/O.
+    ///
+    /// Accepts inline code, a script file or a guest command (see [`Exec`]).
+    /// Submits the call and awaits [`step`](Self::step_async) until it finishes.
+    /// Errors if the guest has no driver ([`Error::NoDriver`]), its call fails
+    /// ([`Error::CallFailed`]), it exits before returning ([`Error::GuestExited`]),
+    /// or nothing can wake a guest that still owes a result ([`Error::Deadlocked`]).
+    ///
+    /// Requires a Tokio runtime with time and I/O enabled. Dropping the future
+    /// after it starts but before it completes poisons the sandbox and
+    /// drops its pending host calls. Restore a snapshot to recover.
+    /// VM entries remain synchronous; an executor timeout cannot interrupt
+    /// a CPU-bound guest. Use [`interrupt_handle`](Self::interrupt_handle).
+    pub async fn run_async(&mut self, exec: impl Into<Exec>) -> Result<()> {
         self.submit(exec)?;
         loop {
-            match self.step_with(None)? {
+            match self.step_async().await? {
                 Yield::CallDone => return Ok(()),
                 Yield::CallFailed { status } => return Err(Error::CallFailed { status }),
                 Yield::Exited { status } => return Err(Error::GuestExited { status }),
-                Yield::Blocked { .. } => {}
+                Yield::Blocked { .. } => tokio::task::yield_now().await,
             }
         }
     }
 
-    /// Call a function the guest has defined and wait for its result: a
-    /// handler loaded once (by a [`run`](Self::run), or in a warm snapshot)
-    /// and called many times with different input.  See [`Exec::Call`] for
-    /// what each image does with `function` and `input`.
+    /// Call a function the guest has defined and await its UTF-8 result.
+    ///
+    /// Load the handler with [`run`](Self::run_async) or from a warm snapshot.
+    /// See [`Exec::Call`] for each image's function and input conventions.
+    /// Runtime requirements, errors and cancellation are as for `run`;
+    /// a non-UTF-8 result returns [`Error::ResultNotText`].
     ///
     /// ```no_run
     /// # use hyperlight_unikraft::SandboxBuilder;
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> hyperlight_unikraft::Result<()> {
     /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/quickjs.cpio").boot()?;
-    /// sandbox.run("function greet(event) { return { message: 'Hello, ' + event.name } }")?;
-    /// let out = sandbox.call("greet", r#"{"name":"World"}"#)?;
+    /// sandbox.run_async("function greet(event) { return { message: 'Hello, ' + event.name } }").await?;
+    /// let out = sandbox.call_async("greet", r#"{"name":"World"}"#).await?;
     /// assert_eq!(out, r#"{"message":"Hello, World"}"#);
-    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// # Ok(())
+    /// # }
     /// ```
-    ///
-    /// Errors as [`run`](Self::run) does, and with
-    /// [`Error::ResultNotText`] when the result is not UTF-8.
-    pub fn call(&mut self, function: &str, input: &str) -> Result<String> {
-        self.run(Exec::Call {
+    pub async fn call_async(&mut self, function: &str, input: &str) -> Result<String> {
+        self.run_async(Exec::Call {
             function: function.to_string(),
             input: input.to_string(),
-        })?;
+        })
+        .await?;
+        self.take_text_result()
+    }
+
+    /// Drive an entry-point image until it exits and return its status.
+    ///
+    /// An idle driver image returns [`Error::NothingToJoin`].
+    /// Runtime requirements and cancellation are as for [`run`](Self::run_async).
+    pub async fn join_async(&mut self) -> Result<i32> {
+        self.check_ready()?;
+        if self.exited.is_none() && self.has_driver() && !self.config.call_in_flight() {
+            return Err(Error::NothingToJoin);
+        }
+        loop {
+            match self.step_async().await? {
+                Yield::Exited { status } => return Ok(status),
+                Yield::CallDone | Yield::CallFailed { .. } if self.has_driver() => {
+                    return Err(Error::NothingToJoin);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Wait asynchronously for work, then run the guest to its next boundary.
+    ///
+    /// Host-call completions, timers and socket readiness share one futures
+    /// set. Ready events are coalesced with batched replies into one entry.
+    /// Dropping the future during its wait poisons the sandbox and drops
+    /// pending operations. An explicit restore is required to reuse it.
+    /// An idle driver with nothing to wait for returns `Blocked` immediately.
+    ///
+    /// Requires Tokio's time and I/O drivers. This has no timeout argument.
+    /// Cancelling it with `tokio::time::timeout` poisons the sandbox; it is not
+    /// a bounded probe. Keep the future alive to wait again without cancellation.
+    pub async fn step_async(&mut self) -> Result<Yield> {
+        self.check_ready()?;
+        let mut drive = AsyncDriveDropGuard {
+            sandbox: self,
+            finished: false,
+        };
+        let result = drive.sandbox.step_inner().await;
+        drive.finished = result.is_ok();
+        result
+    }
+
+    async fn step_inner(&mut self) -> Result<Yield> {
+        use futures::future::poll_fn;
+
+        if let Some(y) = self.pending.take() {
+            return Ok(y);
+        }
+        if let Some(exit) = self.exited {
+            return Ok(exit);
+        }
+        if self
+            .config
+            .net
+            .as_ref()
+            .is_some_and(|net| net.needs_async_wait())
+        {
+            let yielded = self.config.enter(&mut self.sandbox, "step", ())?;
+            if !matches!(self.note(yielded), Yield::Blocked { .. }) {
+                return Ok(yielded);
+            }
+            if self
+                .config
+                .net
+                .as_ref()
+                .is_some_and(|net| net.needs_async_wait())
+            {
+                return Err(Error::Wait(std::io::Error::other(
+                    "the kernel did not submit an asynchronous network wait",
+                )));
+            }
+        }
+        self.async_calls.set_timer(self.config.next_wakeup_at());
+        if !self.async_calls.is_pending() && !self.config.can_wake() {
+            if self.config.call_in_flight() || !self.has_driver() {
+                return Err(Error::Deadlocked);
+            }
+            return Ok(Yield::Blocked { until: None });
+        }
+        let completed = poll_fn(|cx| self.async_calls.poll_batch(cx))
+            .await
+            .map_err(Error::Wait)?
+            == async_calls::Wake::Calls;
+        let result = if completed {
+            self.config.enter(
+                &mut self.sandbox,
+                "step_async",
+                (self.async_calls.take_batch(),),
+            )
+        } else {
+            self.config.enter(&mut self.sandbox, "step", ())
+        };
+        match result {
+            Ok(yielded) => {
+                if completed {
+                    self.async_calls.delivered();
+                }
+                Ok(self.note(yielded))
+            }
+            Err(error) => {
+                if self.sandbox.status().is_poisoned() {
+                    self.async_calls.clear();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn take_text_result(&self) -> Result<String> {
         let bytes = self.take_result().unwrap_or_default();
         String::from_utf8(bytes).map_err(|e| {
             // Put it back, so take_result hands it over as bytes.
@@ -2968,76 +3301,41 @@ impl AppSandbox {
 
     /// The result of the last call, if its driver sent one: for a call
     /// submitted with [`submit`](Self::submit) and driven with
-    /// [`step`](Self::step) to [`Yield::CallDone`].  Taken, so a second
+    /// [`step`](Self::step_async) to [`Yield::CallDone`].  Taken, so a second
     /// take returns `None`.
     pub fn take_result(&self) -> Option<Vec<u8>> {
         self.config.result.lock().unwrap().take()
-    }
-
-    /// Keep the guest running until its process exits, and return its exit
-    /// status.
-    ///
-    /// For an entry-point workload, where the program is the guest's PID 1
-    /// and there is nothing to dispatch:
-    ///
-    /// ```no_run
-    /// # use hyperlight_unikraft::{ListenPorts, NetworkPolicy, SandboxBuilder};
-    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/counter.cpio")
-    ///     .entry("/bin/server --port 80")
-    ///     .network(NetworkPolicy::AllowAll)
-    ///     .listen_ports(ListenPorts::from_ports([80]))
-    ///     .boot()?;                 // returns at the server's first accept()
-    /// let status = sandbox.join()?; // returns when the server process exits
-    /// # Ok::<(), hyperlight_unikraft::Error>(())
-    /// ```
-    ///
-    /// Errors at once on a driver image with no call in flight
-    /// ([`Error::NothingToJoin`]): a driver waiting for calls never exits
-    /// on its own, so the join could never return.  Use [`run`](Self::run)
-    /// or [`submit`](Self::submit) there.  Also errors if the guest
-    /// deadlocks ([`Error::Deadlocked`], see [`run`](Self::run)).
-    pub fn join(&mut self) -> Result<i32> {
-        if self.exited.is_none() && self.has_driver() && !self.config.call_in_flight() {
-            return Err(Error::NothingToJoin);
-        }
-        loop {
-            match self.step_with(None)? {
-                Yield::Exited { status } => return Ok(status),
-                // A driver's call finished, but a driver never exits on its
-                // own, so there is nothing more to join -- report it rather
-                // than loop forever on an idle driver.
-                Yield::CallDone | Yield::CallFailed { .. } if self.has_driver() => {
-                    return Err(Error::NothingToJoin);
-                }
-                Yield::CallDone | Yield::CallFailed { .. } | Yield::Blocked { .. } => {}
-            }
-        }
     }
 
     /// Hand the driver a call without waiting for it to finish.
     ///
     /// The call is delivered by one VM entry, so the guest runs until it
     /// blocks before this returns.  From then on drive it with
-    /// [`step`](Self::step); [`Yield::CallDone`] marks the return.  This is
+    /// [`step`](Self::step_async); [`Yield::CallDone`] marks the return.  This is
     /// how to keep the boundaries for yourself: to talk to a server the
     /// script started, or to checkpoint in the middle of the call.
+    /// Queued host calls are not polled here, even outside a Tokio runtime;
+    /// await [`step`](Self::step_async) to drive them.
     ///
     /// ```no_run
-    /// # use std::time::Duration;
     /// # use hyperlight_unikraft::{SandboxBuilder, Yield};
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> hyperlight_unikraft::Result<()> {
     /// # let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio").boot()?;
     /// sandbox.submit("import select; print('a'); select.select([], [], [], 1); print('b')")?;
     /// // 'a' is printed and the script is parked on its one-second wait.
-    /// let y = sandbox.step(Duration::from_secs(5))?;
+    /// let y = sandbox.step_async().await?;
     /// // Waited ~1 s (VM halted), re-entered, 'b' printed, script returned.
     /// assert_eq!(y, Yield::CallDone);
-    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// Errors if the guest has exited ([`Error::GuestExited`]), has no
     /// driver ([`Error::NoDriver`]), or already has a call in flight
     /// ([`Error::CallInFlight`]: the kernel serves one at a time).
     pub fn submit(&mut self, exec: impl Into<Exec>) -> Result<()> {
+        self.check_ready()?;
         self.ensure_running()?;
         // The kernel would reject it too (nothing reads /dev/hlcall);
         // refusing here is earlier and says why.
@@ -3106,7 +3404,7 @@ impl AppSandbox {
     /// it reseeds its CSPRNG and re-establishes the guest's host sockets.
     /// Like a step, it runs the scheduler to the next boundary, so a
     /// terminal outcome (a call in flight at snapshot time finishing, or
-    /// the process exiting) is kept for the next [`step`](Self::step).
+    /// the process exiting) is kept for the next [`step`](Self::step_async).
     fn resume(&mut self) -> Result<()> {
         let yielded = self.config.enter(&mut self.sandbox, "resume", ());
         // Count from here even when the entry failed: the last baseline
@@ -3146,61 +3444,13 @@ impl AppSandbox {
         Ok(())
     }
 
-    /// Remember an exit; everything else needs no bookkeeping.
+    /// Remember an exit.
     fn note(&mut self, yielded: Yield) -> Yield {
         if let Yield::Exited { .. } = yielded {
+            self.async_calls.clear();
             self.exited = Some(yielded);
         }
         yielded
-    }
-
-    /// Advance the guest by one step.
-    ///
-    /// Waits until the guest may be runnable again (its next timer is due,
-    /// or one of its host sockets is readable), at most `timeout`; then
-    /// enters the VM, lets the scheduler run until every guest thread is
-    /// blocked, and returns why it stopped.  If `timeout` runs out first
-    /// nothing has changed, and the last [`Yield::Blocked`] is returned
-    /// without entering, so `Duration::ZERO` is a non-blocking probe.
-    ///
-    /// The VM is halted for the whole wait; the host thread sits in
-    /// `poll(2)`.  [`run`](Self::run) and [`join`](Self::join) are loops
-    /// over this with no bound: they wait until a timer or a socket wakes
-    /// the guest, and fail if nothing could.
-    ///
-    /// Errors if the guest is deadlocked ([`Error::Deadlocked`]): nothing
-    /// can wake it and something is owed that only it can produce (see
-    /// [`run`](Self::run)).
-    pub fn step(&mut self, timeout: Duration) -> Result<Yield> {
-        self.step_with(Some(timeout))
-    }
-
-    /// [`step`](Self::step) with an optional bound; `None` waits until the
-    /// guest can run, however long that takes, and returns at once when
-    /// nothing could ever wake it (see [`GuestConfig::can_wake`]).
-    fn step_with(&mut self, timeout: Option<Duration>) -> Result<Yield> {
-        if let Some(y) = self.pending.take() {
-            return Ok(y);
-        }
-        if let Some(exit) = self.exited {
-            return Ok(exit);
-        }
-        // A guest nothing can wake -- no timer, no live host socket -- while
-        // something is owed that only it can produce (a call's return, or
-        // an entry-point workload's exit) is stuck for good: waiting any
-        // longer, for any timeout, would be waiting forever.  A driver
-        // idle between calls is not that; the host wakes it by submitting.
-        if !self.config.can_wake() && (self.config.call_in_flight() || !self.config.has_driver()) {
-            return Err(Error::Deadlocked);
-        }
-        // Wait for the guest to become runnable.
-        if !self.config.wait_runnable(timeout) {
-            return Ok(Yield::Blocked {
-                until: self.config.next_wakeup_at(),
-            });
-        }
-        let yielded = self.config.enter(&mut self.sandbox, "step", ())?;
-        Ok(self.note(yielded))
     }
 
     /// Capture the guest at the current boundary: every parked thread, the
@@ -3212,11 +3462,28 @@ impl AppSandbox {
     ///
     /// Errors with [`Error::GuestExited`] once the guest process has
     /// exited: there is nothing left to resume.
+    ///
+    /// Pending host calls are allowed. Taking the snapshot does not cancel or
+    /// poll the original calls. Unfinished calls in the restored
+    /// branch return EINTR without invoking host handlers. Completed but undelivered host
+    /// results are interrupted too. Already-delivered guest results are preserved.
+    /// This does not undo external effects or make arbitrary retries safe.
     pub fn snapshot(&mut self) -> Result<Arc<Snapshot>> {
-        self.ensure_running()?;
+        self.check_snapshot()?;
         let snapshot = self.sandbox.snapshot()?;
         self.mark_clean()?;
         record_scratch_mb(snapshot, self.config.scratch_size.map(|size| size / MIB))
+    }
+
+    fn check_snapshot(&self) -> Result<()> {
+        self.check_ready()?;
+        self.ensure_running()?;
+        if self.async_calls.is_pending()
+            && !self.config.async_inbox.lock().unwrap().interrupt_supported
+        {
+            return Err(Error::AsyncHostCallsUnsupported);
+        }
+        Ok(())
     }
 
     /// [`snapshot`](Self::snapshot), but with `mb` MiB of scratch: this
@@ -3241,8 +3508,8 @@ impl AppSandbox {
     ///   sandbox's next entry, and [`restore`](Self::restore) of the
     ///   snapshot, fail with `Error::Hyperlight(GuestAborted)`; until a
     ///   restore of a snapshot that fits recovers the sandbox, a snapshot
-    ///   fails with `Error::Hyperlight(PoisonedSandbox)`, and after a failed
-    ///   restore a guest function call fails with [`Error::NoDriver`].  A
+    ///   fails with `Error::Hyperlight(PoisonedSandbox)`, as does a guest
+    ///   function call after a failed restore.  A
     ///   new sandbox booted from the snapshot fails to boot, with
     ///   `Error::Hyperlight(GuestAborted)`.
     /// - Scratch also holds the transport, page tables and the kernel's own
@@ -3259,7 +3526,7 @@ impl AppSandbox {
     /// - Errors with [`Error::GuestExited`] once the guest process has
     ///   exited.
     pub fn snapshot_with_scratch_mb(&mut self, mb: usize) -> Result<Arc<Snapshot>> {
-        self.ensure_running()?;
+        self.check_snapshot()?;
         let options = SnapshotOptions::default().scratch_size(mb_to_bytes(mb));
         let snapshot = self.sandbox.snapshot_with_options(&options)?;
         // The sandbox continues from the capture, on its scratch size.
@@ -3291,12 +3558,11 @@ impl AppSandbox {
     ///
     /// The sandbox takes the snapshot's scratch size.  If a resized
     /// snapshot is too small for the kernel, the restore fails, and until a
-    /// restore of a snapshot that fits succeeds, guest function calls fail
-    /// with [`Error::NoDriver`], snapshots with
-    /// `Error::Hyperlight(PoisonedSandbox)`, and [`step`](Self::step) and
-    /// [`join`](Self::join) with [`Error::Deadlocked`].
+    /// restore of a snapshot that fits succeeds, guest function calls,
+    /// snapshots and driving fail with `Error::Hyperlight(PoisonedSandbox)`.
     pub fn restore(&mut self, snapshot: Arc<Snapshot>) -> Result<()> {
         let recorded = snapshot_scratch_mb(&snapshot);
+        self.async_poisoned = true;
         let sandbox = &mut self.sandbox;
         self.config
             .profile
@@ -3312,8 +3578,14 @@ impl AppSandbox {
         }
         self.exited = None;
         self.pending = None;
+        self.async_calls.clear();
+        self.config.async_inbox.lock().unwrap().negotiated = false;
+        self.config.async_inbox.lock().unwrap().interrupt_supported = false;
         self.config.forget();
-        self.resume()
+        self.resume()?;
+        self.check_async_support()?;
+        self.async_poisoned = false;
+        Ok(())
     }
 
     /// [`restore`](Self::restore) with the snapshot read from `dir`, where
@@ -3323,8 +3595,8 @@ impl AppSandbox {
     }
 
     /// Whether a runtime driver in the guest serves calls, so whether
-    /// [`run`](Self::run) and [`submit`](Self::submit) can work.  False for
-    /// an entry-point image, which is driven with [`join`](Self::join).
+    /// [`run`](Self::run_async) and [`submit`](Self::submit) can work.  False for
+    /// an entry-point image, which is driven with [`join`](Self::join_async).
     /// Known once [`SandboxBuilder::boot`] returns, for a fresh and a
     /// restored guest alike.
     pub fn has_driver(&self) -> bool {
@@ -3456,6 +3728,118 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    #[ignore = "requires a hypervisor and build-elfloader/python-rootfs.cpio"]
+    fn restore_discards_prepared_replies_and_checks_capability() {
+        use futures::{FutureExt, future::poll_fn};
+        let rootfs =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("build-elfloader/python-rootfs.cpio");
+        let mut app = SandboxBuilder::from_initrd(rootfs)
+            .async_host_function("work", |_| async { Ok("7".into()) })
+            .echo_output(false)
+            .boot()
+            .unwrap();
+        app.submit(
+            "import hyperlight\ntry:\n    hyperlight.call('work')\n    raise AssertionError('stale result')\n\
+             except RuntimeError as e:\n    assert 'Interrupted system call' in str(e), e\n\
+             print('interrupted')"
+        ).unwrap();
+        assert_eq!(
+            poll_fn(|cx| app.async_calls.poll_batch(cx))
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            async_calls::Wake::Calls
+        );
+        app.config.async_inbox.lock().unwrap().interrupt_supported = false;
+        assert!(matches!(
+            app.snapshot(),
+            Err(Error::AsyncHostCallsUnsupported)
+        ));
+        assert!(matches!(
+            app.snapshot_with_scratch_mb(512),
+            Err(Error::AsyncHostCallsUnsupported)
+        ));
+        app.config.async_inbox.lock().unwrap().interrupt_supported = true;
+        let snapshot = app.snapshot().unwrap();
+        app.restore(snapshot).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                loop {
+                    match app.step_async().await.unwrap() {
+                        Yield::CallDone => break,
+                        Yield::Blocked { .. } => {}
+                        other => panic!("{other:?}: {}", app.drain_output()),
+                    }
+                }
+            });
+        assert!(app.drain_output().contains("interrupted"));
+        app.snapshot().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a hypervisor and build-elfloader/python-rootfs.cpio"]
+    fn malformed_batches_do_not_partially_wake_waiters() {
+        let rootfs =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("build-elfloader/python-rootfs.cpio");
+        let mut app = SandboxBuilder::from_initrd(rootfs)
+            .async_host_function("wait", |_| std::future::pending())
+            .echo_output(false)
+            .boot()
+            .unwrap();
+        app.submit("import hyperlight; assert hyperlight.call('wait') == 7")
+            .unwrap();
+        let valid = vec![
+            1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, b'7',
+        ];
+        let mut bad_version = valid.clone();
+        bad_version[0] = 2;
+        let mut unknown_id = valid.clone();
+        unknown_id[8] = 2;
+        let mut bad_length = valid.clone();
+        bad_length[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut duplicate = valid.clone();
+        duplicate[4] = 2;
+        duplicate.extend_from_slice(&valid[8..]);
+        let mut bad_tag = valid.clone();
+        bad_tag[20] = 2;
+        let mut bad_interrupt = valid.clone();
+        bad_interrupt[20] = 3;
+        let mut single_byte_interrupt = bad_interrupt.clone();
+        single_byte_interrupt[16..20].copy_from_slice(&1u32.to_le_bytes());
+        single_byte_interrupt.pop();
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        for batch in [
+            vec![],
+            bad_version,
+            unknown_id,
+            bad_length,
+            duplicate,
+            bad_tag,
+            bad_interrupt,
+            single_byte_interrupt,
+            valid[..valid.len() - 1].to_vec(),
+            trailing,
+        ] {
+            assert!(matches!(
+                app.config.enter(&mut app.sandbox, "step_async", (batch,)),
+                Err(Error::GuestSilent)
+            ));
+            assert!(app.config.call_in_flight());
+        }
+        assert_eq!(
+            app.config
+                .enter(&mut app.sandbox, "step_async", (valid,))
+                .unwrap(),
+            Yield::CallDone
+        );
+        app.async_calls.clear();
+    }
 
     /// OCI tags forbid `+`, so a `+build` suffix on the crate version would
     /// make every snapshot save panic.

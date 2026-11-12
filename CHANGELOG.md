@@ -4,6 +4,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Added
+
+- Async host functions through `SandboxBuilder::async_host_function`, with
+  `run_async`, `call_async`, `join_async` and `step_async` driving a bounded
+  `FuturesUnordered` engine. Only the calling guest thread parks; replies are
+  batched. Scheduler timers and Tokio socket readiness share the same engine.
+  Existing synchronous driving methods remain as migration adapters.
+- Pending-call snapshots, including resized and saved snapshots. Capture leaves
+  original work unchanged; restore interrupts unfinished and undelivered calls
+  with `EINTR`, without serializing futures, replaying handlers or undoing effects.
+
+### Changed
+
+- Socket descriptors, metadata, readiness interests and runtime-aware Tokio
+  registrations have one owner per guest fd. TCP/UDP transfers use Tokio with
+  immediate syscall fallback; POSIX setup, options and errno translation remain.
+- Async driving requires Tokio's time and I/O drivers. Dropping an unfinished
+  driving future poisons the sandbox until restore. Boot, submission, snapshots
+  and restore remain synchronous. Updated kernels and snapshot contract 10
+  require fresh snapshots.
+
 ### Fixed
 
 - `hluk run` and `hluk snapshot run` called a script they could not read a compiled binary: a directory, or a file `hluk` may not read, got the hint for running one, which for a bare name (`app`) suggested `--mount :/mnt/bin`, a mount `hluk` refuses. A manifest's `[run] script` was only looked for, so one that is not text booted the guest before failing; `hluk snapshot run` restored the snapshot before reading its script; and a script from a pipe (`<(…)`) was said not to exist. The script, from the command line or the manifest, is now read before the guest boots or is restored, and runs as the text read: the error says it does not exist, is a directory, or cannot be read (with the reason), and only text that is not UTF-8 gets the hint, with `.` for a bare name's directory. A script too large for a guest function call is refused then too.

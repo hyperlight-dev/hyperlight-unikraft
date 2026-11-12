@@ -230,7 +230,8 @@ static inline int hl_set_result(const void *buf, size_t len)
  * (the drivers pass JSON), during a call.  Returns 0 with the result, 1
  * with the host's error message, or -1 if the call could not be made
  * (errno set: EPERM outside a call, EIO when the host has no HostCall,
- * ENOMEM when the reply buffer cannot be allocated, EILSEQ from the
+ * EINTR when a pending host call is interrupted by restore (never retried
+ * here), ENOMEM when the reply buffer cannot be allocated, EILSEQ from the
  * kernel when `name` is not UTF-8, which the host takes as a string).
  * *out points into a buffer the next host call reuses, NUL-terminated.
  * The empty name lists the registered functions, one per line.  Call it
