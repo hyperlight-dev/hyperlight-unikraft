@@ -4,17 +4,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Added
+
+- Code coverage (#123): `coverage.yml` measures how much of the library and `hluk` the Rust tests cover, weekly on `main`, running them as tier 1's Linux test job does; `hluk` is measured where the integration tests run it as a program too. The run's page has the summary, per file, and its artifacts an HTML report, per line, and an LCOV file. `ci-report.yml` reports a failed run as it does a failed CI run on `main`. Locally, `just coverage-run` runs the tests instrumented, and `just coverage`, `just coverage-html` or `just coverage-lcov` reports on them (see [`docs/ci.md`](docs/ci.md)).
+- Async host functions through `SandboxBuilder::async_host_function`, with
+  `run_async`, `call_async`, `join_async` and `step_async` driving a bounded
+  `FuturesUnordered` engine. Only the calling guest thread parks; replies are
+  batched. Scheduler timers and Tokio socket readiness share the same engine.
+  Existing synchronous driving methods remain as migration adapters.
+- Pending-call snapshots, including resized and saved snapshots. Capture leaves
+  original work unchanged; restore interrupts unfinished and undelivered calls
+  with `EINTR`, without serializing futures, replaying handlers or undoing effects.
+
 ### Changed
 
 - Hyperlight host and common dependencies now track upstream `main` through Git.
   The kernel and runtime drivers use Postcard calls, replies and logs with the
   16-byte transport header. Rebuild runtime images with the updated drivers;
   FlatBuffer-based images are incompatible. Both embedded kernels and the native
-  test fixture are rebuilt, and snapshot contract 9 requires fresh snapshots.
-
-### Added
-
-- Code coverage (#123): `coverage.yml` measures how much of the library and `hluk` the Rust tests cover, weekly on `main`, running them as tier 1's Linux test job does; `hluk` is measured where the integration tests run it as a program too. The run's page has the summary, per file, and its artifacts an HTML report, per line, and an LCOV file. `ci-report.yml` reports a failed run as it does a failed CI run on `main`. Locally, `just coverage-run` runs the tests instrumented, and `just coverage`, `just coverage-html` or `just coverage-lcov` reports on them (see [`docs/ci.md`](docs/ci.md)).
+  test fixture are rebuilt, and snapshot contract 11 requires fresh snapshots.
+- Socket descriptors, metadata, readiness interests and runtime-aware Tokio
+  registrations have one owner per guest fd. TCP/UDP transfers use Tokio with
+  immediate syscall fallback; POSIX setup, options and errno translation remain.
+- Async driving requires Tokio's time and I/O drivers. Dropping an unfinished
+  driving future poisons the sandbox until restore. Boot, submission, snapshots
+  and restore remain synchronous. Updated kernels and snapshot contract 11
+  require fresh snapshots.
 
 ### Fixed
 

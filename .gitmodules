@@ -1,8 +1,8 @@
 [submodule "kernel/unikraft"]
 	path = kernel/unikraft
-	# Postcard transport support on top of upstream plat-hyperlight-v2.
+	# Async host calls on top of the Postcard transport.
 	url = https://github.com/jprendes/unikraft.git
-	branch = feat/postcard-protocol
+	branch = feat/async-host-calls
 [submodule "kernel/app-elfloader"]
 	path = kernel/app-elfloader
 	# The fork, for five fixes: arm64 AT_HWCAP (upstream has it in another

@@ -88,6 +88,29 @@ fn agent_shell_subprocess() {
     );
 }
 
+#[tokio::test]
+async fn first_socket_in_child_releases_captured_pipes() {
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("agent"))
+        .scratch_mb(1536)
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+    sandbox
+        .run_async(
+            r#"
+import subprocess, sys
+r = subprocess.run(
+    [sys.executable, "-c", "import socket; socket.socket().close(); print('done')"],
+    capture_output=True, text=True, check=True, timeout=5,
+)
+print(r.stdout.strip())
+"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sandbox.drain_output().trim(), "done");
+}
+
 #[test]
 fn agent_ssl_available() {
     let rootfs = require_rootfs("agent");
