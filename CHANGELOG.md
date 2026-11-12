@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- An opt-in async driving release benchmark, including
+  latency, throughput, CPU use and VM-entry counts for calls, timers, fan-out
+  and ready/delayed TCP and UDP peers.
 - Async host functions through `SandboxBuilder::async_host_function`, with
   `run`, `call`, `join` and `step` driving a bounded
   `FuturesUnordered` engine. Only the calling guest thread parks; replies are
