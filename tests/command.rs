@@ -42,6 +42,93 @@ async fn structured_command_and_distinct_streams() {
         b"cwd=/tmp\nenv=one value\narg=a b\narg=\narg=quoted\"text\n"
     );
     assert_eq!(out.stderr, b"stderr\n");
+    let info = sandbox.children().pop().unwrap();
+    assert_eq!(info.program, "/mnt/bin/command");
+    assert_eq!(info.args, ["args", "a b", "", "quoted\"text"]);
+    assert_eq!(info.cwd.as_deref(), Some("/tmp"));
+    assert_eq!(
+        info.env,
+        [("COMMAND_TEST".to_owned(), "one value".to_owned())].into()
+    );
+    assert_eq!(info.stdio, [Stdio::Null, Stdio::Piped, Stdio::Piped]);
+    let snapshot = sandbox.snapshot().unwrap();
+    sandbox.restore(&snapshot).unwrap();
+    assert_eq!(sandbox.children()[0].stdio, info.stdio);
+}
+
+#[test]
+fn child_launch_metadata_survives_builder_reuse_and_snapshot_restore() {
+    let sandbox = builder()
+        .env("INHERITED", "original")
+        .env("OVERRIDE", "original")
+        .env("REMOVE", "original")
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut command = sandbox.command("/mnt/bin/command");
+    command
+        .args(["sleep", "0", ""])
+        .env("OVERRIDE", "a=b")
+        .env_remove("REMOVE");
+    let first = command.spawn().unwrap();
+    let id = first.execution_id();
+    let info = sandbox.children().pop().unwrap();
+    assert_eq!(info.program, "/mnt/bin/command");
+    assert_eq!(info.args, ["sleep", "0", ""]);
+    assert_eq!(info.cwd, None);
+    assert_eq!(info.env["INHERITED"], "original");
+    assert_eq!(info.env["OVERRIDE"], "a=b");
+    assert!(!info.env.contains_key("REMOVE"));
+    assert_eq!(info.stdio, [Stdio::Null; 3]);
+    drop(first);
+    let snapshot = sandbox.snapshot().unwrap();
+
+    let second = command
+        .arg("later")
+        .env_clear()
+        .env("OVERRIDE", "changed")
+        .current_dir("/tmp")
+        .spawn()
+        .unwrap();
+    let second_info = sandbox.children().pop().unwrap();
+    assert_eq!(second_info.args, ["sleep", "0", "", "later"]);
+    assert_eq!(second_info.cwd.as_deref(), Some("/tmp"));
+    assert_eq!(
+        second_info.env,
+        [("OVERRIDE".to_owned(), "changed".to_owned())].into()
+    );
+    drop(second);
+
+    let fork = SandboxBuilder::from_command_snapshot(&snapshot)
+        .env("INHERITED", "different fork configuration")
+        .echo_output(false)
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    // Neither builder reuse nor inspecting and mutating a listing rewrites launch data.
+    let mut edited = sandbox.children().remove(0);
+    edited.args.clear();
+    edited.env.clear();
+    for source in [&sandbox, &fork] {
+        let child = source.restore_child(id).unwrap();
+        let restored = source.children().remove(0);
+        assert_eq!(restored.program, info.program);
+        assert_eq!(restored.args, info.args);
+        assert_eq!(restored.cwd, info.cwd);
+        assert_eq!(restored.env, info.env);
+        assert_eq!(restored.stdio, info.stdio);
+        drop(child);
+    }
+    sandbox.restore(&snapshot).unwrap();
+    let restored = sandbox.children().pop().unwrap();
+    assert_eq!(restored.execution_id, id);
+    assert_eq!(restored.program, info.program);
+    assert_eq!(restored.args, info.args);
+    assert_eq!(restored.cwd, info.cwd);
+    assert_eq!(restored.env, info.env);
+    assert_eq!(restored.stdio, info.stdio);
 }
 
 #[test]

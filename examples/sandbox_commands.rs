@@ -115,6 +115,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "\x1b[1m[execution {:?}]\x1b[0m pid={:?}, detached={}, completed={}",
             child.execution_id, child.pid, child.detached, child.completed
         );
+        println!(
+            "  program={:?}, args={:?}, cwd={:?}, stdio={:?}, env keys={:?}",
+            child.program,
+            child.args,
+            child.cwd,
+            child.stdio,
+            child.env.keys().collect::<Vec<_>>()
+        );
     }
     let first = children
         .iter()

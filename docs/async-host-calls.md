@@ -135,7 +135,14 @@ reconstructs resources and interrupts unfinished calls with `EINTR`; the guest
 chooses whether to retry. `sandbox.children()` lists all retained commands in
 execution-ID order, including attached and completed commands. Each `ChildInfo`
 reports `execution_id`, the guest `pid` if known, `detached`, and `completed`
-(root, descendant and worker cleanup finished). Call `info.restore()` to
+(root, descendant and worker cleanup finished). Launch metadata includes
+`program`, `args` (excluding `argv[0]`), `cwd` (`None` inherits the driver's
+working directory), `env` (the complete environment sent after inheritance,
+overrides, removals and `env_clear()`), and `stdio` (stdin, stdout, stderr).
+These are launch values, not live guest state; they survive detachment and
+snapshot restoration, including independent clones. Environment values may
+contain secrets, so avoid logging them or the full debug representation.
+Call `info.restore()` to
 reacquire that command from its originating sandbox. Metadata is an observation,
 not a live status view: restoration rechecks the current attachment state.
 Listing neither drives commands nor keeps the sandbox alive; entries remain

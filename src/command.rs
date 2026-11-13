@@ -20,7 +20,7 @@ use futures::{
 
 use crate::{
     AppSandbox, Error, Result, Yield, async_calls,
-    execution::{Execution, Subscription},
+    execution::{CommandMetadata, Execution, Subscription},
 };
 
 /// A sandbox dedicated to independently polled command trees.
@@ -44,6 +44,18 @@ pub struct ExecutionId(u64);
 pub struct ChildInfo {
     /// Stable execution identity within the originating sandbox.
     pub execution_id: ExecutionId,
+    /// Absolute guest executable path supplied at launch.
+    pub program: String,
+    /// Arguments supplied at launch, excluding the executable name (`argv[0]`).
+    pub args: Vec<String>,
+    /// Requested guest working directory; `None` means inherit the driver's cwd.
+    /// This is not updated by subsequent guest directory changes.
+    pub cwd: Option<String>,
+    /// Full environment sent at launch, after inheritance, overrides and removals.
+    /// Does not track subsequent guest changes. Values may contain secrets.
+    pub env: BTreeMap<String, String>,
+    /// Original stdin, stdout and stderr configurations, in that order.
+    pub stdio: [Stdio; 3],
     /// Guest root PID, if the executable has started.
     pub pid: Option<u32>,
     /// Whether there was no child handle when observed. An attached child is not
@@ -167,6 +179,11 @@ impl CommandSandbox {
                 let process = execution.process.lock().unwrap();
                 ChildInfo {
                     execution_id: ExecutionId(execution.id),
+                    program: execution.command.program.clone(),
+                    args: execution.command.args.clone(),
+                    cwd: execution.command.cwd.clone(),
+                    env: execution.command.env.clone(),
+                    stdio: execution.command.stdio,
                     pid: process.pid,
                     detached,
                     completed: execution.done.load(std::sync::atomic::Ordering::Relaxed),
@@ -179,10 +196,12 @@ impl CommandSandbox {
     /// List detached executions, including completed commands not yet forgotten.
     /// Use [`children`](Self::children) for metadata and per-entry restoration.
     pub fn parked_children(&self) -> Vec<ExecutionId> {
-        self.children()
+        self.0
+            .executions
+            .list()
             .into_iter()
-            .filter(|child| child.detached)
-            .map(|child| child.execution_id)
+            .filter(|execution| !execution.attachment.lock().unwrap().attached)
+            .map(|execution| ExecutionId(execution.id))
             .collect()
     }
 
@@ -260,7 +279,7 @@ pub struct Command {
 }
 
 /// A command's standard stream configuration.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stdio {
     /// Connect to `/dev/null` (the default).
     Null,
@@ -394,7 +413,7 @@ impl Command {
             self.program.clone(),
         ];
         fields.extend(self.args.iter().cloned());
-        fields.extend(env.into_iter().map(|(key, value)| format!("{key}={value}")));
+        fields.extend(env.iter().map(|(key, value)| format!("{key}={value}")));
         if fields.iter().any(|field| field.contains('\0')) {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -409,6 +428,13 @@ impl Command {
             &sandbox.config.async_inbox,
             sandbox.config.net.as_ref(),
             self.stdio.map(|mode| mode == Stdio::Piped),
+            CommandMetadata {
+                program: self.program.clone(),
+                args: self.args.clone(),
+                cwd: self.cwd.clone(),
+                env,
+                stdio: self.stdio,
+            },
         )?;
         fields[1] = id.to_string();
         let request = fields.join("\0") + "\0";
