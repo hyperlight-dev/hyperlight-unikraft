@@ -44,6 +44,94 @@ async fn structured_command_and_distinct_streams() {
     assert_eq!(out.stderr, b"stderr\n");
 }
 
+#[test]
+fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox() {
+    use hyperlight_unikraft::Error;
+    use std::io::ErrorKind;
+
+    let gate = |_| -> std::future::Ready<Result<String, String>> {
+        panic!("listing and reacquiring children must not poll host calls");
+    };
+    let sandbox = builder()
+        .async_host_function("gate", gate)
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    assert!(sandbox.children().is_empty());
+    let pending = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .spawn()
+        .unwrap();
+    let pending_id = pending.execution_id();
+    let mut done = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "0", "done"])
+        .spawn()
+        .unwrap();
+    let done_id = done.execution_id();
+    assert!(done.wait().now_or_never().unwrap().unwrap().success());
+    let done_pid = done.id();
+    drop(done);
+
+    let entries = sandbox.children();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.execution_id)
+            .collect::<Vec<_>>(),
+        [pending_id, done_id]
+    );
+    let pending_info = &entries[0];
+    let done_info = &entries[1];
+    assert_eq!(pending_info.pid, pending.id());
+    assert!(!pending_info.detached && !pending_info.completed);
+    assert_eq!(done_info.pid, done_pid);
+    assert!(done_info.detached && done_info.completed);
+    assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::AlreadyExists));
+
+    drop(pending);
+    assert!(!pending_info.detached); // Metadata is an observation, not a live handle.
+    assert!(sandbox.children().iter().all(|entry| entry.detached));
+    let snapshot = sandbox.snapshot().unwrap();
+    let fork = SandboxBuilder::from_command_snapshot(&snapshot)
+        .async_host_function("gate", gate)
+        .echo_output(false)
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut pending = pending_info.restore().unwrap();
+    let mut fork_pending = fork
+        .children()
+        .into_iter()
+        .find(|entry| entry.execution_id == pending_id)
+        .unwrap()
+        .restore()
+        .unwrap();
+    fork_pending.kill().unwrap();
+    drop(fork_pending);
+    assert!(pending.try_wait().unwrap().is_none());
+    assert!(!sandbox.children()[0].detached);
+    assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::AlreadyExists));
+    pending.kill().unwrap();
+    drop(pending);
+    assert!(sandbox.children()[0].completed);
+    sandbox.forget_child(pending_id).unwrap();
+    assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::NotFound));
+    assert_eq!(sandbox.children().len(), 1);
+    let mut done = done_info.restore().unwrap();
+    assert!(done.wait().now_or_never().unwrap().unwrap().success());
+    drop(done);
+    drop(sandbox);
+    assert!(matches!(done_info.restore(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::NotFound));
+}
+
 #[tokio::test]
 async fn independent_host_futures_and_cancelled_wait() {
     let polled = Arc::new(Mutex::new(Vec::new()));

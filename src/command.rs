@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::task::{Context, Poll};
 
 use futures::{
@@ -35,6 +35,41 @@ pub struct CommandSandbox(Arc<Coordinator>);
 /// Stable execution identity within a command sandbox, distinct from a guest PID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExecutionId(u64);
+
+/// An observation of a command, without acquiring a driving handle.
+///
+/// Metadata may become stale as commands are attached, detached or completed.
+/// This entry does not keep the sandbox alive or prevent snapshots.
+#[derive(Clone, Debug)]
+pub struct ChildInfo {
+    /// Stable execution identity within the originating sandbox.
+    pub execution_id: ExecutionId,
+    /// Guest root PID, if the executable has started.
+    pub pid: Option<u32>,
+    /// Whether there was no child handle when observed. An attached child is not
+    /// necessarily being polled.
+    pub detached: bool,
+    /// Whether the root, descendants and command workers have finished cleanup.
+    pub completed: bool,
+    sandbox: Weak<Coordinator>,
+}
+
+impl ChildInfo {
+    /// Reacquire this command from its originating sandbox without driving it.
+    ///
+    /// Rechecks the current state, not the observed `detached` field. Like
+    /// [`CommandSandbox::restore_child`], fails if already attached or still
+    /// detaching. Also fails if forgotten or the sandbox has been dropped.
+    pub fn restore(&self) -> Result<Child> {
+        let coordinator = self.sandbox.upgrade().ok_or_else(|| {
+            Error::Wait(io::Error::new(
+                io::ErrorKind::NotFound,
+                "command sandbox has been dropped",
+            ))
+        })?;
+        CommandSandbox(coordinator).restore_child(self.execution_id)
+    }
+}
 
 /// A whole-VM snapshot plus parked command metadata, streams and retained replies.
 ///
@@ -117,13 +152,37 @@ impl CommandSandbox {
         result
     }
 
-    /// List detached executions, including completed commands not yet forgotten.
-    pub fn parked_children(&self) -> Vec<ExecutionId> {
+    /// Observe all retained commands in execution-ID order without driving them.
+    ///
+    /// Includes attached, detached and completed commands until forgotten.
+    /// Each entry can reacquire its child through [`ChildInfo::restore`].
+    /// Observations are not an atomic snapshot of concurrent lifecycle changes.
+    pub fn children(&self) -> Vec<ChildInfo> {
         self.0
             .executions
-            .parked()
+            .list()
             .into_iter()
-            .map(ExecutionId)
+            .map(|execution| {
+                let detached = !execution.attachment.lock().unwrap().attached;
+                let process = execution.process.lock().unwrap();
+                ChildInfo {
+                    execution_id: ExecutionId(execution.id),
+                    pid: process.pid,
+                    detached,
+                    completed: execution.done.load(std::sync::atomic::Ordering::Relaxed),
+                    sandbox: Arc::downgrade(&self.0),
+                }
+            })
+            .collect()
+    }
+
+    /// List detached executions, including completed commands not yet forgotten.
+    /// Use [`children`](Self::children) for metadata and per-entry restoration.
+    pub fn parked_children(&self) -> Vec<ExecutionId> {
+        self.children()
+            .into_iter()
+            .filter(|child| child.detached)
+            .map(|child| child.execution_id)
             .collect()
     }
 

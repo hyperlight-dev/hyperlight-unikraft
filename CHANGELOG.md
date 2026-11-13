@@ -6,7 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Code coverage (#123): `coverage.yml` measures how much of the library and `hluk` the Rust tests cover, weekly on `main`, running them as tier 1's Linux test job does; `hluk` is measured where the integration tests run it as a program too. The run's page has the summary, per file, and its artifacts an HTML report, per line, and an LCOV file. `ci-report.yml` reports a failed run as it does a failed CI run on `main`. Locally, `just coverage-run` runs the tests instrumented, and `just coverage`, `just coverage-html` or `just coverage-lcov` reports on them (see [`docs/ci.md`](docs/ci.md)).
+- `CommandSandbox::children()` lists retained commands with execution ID,
+  guest PID, attachment state and completion state. Each metadata entry can
+  restore its detached child without driving it or keeping the sandbox alive.
 - An opt-in `AppSandbox::into_commands()` API for concurrent compiled guest
   executables, with structured arguments, environment and cwd, cancellation-safe
   waits, root-scoped lifetimes, and bounded stdin/stdout/stderr pipes.
@@ -32,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Pending-call snapshots, including resized and saved snapshots. Capture leaves
   original work unchanged; restore interrupts unfinished and undelivered calls
   with `EINTR`, without serializing futures, replaying handlers or undoing effects.
+- Code coverage (#123): `coverage.yml` measures how much of the library and `hluk` the Rust tests cover, weekly on `main`, running them as tier 1's Linux test job does; `hluk` is measured where the integration tests run it as a program too. The run's page has the summary, per file, and its artifacts an HTML report, per line, and an LCOV file. `ci-report.yml` reports a failed run as it does a failed CI run on `main`. Locally, `just coverage-run` runs the tests instrumented, and `just coverage`, `just coverage-html` or `just coverage-lcov` reports on them (see [`docs/ci.md`](docs/ci.md)).
 
 ### Changed
 

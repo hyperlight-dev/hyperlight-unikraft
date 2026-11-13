@@ -109,7 +109,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let first_id = first.execution_id();
     drop(first);
     let checkpoint = sandbox.snapshot()?;
-    let first = sandbox.restore_child(first_id)?;
+    let children = sandbox.children();
+    for child in &children {
+        println!(
+            "\x1b[1m[execution {:?}]\x1b[0m pid={:?}, detached={}, completed={}",
+            child.execution_id, child.pid, child.detached, child.completed
+        );
+    }
+    let first = children
+        .iter()
+        .find(|child| child.execution_id == first_id)
+        .expect("the parked child is listed")
+        .restore()?;
     let second = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "25", "hello from the second command"])
