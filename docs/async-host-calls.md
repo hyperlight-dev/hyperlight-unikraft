@@ -132,7 +132,16 @@ Untaken streams and buffered bytes are preserved, not closed.
 Save `child.execution_id()` before dropping it, then use
 `sandbox.restore_child(id)` to acquire a new exclusive handle. The first drive
 reconstructs resources and interrupts unfinished calls with `EINTR`; the guest
-chooses whether to retry. List detached executions with `parked_children()`.
+chooses whether to retry. `sandbox.children()` lists all retained commands in
+execution-ID order, including attached and completed commands. Each `ChildInfo`
+reports `execution_id`, the guest `pid` if known, `detached`, and `completed`
+(root, descendant and worker cleanup finished). Call `info.restore()` to
+reacquire that command from its originating sandbox. Metadata is an observation,
+not a live status view: restoration rechecks the current attachment state.
+Listing neither drives commands nor keeps the sandbox alive; entries remain
+usable across detach but fail after forgetting the command or dropping its sandbox.
+An attached child is not necessarily being polled. `parked_children()` remains
+a convenience for listing only detached execution IDs.
 Completed executions and their output remain available until `forget_child(id)`;
 that method requires a detached, completed command. To discard an unfinished
 command, restore it, kill it, drop it, then forget it.

@@ -153,14 +153,8 @@ impl Executions {
             })
     }
 
-    pub fn parked(&self) -> Vec<u64> {
-        self.entries
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, entry)| !entry.attachment.lock().unwrap().attached)
-            .map(|(id, _)| *id)
-            .collect()
+    pub fn list(&self) -> Vec<Arc<Execution>> {
+        self.entries.lock().unwrap().values().cloned().collect()
     }
 
     pub fn forget(&self, id: u64) -> crate::Result<()> {
