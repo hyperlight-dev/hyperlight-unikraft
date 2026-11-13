@@ -48,9 +48,9 @@ async fn report(name: &str, mut child: Child) -> Result<(), Box<dyn Error>> {
 
 fn report_status(name: &str, status: ExitStatus) {
     let color = if status.success() {
-        "\x1b[32m"
+        "\x1b[1;32m"
     } else {
-        "\x1b[31m"
+        "\x1b[1;31m"
     };
     match status.code() {
         Some(code) => {
