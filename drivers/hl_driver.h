@@ -98,6 +98,7 @@ struct hlcall_hostcall {
 #define HL_HOST_CALL_ERR 1
 
 static int g_hl_call_fd = -1;
+static hl_dispatch_fn_t g_hl_command_dispatch;
 static uint8_t *g_hl_call_buf;
 static size_t g_hl_call_cap;
 
@@ -342,7 +343,12 @@ static inline __attribute__((noreturn)) void hl_driver_run(hl_dispatch_fn_t cb)
 		/* Only the calls the callback serves reach it: Exec and
 		 * GuestExec, and Call when it said so.  Anything else fails
 		 * here, rather than run as the kind it is not. */
-		if (fc_name_is(fc, (size_t)n, "Exec") ||
+		if (g_hl_command_dispatch &&
+		    (fc_name_is(fc, (size_t)n, "CommandSpawn") ||
+		     fc_name_is(fc, (size_t)n, "CommandKill"))) {
+			status = g_hl_command_dispatch(fc, (size_t)n);
+			ran = 1;
+		} else if (fc_name_is(fc, (size_t)n, "Exec") ||
 		    fc_name_is(fc, (size_t)n, "GuestExec") ||
 		    (g_hl_serves_calls && fc_name_is(fc, (size_t)n, "Call"))) {
 			status = cb(fc, (size_t)n);
