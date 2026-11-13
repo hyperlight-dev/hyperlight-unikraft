@@ -26,11 +26,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Hyperlight host and common dependencies now track upstream `main` through Git.
-  The kernel and runtime drivers use Postcard calls, replies and logs with the
-  16-byte transport header. Rebuild runtime images with the updated drivers;
-  FlatBuffer-based images are incompatible. Both embedded kernels and the native
-  test fixture are rebuilt, and snapshot contract 11 requires fresh snapshots.
+- Command `Child::wait()` now waits for the whole process tree and returns the
+  root's exit status; `wait_root()` provides the former root-only behavior.
+  `wait_tree()` is removed. `status()`, `output()`, and `wait_with_output()` also
+  wait for whole-tree completion; `try_wait()` and `kill()` remain root-only.
 - **Breaking:** `AppSandbox::run`, `call`, `join` and `step` are async-only.
   The migration's `_async` names are consolidated into these methods and the
   synchronous adapters are removed. `step()` has no timeout argument:
@@ -48,6 +47,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   driving future poisons the sandbox until restore. Boot, submission, snapshots
   and restore remain synchronous. Updated kernels and snapshot contract 11
   require fresh snapshots.
+- Hyperlight host and common dependencies now track upstream `main` through Git.
+  The kernel and runtime drivers use Postcard calls, replies and logs with the
+  16-byte transport header. Rebuild runtime images with the updated drivers;
+  FlatBuffer-based images are incompatible. Both embedded kernels and the native
+  test fixture are rebuilt, and snapshot contract 11 requires fresh snapshots.
 
 ### Fixed
 
