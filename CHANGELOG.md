@@ -25,10 +25,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Command `Child::wait()` now waits for the whole process tree and returns the
-  root's exit status; `wait_root()` provides the former root-only behavior.
-  `wait_tree()` is removed. `status()`, `output()`, and `wait_with_output()` also
-  wait for whole-tree completion; `try_wait()` and `kill()` remain root-only.
+- Command `Child::wait()` waits for the root; `wait_all()` waits for the whole
+  process tree and returns the root's status. `kill_all()` signals the entire
+  execution, including reparented descendants, then waits for cleanup.
+  `try_wait()`, `status()`, and `kill()` remain root-only; output helpers also
+  drain their captured pipes to EOF. Command protocol v2 requires rebuilt
+  compiled-runtime driver images.
 - **Breaking:** `AppSandbox::run`, `call`, `join` and `step` are async-only.
   The migration's `_async` names are consolidated into these methods and the
   synchronous adapters are removed. `step()` has no timeout argument:
@@ -44,7 +46,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   immediate syscall fallback; POSIX setup, options and errno translation remain.
 - Async driving requires Tokio's time and I/O drivers. Dropping an unfinished
   driving future poisons the sandbox until restore. Boot, submission, snapshots
-  and restore remain synchronous. Updated kernels and snapshot contract 11
+  and restore remain synchronous. Updated kernels and snapshot contract 12
   require fresh snapshots.
 
 ### Fixed

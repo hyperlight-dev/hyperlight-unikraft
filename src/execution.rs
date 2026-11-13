@@ -191,7 +191,7 @@ impl Executions {
             "CommandDriverVersion",
             move || -> hyperlight_host::Result<u64> {
                 registry.supported.store(true, Ordering::Relaxed);
-                Ok(1)
+                Ok(2)
             },
         )?;
         let registry = self.clone();

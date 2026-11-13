@@ -92,8 +92,31 @@ int main(int argc, char **argv)
 		assert(n == 0);
 		return 0;
 	}
-	if (!strcmp(argv[1], "host")) {
+	if (!strcmp(argv[1], "kill-tree")) {
+		pid_t child = vfork();
+		assert(child >= 0);
+		if (!child) {
+			execl(argv[0], argv[0], "kill-middle", (char *)NULL);
+			_exit(127);
+		}
+		if (!strcmp(argv[2], "live")) pause_ms(60000);
+		return 7;
+	}
+	if (!strcmp(argv[1], "kill-middle")) {
+		pid_t child = vfork();
+		assert(child >= 0);
+		if (!child) {
+			execl(argv[0], argv[0], "detached-host", "[]", (char *)NULL);
+			_exit(127);
+		}
+		return 0;
+	}
+	if (!strcmp(argv[1], "host") || !strcmp(argv[1], "detached-host")) {
 		assert(argc == 3);
+		if (!strcmp(argv[1], "detached-host")) {
+			assert(setsid() >= 0);
+			assert(write(1, "before kill\n", 12) == 12);
+		}
 		int fd = open("/dev/hlcall", O_RDWR | O_CLOEXEC);
 		assert(fd >= 0);
 		uint8_t reply[4096];
