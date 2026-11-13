@@ -22,6 +22,7 @@
  *              → back into read(): the call is done
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,7 @@
 #include "hl_fc.h"
 #include "hl_env.h"
 #include "hl_driver.h"
+#include "hl_command.h"
 
 /* ── Dispatch callback ─────────────────────────────────────────── */
 
@@ -153,6 +155,8 @@ int main(int argc, char **argv)
 	(void)argv;
 
 	if (hl_driver_init("hl_execdriver"))
+		return 1;
+	if (command_init())
 		return 1;
 
 	/* Serve named calls from the kernel's queue; never returns */
