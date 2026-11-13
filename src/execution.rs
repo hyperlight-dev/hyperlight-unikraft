@@ -86,6 +86,24 @@ pub(crate) struct Attachment {
     pub resume: Option<Vec<u8>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ExecutionSnapshot {
+    next: u64,
+    next_request: u64,
+    entries: Vec<ExecutionImage>,
+}
+
+#[derive(Clone)]
+struct ExecutionImage {
+    id: u64,
+    done: bool,
+    failure: Option<String>,
+    process: ProcessState,
+    pipes: [PipeState; 3],
+    streams: [bool; 3],
+    resume: Vec<u8>,
+}
+
 #[derive(Default)]
 pub(crate) struct Executions {
     pub supported: AtomicBool,
@@ -116,26 +134,7 @@ impl Executions {
             .checked_add(1)
             .ok_or_else(|| HyperlightError::Error("execution IDs exhausted".into()))?;
         *next = id;
-        let inbox = Arc::new(Mutex::new(inbox.lock().unwrap().child()));
-        let entry = Arc::new(Execution {
-            id,
-            attachment: Mutex::new(Attachment {
-                attached: true,
-                generation: 1,
-                streams,
-                resume: None,
-            }),
-            needs_restore: AtomicBool::new(false),
-            failure: Mutex::default(),
-            done: AtomicBool::new(false),
-            process: Mutex::default(),
-            pipes: std::array::from_fn(|_| Arc::default()),
-            calls: Mutex::new(async_calls::PendingCalls::new(inbox.clone())),
-            inbox,
-            net: Arc::new(net.map_or_else(hostnet::Net::disabled, |net| net.fork())),
-            wake: Arc::default(),
-            deadline: Mutex::new(None),
-        });
+        let entry = Arc::new(Execution::new(id, inbox, net, streams));
         entries.insert(id, entry.clone());
         Ok((id, entry))
     }
@@ -180,6 +179,92 @@ impl Executions {
         }
         entries.remove(&id);
         Ok(())
+    }
+
+    pub fn snapshot(
+        &self,
+        inbox: &Arc<Mutex<async_calls::Inbox>>,
+    ) -> crate::Result<ExecutionSnapshot> {
+        let entries: Vec<_> = self.entries.lock().unwrap().values().cloned().collect();
+        if entries
+            .iter()
+            .any(|entry| entry.attachment.lock().unwrap().attached)
+        {
+            return Err(Error::Wait(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "drop all child handles before snapshot or restore",
+            )));
+        }
+        let mut images = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut calls = match entry.calls.try_lock() {
+                Ok(calls) => calls,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(Error::Wait(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "a command poll is still detaching",
+                    )));
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
+            };
+            entry.park(&mut calls);
+            let state = entry.attachment.lock().unwrap();
+            images.push(ExecutionImage {
+                id: entry.id,
+                done: entry.done.load(Ordering::Relaxed),
+                failure: entry.failure.lock().unwrap().clone(),
+                process: entry.process.lock().unwrap().clone(),
+                pipes: std::array::from_fn(|i| entry.pipes[i].state.lock().unwrap().clone()),
+                streams: state.streams,
+                resume: state.resume.clone().unwrap(),
+            });
+        }
+        Ok(ExecutionSnapshot {
+            next: *self.next.lock().unwrap(),
+            next_request: inbox.lock().unwrap().next_id(),
+            entries: images,
+        })
+    }
+
+    pub fn restore(
+        &self,
+        snapshot: &ExecutionSnapshot,
+        inbox: &Arc<Mutex<async_calls::Inbox>>,
+        net: Option<&Arc<hostnet::Net>>,
+    ) {
+        let mut entries = BTreeMap::new();
+        for image in &snapshot.entries {
+            let mut entry = Execution::new(image.id, inbox, net, image.streams);
+            entry.done.store(image.done, Ordering::Relaxed);
+            *entry.failure.get_mut().unwrap() = image.failure.clone();
+            *entry.process.get_mut().unwrap() = image.process.clone();
+            entry.pipes = std::array::from_fn(|i| {
+                Arc::new(Pipe {
+                    state: Mutex::new(image.pipes[i].clone()),
+                    ..Pipe::default()
+                })
+            });
+            let state = entry.attachment.get_mut().unwrap();
+            state.attached = false;
+            state.resume = Some(image.resume.clone());
+            entry.needs_restore.store(true, Ordering::Relaxed);
+            entries.insert(image.id, Arc::new(entry));
+        }
+        *self.entries.lock().unwrap() = entries;
+        let mut next = self.next.lock().unwrap();
+        *next = (*next).max(snapshot.next);
+        inbox.lock().unwrap().restore_next_id(snapshot.next_request);
+        self.current.store(0, Ordering::Relaxed);
+        self.active.store(0, Ordering::Relaxed);
+    }
+
+    pub fn negotiate(&self, inbox: &Arc<Mutex<async_calls::Inbox>>) {
+        let inbox = inbox.lock().unwrap();
+        for entry in self.entries.lock().unwrap().values() {
+            let mut child = entry.inbox.lock().unwrap();
+            child.negotiated = inbox.negotiated;
+            child.interrupt_supported = inbox.interrupt_supported;
+        }
     }
 
     pub fn current(&self) -> hyperlight_host::Result<Option<Arc<Execution>>> {
@@ -328,7 +413,7 @@ impl Executions {
 const PIPE_CAPACITY: usize = 64 * 1024;
 const IO_CHUNK: usize = 4096;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PipeState {
     bytes: VecDeque<u8>,
     eof: bool,
@@ -410,7 +495,7 @@ impl Pipe {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ProcessState {
     pub pid: Option<u32>,
     pub status: Option<i32>,
@@ -418,6 +503,34 @@ pub(crate) struct ProcessState {
 }
 
 impl Execution {
+    fn new(
+        id: u64,
+        inbox: &Arc<Mutex<async_calls::Inbox>>,
+        net: Option<&Arc<hostnet::Net>>,
+        streams: [bool; 3],
+    ) -> Self {
+        let inbox = Arc::new(Mutex::new(inbox.lock().unwrap().child()));
+        Self {
+            id,
+            attachment: Mutex::new(Attachment {
+                attached: true,
+                generation: 1,
+                streams,
+                resume: None,
+            }),
+            needs_restore: AtomicBool::new(false),
+            failure: Mutex::default(),
+            done: AtomicBool::new(false),
+            process: Mutex::default(),
+            pipes: std::array::from_fn(|_| Arc::default()),
+            calls: Mutex::new(async_calls::PendingCalls::new(inbox.clone())),
+            inbox,
+            net: Arc::new(net.map_or_else(hostnet::Net::disabled, |net| net.fork())),
+            wake: Arc::default(),
+            deadline: Mutex::new(None),
+        }
+    }
+
     pub fn check_attachment(&self, generation: u64) -> Result<()> {
         let state = self.attachment.lock().unwrap();
         if !state.attached || state.generation != generation {

@@ -175,8 +175,47 @@ other's command descriptors. Cross-tree socket sharing is not supported.
 Command protocol version 5 requires rebuilt C, Rust, Go, or .NET AOT exec
 driver images. Other runtimes and snapshots restored without the command
 handshake are rejected explicitly by `into_commands()`. Command sandboxes
-do not expose snapshots/restores or the legacy interpreter API. Existing
-`AppSandbox` driving and snapshot behavior remain unchanged.
+do not expose the legacy interpreter API. Existing `AppSandbox` driving and
+snapshot behavior remain unchanged.
+
+### Parked command snapshots
+
+Drop every child before calling `CommandSandbox::snapshot()`. This captures
+the whole VM and the host-side command registry: execution IDs, root statuses,
+stream states and buffered bytes, and retained completion records. It contains
+no futures or live host I/O resources. The original commands remain parked and
+can be reacquired independently of the snapshot.
+
+```rust,ignore
+let id = child.execution_id();
+drop(child);
+let snapshot = sandbox.snapshot()?;
+
+let child = sandbox.restore_child(id)?;
+let output = child.wait_with_output().await?;
+
+// All children must be dropped before replacing the current guest state.
+sandbox.restore(&snapshot)?;
+let child = sandbox.restore_child(id)?;
+```
+
+`SandboxBuilder::from_command_snapshot(&snapshot)` boots an independent clone.
+Supply host functions, mounts, network policy and listening ports on that builder,
+then call `boot()?.into_commands()?`. Boot and restore do not run command threads
+or invoke their async handlers. Use `parked_children()` and `restore_child(id)`
+to drive them. In-place restore preserves execution-ID allocation high-water
+marks, so IDs from discarded branches are not reused for new commands.
+
+The `CommandSnapshot` object is an in-memory snapshot; it is not the raw
+`Snapshot` accepted by the legacy disk/OCI helpers. Its command metadata must not
+be omitted. Guest timer deadlines follow the existing snapshot clock policy;
+live detach/reattach does not restart their duration. Connections are not cloned,
+and pending resource-dependent operations are interrupted on first drive.
+
+Snapshots reject attached children. A concurrent lifecycle transition or an
+in-flight poll still finishing detachment returns `Error::Wait` with
+`WouldBlock`; retry after that operation finishes. Taken handles from before a
+detach or restore remain invalid and cannot consume restored output.
 
 ### Attribution and control wire format
 
@@ -193,6 +232,10 @@ are eligible to run. Other trees remain queued even when their timers expire;
 their deadlines and socket readiness are not serviced by this entry. Runnable
 foreign threads do not prevent returning to the host. This gate is independent
 of ordinary blocking and wakeups. Spawn and kill select their target too.
+Shared supervisor and guest-init bookkeeping can run, but not another command's
+application threads. This is scheduling isolation, not a PID/filesystem namespace:
+applications deliberately synchronizing across trees still require both trees
+to be driven. CPU-bound guest code still requires the interrupt handle to preempt.
 
 `ExecutionRestore() -> i32` marks the first entry after resource teardown.
 After delivering retained completion records, the kernel reconstructs only

@@ -10,8 +10,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   executables, with structured arguments, environment and cwd, cancellation-safe
   waits, root-scoped lifetimes, and bounded stdin/stdout/stderr pipes.
   Each command tree owns its host futures, sockets and timers; polling one
-  handle does not poll another tree's queued host operations. Requires rebuilt
-  C, Rust, Go or .NET AOT exec driver images; command snapshots are not yet exposed.
+  handle runs only its own guest tree and host operations, plus shared supervisor
+  infrastructure. Requires rebuilt C, Rust, Go or .NET AOT exec driver images.
+- Dropped command children are parked and can be reacquired by execution ID.
+  Detachment releases host futures, sockets and timer registrations without VM
+  entry, invalidates taken stream handles, and preserves logical streams and data.
+  Reattachment reconstructs resources and interrupts pending calls with `EINTR`.
+  Completed data replies survive; established connections do not.
+- In-memory command snapshots capture the whole guest plus parked execution
+  metadata, pipe buffers and retained replies. Restore in place with
+  `CommandSandbox::restore`, or boot an independent clone with
+  `SandboxBuilder::from_command_snapshot`. All children must be detached first.
 - An opt-in async driving release benchmark, including
   latency, throughput, CPU use and VM-entry counts for calls, timers, fan-out
   and ready/delayed TCP and UDP peers.
@@ -32,7 +41,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   synchronous VM entry without polling host futures. Unforwarded output is
   discarded; host-buffered output remains readable.
   The separate `wait_all()`, `kill_all()`, and `start_kill()` APIs are removed.
-  Output helpers also drain their captured pipes to EOF. Command protocol v3 requires rebuilt
+  Output helpers also drain their captured pipes to EOF. Command protocol v5 requires rebuilt
   compiled-runtime driver images.
 - **Breaking:** `AppSandbox::run`, `call`, `join` and `step` are async-only.
   The migration's `_async` names are consolidated into these methods and the
@@ -49,7 +58,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   immediate syscall fallback; POSIX setup, options and errno translation remain.
 - Async driving requires Tokio's time and I/O drivers. Dropping an unfinished
   driving future poisons the sandbox until restore. Boot, submission, snapshots
-  and restore remain synchronous. Updated kernels and snapshot contract 13
+  and restore remain synchronous. Updated kernels and snapshot contract 16
   require fresh snapshots.
 
 ### Fixed

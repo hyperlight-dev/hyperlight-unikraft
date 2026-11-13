@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The Hyperlight Authors.
 
-//! Concurrent commands and automatic descendant cleanup in one sandbox.
+//! Concurrent commands, parking, snapshots, and descendant cleanup in one sandbox.
 //!
 //! From the repository root on Linux, with Docker, just, GCC, Rust, and KVM:
 //!
@@ -106,6 +106,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let first_id = first.execution_id();
+    drop(first);
+    let checkpoint = sandbox.snapshot()?;
+    let first = sandbox.restore_child(first_id)?;
     let second = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "25", "hello from the second command"])
@@ -115,6 +119,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Both waits are polled concurrently, including their output drains.
     futures::try_join!(report("first", first), report("second", second))?;
+
+    sandbox.restore(&checkpoint)?;
+    report("restored", sandbox.restore_child(first_id)?).await?;
 
     let mut tree = sandbox
         .command("/mnt/bin/command")

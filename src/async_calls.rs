@@ -62,6 +62,15 @@ struct Budget {
 }
 
 impl Inbox {
+    pub fn next_id(&self) -> u64 {
+        self.budget.lock().unwrap().next_id
+    }
+
+    pub fn restore_next_id(&self, next_id: u64) {
+        let mut budget = self.budget.lock().unwrap();
+        budget.next_id = budget.next_id.max(next_id);
+    }
+
     pub fn child(&self) -> Self {
         Self {
             negotiated: self.negotiated,

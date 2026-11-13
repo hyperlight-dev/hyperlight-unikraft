@@ -2335,6 +2335,7 @@ pub struct SandboxBuilder {
     /// booting a fresh guest; `kernel`/`initrd`/`entry`/`scratch_mb` are
     /// then an error (the snapshot carries them).
     snapshot: Option<Arc<Snapshot>>,
+    command_state: Option<execution::ExecutionSnapshot>,
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
@@ -2366,6 +2367,7 @@ impl SandboxBuilder {
             entry: None,
             scratch_mb: None,
             snapshot: None,
+            command_state: None,
             mounts: Vec::new(),
             network: None,
             listen_ports: None,
@@ -2426,6 +2428,18 @@ impl SandboxBuilder {
     pub fn from_snapshot(snapshot: Arc<Snapshot>) -> Self {
         Self {
             snapshot: Some(snapshot),
+            ..Self::empty()
+        }
+    }
+
+    /// Restore a command sandbox, including its parked executions and pipe data.
+    /// Configure host functions, mounts and network policy, then call
+    /// [`boot`](Self::boot) and [`AppSandbox::into_commands`].
+    /// No command is driven until its child handle is reacquired and polled.
+    pub fn from_command_snapshot(snapshot: &command::CommandSnapshot) -> Self {
+        Self {
+            snapshot: Some(snapshot.guest.clone()),
+            command_state: Some(snapshot.executions.clone()),
             ..Self::empty()
         }
     }
@@ -2715,6 +2729,7 @@ impl SandboxBuilder {
             entry,
             scratch_mb,
             snapshot,
+            command_state,
             mounts,
             network,
             listen_ports,
@@ -2887,11 +2902,17 @@ impl SandboxBuilder {
             clean_scratch_bytes: 0,
             async_poisoned: false,
         };
+        if let Some(state) = command_state {
+            app.config
+                .executions
+                .restore(&state, &app.config.async_inbox, app.config.net.as_ref());
+        }
         if restored {
             // Put the image right for this host before anyone can observe
             // it: the kernel reseeds its CSPRNG and re-establishes the
             // guest's host sockets (see `resume`).
             app.resume()?;
+            app.config.executions.negotiate(&app.config.async_inbox);
         } else {
             app.mark_clean()?;
         }
