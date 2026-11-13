@@ -25,13 +25,37 @@ use hyperlight_unikraft::{
 
 async fn report(name: &str, child: Child) -> Result<(), Box<dyn Error>> {
     let output = child.wait_with_output().await?;
-    println!("{name}: exit code {:?}", output.status.code());
-    io::stdout().write_all(&output.stdout)?;
-    io::stderr().write_all(&output.stderr)?;
+    report_lines(name, &output.stdout, &mut io::stdout())?;
+    report_lines(name, &output.stderr, &mut io::stderr())?;
+    match output.status.code() {
+        Some(code) => {
+            let message = if output.status.success() {
+                "success"
+            } else {
+                "non-zero exit status"
+            };
+            println!("[{name} exit code {code}: {message}]");
+        }
+        None => println!(
+            "[{name} exit code unavailable: terminated by signal {}]",
+            output.status.signal().expect("exit status has a signal")
+        ),
+    }
     if !output.status.success() {
         return Err(io::Error::other(format!("{name} failed: {:?}", output.status)).into());
     }
     Ok(())
+}
+
+fn report_lines(name: &str, output: &[u8], writer: &mut impl Write) -> io::Result<()> {
+    for line in output.split_inclusive(|byte| *byte == b'\n') {
+        write!(writer, "[{name}] ")?;
+        writer.write_all(line)?;
+        if !line.ends_with(b"\n") {
+            writeln!(writer)?;
+        }
+    }
+    writer.flush()
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -77,4 +101,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tree.wait_tree().await?;
     println!("whole tree finished");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixes_each_line_and_terminates_partial_lines() {
+        let mut output = Vec::new();
+        report_lines("worker", b"first\n\nlast\xff", &mut output).unwrap();
+        assert_eq!(output, b"[worker] first\n[worker] \n[worker] last\xff\n");
+    }
+
+    #[test]
+    fn empty_output_has_no_prefixed_line() {
+        let mut output = Vec::new();
+        report_lines("worker", b"", &mut output).unwrap();
+        assert!(output.is_empty());
+    }
 }
