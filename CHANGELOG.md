@@ -27,7 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Command `Child::wait()` waits for the root; `wait_all()` waits for the whole
   process tree and returns the root's status. `kill_all()` signals the entire
-  execution, including reparented descendants, then waits for cleanup.
+  execution, including reparented descendants, and completes cleanup in one
+  synchronous VM entry without polling host futures. Unforwarded output is
+  discarded; host-buffered output remains readable.
   `try_wait()`, `status()`, and `kill()` remain root-only; output helpers also
   drain their captured pipes to EOF. Command protocol v2 requires rebuilt
   compiled-runtime driver images.

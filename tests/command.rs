@@ -427,16 +427,15 @@ async fn kill_all_ends_reparented_descendants_and_drops_their_host_calls() {
             } else {
                 assert!(child.try_wait().unwrap().is_none());
             }
+            child.kill_all().unwrap();
+            let status = child.wait_all().now_or_never().unwrap().unwrap();
             let mut output = Vec::new();
-            let ((), _) = futures::try_join!(child.kill_all(), async {
-                stdout
-                    .read_to_end(&mut output)
-                    .await
-                    .map_err(hyperlight_unikraft::Error::Wait)
-            })
-            .unwrap();
-            assert_eq!(output, b"before kill\n");
-            let status = child.wait_all().await.unwrap();
+            stdout
+                .read_to_end(&mut output)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            assert!(b"before kill\n".starts_with(&output));
             if root_mode == "exit" {
                 assert_eq!(status.code(), Some(7));
             } else {
@@ -444,7 +443,7 @@ async fn kill_all_ends_reparented_descendants_and_drops_their_host_calls() {
             }
             assert!(dropped.load(Ordering::SeqCst));
             assert!(stdin.write_all(b"closed").await.is_err());
-            child.kill_all().await.unwrap();
+            child.kill_all().unwrap();
             let next = sandbox
                 .command("/mnt/bin/command")
                 .args(["sleep", "0", "still alive"])
@@ -459,7 +458,23 @@ async fn kill_all_ends_reparented_descendants_and_drops_their_host_calls() {
 }
 
 #[tokio::test]
-async fn cancelled_kill_all_preserves_backpressured_output() {
+async fn synchronous_kill_all_preserves_only_host_buffered_output_in_one_entry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    struct Entries(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> Layer<S> for Entries {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            let metadata = event.metadata();
+            if metadata.target() == "hyperlight_unikraft"
+                && metadata.fields().field("yielded").is_some()
+                && metadata.fields().field("name").is_some()
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
     let sandbox = builder().boot().unwrap().into_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -474,36 +489,66 @@ async fn cancelled_kill_all_preserves_backpressured_output() {
             .is_err()
     );
     assert!(child.try_wait().unwrap().is_none());
-    assert!(child.kill_all().now_or_never().is_none());
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let (status, _, _) = tokio::time::timeout(Duration::from_secs(5), async {
-        futures::try_join!(
-            child.wait_all(),
-            async {
-                stdout
-                    .read_to_end(&mut out)
-                    .await
-                    .map_err(hyperlight_unikraft::Error::Wait)
-            },
-            async {
-                stderr
-                    .read_to_end(&mut err)
-                    .await
-                    .map_err(hyperlight_unikraft::Error::Wait)
-            },
-        )
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(status.signal(), Some(9));
+    let entries = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Entries(entries.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        child.kill_all().unwrap();
+        assert_eq!(entries.load(Ordering::SeqCst), 1);
+        let status = child.wait_all().now_or_never().unwrap().unwrap();
+        assert_eq!(status.signal(), Some(9));
+        stdout
+            .read_to_end(&mut out)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        stderr
+            .read_to_end(&mut err)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        child.kill_all().unwrap();
+        assert_eq!(entries.load(Ordering::SeqCst), 1);
+    });
     for output in [out, err] {
-        assert!(output.len() >= 64 * 1024);
+        assert_eq!(output.len(), 64 * 1024);
         assert!(output.iter().all(|byte| *byte == b'x'));
     }
+}
+
+#[test]
+fn kill_all_without_a_runtime_does_not_poll_queued_host_functions() {
+    let sandbox = builder()
+        .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
+            panic!("kill_all must cancel, not poll, the host function");
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    child.kill_all().unwrap();
+    let status = child.wait_all().now_or_never().unwrap().unwrap();
+    assert_eq!(status.signal(), Some(9));
+    assert!(stdin.write_all(b"closed").now_or_never().unwrap().is_err());
+    let mut output = Vec::new();
+    stdout
+        .read_to_end(&mut output)
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    assert!(output.is_empty());
 }
 
 #[tokio::test]
@@ -534,7 +579,11 @@ async fn kill_all_closes_only_its_trees_inherited_socket() {
         let (peer_b, _) = listener.accept().await.unwrap();
 
         assert!(a.wait_all().now_or_never().is_none());
-        a.kill_all().await.unwrap();
+        a.kill_all().unwrap();
+        assert_eq!(
+            a.wait_all().now_or_never().unwrap().unwrap().code(),
+            Some(9)
+        );
         loop {
             peer_a.readable().await.unwrap();
             match peer_a.try_read(&mut [0]) {
