@@ -20,7 +20,7 @@ use std::{error::Error, io, io::Write, path::Path};
 use futures::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use hyperlight_unikraft::{
     Mount, SandboxBuilder,
-    command::{Child, Stdio},
+    command::{Child, ExitStatus, Stdio},
 };
 
 async fn report(name: &str, mut child: Child) -> Result<(), Box<dyn Error>> {
@@ -39,6 +39,19 @@ async fn report(name: &str, mut child: Child) -> Result<(), Box<dyn Error>> {
                 .map_err(hyperlight_unikraft::Error::Wait)
         },
     )?;
+    report_status(name, status);
+    if !status.success() {
+        return Err(io::Error::other(format!("{name} failed: {status:?}")).into());
+    }
+    Ok(())
+}
+
+fn report_status(name: &str, status: ExitStatus) {
+    let color = if status.success() {
+        "\x1b[32m"
+    } else {
+        "\x1b[31m"
+    };
     match status.code() {
         Some(code) => {
             let message = if status.success() {
@@ -46,17 +59,13 @@ async fn report(name: &str, mut child: Child) -> Result<(), Box<dyn Error>> {
             } else {
                 "non-zero exit status"
             };
-            println!("[{name} exit code {code}: {message}]");
+            println!("{color}[{name} exit code {code}: {message}]\x1b[0m");
         }
         None => println!(
-            "[{name} exit code unavailable: terminated by signal {}]",
+            "{color}[{name} exit code unavailable: terminated by signal {}]\x1b[0m",
             status.signal().expect("exit status has a signal")
         ),
     }
-    if !status.success() {
-        return Err(io::Error::other(format!("{name} failed: {status:?}")).into());
-    }
-    Ok(())
 }
 
 async fn report_lines(
@@ -70,7 +79,7 @@ async fn report_lines(
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
     while reader.read_until(b'\n', &mut line).await? != 0 {
-        write!(writer, "[{name}] ")?;
+        write!(writer, "\x1b[1m[{name}]\x1b[0m ")?;
         writer.write_all(&line)?;
         if !line.ends_with(b"\n") {
             writeln!(writer)?;
@@ -115,7 +124,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let stdout = tree.stdout.take().expect("stdout was configured as piped");
     // This fixture's root deliberately exits with 7 before its descendant.
     let status = tree.wait().await?;
-    println!("tree root: exit code {:?}", status.code());
+    report_status("tree root", status);
 
     // Reading the taken pipe continues driving descendants after root exit.
     report_lines("tree", Some(stdout), &mut io::stdout()).await?;
@@ -135,7 +144,10 @@ mod tests {
         report_lines("worker", Some(&b"first\n\nlast\xff"[..]), &mut output)
             .await
             .unwrap();
-        assert_eq!(output, b"[worker] first\n[worker] \n[worker] last\xff\n");
+        assert_eq!(
+            output,
+            b"\x1b[1m[worker]\x1b[0m first\n\x1b[1m[worker]\x1b[0m \n\x1b[1m[worker]\x1b[0m last\xff\n"
+        );
     }
 
     #[tokio::test]
@@ -158,6 +170,6 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
-        assert_eq!(output, b"[worker] early\n");
+        assert_eq!(output, b"\x1b[1m[worker]\x1b[0m early\n");
     }
 }
