@@ -49,6 +49,7 @@ mod cgroup;
 #[cfg(feature = "cpio")]
 pub mod cpio;
 mod errno;
+mod execution;
 mod hostfs;
 mod hostnet;
 pub mod net_policy;
@@ -1300,6 +1301,7 @@ pub(crate) struct GuestConfig {
     /// The embedder's functions, served through `HostCall`.
     host_functions: HostFunctionTable,
     async_inbox: Arc<Mutex<async_calls::Inbox>>,
+    executions: Arc<execution::Executions>,
     /// Whether to register `HostWriteErr`; off only to test a host
     /// without it ([`SandboxBuilder::without_host_write_err`]).
     host_write_err: bool,
@@ -1349,6 +1351,7 @@ impl GuestConfig {
             result: Arc::new(Mutex::new(None)),
             host_functions: HostFunctionTable::default(),
             async_inbox: Arc::default(),
+            executions: Arc::default(),
             host_write_err: true,
             guest: Mutex::new(Guest::default()),
             profile: profile::Profile::new(),
@@ -1497,6 +1500,7 @@ impl GuestConfig {
     /// Works for both the init path (`UninitializedSandbox`) and the
     /// snapshot-restore path (`HostFunctions`).
     pub fn register(&self, target: &mut impl Registerable) -> Result<()> {
+        self.executions.register(target)?;
         // Guest console output, uncolored (Hyperlight's own HostPrint wraps
         // it in green ANSI), and captured for programmatic access.
         self.register_write(target, Stream::Out)?;
@@ -1792,12 +1796,15 @@ impl GuestConfig {
         // forwards a driver's HLCALL_IOC_HOSTCALL here as it is.
         let table = self.host_functions.clone();
         let inbox = self.async_inbox.clone();
+        let executions = self.executions.clone();
         let prof = self.profile.clone();
         target.register_host_function(
             "HostCall",
             move |name: String, args: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
                 let _profile = prof.host("HostCall");
-                Ok(dispatch_host_call(&table, &inbox, &name, &args))
+                let execution = executions.current()?;
+                let inbox = execution.as_ref().map_or(&inbox, |e| &e.inbox);
+                Ok(dispatch_host_call(&table, inbox, &name, &args))
             },
         )?;
         let inbox = self.async_inbox.clone();
@@ -1817,10 +1824,17 @@ impl GuestConfig {
             },
         )?;
         let inbox = self.async_inbox.clone();
+        let executions = self.executions.clone();
         target.register_host_function(
             "CancelAsyncHostCall",
             move |id: u64| -> hyperlight_host::Result<i32> {
-                inbox.lock().unwrap().cancel(id);
+                let execution = executions.current()?;
+                execution
+                    .as_ref()
+                    .map_or(&inbox, |e| &e.inbox)
+                    .lock()
+                    .unwrap()
+                    .cancel(id);
                 Ok(0)
             },
         )?;
@@ -1859,12 +1873,19 @@ impl GuestConfig {
         // to use the network.
         hostfs::register(target, &self.mounts, &self.profile)?;
         match &self.net {
-            Some(net) => hostnet::register(target, net, &self.profile, &self.async_inbox)?,
+            Some(net) => hostnet::register(
+                target,
+                net,
+                &self.profile,
+                &self.async_inbox,
+                &self.executions,
+            )?,
             None => hostnet::register(
                 target,
                 &Arc::new(hostnet::Net::disabled()),
                 &self.profile,
                 &self.async_inbox,
+                &self.executions,
             )?,
         }
 
