@@ -98,6 +98,40 @@ async fn independent_host_futures_and_cancelled_wait() {
 }
 
 #[tokio::test]
+async fn driving_one_tree_does_not_schedule_another_trees_expired_timers() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    for mode in ["sleep", "sleep-tree"] {
+        let mut a = sandbox
+            .command("/mnt/bin/command")
+            .args([mode, "20", "a"])
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            sandbox
+                .command("/mnt/bin/command")
+                .args(["sleep", "80", "b"])
+                .status(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(status.success());
+        assert!(
+            a.try_wait().unwrap().is_none(),
+            "{mode} ran while driving b"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), a.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[tokio::test]
 async fn root_exit_kills_the_descendant_and_closes_taken_output() {
     let sandbox = builder().boot().unwrap().into_commands().unwrap();
     let mut child = sandbox

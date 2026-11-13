@@ -150,7 +150,7 @@ there is no shell parsing or PATH search. Stdio defaults to `/dev/null`;
 `Stdio::piped()` opts into a host pipe. Independent roots do not inherit each
 other's command descriptors. Cross-tree socket sharing is not supported.
 
-Command protocol version 3 requires rebuilt C, Rust, Go, or .NET AOT exec
+Command protocol version 4 requires rebuilt C, Rust, Go, or .NET AOT exec
 driver images. Other runtimes and snapshots restored without the command
 handshake are rejected explicitly by `into_commands()`. Command sandboxes
 do not expose snapshots/restores or the legacy interpreter API. Existing
@@ -158,12 +158,19 @@ do not expose snapshots/restores or the legacy interpreter API. Existing
 
 ### Attribution and control wire format
 
-The exec driver negotiates version 3 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
+The exec driver negotiates version 4 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
 Workers attach with `HLCALL_IOC_EXECUTION` (ioctl 5, `u64`). The kernel inherits
 this identity through thread creation. Before a host call whose owner changed,
 the transport sends `ExecutionContext(u64) -> i32` under the same transport
 lock as the following call. Socket rescans and resource destruction use the
 resource owner's identity, never the currently polled host handle.
+
+Before scheduling on each entry, `ExecutionActive() -> u64` selects the command
+being driven. Only that execution's threads and execution-zero infrastructure
+are eligible to run. Other trees remain queued even when their timers expire;
+their deadlines and socket readiness are not serviced by this entry. Runnable
+foreign threads do not prevent returning to the host. This gate is independent
+of ordinary blocking and wakeups. Spawn and kill select their target too.
 
 `CommandSpawn` carries one NUL-delimited string: version, execution ID,
 argument count (excluding argv[0]), environment count, piped-stream bitmask
@@ -199,7 +206,7 @@ execution as the requesting worker.
 
 Each boundary reports `ExecutionTimers(Vec<u8>)`: pairs of little-endian
 `u64 execution_id, u64 nanoseconds_until_wakeup`. The host takes the earliest
-deadline per execution, replacing the previous boundary's set; absent timers
+deadline for the selected execution, replacing its previous boundary's set; absent timers
 are removed. Legacy execution zero retains the original `Yield` protocol.
 The control device releases its read vnode lock while the supervisor waits,
 so control ioctls and independent worker opens cannot deadlock behind it.

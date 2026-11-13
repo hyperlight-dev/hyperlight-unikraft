@@ -223,7 +223,7 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 	memcpy(command->storage, data, len);
 	char *cursor = command->storage, *end = cursor + len;
 
-	if (command_number(&cursor, end, &version) || version != 3 ||
+	if (command_number(&cursor, end, &version) || version != 4 ||
 	    command_number(&cursor, end, &command->id) || !command->id ||
 	    command_number(&cursor, end, &argc) || argc > len ||
 	    command_number(&cursor, end, &envc) || envc > len ||
@@ -258,7 +258,7 @@ static int command_init(void)
 		fprintf(stderr, "hl_command: negotiation failed: %s\n", strerror(errno));
 		return -1;
 	}
-	if (version != 3) return -1;
+	if (version != 4) return -1;
 	g_hl_command_dispatch = command_dispatch;
 	return 0;
 }

@@ -109,6 +109,18 @@ int main(int argc, char **argv)
 		printf("%s\n", argv[3]);
 		return 0;
 	}
+	if (!strcmp(argv[1], "sleep-tree")) {
+		pid_t child = vfork();
+		assert(child >= 0);
+		if (!child) {
+			execl(argv[0], argv[0], "sleep", argv[2], "descendant", (char *)NULL);
+			_exit(127);
+		}
+		int status;
+		assert(waitpid(child, &status, 0) == child);
+		assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		return 0;
+	}
 	if (!strcmp(argv[1], "echo")) {
 		char buffer[4096];
 		ssize_t n;
