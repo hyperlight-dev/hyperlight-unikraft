@@ -17,19 +17,31 @@
 
 use std::{error::Error, io, io::Write, path::Path};
 
-use futures::io::AsyncReadExt;
+use futures::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use hyperlight_unikraft::{
     Mount, SandboxBuilder,
     command::{Child, Stdio},
 };
 
-async fn report(name: &str, child: Child) -> Result<(), Box<dyn Error>> {
-    let output = child.wait_with_output().await?;
-    report_lines(name, &output.stdout, &mut io::stdout())?;
-    report_lines(name, &output.stderr, &mut io::stderr())?;
-    match output.status.code() {
+async fn report(name: &str, mut child: Child) -> Result<(), Box<dyn Error>> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (status, (), ()) = futures::try_join!(
+        child.wait(),
+        async {
+            report_lines(name, stdout, &mut io::stdout())
+                .await
+                .map_err(hyperlight_unikraft::Error::Wait)
+        },
+        async {
+            report_lines(name, stderr, &mut io::stderr())
+                .await
+                .map_err(hyperlight_unikraft::Error::Wait)
+        },
+    )?;
+    match status.code() {
         Some(code) => {
-            let message = if output.status.success() {
+            let message = if status.success() {
                 "success"
             } else {
                 "non-zero exit status"
@@ -38,24 +50,35 @@ async fn report(name: &str, child: Child) -> Result<(), Box<dyn Error>> {
         }
         None => println!(
             "[{name} exit code unavailable: terminated by signal {}]",
-            output.status.signal().expect("exit status has a signal")
+            status.signal().expect("exit status has a signal")
         ),
     }
-    if !output.status.success() {
-        return Err(io::Error::other(format!("{name} failed: {:?}", output.status)).into());
+    if !status.success() {
+        return Err(io::Error::other(format!("{name} failed: {status:?}")).into());
     }
     Ok(())
 }
 
-fn report_lines(name: &str, output: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    for line in output.split_inclusive(|byte| *byte == b'\n') {
+async fn report_lines(
+    name: &str,
+    reader: Option<impl AsyncRead + Unpin>,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let Some(reader) = reader else {
+        return Ok(());
+    };
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).await? != 0 {
         write!(writer, "[{name}] ")?;
-        writer.write_all(line)?;
+        writer.write_all(&line)?;
         if !line.ends_with(b"\n") {
             writeln!(writer)?;
         }
+        writer.flush()?;
+        line.clear();
     }
-    writer.flush()
+    Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -89,15 +112,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .arg("tree")
         .stdout(Stdio::piped())
         .spawn()?;
-    let mut stdout = tree.stdout.take().expect("stdout was configured as piped");
+    let stdout = tree.stdout.take().expect("stdout was configured as piped");
     // This fixture's root deliberately exits with 7 before its descendant.
     let status = tree.wait().await?;
     println!("tree root: exit code {:?}", status.code());
 
     // Reading the taken pipe continues driving descendants after root exit.
-    let mut output = Vec::new();
-    stdout.read_to_end(&mut output).await?;
-    io::stdout().write_all(&output)?;
+    report_lines("tree", Some(stdout), &mut io::stdout()).await?;
     tree.wait_tree().await?;
     println!("whole tree finished");
     Ok(())
@@ -106,18 +127,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{FutureExt, StreamExt, TryStreamExt};
 
-    #[test]
-    fn prefixes_each_line_and_terminates_partial_lines() {
+    #[tokio::test]
+    async fn prefixes_each_line_and_terminates_partial_lines() {
         let mut output = Vec::new();
-        report_lines("worker", b"first\n\nlast\xff", &mut output).unwrap();
+        report_lines("worker", Some(&b"first\n\nlast\xff"[..]), &mut output)
+            .await
+            .unwrap();
         assert_eq!(output, b"[worker] first\n[worker] \n[worker] last\xff\n");
     }
 
-    #[test]
-    fn empty_output_has_no_prefixed_line() {
+    #[tokio::test]
+    async fn empty_output_has_no_prefixed_line() {
         let mut output = Vec::new();
-        report_lines("worker", b"", &mut output).unwrap();
+        report_lines("worker", Some(&b""[..]), &mut output)
+            .await
+            .unwrap();
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn reports_complete_lines_before_eof() {
+        let reader = futures::stream::iter([Ok::<_, io::Error>(b"early\npartial".to_vec())])
+            .chain(futures::stream::pending())
+            .into_async_read();
+        let mut output = Vec::new();
+        assert!(
+            report_lines("worker", Some(reader), &mut output)
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(output, b"[worker] early\n");
     }
 }

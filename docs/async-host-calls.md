@@ -60,7 +60,10 @@ cargo run --example sandbox_commands
 
 The guest executable is the existing C command fixture; `just build-test-bins`
 also builds it. No Rust, Go, or .NET guest toolchains are needed for the commands
-above. Output from the two commands is reported in completion order.
+above. Stdout and stderr are drained concurrently with the process waits;
+each line is reported as it arrives, prefixed with the command name. The exit
+summary follows both streams reaching EOF. Only the current line is collected,
+rather than the entire output (a very long line can still use unbounded memory).
 
 `AppSandbox::into_commands()` consumes an idle compiled-runtime sandbox and
 returns a `command::CommandSandbox`. This opt-in API runs executable paths,
