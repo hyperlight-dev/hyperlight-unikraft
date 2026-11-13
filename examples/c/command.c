@@ -3,6 +3,7 @@
  */
 #define _GNU_SOURCE
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,7 +35,13 @@ static void host_call(const char *name, const char *args)
 		uint8_t *out;
 		uint64_t cap, len;
 	} request = { name, strlen(name), args, strlen(args), reply, sizeof(reply), 0 };
-	assert(ioctl(fd, _IOWR('H', 3, struct request), &request) == 0);
+	int rc;
+	for (;;) {
+		rc = ioctl(fd, _IOWR('H', 3, struct request), &request);
+		if (!rc || errno != EINTR) break;
+		assert(write(1, "interrupted\n", 12) == 12);
+	}
+	assert(rc == 0);
 	assert(request.len && reply[0] == 0);
 	assert(write(1, reply + 1, request.len - 1) == (ssize_t)request.len - 1);
 	close(fd);
@@ -43,6 +50,35 @@ static void host_call(const char *name, const char *args)
 int main(int argc, char **argv)
 {
 	assert(argc >= 2);
+	if (!strcmp(argv[1], "park-socket") || !strcmp(argv[1], "park-listener")) {
+		int fd = socket(AF_INET, SOCK_STREAM, 0);
+		assert(fd >= 0);
+		struct sockaddr_in address = {
+			.sin_family = AF_INET,
+			.sin_port = htons(atoi(argv[2])),
+			.sin_addr.s_addr = htonl(INADDR_LOOPBACK)
+		};
+		int listening = !strcmp(argv[1], "park-listener");
+		if (listening) {
+			assert(bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0);
+			assert(listen(fd, 4) == 0);
+		} else {
+			assert(connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0);
+		}
+		assert(write(1, "ready\n", 6) == 6);
+		if (listening) {
+			host_call("gate", "[]");
+			int peer = accept(fd, NULL, NULL);
+			assert(peer >= 0);
+			close(peer);
+		} else {
+			char byte;
+			assert(read(fd, &byte, 1) == 0);
+		}
+		close(fd);
+		assert(write(1, "closed\n", 7) == 7);
+		return 0;
+	}
 	if (!strcmp(argv[1], "net-tree")) {
 		int fd = socket(AF_INET, SOCK_STREAM, 0);
 		assert(fd >= 0);

@@ -146,13 +146,290 @@ async fn root_exit_kills_the_descendant_and_closes_taken_output() {
         .unwrap()
         .unwrap();
     assert_eq!(status.code(), Some(7));
-    drop(child);
     let mut output = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut output))
         .await
         .unwrap()
         .unwrap();
     assert!(output.is_empty());
+}
+
+#[tokio::test]
+async fn dropping_a_child_cancels_calls_and_restoring_retries_with_eintr() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (sender, receiver) = futures::channel::oneshot::channel::<String>();
+    let receiver = Arc::new(Mutex::new(Some(receiver)));
+    let count = Arc::new(AtomicUsize::new(0));
+    let called = count.clone();
+    let sandbox = builder()
+        .async_host_function("gate", move |_| {
+            called.fetch_add(1, Ordering::SeqCst);
+            let receiver = receiver.lock().unwrap().take();
+            async move {
+                match receiver {
+                    Some(receiver) => receiver.await.map_err(|error| error.to_string()),
+                    None => Ok("retried".into()),
+                }
+            }
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let id = child.execution_id();
+    assert!(sandbox.restore_child(id).is_err());
+    assert!(child.wait().now_or_never().is_none());
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    drop(child);
+    assert!(sender.is_canceled());
+    assert_eq!(sandbox.parked_children(), [id]);
+    assert!(sandbox.forget_child(id).is_err());
+    assert!(
+        sandbox
+            .command("/mnt/bin/command")
+            .args(["sleep", "0", "other"])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let child = sandbox.restore_child(id).unwrap();
+    drop(child);
+    let child = sandbox.restore_child(id).unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"interrupted\nretried");
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    assert!(
+        sandbox
+            .restore_child(id)
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    sandbox.forget_child(id).unwrap();
+    assert!(sandbox.restore_child(id).is_err());
+}
+
+#[tokio::test]
+async fn parking_preserves_backpressured_output_and_invalidates_taken_pipes() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("large")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let id = child.execution_id();
+    let mut old_stdout = child.stdout.take().unwrap();
+    for _ in 0..40 {
+        assert!(child.wait().now_or_never().is_none());
+    }
+    let mut first = [0];
+    old_stdout.read_exact(&mut first).await.unwrap();
+    assert!(child.wait().now_or_never().is_none());
+    drop(child);
+    assert!(old_stdout.read(&mut first).await.is_err());
+    let child = sandbox.restore_child(id).unwrap();
+    assert!(old_stdout.read(&mut first).await.is_err());
+    drop(old_stdout);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(first, [b'x']);
+    assert_eq!(output.stdout, vec![b'x'; 80 * 4096 - 1]);
+    assert_eq!(output.stderr, vec![b'x'; 80 * 4096]);
+}
+
+#[tokio::test]
+async fn parking_closes_host_connections_without_entering_the_vm() {
+    use tokio::io::AsyncRead as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let sandbox = builder()
+        .network(hyperlight_unikraft::NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["park-socket", &port])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let id = child.execution_id();
+    let mut output = child.stdout.take().unwrap();
+    let mut ready = [0; 6];
+    tokio::time::timeout(Duration::from_secs(5), output.read_exact(&mut ready))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&ready, b"ready\n");
+    let (mut socket, _) = listener.accept().await.unwrap();
+    drop(child);
+    let mut byte = [0];
+    let mut buffer = tokio::io::ReadBuf::new(&mut byte);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::poll_fn(|cx| std::pin::Pin::new(&mut socket).poll_read(cx, &mut buffer)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(buffer.filled().is_empty());
+    let child = sandbox.restore_child(id).unwrap();
+    drop(output);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"closed\n");
+}
+
+#[tokio::test]
+async fn parking_releases_a_listener_and_restores_it_on_first_drive() {
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let (sender, receiver) = futures::channel::oneshot::channel::<String>();
+    let receiver = Arc::new(Mutex::new(Some(receiver)));
+    let sandbox = builder()
+        .network(hyperlight_unikraft::NetworkPolicy::AllowAll)
+        .listen_ports(hyperlight_unikraft::ListenPorts::from_ports([
+            address.port()
+        ]))
+        .async_host_function("gate", move |_| {
+            let receiver = receiver.lock().unwrap().take();
+            async move {
+                match receiver {
+                    Some(receiver) => receiver.await.map_err(|error| error.to_string()),
+                    None => Ok(String::new()),
+                }
+            }
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["park-listener", &address.port().to_string()])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let id = child.execution_id();
+    let mut stdout = child.stdout.take().unwrap();
+    stdout.read_exact(&mut [0; 6]).await.unwrap();
+    drop(child);
+    assert!(sender.is_canceled());
+    let reservation = std::net::TcpListener::bind(address).unwrap();
+    let mut child = sandbox.restore_child(id).unwrap();
+    drop(reservation);
+    assert!(child.wait().now_or_never().is_none());
+    let (connection, output) = tokio::time::timeout(Duration::from_secs(5), async {
+        futures::join!(
+            tokio::net::TcpStream::connect(address),
+            child.wait_with_output()
+        )
+    })
+    .await
+    .unwrap();
+    connection.unwrap();
+    let output = output.unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"interrupted\nclosed\n");
+}
+
+#[test]
+fn parked_child_can_be_restored_and_killed_without_a_runtime() {
+    let sandbox = builder()
+        .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
+            panic!("an undriven call must never be polled");
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let child = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .spawn()
+        .unwrap();
+    let id = child.execution_id();
+    drop(child);
+    let mut child = sandbox.restore_child(id).unwrap();
+    child.kill().unwrap();
+    assert_eq!(
+        child.wait().now_or_never().unwrap().unwrap().signal(),
+        Some(9)
+    );
+}
+
+#[tokio::test]
+async fn restoring_a_parked_timer_does_not_restart_its_duration() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let child = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep-tree", "200"])
+        .spawn()
+        .unwrap();
+    let id = child.execution_id();
+    drop(child);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut child = sandbox.restore_child(id).unwrap();
+    let _ = child.wait().now_or_never();
+    assert!(child.try_wait().unwrap().unwrap().success());
+}
+
+#[tokio::test]
+async fn host_future_can_drop_its_own_child_without_deadlocking() {
+    let slot = Arc::new(Mutex::new(None));
+    let owned = slot.clone();
+    let sandbox = builder()
+        .async_host_function("gate", move |_| {
+            drop(owned.lock().unwrap().take());
+            std::future::ready(Ok("completed".into()))
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let id = child.execution_id();
+    let mut stdout = child.stdout.take().unwrap();
+    *slot.lock().unwrap() = Some(child);
+    assert!(stdout.read(&mut [0]).await.is_err());
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        sandbox.restore_child(id).unwrap().wait_with_output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"completed");
 }
 
 #[tokio::test]
@@ -659,7 +936,10 @@ async fn independent_wait_and_pipe_tasks_do_not_overwrite_wakers() {
         stderr.read_to_end(&mut bytes).await.unwrap();
         bytes
     });
-    let status = tokio::spawn(async move { child.wait().await.unwrap() });
+    let status = tokio::spawn(async move {
+        let status = child.wait().await.unwrap();
+        (status, child)
+    });
     let (out, err, status) = tokio::time::timeout(Duration::from_secs(5), async {
         futures::join!(out, err, status)
     })
@@ -667,7 +947,7 @@ async fn independent_wait_and_pipe_tasks_do_not_overwrite_wakers() {
     .unwrap();
     assert_eq!(out.unwrap(), vec![b'x'; 80 * 4096]);
     assert_eq!(err.unwrap(), vec![b'x'; 80 * 4096]);
-    assert!(status.unwrap().success());
+    assert!(status.unwrap().0.success());
 }
 
 #[tokio::test]

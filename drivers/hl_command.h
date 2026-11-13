@@ -56,19 +56,24 @@ static void *command_pipe(void *arg)
 
 	for (;;) {
 		ssize_t count;
+		int rc;
 
 		if (pipe->stream) {
 			do { count = read(pipe->fd, bytes, sizeof(bytes)); }
 			while (count < 0 && errno == EINTR);
 			if (count < 0) { error = errno; break; }
 			io.len = count;
-			if (ioctl(control, HLCALL_IOC_COMMAND_IO, &io)) {
+			do { rc = ioctl(control, HLCALL_IOC_COMMAND_IO, &io); }
+			while (rc && errno == EINTR);
+			if (rc) {
 				if (errno != EPIPE) error = errno;
 				break;
 			}
 			if (!count) break;
 		} else {
-			if (ioctl(control, HLCALL_IOC_COMMAND_IO, &io)) {
+			do { rc = ioctl(control, HLCALL_IOC_COMMAND_IO, &io); }
+			while (rc && errno == EINTR);
+			if (rc) {
 				error = errno; break;
 			}
 			if (!io.done) break;
@@ -223,7 +228,7 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 	memcpy(command->storage, data, len);
 	char *cursor = command->storage, *end = cursor + len;
 
-	if (command_number(&cursor, end, &version) || version != 4 ||
+	if (command_number(&cursor, end, &version) || version != 5 ||
 	    command_number(&cursor, end, &command->id) || !command->id ||
 	    command_number(&cursor, end, &argc) || argc > len ||
 	    command_number(&cursor, end, &envc) || envc > len ||
@@ -258,7 +263,7 @@ static int command_init(void)
 		fprintf(stderr, "hl_command: negotiation failed: %s\n", strerror(errno));
 		return -1;
 	}
-	if (version != 4) return -1;
+	if (version != 5) return -1;
 	g_hl_command_dispatch = command_dispatch;
 	return 0;
 }

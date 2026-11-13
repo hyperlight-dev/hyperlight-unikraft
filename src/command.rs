@@ -31,6 +31,10 @@ use crate::{
 #[derive(Clone)]
 pub struct CommandSandbox(Arc<Coordinator>);
 
+/// Stable execution identity within a command sandbox, distinct from a guest PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExecutionId(u64);
+
 struct Coordinator {
     sandbox: Mutex<AppSandbox>,
     executions: Arc<crate::execution::Executions>,
@@ -53,7 +57,7 @@ impl AppSandbox {
         {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "this rootfs does not support command protocol version 4",
+                "this rootfs does not support command protocol version 5",
             )));
         }
         Ok(CommandSandbox(Arc::new(Coordinator {
@@ -65,6 +69,62 @@ impl AppSandbox {
 }
 
 impl CommandSandbox {
+    /// List detached executions, including completed commands not yet forgotten.
+    pub fn parked_children(&self) -> Vec<ExecutionId> {
+        self.0
+            .executions
+            .parked()
+            .into_iter()
+            .map(ExecutionId)
+            .collect()
+    }
+
+    /// Reacquire a detached command. Resources are reconstructed when first driven.
+    ///
+    /// Previously taken pipe handles remain invalid; the returned child owns new
+    /// handles to the preserved streams. Fails if a handle is already attached,
+    /// or an in-flight poll has not yet finished detaching.
+    pub fn restore_child(&self, id: ExecutionId) -> Result<Child> {
+        self.0.failure()?;
+        let execution = self.0.executions.get(id.0)?;
+        let mut calls = match execution.calls.try_lock() {
+            Ok(calls) => calls,
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::Wait(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "command is still being driven",
+                )));
+            }
+            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+        };
+        {
+            let state = execution.attachment.lock().unwrap();
+            if state.attached {
+                return Err(Error::Wait(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "command already has a child handle",
+                )));
+            }
+        }
+        execution.park(&mut calls);
+        let generation = {
+            let mut state = execution.attachment.lock().unwrap();
+            state.generation = state.generation.checked_add(1).ok_or_else(|| {
+                Error::Wait(io::Error::other("command handle generations exhausted"))
+            })?;
+            state.attached = true;
+            state.generation
+        };
+        drop(calls);
+        Ok(Child::attach(self.0.clone(), execution, generation))
+    }
+
+    /// Release retained metadata and output for a detached, completed command.
+    /// Restore and kill unfinished commands before forgetting them.
+    pub fn forget_child(&self, id: ExecutionId) -> Result<()> {
+        self.0.executions.forget(id.0)
+    }
+
     /// Build a command using an absolute guest executable path.
     pub fn command(&self, program: impl Into<String>) -> Command {
         Command {
@@ -209,7 +269,7 @@ impl Command {
             )));
         }
         let mut fields = vec![
-            "4".to_owned(),
+            "5".to_owned(),
             "0".to_owned(),
             self.args.len().to_string(),
             env.len().to_string(),
@@ -235,9 +295,11 @@ impl Command {
         if size > crate::CALL_PAYLOAD_MAX {
             return Err(Error::CallTooLarge { bytes: size });
         }
-        let (id, execution) = coordinator
-            .executions
-            .create(&sandbox.config.async_inbox, sandbox.config.net.as_ref())?;
+        let (id, execution) = coordinator.executions.create(
+            &sandbox.config.async_inbox,
+            sandbox.config.net.as_ref(),
+            self.stdio.map(|mode| mode == Stdio::Piped),
+        )?;
         fields[1] = id.to_string();
         let request = fields.join("\0") + "\0";
         coordinator.executions.before_entry(id);
@@ -251,20 +313,7 @@ impl Command {
         drop(sandbox);
         coordinator.executions.wake_all();
         result?;
-        let make_pipe = |stream: usize| ChildPipe {
-            subscription: execution.wake.subscribe(),
-            coordinator: coordinator.clone(),
-            execution: execution.clone(),
-            stream,
-        };
-        let child = Child {
-            id,
-            stdin: (self.stdio[0] == Stdio::Piped).then(|| ChildStdin(make_pipe(0))),
-            stdout: (self.stdio[1] == Stdio::Piped).then(|| ChildStdout(make_pipe(1))),
-            stderr: (self.stdio[2] == Stdio::Piped).then(|| ChildStderr(make_pipe(2))),
-            execution,
-            coordinator: coordinator.clone(),
-        };
+        let child = Child::attach(coordinator.clone(), execution, 1);
         child.try_wait()?;
         Ok(child)
     }
@@ -306,7 +355,15 @@ impl Coordinator {
         }
     }
 
-    fn poll(&self, execution: &Arc<Execution>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll(
+        &self,
+        execution: &Arc<Execution>,
+        generation: u64,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>> {
+        if let Err(error) = execution.check_attachment(generation) {
+            return Poll::Ready(Err(error));
+        }
         if let Err(error) = self.failure() {
             return Poll::Ready(Err(error));
         }
@@ -318,9 +375,44 @@ impl Coordinator {
             Err(TryLockError::WouldBlock) => return Poll::Pending,
             Err(TryLockError::Poisoned(error)) => panic!("{error}"),
         };
-        calls.set_timer(*execution.deadline.lock().unwrap());
-        // Poll embedder futures without the VM lock.
-        let polled = execution.wake.with_context(|cx| calls.poll_batch(cx));
+        let result = self.poll_locked(execution, generation, cx, &mut calls);
+        if execution.done.load(std::sync::atomic::Ordering::Relaxed)
+            || matches!(&result, Poll::Ready(Err(_)))
+        {
+            calls.clear();
+        }
+        let mut state = execution.attachment.lock().unwrap();
+        if !state.attached {
+            drop(state);
+            execution.park(&mut calls);
+            state = execution.attachment.lock().unwrap();
+        }
+        drop(calls);
+        drop(state);
+        if result.is_ready() {
+            self.executions.wake_all();
+        }
+        result
+    }
+
+    fn poll_locked(
+        &self,
+        execution: &Arc<Execution>,
+        generation: u64,
+        cx: &mut Context<'_>,
+        calls: &mut async_calls::PendingCalls,
+    ) -> Poll<Result<()>> {
+        let resuming = execution.attachment.lock().unwrap().resume.is_some();
+        let polled = if resuming {
+            Poll::Ready(Ok(async_calls::Wake::Calls))
+        } else {
+            calls.set_timer(*execution.deadline.lock().unwrap());
+            // Poll embedder futures without the VM lock.
+            execution.wake.with_context(|cx| calls.poll_batch(cx))
+        };
+        if let Err(error) = execution.check_attachment(generation) {
+            return Poll::Ready(Err(error));
+        }
         if execution.done.load(std::sync::atomic::Ordering::Relaxed) {
             calls.clear();
             return Poll::Pending;
@@ -353,7 +445,12 @@ impl Coordinator {
             ..
         } = &mut *sandbox;
         let result = if wake == async_calls::Wake::Calls {
-            config.enter(vm, "step_async", (calls.take_batch(),))
+            let batch = if resuming {
+                execution.attachment.lock().unwrap().resume.take().unwrap()
+            } else {
+                calls.take_batch()
+            };
+            config.enter(vm, "step_async", (batch,))
         } else {
             config.enter(vm, "step", ())
         };
@@ -362,8 +459,6 @@ impl Coordinator {
             calls.delivered();
         }
         drop(sandbox);
-        drop(calls);
-        self.executions.wake_all();
         cx.waker().wake_by_ref();
         Poll::Ready(result)
     }
@@ -400,12 +495,16 @@ pub struct Output {
 
 /// A root process and handles driving its entire guest process tree.
 ///
-/// Dropping a wait future is safe. Dropping this handle does not kill the tree.
+/// Dropping a wait future is safe. Dropping this handle parks the tree, cancels
+/// pending host work, and releases host sockets and timers without a VM entry.
+/// An in-flight pipe poll finishes the teardown when it returns. Taken pipes
+/// become invalid. Restore using [`CommandSandbox::restore_child`].
 /// Root exit automatically kills any remaining descendants.
 /// Waiting does not drain piped output; drain concurrently or use
 /// [`wait_with_output`](Self::wait_with_output).
 pub struct Child {
     id: u64,
+    generation: u64,
     coordinator: Arc<Coordinator>,
     execution: Arc<Execution>,
     /// Piped stdin, when requested. Drop it to send EOF.
@@ -417,6 +516,31 @@ pub struct Child {
 }
 
 impl Child {
+    fn attach(coordinator: Arc<Coordinator>, execution: Arc<Execution>, generation: u64) -> Self {
+        let streams = execution.attachment.lock().unwrap().streams;
+        let pipe = |stream| ChildPipe {
+            subscription: execution.wake.subscribe(),
+            coordinator: coordinator.clone(),
+            execution: execution.clone(),
+            generation,
+            stream,
+        };
+        Self {
+            id: execution.id,
+            generation,
+            stdin: streams[0].then(|| ChildStdin(pipe(0))),
+            stdout: streams[1].then(|| ChildStdout(pipe(1))),
+            stderr: streams[2].then(|| ChildStderr(pipe(2))),
+            coordinator,
+            execution,
+        }
+    }
+
+    /// Identity used to reacquire this command after dropping its handle.
+    pub fn execution_id(&self) -> ExecutionId {
+        ExecutionId(self.id)
+    }
+
     /// Synchronously stop the root, all descendants, and their workers.
     ///
     /// Uses one VM entry, without polling host futures or draining output.
@@ -425,6 +549,7 @@ impl Child {
     /// After success, `wait()` is immediately ready with the root's status.
     /// Like other VM entries, this cannot preempt CPU-bound guest code.
     pub fn kill(&mut self) -> Result<()> {
+        self.execution.check_attachment(self.generation)?;
         self.coordinator.failure()?;
         if !self
             .execution
@@ -477,6 +602,7 @@ impl Child {
     /// Returns the root's status only after descendant and worker cleanup,
     /// matching [`wait`](Self::wait).
     pub fn try_wait(&self) -> Result<Option<ExitStatus>> {
+        self.execution.check_attachment(self.generation)?;
         self.coordinator.failure()?;
         self.execution.check()?;
         if !self
@@ -510,7 +636,9 @@ impl Child {
             if let Some(status) = self.try_wait()? {
                 return Poll::Ready(Ok(status));
             }
-            if let Poll::Ready(Err(error)) = self.coordinator.poll(&self.execution, cx) {
+            if let Poll::Ready(Err(error)) =
+                self.coordinator.poll(&self.execution, self.generation, cx)
+            {
                 return Poll::Ready(Err(error));
             }
             Poll::Pending
@@ -543,20 +671,67 @@ impl Child {
     }
 }
 
+impl Drop for Child {
+    fn drop(&mut self) {
+        {
+            let mut state = self.execution.attachment.lock().unwrap();
+            if state.generation != self.generation {
+                return;
+            }
+            state.attached = false;
+        }
+        match self.execution.calls.try_lock() {
+            Ok(mut calls) => self.execution.park(&mut calls),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+        }
+        self.execution.wake.notify();
+    }
+}
+
 struct ChildPipe {
     subscription: Subscription,
     coordinator: Arc<Coordinator>,
     execution: Arc<Execution>,
+    generation: u64,
     stream: usize,
 }
 
 impl Drop for ChildPipe {
     fn drop(&mut self) {
+        let mut state = self.execution.attachment.lock().unwrap();
+        if !state.attached || state.generation != self.generation {
+            return;
+        }
+        state.streams[self.stream] = false;
         if self.stream == 0 {
             self.execution.pipes[0].eof();
         } else {
             self.execution.pipes[self.stream].close();
         }
+    }
+}
+
+impl ChildPipe {
+    fn access<T>(
+        &self,
+        action: impl FnOnce(&crate::execution::Pipe) -> Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        let state = self.execution.attachment.lock().unwrap();
+        if !state.attached || state.generation != self.generation {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "command pipe is detached",
+            )));
+        }
+        if let Err(error) = self
+            .coordinator
+            .failure()
+            .and_then(|_| self.execution.check())
+        {
+            return Poll::Ready(Err(io::Error::other(error)));
+        }
+        action(&self.execution.pipes[self.stream])
     }
 }
 
@@ -566,22 +741,15 @@ impl AsyncRead for ChildPipe {
         cx: &mut Context<'_>,
         out: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let pipe = &self.execution.pipes[self.stream];
         self.subscription.register(cx.waker());
-        if let Err(error) = self
-            .coordinator
-            .failure()
-            .and_then(|_| self.execution.check())
+        if let Poll::Ready(result) = self.access(|pipe| pipe.read(cx, out)) {
+            return Poll::Ready(result);
+        }
+        if let Poll::Ready(Err(error)) = self.coordinator.poll(&self.execution, self.generation, cx)
         {
             return Poll::Ready(Err(io::Error::other(error)));
         }
-        if let Poll::Ready(result) = pipe.read(cx, out) {
-            return Poll::Ready(result);
-        }
-        if let Poll::Ready(Err(error)) = self.coordinator.poll(&self.execution, cx) {
-            return Poll::Ready(Err(io::Error::other(error)));
-        }
-        pipe.read(cx, out)
+        self.access(|pipe| pipe.read(cx, out))
     }
 }
 
@@ -616,30 +784,26 @@ impl AsyncWrite for ChildStdin {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let pipe = &self.0.execution.pipes[0];
         self.0.subscription.register(cx.waker());
-        if let Err(error) = self
-            .0
-            .coordinator
-            .failure()
-            .and_then(|_| self.0.execution.check())
+        if let Poll::Ready(result) = self.0.access(|pipe| pipe.write(cx, bytes)) {
+            return Poll::Ready(result);
+        }
+        if let Poll::Ready(Err(error)) =
+            self.0
+                .coordinator
+                .poll(&self.0.execution, self.0.generation, cx)
         {
             return Poll::Ready(Err(io::Error::other(error)));
         }
-
-        if let Poll::Ready(result) = pipe.write(cx, bytes) {
-            return Poll::Ready(result);
-        }
-        if let Poll::Ready(Err(error)) = self.0.coordinator.poll(&self.0.execution, cx) {
-            return Poll::Ready(Err(io::Error::other(error)));
-        }
-        pipe.write(cx, bytes)
+        self.0.access(|pipe| pipe.write(cx, bytes))
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+        self.0.access(|_| Poll::Ready(Ok(())))
     }
     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0.execution.pipes[0].eof();
-        Poll::Ready(Ok(()))
+        self.0.access(|pipe| {
+            pipe.eof();
+            Poll::Ready(Ok(()))
+        })
     }
 }

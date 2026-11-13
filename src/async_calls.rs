@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The Hyperlight Authors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -51,6 +51,7 @@ pub(crate) struct Inbox {
     pub interrupt_supported: bool,
     budget: Arc<Mutex<Budget>>,
     outstanding: HashMap<u64, AbortHandle>,
+    resource_bound: HashSet<u64>,
     queued: Vec<(u64, Operation)>,
 }
 
@@ -67,6 +68,7 @@ impl Inbox {
             interrupt_supported: self.interrupt_supported,
             budget: self.budget.clone(),
             outstanding: HashMap::new(),
+            resource_bound: HashSet::new(),
             queued: Vec::new(),
         }
     }
@@ -122,11 +124,21 @@ impl Inbox {
         Ok(id)
     }
 
+    pub fn submit_resource_reply(
+        &mut self,
+        reply: impl std::future::Future<Output = std::io::Result<Vec<u8>>> + Send + 'static,
+    ) -> Result<u64, String> {
+        let id = self.submit_fallible_reply(reply)?;
+        self.resource_bound.insert(id);
+        Ok(id)
+    }
+
     pub fn is_pending(&self) -> bool {
         !self.outstanding.is_empty()
     }
 
     pub fn cancel(&mut self, id: u64) {
+        self.resource_bound.remove(&id);
         if let Some(abort) = self.outstanding.remove(&id) {
             self.budget.lock().unwrap().outstanding -= 1;
             abort.abort();
@@ -135,6 +147,7 @@ impl Inbox {
     }
 
     fn delivered(&mut self, id: u64) {
+        self.resource_bound.remove(&id);
         if self.outstanding.remove(&id).is_some() {
             self.budget.lock().unwrap().outstanding -= 1;
         }
@@ -143,6 +156,7 @@ impl Inbox {
     fn clear(&mut self) {
         self.budget.lock().unwrap().outstanding -= self.outstanding.len();
         self.outstanding.clear();
+        self.resource_bound.clear();
         self.queued.clear();
     }
 }
@@ -290,6 +304,32 @@ impl PendingCalls {
         self.batch_ids.clear();
         let mut inbox = self.inbox.lock().unwrap();
         inbox.clear();
+    }
+
+    pub fn suspend(&mut self) -> Vec<u8> {
+        let mut batch: Vec<_> = [VERSION as u32, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut count = 0u32;
+        let mut offset = 8;
+        {
+            let inbox = self.inbox.lock().unwrap();
+            for id in &self.batch_ids {
+                let len =
+                    u32::from_le_bytes(self.batch[offset + 8..offset + 12].try_into().unwrap())
+                        as usize;
+                let end = offset + 12 + len;
+                if !inbox.resource_bound.contains(id) {
+                    batch.extend_from_slice(&self.batch[offset..end]);
+                    count += 1;
+                }
+                offset = end;
+            }
+        }
+        batch[4..8].copy_from_slice(&count.to_le_bytes());
+        self.clear();
+        batch
     }
 }
 
@@ -922,6 +962,39 @@ mod tests {
         inbox.cancel(id);
         assert!(inbox.queued.is_empty());
         assert!(!inbox.is_pending());
+    }
+
+    #[tokio::test]
+    async fn suspend_preserves_completed_data_but_not_reset_socket_results() {
+        let mut engine = engine();
+        let kept = submit(&engine, "completed");
+        engine
+            .inbox
+            .lock()
+            .unwrap()
+            .submit_resource_reply(async { Ok(vec![0, 0, 0, 0, 0]) })
+            .unwrap();
+        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
+        engine
+            .inbox
+            .lock()
+            .unwrap()
+            .submit_reply(async move {
+                receiver.await.unwrap();
+                vec![0]
+            })
+            .unwrap();
+        assert_eq!(
+            poll_fn(|cx| engine.poll_batch(cx)).await.unwrap(),
+            Wake::Calls
+        );
+        assert_eq!(engine.batch_ids.len(), 2);
+        let batch = engine.suspend();
+        assert_eq!(u32::from_le_bytes(batch[4..8].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(batch[8..16].try_into().unwrap()), kept);
+        assert_eq!(&batch[20..], b"\0completed");
+        assert!(sender.is_canceled());
+        assert!(!engine.is_pending());
     }
 
     #[tokio::test]
