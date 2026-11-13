@@ -447,13 +447,14 @@ impl Child {
         Ok(())
     }
 
-    /// Kill the root and all descendants, including reparented descendants,
-    /// then wait for the whole tree and its workers to finish.
+    /// Synchronously stop the root, all descendants, and their workers.
     ///
-    /// Closes stdin, including a taken stdin handle. Piped output is preserved
-    /// and must be drained concurrently to avoid backpressure blocking cleanup.
-    /// Cancellation leaves the kill request in effect; resume with `wait_all`.
-    pub async fn kill_all(&mut self) -> Result<()> {
+    /// Uses one VM entry, without polling host futures or draining output.
+    /// Unforwarded output is discarded; bytes already in host pipe buffers
+    /// remain readable, followed by EOF. Taken stdin handles are closed too.
+    /// After success, `wait_all()` is immediately ready with the root's status.
+    /// Like other VM entries, this cannot preempt CPU-bound guest code.
+    pub fn kill_all(&mut self) -> Result<()> {
         self.coordinator.failure()?;
         if !self
             .execution
@@ -461,9 +462,25 @@ impl Child {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             self.request_kill("CommandKillAll")?;
-            self.execution.pipes[0].eof();
         }
-        self.wait_all().await?;
+        if !self
+            .execution
+            .done
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Error::Wait(io::Error::other(
+                "whole-tree termination did not complete in one VM entry",
+            )));
+        }
+        self.execution.pipes[0].close();
+        self.execution.pipes[1].eof();
+        self.execution.pipes[2].eof();
+        self.execution.check()?;
+        if self.execution.process.lock().unwrap().status.is_none() {
+            return Err(Error::Wait(io::Error::other(
+                "execution ended without a root status",
+            )));
+        }
         Ok(())
     }
     /// Guest root PID once the executable has started.

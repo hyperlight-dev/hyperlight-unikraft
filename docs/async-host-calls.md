@@ -127,11 +127,14 @@ Dropping a child does not explicitly kill it, but closes any untaken pipes.
 waits only for root exit.
 `kill_all()` sends SIGKILL to every guest process with that execution identity,
 including descendants reparented to guest init or moved into a new session.
-It closes stdin (including a taken handle), then waits for the tree and its
-workers to finish. Piped output is preserved and must be drained concurrently
-with `kill_all()` if it could fill its buffers. Cancelling the wait does not
-undo the kill request; use `wait_all()` to finish cleanup. Killing an already
-completed tree is a no-op, and other command trees are not signalled.
+It is synchronous: one VM entry stops the tree and its workers, cancelling
+pending host calls without polling them. Stdin is closed, including a taken
+handle. Unforwarded output is discarded; bytes already in the host buffers
+remain readable, followed by EOF. No output draining or Tokio runtime is needed
+to call `kill_all()`. After success, `wait_all()` is immediately ready.
+Killing an already completed tree needs no VM entry, and other command trees
+are not signalled. As with other VM entries, CPU-bound guest code requires the
+existing interrupt-handle mechanism to preempt.
 Dropping the last handle to a tree stops its host-driven progress; keep a child
 or stream handle to continue driving it. Dropping every sandbox, child, and
 stream handle releases the VM and any unfinished work.
@@ -172,6 +175,10 @@ The numeric fields are decimal. A final NUL is required. `CommandKill` and
 `HLCALL_IOC_EXECUTION_KILL` (ioctl 9, `u64`) to signal all matching processes,
 excluding guest init and the calling driver supervisor. It uses inherited
 execution identity, not current parent PIDs or process groups.
+During whole-tree termination, the kernel cancels execution-owned async waits
+and refuses new forwarding operations so cleanup does not need another host
+completion batch. Socket readiness workers stop waiting on the host while
+process teardown closes their sockets.
 The normal named-call completion
 acknowledges control delivery, **not** process exit.
 
