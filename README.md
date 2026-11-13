@@ -49,6 +49,11 @@ and bounded-step behavior. The CLI manages its own runtime.
 Snapshots include pending host calls, which are
 [interrupted on restore](docs/async-host-calls.md#restoring-pending-host-calls).
 
+For concurrent executable process trees, an idle compiled-runtime sandbox can
+opt into the [Command-style API](docs/async-host-calls.md#command-process-trees)
+with `into_commands()`. Each child's waits and pipes independently drive its
+tree's host futures, sockets and timers; command waits are cancellation-safe.
+
 hyperlight-unikraft runs on **Linux** (KVM, or MSHV with `cargo build --features mshv`), **Windows** (WHP), and **macOS** on Apple silicon (HVF). On an arm64 host it embeds an arm64 kernel and runs arm64 guests; every published runtime image carries both architectures. On macOS the `hluk` binary needs the hypervisor entitlement: `codesign -f -s - --entitlements dev/macos-entitlements.plist target/release/hluk` (`cargo run` and `cargo test` do it for you, `install.sh` signs the one it installs, and an unsigned `hluk` prints a command that signs it). Hypervisor.framework allows one VM per process, so the sandboxes of one process take turns: run them from separate processes to run them side by side. A guest waiting on a timer while another sandbox runs sees its deadline pass.
 Releases carry a Windows arm64 `hluk` from v0.19.0.
 

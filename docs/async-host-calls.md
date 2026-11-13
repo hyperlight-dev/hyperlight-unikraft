@@ -42,6 +42,118 @@ buffers must not be retained across a scheduler switch. The hlcall device opts
 out of the vnode ioctl lock, since holding it across the wait would serialize
 unrelated guest threads. Other devices keep their existing locking.
 
+## Command process trees
+
+`AppSandbox::into_commands()` consumes an idle compiled-runtime sandbox and
+returns a `command::CommandSandbox`. This opt-in API runs executable paths,
+not interpreter snippets:
+
+```rust,no_run
+use hyperlight_unikraft::{SandboxBuilder, command::Stdio};
+
+# async fn example() -> hyperlight_unikraft::Result<()> {
+let sandbox = SandboxBuilder::from_initrd("build-elfloader/c-rootfs.cpio")
+    .boot()?
+    .into_commands()?;
+let first = sandbox.command("/usr/local/bin/first")
+    .arg("one argument with spaces")
+    .stdout(Stdio::piped())
+    .spawn()?;
+let second = sandbox.command("/usr/local/bin/second").spawn()?;
+let (first, second) = futures::try_join!(
+    first.wait_with_output(),
+    second.wait_with_output(),
+)?;
+assert!(first.status.success() && second.status.success());
+# Ok(())
+# }
+```
+
+Each host-launched root and all its descendants share one execution identity.
+It survives guest `exec` and reparenting. That execution owns its future set,
+socket table, socket-readiness wait, and scheduler deadlines. IDs and limits
+remain sandbox-wide: 1024 outstanding host operations and 1024 host sockets.
+The host routes at most 1024 active execution contexts at once; completed
+contexts are removed before another spawn. Their handles retain status and
+buffered output.
+Execution contexts separate progress and resource ownership, not guest security
+boundaries.
+
+Polling a child's wait, stdin, stdout, or stderr drives that tree's host
+operations. There is no background task or sandbox-wide async runner. VM entry
+is serialized, and embedder futures are polled outside the VM lock. Entering
+for one tree can still schedule runnable guest threads from another, or
+observe another tree's elapsed guest timers. It does **not** poll that other
+tree's queued embedder or network futures. Guest IPC between independent
+trees may require the host to drive both.
+
+`wait()` reports root exit; `wait_tree()` also waits for descendants and stream
+workers. Pipe EOF is separate from root exit because descendants can inherit
+writers. `wait_with_output()` drains both output pipes to EOF and collects the
+root status. Cancellation of any wait preserves the execution and prepared
+completion batches. Like a process wait, waiting closes stdin still held in
+the child's `stdin` field; take the handle first to manage its lifetime yourself.
+Dropping a child does not explicitly kill it, but closes any untaken pipes.
+`start_kill()` and `kill()` signal the root only, not its descendants.
+Dropping the last handle to a tree stops its host-driven progress; keep a child
+or stream handle to continue driving it. Dropping every sandbox, child, and
+stream handle releases the VM and any unfinished work.
+
+Streams implement `futures::io::AsyncRead` / `AsyncWrite`. Each host pipe holds
+at most 64 KiB, with 4 KiB transport chunks and ordinary backpressure. Drain
+piped output concurrently with `wait()` to avoid a full-pipe deadlock.
+`output()` and `wait_with_output()` collect into unbounded host vectors, like
+the corresponding standard-library APIs. Separate stream and wait handles
+can be polled on separate tasks without replacing each other's wakeups.
+
+The initial API accepts UTF-8 arguments, per-command environment overrides,
+and a guest working directory. Executables require absolute guest paths:
+there is no shell parsing or PATH search. Stdio defaults to `/dev/null`;
+`Stdio::piped()` opts into a host pipe. Independent roots do not inherit each
+other's command descriptors. Cross-tree socket sharing is not supported.
+
+Command protocol version 1 requires rebuilt C, Rust, Go, or .NET AOT exec
+driver images. Other runtimes and snapshots restored without the command
+handshake are rejected explicitly by `into_commands()`. Command sandboxes
+do not expose snapshots/restores or the legacy interpreter API. Existing
+`AppSandbox` driving and snapshot behavior remain unchanged.
+
+### Attribution and control wire format
+
+The exec driver negotiates with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
+Workers attach with `HLCALL_IOC_EXECUTION` (ioctl 5, `u64`). The kernel inherits
+this identity through thread creation. Before a host call whose owner changed,
+the transport sends `ExecutionContext(u64) -> i32` under the same transport
+lock as the following call. Socket rescans and resource destruction use the
+resource owner's identity, never the currently polled host handle.
+
+`CommandSpawn` carries one NUL-delimited string: version, execution ID,
+argument count (excluding argv[0]), environment count, piped-stream bitmask
+(stdin/stdout/stderr), cwd, executable, arguments, and `KEY=VALUE` entries.
+The numeric fields are decimal. A final NUL is required. `CommandKill` carries
+the execution ID as a decimal string. The normal named-call completion
+acknowledges control delivery, **not** process exit.
+
+`HLCALL_IOC_COMMAND_EVENT` (ioctl 7, two `i32`s) forwards `CommandEvent(kind,
+value)`: kind 0 is a positive root PID or negative spawn errno, kind 1 a raw
+Linux wait status, kind 2 a positive stream error errno, and kind 3/value 0
+closes host stdin when its guest reader is gone. `ExecutionDone()` marks the
+end of all context-owned guest threads, including readiness and pipe workers.
+
+`HLCALL_IOC_COMMAND_IO` (ioctl 8) contains `u64 stream`, a buffer pointer,
+`u64 len`, and `u64 done`. Streams 1/2 write stdout/stderr; zero length reports
+EOF. Stream 0 reads stdin in chunks of up to 4096 bytes. `CommandIo` replies
+use tag 0 plus read bytes (empty for writes), tag 1 plus a little-endian Linux
+errno, or the standard tag 2 pending ID. These futures belong to the same
+execution as the requesting worker.
+
+Each boundary reports `ExecutionTimers(Vec<u8>)`: pairs of little-endian
+`u64 execution_id, u64 nanoseconds_until_wakeup`. The host takes the earliest
+deadline per execution, replacing the previous boundary's set; absent timers
+are removed. Legacy execution zero retains the original `Yield` protocol.
+The control device releases its read vnode lock while the supervisor waits,
+so control ioctls and independent worker opens cannot deadlock behind it.
+
 ## Completion
 
 `step_async(Vec<u8>)` runs the normal step pump after delivering a batch:
@@ -80,7 +192,7 @@ itself is boxed, not another async wrapper around cancellation.
 
 ## Lifetime and cancellation
 
-Dropping a polled, unfinished `step` or a higher-level driving future
+For the legacy `AppSandbox` APIs, dropping a polled, unfinished `step` or a higher-level driving future
 poisons the sandbox and drops its pending host futures and results. Execution
 and snapshots then fail with `PoisonedSandbox`; an explicit successful restore
 is the recovery path. Dropping an unpolled future does nothing. Cancellation
