@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::task::{Context, Poll};
 
 use futures::{
@@ -27,7 +27,8 @@ use crate::{
 ///
 /// There is no background executor. Poll a child's wait or its pipes to drive
 /// that tree's host operations and guest threads. Other command trees do not run.
-/// Snapshots and the legacy interpreter API are intentionally unavailable.
+/// Snapshots require all child handles to be dropped. The legacy interpreter
+/// API is intentionally unavailable.
 #[derive(Clone)]
 pub struct CommandSandbox(Arc<Coordinator>);
 
@@ -35,7 +36,20 @@ pub struct CommandSandbox(Arc<Coordinator>);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExecutionId(u64);
 
+/// A whole-VM snapshot plus parked command metadata, streams and retained replies.
+///
+/// Contains no live host futures, sockets, timers or pipe handles. Restore in
+/// place with [`CommandSandbox::restore`] or boot a separate sandbox with
+/// [`crate::SandboxBuilder::from_command_snapshot`]. Host functions, mounts and
+/// networking policy must be supplied again when booting a separate sandbox.
+#[derive(Clone)]
+pub struct CommandSnapshot {
+    pub(crate) guest: Arc<crate::Snapshot>,
+    pub(crate) executions: crate::execution::ExecutionSnapshot,
+}
+
 struct Coordinator {
+    lifecycle: Mutex<()>,
     sandbox: Mutex<AppSandbox>,
     executions: Arc<crate::execution::Executions>,
     failure: Mutex<Option<String>>,
@@ -61,6 +75,7 @@ impl AppSandbox {
             )));
         }
         Ok(CommandSandbox(Arc::new(Coordinator {
+            lifecycle: Mutex::new(()),
             executions: self.config.executions.clone(),
             sandbox: Mutex::new(self),
             failure: Mutex::new(None),
@@ -69,6 +84,39 @@ impl AppSandbox {
 }
 
 impl CommandSandbox {
+    /// Capture every parked command and the shared guest VM without driving it.
+    ///
+    /// Drop every child first. Taken pipes are already invalidated by that drop.
+    /// Returns `WouldBlock` through [`Error::Wait`] if a poll is still detaching.
+    /// The original sandbox remains usable and its commands stay parked.
+    pub fn snapshot(&self) -> Result<CommandSnapshot> {
+        let _transition = self.0.transition()?;
+        self.0.failure()?;
+        // Quiesce outside the VM lock: dropping user futures may call host code.
+        let inbox = self.0.try_sandbox()?.config.async_inbox.clone();
+        let executions = self.0.executions.snapshot(&inbox)?;
+        let guest = self.0.try_sandbox()?.snapshot()?;
+        Ok(CommandSnapshot { guest, executions })
+    }
+
+    /// Replace the guest and command state with a snapshot. All commands restore
+    /// parked; use their saved execution IDs to reacquire handles.
+    ///
+    /// All current children must be dropped first. Old pipe handles remain invalid.
+    pub fn restore(&self, snapshot: &CommandSnapshot) -> Result<()> {
+        let _transition = self.0.transition()?;
+        let inbox = self.0.try_sandbox()?.config.async_inbox.clone();
+        self.0.executions.snapshot(&inbox)?;
+        let mut sandbox = self.0.try_sandbox()?;
+        self.0
+            .executions
+            .restore(&snapshot.executions, &inbox, sandbox.config.net.as_ref());
+        let result = sandbox.restore(snapshot.guest.clone());
+        self.0.executions.negotiate(&inbox);
+        *self.0.failure.lock().unwrap() = result.as_ref().err().map(ToString::to_string);
+        result
+    }
+
     /// List detached executions, including completed commands not yet forgotten.
     pub fn parked_children(&self) -> Vec<ExecutionId> {
         self.0
@@ -85,6 +133,7 @@ impl CommandSandbox {
     /// handles to the preserved streams. Fails if a handle is already attached,
     /// or an in-flight poll has not yet finished detaching.
     pub fn restore_child(&self, id: ExecutionId) -> Result<Child> {
+        let _transition = self.0.transition()?;
         self.0.failure()?;
         let execution = self.0.executions.get(id.0)?;
         let mut calls = match execution.calls.try_lock() {
@@ -122,6 +171,7 @@ impl CommandSandbox {
     /// Release retained metadata and output for a detached, completed command.
     /// Restore and kill unfinished commands before forgetting them.
     pub fn forget_child(&self, id: ExecutionId) -> Result<()> {
+        let _transition = self.0.transition()?;
         self.0.executions.forget(id.0)
     }
 
@@ -223,6 +273,7 @@ impl Command {
     /// commands remain owned by the sandbox if their handles are dropped.
     pub fn spawn(&mut self) -> Result<Child> {
         let coordinator = &self.sandbox.0;
+        let _transition = coordinator.transition()?;
         coordinator.failure()?;
         let mut sandbox = coordinator.sandbox.lock().unwrap();
         let mut env = BTreeMap::new();
@@ -331,6 +382,28 @@ impl Command {
 }
 
 impl Coordinator {
+    fn try_sandbox(&self) -> Result<MutexGuard<'_, AppSandbox>> {
+        match self.sandbox.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::WouldBlock) => Err(Error::Wait(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a VM entry is still in progress",
+            ))),
+            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+        }
+    }
+
+    fn transition(&self) -> Result<MutexGuard<'_, ()>> {
+        match self.lifecycle.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::WouldBlock) => Err(Error::Wait(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another command lifecycle transition is in progress",
+            ))),
+            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+        }
+    }
+
     fn entered(&self, result: Result<Yield>) -> Result<()> {
         let result = match result {
             Ok(Yield::Exited { status }) => Err(Error::Wait(io::Error::other(format!(
@@ -377,7 +450,7 @@ impl Coordinator {
         };
         let result = self.poll_locked(execution, generation, cx, &mut calls);
         if execution.done.load(std::sync::atomic::Ordering::Relaxed)
-            || matches!(&result, Poll::Ready(Err(_)))
+            || self.failure.lock().unwrap().is_some()
         {
             calls.clear();
         }
@@ -683,7 +756,11 @@ impl Drop for Child {
         match self.execution.calls.try_lock() {
             Ok(mut calls) => self.execution.park(&mut calls),
             Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+            Err(TryLockError::Poisoned(error)) => {
+                tracing::error!("command driver panicked; cancelling its host work");
+                *self.execution.failure.lock().unwrap() = Some("command driver panicked".into());
+                self.execution.park(&mut error.into_inner());
+            }
         }
         self.execution.wake.notify();
     }
