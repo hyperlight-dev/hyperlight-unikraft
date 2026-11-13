@@ -66,6 +66,7 @@ impl ArcWake for WakeSet {
 
 pub(crate) struct Execution {
     pub id: u64,
+    pub command: CommandMetadata,
     pub attachment: Mutex<Attachment>,
     pub needs_restore: AtomicBool,
     pub failure: Mutex<Option<String>>,
@@ -77,6 +78,15 @@ pub(crate) struct Execution {
     pub net: Arc<hostnet::Net>,
     pub wake: Arc<WakeSet>,
     pub deadline: Mutex<Option<Instant>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandMetadata {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub stdio: [crate::command::Stdio; 3],
 }
 
 pub(crate) struct Attachment {
@@ -96,6 +106,7 @@ pub(crate) struct ExecutionSnapshot {
 #[derive(Clone)]
 struct ExecutionImage {
     id: u64,
+    command: CommandMetadata,
     done: bool,
     failure: Option<String>,
     process: ProcessState,
@@ -119,6 +130,7 @@ impl Executions {
         inbox: &Arc<Mutex<async_calls::Inbox>>,
         net: Option<&Arc<hostnet::Net>>,
         streams: [bool; 3],
+        command: CommandMetadata,
     ) -> crate::Result<(u64, Arc<Execution>)> {
         let mut entries = self.entries.lock().unwrap();
         if entries
@@ -134,7 +146,7 @@ impl Executions {
             .checked_add(1)
             .ok_or_else(|| HyperlightError::Error("execution IDs exhausted".into()))?;
         *next = id;
-        let entry = Arc::new(Execution::new(id, inbox, net, streams));
+        let entry = Arc::new(Execution::new(id, inbox, net, streams, command));
         entries.insert(id, entry.clone());
         Ok((id, entry))
     }
@@ -205,6 +217,7 @@ impl Executions {
             let state = entry.attachment.lock().unwrap();
             images.push(ExecutionImage {
                 id: entry.id,
+                command: entry.command.clone(),
                 done: entry.done.load(Ordering::Relaxed),
                 failure: entry.failure.lock().unwrap().clone(),
                 process: entry.process.lock().unwrap().clone(),
@@ -228,7 +241,8 @@ impl Executions {
     ) {
         let mut entries = BTreeMap::new();
         for image in &snapshot.entries {
-            let mut entry = Execution::new(image.id, inbox, net, image.streams);
+            let mut entry =
+                Execution::new(image.id, inbox, net, image.streams, image.command.clone());
             entry.done.store(image.done, Ordering::Relaxed);
             *entry.failure.get_mut().unwrap() = image.failure.clone();
             *entry.process.get_mut().unwrap() = image.process.clone();
@@ -502,10 +516,12 @@ impl Execution {
         inbox: &Arc<Mutex<async_calls::Inbox>>,
         net: Option<&Arc<hostnet::Net>>,
         streams: [bool; 3],
+        command: CommandMetadata,
     ) -> Self {
         let inbox = Arc::new(Mutex::new(inbox.lock().unwrap().child()));
         Self {
             id,
+            command,
             attachment: Mutex::new(Attachment {
                 attached: true,
                 generation: 1,
