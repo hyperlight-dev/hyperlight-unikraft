@@ -53,7 +53,7 @@ impl AppSandbox {
         {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "this rootfs does not support command protocol version 1",
+                "this rootfs does not support command protocol version 2",
             )));
         }
         Ok(CommandSandbox(Arc::new(Coordinator {
@@ -209,7 +209,7 @@ impl Command {
             )));
         }
         let mut fields = vec![
-            "1".to_owned(),
+            "2".to_owned(),
             "0".to_owned(),
             self.args.len().to_string(),
             env.len().to_string(),
@@ -275,7 +275,7 @@ impl Command {
         self.spawn()?.wait_with_output().await
     }
 
-    /// Launch and wait for the whole process tree, returning the root's status.
+    /// Launch and wait for the root process.
     pub async fn status(&mut self) -> Result<ExitStatus> {
         self.spawn()?.wait().await
     }
@@ -422,6 +422,10 @@ impl Child {
         if self.execution.process.lock().unwrap().status.is_some() {
             return Ok(());
         }
+        self.request_kill("CommandKill")
+    }
+
+    fn request_kill(&self, command: &str) -> Result<()> {
         let mut sandbox = self.coordinator.sandbox.lock().unwrap();
         self.coordinator.executions.before_entry();
         let AppSandbox {
@@ -429,11 +433,7 @@ impl Child {
             sandbox: vm,
             ..
         } = &mut *sandbox;
-        let result = config.enter(
-            vm,
-            "CommandKill",
-            (self.id.to_string(), config.env_version()),
-        );
+        let result = config.enter(vm, command, (self.id.to_string(), config.env_version()));
         let result = self.coordinator.entered(result);
         drop(sandbox);
         self.coordinator.executions.wake_all();
@@ -443,7 +443,27 @@ impl Child {
     /// Kill the root process and await its exit. Descendants remain independent.
     pub async fn kill(&mut self) -> Result<()> {
         self.start_kill()?;
-        self.wait_root().await?;
+        self.wait().await?;
+        Ok(())
+    }
+
+    /// Kill the root and all descendants, including reparented descendants,
+    /// then wait for the whole tree and its workers to finish.
+    ///
+    /// Closes stdin, including a taken stdin handle. Piped output is preserved
+    /// and must be drained concurrently to avoid backpressure blocking cleanup.
+    /// Cancellation leaves the kill request in effect; resume with `wait_all`.
+    pub async fn kill_all(&mut self) -> Result<()> {
+        self.coordinator.failure()?;
+        if !self
+            .execution
+            .done
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.request_kill("CommandKillAll")?;
+            self.execution.pipes[0].eof();
+        }
+        self.wait_all().await?;
         Ok(())
     }
     /// Guest root PID once the executable has started.
@@ -452,7 +472,7 @@ impl Child {
     }
     /// Observe the root status without driving guest work.
     ///
-    /// This can return a status before [`wait`](Self::wait) completes, while
+    /// This can return a status before [`wait_all`](Self::wait_all) completes, while
     /// descendants or stream workers are still alive.
     pub fn try_wait(&self) -> Result<Option<ExitStatus>> {
         self.coordinator.failure()?;
@@ -461,7 +481,7 @@ impl Child {
         Ok(state.status.map(ExitStatus))
     }
     /// Wait for root exit, driving this tree only. Cancellation is safe.
-    pub async fn wait_root(&mut self) -> Result<ExitStatus> {
+    pub async fn wait(&mut self) -> Result<ExitStatus> {
         self.stdin.take();
         let subscription = self.execution.wake.subscribe();
         poll_fn(|cx| {
@@ -485,10 +505,10 @@ impl Child {
     ///
     /// Cancellation is safe. Descendant exit codes are not aggregated. A
     /// long-lived descendant can keep this wait pending after the root exits;
-    /// use [`wait_root`](Self::wait_root) to wait for only the root.
+    /// use [`wait`](Self::wait) to wait for only the root.
     /// Piped output must be drained concurrently or via
     /// [`wait_with_output`](Self::wait_with_output).
-    pub async fn wait(&mut self) -> Result<ExitStatus> {
+    pub async fn wait_all(&mut self) -> Result<ExitStatus> {
         self.stdin.take();
         let subscription = self.execution.wake.subscribe();
         poll_fn(|cx| {
@@ -510,7 +530,7 @@ impl Child {
         })
         .await
     }
-    /// Drain both pipes to EOF, wait for the whole tree, and collect the root status.
+    /// Drain both pipes to EOF and collect the root status.
     ///
     /// Descendants may keep pipes open after the root exits. Collected output
     /// is unbounded, like `std::process::Command::output`.

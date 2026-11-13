@@ -110,21 +110,28 @@ observe another tree's elapsed guest timers. It does **not** poll that other
 tree's queued embedder or network futures. Guest IPC between independent
 trees may require the host to drive both.
 
-`wait()` waits for the entire tree and its workers; `wait_root()` reports only
-root exit. Both return the root's exit status, without aggregating descendant
+`wait()` reports root exit; `wait_all()` waits for the entire tree and its
+workers. Both return the root's exit status, without aggregating descendant
 exit codes. `try_wait()` observes the root status without driving progress, so
-it can return a status while `wait()` is still pending. A long-lived descendant
-can keep `wait()` pending indefinitely. The former `wait_tree()` is now `wait()`.
+it can return a status while `wait_all()` is still pending. A long-lived descendant
+can keep `wait_all()` pending indefinitely.
 Pipe EOF is separate from root exit because descendants can inherit writers.
-`wait_with_output()` drains both output pipes to EOF and waits for the whole tree,
-returning the root status. `Command::status()` and `Command::output()` likewise
-wait for whole-tree completion.
+`wait_with_output()` and `Command::output()` drain both output pipes to EOF and
+return the root status; they do not wait for descendants that no longer hold
+those pipes open. `Command::status()` waits only for the root.
 Cancellation of any wait preserves the execution and prepared
 completion batches. Like a process wait, waiting closes stdin still held in
 the child's `stdin` field; take the handle first to manage its lifetime yourself.
 Dropping a child does not explicitly kill it, but closes any untaken pipes.
 `start_kill()` and `kill()` signal the root only, not its descendants; `kill()`
 waits only for root exit.
+`kill_all()` sends SIGKILL to every guest process with that execution identity,
+including descendants reparented to guest init or moved into a new session.
+It closes stdin (including a taken handle), then waits for the tree and its
+workers to finish. Piped output is preserved and must be drained concurrently
+with `kill_all()` if it could fill its buffers. Cancelling the wait does not
+undo the kill request; use `wait_all()` to finish cleanup. Killing an already
+completed tree is a no-op, and other command trees are not signalled.
 Dropping the last handle to a tree stops its host-driven progress; keep a child
 or stream handle to continue driving it. Dropping every sandbox, child, and
 stream handle releases the VM and any unfinished work.
@@ -142,7 +149,7 @@ there is no shell parsing or PATH search. Stdio defaults to `/dev/null`;
 `Stdio::piped()` opts into a host pipe. Independent roots do not inherit each
 other's command descriptors. Cross-tree socket sharing is not supported.
 
-Command protocol version 1 requires rebuilt C, Rust, Go, or .NET AOT exec
+Command protocol version 2 requires rebuilt C, Rust, Go, or .NET AOT exec
 driver images. Other runtimes and snapshots restored without the command
 handshake are rejected explicitly by `into_commands()`. Command sandboxes
 do not expose snapshots/restores or the legacy interpreter API. Existing
@@ -150,7 +157,7 @@ do not expose snapshots/restores or the legacy interpreter API. Existing
 
 ### Attribution and control wire format
 
-The exec driver negotiates with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
+The exec driver negotiates version 2 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
 Workers attach with `HLCALL_IOC_EXECUTION` (ioctl 5, `u64`). The kernel inherits
 this identity through thread creation. Before a host call whose owner changed,
 the transport sends `ExecutionContext(u64) -> i32` under the same transport
@@ -160,8 +167,12 @@ resource owner's identity, never the currently polled host handle.
 `CommandSpawn` carries one NUL-delimited string: version, execution ID,
 argument count (excluding argv[0]), environment count, piped-stream bitmask
 (stdin/stdout/stderr), cwd, executable, arguments, and `KEY=VALUE` entries.
-The numeric fields are decimal. A final NUL is required. `CommandKill` carries
-the execution ID as a decimal string. The normal named-call completion
+The numeric fields are decimal. A final NUL is required. `CommandKill` and
+`CommandKillAll` carry the execution ID as a decimal string. The latter uses
+`HLCALL_IOC_EXECUTION_KILL` (ioctl 9, `u64`) to signal all matching processes,
+excluding guest init and the calling driver supervisor. It uses inherited
+execution identity, not current parent PIDs or process groups.
+The normal named-call completion
 acknowledges control delivery, **not** process exit.
 
 `HLCALL_IOC_COMMAND_EVENT` (ioctl 7, two `i32`s) forwards `CommandEvent(kind,

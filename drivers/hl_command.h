@@ -17,6 +17,7 @@ struct hl_command_io {
 };
 #define HLCALL_IOC_COMMAND_EVENT _IOW('H', 7, struct hl_command_event)
 #define HLCALL_IOC_COMMAND_IO _IOWR('H', 8, struct hl_command_io)
+#define HLCALL_IOC_EXECUTION_KILL _IOW('H', 9, uint64_t)
 
 struct command_pipe { int fd, stream; };
 struct command {
@@ -209,14 +210,18 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 {
 	size_t len;
 	const char *data = fc_arg0_string(fc, fc_len, &len);
-	if (fc_name_is(fc, fc_len, "CommandKill")) {
+	if (fc_name_is(fc, fc_len, "CommandKill") ||
+	    fc_name_is(fc, fc_len, "CommandKillAll")) {
 		char *end;
 		uint64_t id;
 
 		if (!data || !len || data[0] < '0' || data[0] > '9') return -1;
 		errno = 0;
 		id = strtoull(data, &end, 10);
-		if (errno || (size_t)(end - data) != len) return -1;
+		if (errno || !id || (size_t)(end - data) != len) return -1;
+		if (fc_name_is(fc, fc_len, "CommandKillAll"))
+			return ioctl(g_hl_call_fd, HLCALL_IOC_EXECUTION_KILL, &id) ?
+				-errno : 0;
 		for (struct command *entry = commands; entry; entry = entry->next)
 			if (entry->id == id && entry->pid > 0) {
 				if (kill(entry->pid, SIGKILL) && errno != ESRCH)
@@ -235,7 +240,7 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 	memcpy(command->storage, data, len);
 	char *cursor = command->storage, *end = cursor + len;
 
-	if (command_number(&cursor, end, &version) || version != 1 ||
+	if (command_number(&cursor, end, &version) || version != 2 ||
 	    command_number(&cursor, end, &command->id) || !command->id ||
 	    command_number(&cursor, end, &argc) || argc > len ||
 	    command_number(&cursor, end, &envc) || envc > len ||
@@ -273,7 +278,7 @@ static int command_init(void)
 		fprintf(stderr, "hl_command: negotiation failed: %s\n", strerror(errno));
 		return -1;
 	}
-	if (version != 1) return -1;
+	if (version != 2) return -1;
 	g_hl_command_dispatch = command_dispatch;
 	return 0;
 }
