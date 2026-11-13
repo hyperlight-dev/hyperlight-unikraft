@@ -328,6 +328,7 @@ struct SockMeta {
 }
 
 struct Socket {
+    _permit: SocketPermit,
     handle: OwnedFd,
     meta: SockMeta,
     registration: Option<AsyncSocket>,
@@ -339,6 +340,14 @@ struct Socket {
     /// not watched, or unread data on it would make every wait return at
     /// once and spin the step loop.
     interests: PollFlags,
+}
+
+struct SocketPermit(Arc<Mutex<usize>>);
+
+impl Drop for SocketPermit {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() -= 1;
+    }
 }
 
 impl Socket {
@@ -369,6 +378,7 @@ impl Socket {
 
 /// Guest fd → host socket. Dropping an entry releases all its socket state.
 struct SocketTable {
+    budget: Arc<Mutex<usize>>,
     sockets: HashMap<i32, Socket>,
     next_fd: i32,
 }
@@ -376,6 +386,7 @@ struct SocketTable {
 impl SocketTable {
     fn new() -> Self {
         Self {
+            budget: Arc::default(),
             sockets: HashMap::new(),
             next_fd: 3, // skip stdin/stdout/stderr
         }
@@ -402,14 +413,18 @@ impl SocketTable {
         udp: bool,
         origin: Option<(AddressFamily, Option<Protocol>)>,
     ) -> Res<i32> {
-        if self.sockets.len() >= MAX_SOCKETS {
+        let mut count = self.budget.lock().unwrap();
+        if *count >= MAX_SOCKETS {
             return Err(errno::EMFILE);
         }
+        *count += 1;
+        drop(count);
         let fd = self.next_fd;
         self.next_fd = self.next_fd.wrapping_add(1);
         self.sockets.insert(
             fd,
             Socket {
+                _permit: SocketPermit(self.budget.clone()),
                 handle: sock,
                 meta: SockMeta {
                     udp,
@@ -589,6 +604,15 @@ impl Drop for Net {
 }
 
 impl Net {
+    pub(crate) fn fork(&self) -> Self {
+        let child = match &self.policy {
+            Some(policy) => Self::new(policy.clone(), self.listen_ports.clone()),
+            None => Self::disabled(),
+        };
+        child.table.lock().unwrap().budget = self.table.lock().unwrap().budget.clone();
+        child
+    }
+
     pub(crate) fn new(policy: NetworkPolicy, listen_ports: Option<ListenPorts>) -> Self {
         // WinSock must be initialised before any socket call; std does
         // this lazily for its own types but rustix calls it directly.
@@ -1518,36 +1542,46 @@ pub(crate) fn register(
     net: &Arc<Net>,
     profile: &Arc<crate::profile::Profile>,
     inbox: &Arc<Mutex<crate::async_calls::Inbox>>,
+    owners: &Arc<crate::execution::Executions>,
 ) -> hyperlight_host::Result<()> {
     let net = net.clone();
 
     let n = net.clone();
     let pending = inbox.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_wait_async",
         move || -> hyperlight_host::Result<Vec<u8>> {
             let _profile = prof.host("net_wait_async");
-            Ok(n.wait_reply(&pending))
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
+            let pending = execution.as_ref().map_or(&pending, |e| &e.inbox);
+            Ok(n.wait_reply(pending))
         },
     )?;
 
     let n = net.clone();
     let pending = inbox.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_connect_async",
         move |fd: i32, family: i32, addr: String, port: i32| -> hyperlight_host::Result<Vec<u8>> {
             let _profile = prof.host("net_connect_async");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
+            let pending = execution.as_ref().map_or(&pending, |e| &e.inbox);
             let Some(addr) = parse_addr(family, &addr, port) else {
                 return Ok(int_reply(-errno::EINVAL));
             };
-            Ok(n.connect_reply(fd, addr, &pending))
+            Ok(n.connect_reply(fd, addr, pending))
         },
     )?;
     let n = net.clone();
     let pending = inbox.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_sendto_async",
         move |fd: i32,
@@ -1557,31 +1591,41 @@ pub(crate) fn register(
               port: i32|
               -> hyperlight_host::Result<Vec<u8>> {
             let _profile = prof.host("net_sendto_async");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
+            let pending = execution.as_ref().map_or(&pending, |e| &e.inbox);
             let Some(addr) = parse_addr(family, &addr, port) else {
                 return Ok(int_reply(-errno::EINVAL));
             };
-            Ok(n.sendto_reply(fd, data, addr, &pending))
+            Ok(n.sendto_reply(fd, data, addr, pending))
         },
     )?;
 
     let n = net.clone();
     let pending = inbox.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_send_async",
         move |fd: i32, data: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
             let _profile = prof.host("net_send_async");
-            Ok(n.send_reply(fd, data, &pending))
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
+            let pending = execution.as_ref().map_or(&pending, |e| &e.inbox);
+            Ok(n.send_reply(fd, data, pending))
         },
     )?;
 
     // net_socket(family, type, protocol) -> fd or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_socket",
         move |family: i32, ty: i32, proto: i32| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_socket");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret(n.socket(family, ty, proto), |fd| fd))
         },
     )?;
@@ -1589,10 +1633,13 @@ pub(crate) fn register(
     // net_bind(fd, family, addr, port) -> 0 or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_bind",
         move |fd: i32, family: i32, addr: String, port: i32| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_bind");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             let Some(sa) = parse_addr(family, &addr, port) else {
                 return Ok(-errno::EINVAL);
             };
@@ -1603,10 +1650,13 @@ pub(crate) fn register(
     // net_listen(fd, backlog) -> 0 or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_listen",
         move |fd: i32, backlog: i32| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_listen");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret(n.listen(fd, backlog), |()| 0))
         },
     )?;
@@ -1614,10 +1664,13 @@ pub(crate) fn register(
     // net_accept(fd) -> [i32 new_fd | packed peer addr]
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_accept",
         move |fd: i32| -> hyperlight_host::Result<Vec<u8>> {
             let _profile = prof.host("net_accept");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret_vec(n.accept(fd).map(|(new_fd, peer)| {
                 let mut buf = Vec::with_capacity(32);
                 buf.extend(new_fd.to_le_bytes());
@@ -1632,10 +1685,13 @@ pub(crate) fn register(
     // net_connect(fd, family, addr, port) -> 0 or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_connect",
         move |fd: i32, family: i32, addr: String, port: i32| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_connect");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             let Some(sa) = parse_addr(family, &addr, port) else {
                 return Ok(-errno::EINVAL);
             };
@@ -1646,10 +1702,13 @@ pub(crate) fn register(
     // net_send(fd, data) -> bytes_sent or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_send",
         move |fd: i32, data: Vec<u8>| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_send");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret(n.send(fd, &data), |sent| sent as i32))
         },
     )?;
@@ -1657,6 +1716,7 @@ pub(crate) fn register(
     // net_sendto(fd, data, family, addr, port) -> bytes_sent or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_sendto",
         move |fd: i32,
@@ -1666,6 +1726,8 @@ pub(crate) fn register(
               port: i32|
               -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_sendto");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             let Some(sa) = parse_addr(family, &addr, port) else {
                 return Ok(-errno::EINVAL);
             };
@@ -1676,10 +1738,13 @@ pub(crate) fn register(
     // net_recvfrom(fd, len) -> [i32 len | packed src addr | data]
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_recvfrom",
         move |fd: i32, len: i32| -> hyperlight_host::Result<Vec<u8>> {
             let _profile = prof.host("net_recvfrom");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             let len = usize::try_from(len).unwrap_or(0);
             Ok(ret_vec(n.recvfrom(fd, len).map(|(data, from)| {
                 let mut buf = Vec::with_capacity(32 + data.len());
@@ -1697,10 +1762,13 @@ pub(crate) fn register(
     // net_shutdown(fd, how) -> 0 or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_shutdown",
         move |fd: i32, how: i32| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_shutdown");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret(n.shutdown(fd, how), |()| 0))
         },
     )?;
@@ -1708,10 +1776,13 @@ pub(crate) fn register(
     // net_close(fd) -> 0 or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_close",
         move |fd: i32| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_close");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret(n.close(fd), |()| 0))
         },
     )?;
@@ -1719,10 +1790,13 @@ pub(crate) fn register(
     // net_disconnect(fd) -> 0 or -errno: connect(AF_UNSPEC) on a datagram socket
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_disconnect",
         move |fd: i32| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_disconnect");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret(n.disconnect(fd), |()| 0))
         },
     )?;
@@ -1730,10 +1804,13 @@ pub(crate) fn register(
     // net_getpeername(fd) -> [i32 status | packed addr]
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_getpeername",
         move |fd: i32| -> hyperlight_host::Result<Vec<u8>> {
             let _profile = prof.host("net_getpeername");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret_vec(n.peer_addr(fd).map(|sa| addr_result(&sa))))
         },
     )?;
@@ -1741,10 +1818,13 @@ pub(crate) fn register(
     // net_getsockname(fd) -> [i32 status | packed addr]
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_getsockname",
         move |fd: i32| -> hyperlight_host::Result<Vec<u8>> {
             let _profile = prof.host("net_getsockname");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret_vec(n.local_addr(fd).map(|sa| addr_result(&sa))))
         },
     )?;
@@ -1752,10 +1832,13 @@ pub(crate) fn register(
     // net_getsockopt(fd, level, optname) -> value or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_getsockopt",
         move |fd: i32, level: i32, optname: i32| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_getsockopt");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret(n.getsockopt(fd, level, optname), |v| v))
         },
     )?;
@@ -1763,10 +1846,13 @@ pub(crate) fn register(
     // net_setsockopt(fd, level, optname, value) -> 0 or -errno
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_setsockopt",
         move |fd: i32, level: i32, optname: i32, value: i32| -> hyperlight_host::Result<i32> {
             let _profile = prof.host("net_setsockopt");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             Ok(ret(n.setsockopt(fd, level, optname, value), |()| 0))
         },
     )?;
@@ -1776,10 +1862,13 @@ pub(crate) fn register(
     // Input is 8 bytes per fd: i32 fd, i16 events, i16 pad.
     let n = net.clone();
     let prof = profile.clone();
+    let executions = owners.clone();
     target.register_host_function(
         "net_poll",
         move |pollfds: Vec<u8>, timeout_ms: i32| -> hyperlight_host::Result<Vec<u8>> {
             let _profile = prof.host("net_poll");
+            let execution = executions.current()?;
+            let n = execution.as_ref().map_or(&n, |e| &e.net);
             let entries: Vec<(i32, i16)> = pollfds
                 .as_chunks::<8>()
                 .0
@@ -1870,6 +1959,27 @@ mod tests {
     use rustix::fd::{AsRawFd, RawFd};
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn execution_socket_tables_share_the_sandbox_limit() {
+        let parent = Net::new(NetworkPolicy::AllowAll, None);
+        let a = parent.fork();
+        let b = parent.fork();
+        for _ in 0..MAX_SOCKETS - 1 {
+            a.socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        }
+        let fd = b.socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        assert_eq!(parent.socket(AF_INET, SOCK_DGRAM, 0), Err(errno::EMFILE));
+        b.close(fd).unwrap();
+        parent.socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        assert_eq!(b.socket(AF_INET, SOCK_DGRAM, 0), Err(errno::EMFILE));
+        drop(a);
+        for _ in 0..MAX_SOCKETS - 1 {
+            b.socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        }
+        b.reset();
+        assert_eq!(*parent.table.lock().unwrap().budget.lock().unwrap(), 1);
+    }
 
     #[derive(Default)]
     struct WakeCount(AtomicUsize);
