@@ -44,6 +44,24 @@ unrelated guest threads. Other devices keep their existing locking.
 
 ## Command process trees
 
+The runnable [sandbox commands example](../examples/sandbox_commands.rs) starts
+two commands in one sandbox and concurrently awaits their output and exit
+statuses. It then demonstrates a root exiting before its descendant, with the
+stdout handle continuing to drive the descendant until EOF.
+
+From the repository root on Linux, with Docker, just, GCC, Rust, and KVM:
+
+```sh
+just build-rootfs c
+mkdir -p build-elfloader/bins/c
+gcc -O2 -Wall -static-pie -fPIE -o build-elfloader/bins/c/command examples/c/command.c
+cargo run --example sandbox_commands
+```
+
+The guest executable is the existing C command fixture; `just build-test-bins`
+also builds it. No Rust, Go, or .NET guest toolchains are needed for the commands
+above. Output from the two commands is reported in completion order.
+
 `AppSandbox::into_commands()` consumes an idle compiled-runtime sandbox and
 returns a `command::CommandSandbox`. This opt-in API runs executable paths,
 not interpreter snippets:
