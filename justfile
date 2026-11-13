@@ -807,7 +807,7 @@ build-test-bins:
     rm -rf "$bins"
     mkdir -p "$bins/c" "$bins/rust" "$bins/go" "$bins/dotnet-aot" "$bins/wasmtime"
     echo "==> C / C++"
-    for src in hello goodbye env_vars status; do
+    for src in hello goodbye env_vars status command; do
         gcc -O2 -Wall -static-pie -fPIE -o "$bins/c/$src" "{{examples_dir}}/c/$src.c"
     done
     g++ -O2 -Wall -static-pie -fPIE -o "$bins/c/hello_cpp" "{{examples_dir}}/c/hello_cpp.cpp"

@@ -46,6 +46,7 @@ use tracing::{debug, info};
 
 mod async_calls;
 mod cgroup;
+pub mod command;
 #[cfg(feature = "cpio")]
 pub mod cpio;
 mod errno;

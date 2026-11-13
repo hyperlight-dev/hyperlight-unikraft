@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- An opt-in `AppSandbox::into_commands()` API for concurrent compiled guest
+  executables, with structured arguments, environment and cwd, cancellation-safe
+  waits, root exit/whole-tree completion, and bounded stdin/stdout/stderr pipes.
+  Each command tree owns its host futures, sockets and timers; polling one
+  handle does not poll another tree's queued host operations. Requires rebuilt
+  C, Rust, Go or .NET AOT exec driver images; command snapshots are not yet exposed.
 - An opt-in async driving release benchmark, including
   latency, throughput, CPU use and VM-entry counts for calls, timers, fan-out
   and ready/delayed TCP and UDP peers.
@@ -34,11 +40,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   immediate syscall fallback; POSIX setup, options and errno translation remain.
 - Async driving requires Tokio's time and I/O drivers. Dropping an unfinished
   driving future poisons the sandbox until restore. Boot, submission, snapshots
-  and restore remain synchronous. Updated kernels and snapshot contract 10
+  and restore remain synchronous. Updated kernels and snapshot contract 11
   require fresh snapshots.
 
 ### Fixed
 
+- Concurrent guest `waitpid` callers can no longer consume each other's
+  child-exit wakeups. The command supervisor can wait on its control channel
+  without blocking other threads' opens or ioctls on that device.
 - `hluk run` and `hluk snapshot run` called a script they could not read a compiled binary: a directory, or a file `hluk` may not read, got the hint for running one, which for a bare name (`app`) suggested `--mount :/mnt/bin`, a mount `hluk` refuses. A manifest's `[run] script` was only looked for, so one that is not text booted the guest before failing; `hluk snapshot run` restored the snapshot before reading its script; and a script from a pipe (`<(…)`) was said not to exist. The script, from the command line or the manifest, is now read before the guest boots or is restored, and runs as the text read: the error says it does not exist, is a directory, or cannot be read (with the reason), and only text that is not UTF-8 gets the hint, with `.` for a bare name's directory. A script too large for a guest function call is refused then too.
 - An `AllowList` or `BlockList` entry (`--net-allow`, `--net-block`, `[run.net]`) written as IPv4-mapped IPv6 (`::ffff:10.0.0.5`, the form a dual-stack server logs an IPv4 client in) matched no destination, since a destination is judged as the IPv4 address it reaches (`10.0.0.5`): a block list let the guest reach the address it named, and an allow list refused the one it named. A listed name that resolves to such an address, and such an address in a DNS answer, missed the same way. Every address a destination is compared with is now taken as the IPv4 address too.
 - Pulling a rootfs image took a manifest fetched by digest without checking it against the digest: an image pinned by digest (`…/python@sha256:…`) and the manifest an image index lists for the host's platform, which every published image goes through. The layer is checked against the digest the manifest lists, so a registry that served another manifest under the digest had its layer accepted too. Such a manifest is now refused unless it hashes to the digest, as a layer already was, and a digest other than `sha256` is refused.
