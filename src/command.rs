@@ -26,7 +26,7 @@ use crate::{
 /// A sandbox dedicated to independently polled command trees.
 ///
 /// There is no background executor. Poll a child's wait or its pipes to drive
-/// that tree's host operations. Guest CPU scheduling remains shared.
+/// that tree's host operations and guest threads. Other command trees do not run.
 /// Snapshots and the legacy interpreter API are intentionally unavailable.
 #[derive(Clone)]
 pub struct CommandSandbox(Arc<Coordinator>);
@@ -53,7 +53,7 @@ impl AppSandbox {
         {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "this rootfs does not support command protocol version 3",
+                "this rootfs does not support command protocol version 4",
             )));
         }
         Ok(CommandSandbox(Arc::new(Coordinator {
@@ -209,7 +209,7 @@ impl Command {
             )));
         }
         let mut fields = vec![
-            "3".to_owned(),
+            "4".to_owned(),
             "0".to_owned(),
             self.args.len().to_string(),
             env.len().to_string(),
@@ -240,7 +240,7 @@ impl Command {
             .create(&sandbox.config.async_inbox, sandbox.config.net.as_ref())?;
         fields[1] = id.to_string();
         let request = fields.join("\0") + "\0";
-        coordinator.executions.before_entry();
+        coordinator.executions.before_entry(id);
         let AppSandbox {
             config,
             sandbox: vm,
@@ -346,7 +346,7 @@ impl Coordinator {
             }
             Err(TryLockError::Poisoned(error)) => panic!("{error}"),
         };
-        self.executions.before_entry();
+        self.executions.before_entry(execution.id);
         let AppSandbox {
             config,
             sandbox: vm,
@@ -432,7 +432,7 @@ impl Child {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             let mut sandbox = self.coordinator.sandbox.lock().unwrap();
-            self.coordinator.executions.before_entry();
+            self.coordinator.executions.before_entry(self.id);
             let AppSandbox {
                 config,
                 sandbox: vm,

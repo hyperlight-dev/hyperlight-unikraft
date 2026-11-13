@@ -65,6 +65,7 @@ impl ArcWake for WakeSet {
 }
 
 pub(crate) struct Execution {
+    pub id: u64,
     pub failure: Mutex<Option<String>>,
     pub done: AtomicBool,
     pub process: Mutex<ProcessState>,
@@ -80,6 +81,7 @@ pub(crate) struct Execution {
 pub(crate) struct Executions {
     pub supported: AtomicBool,
     current: AtomicU64,
+    active: AtomicU64,
     next: Mutex<u64>,
     entries: Mutex<BTreeMap<u64, Arc<Execution>>>,
 }
@@ -102,6 +104,7 @@ impl Executions {
         *next = id;
         let inbox = Arc::new(Mutex::new(inbox.lock().unwrap().child()));
         let entry = Arc::new(Execution {
+            id,
             failure: Mutex::default(),
             done: AtomicBool::new(false),
             process: Mutex::default(),
@@ -130,8 +133,9 @@ impl Executions {
             .ok_or_else(|| HyperlightError::Error(format!("unknown execution {id}")))
     }
 
-    pub fn before_entry(&self) {
-        for execution in self.entries.lock().unwrap().values() {
+    pub fn before_entry(&self, id: u64) {
+        self.active.store(id, Ordering::Relaxed);
+        if let Some(execution) = self.entries.lock().unwrap().get(&id) {
             *execution.deadline.lock().unwrap() = None;
         }
     }
@@ -151,6 +155,11 @@ impl Executions {
     }
 
     pub fn register(self: &Arc<Self>, target: &mut impl Registerable) -> crate::Result<()> {
+        let registry = self.clone();
+        target.register_host_function(
+            "ExecutionActive",
+            move || -> hyperlight_host::Result<u64> { Ok(registry.active.load(Ordering::Relaxed)) },
+        )?;
         let registry = self.clone();
         target.register_host_function(
             "ExecutionDone",
@@ -191,7 +200,7 @@ impl Executions {
             "CommandDriverVersion",
             move || -> hyperlight_host::Result<u64> {
                 registry.supported.store(true, Ordering::Relaxed);
-                Ok(3)
+                Ok(4)
             },
         )?;
         let registry = self.clone();
