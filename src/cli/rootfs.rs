@@ -145,7 +145,11 @@ impl Progress {
             .unwrap_or(&reference.repository);
         Progress {
             reference: reference.to_string(),
-            short: format!("{repo}:{}", reference.reference),
+            // A pinned image is shown by its tag, the name it is known by.
+            short: format!(
+                "{repo}:{}",
+                reference.tag.as_deref().unwrap_or(&reference.reference)
+            ),
             started: Instant::now(),
             tty,
             last_draw: None,
