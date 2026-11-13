@@ -62,7 +62,9 @@ The guest executable is the existing C command fixture; `just build-test-bins`
 also builds it. No Rust, Go, or .NET guest toolchains are needed for the commands
 above. Stdout and stderr are drained concurrently with the process waits;
 each line is reported as it arrives, prefixed with the command name. The exit
-summary follows both streams reaching EOF. Only the current line is collected,
+summary follows both streams reaching EOF. ANSI escapes make name prefixes bold
+and exit summaries green for success or red for failure.
+Only the current line is collected,
 rather than the entire output (a very long line can still use unbounded memory).
 
 `AppSandbox::into_commands()` consumes an idle compiled-runtime sandbox and
