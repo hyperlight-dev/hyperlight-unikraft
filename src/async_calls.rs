@@ -49,12 +49,28 @@ pub(crate) type Handler =
 pub(crate) struct Inbox {
     pub negotiated: bool,
     pub interrupt_supported: bool,
-    next_id: u64,
+    budget: Arc<Mutex<Budget>>,
     outstanding: HashMap<u64, AbortHandle>,
     queued: Vec<(u64, Operation)>,
 }
 
+#[derive(Default)]
+struct Budget {
+    next_id: u64,
+    outstanding: usize,
+}
+
 impl Inbox {
+    pub fn child(&self) -> Self {
+        Self {
+            negotiated: self.negotiated,
+            interrupt_supported: self.interrupt_supported,
+            budget: self.budget.clone(),
+            outstanding: HashMap::new(),
+            queued: Vec::new(),
+        }
+    }
+
     pub fn submit(&mut self, name: String, args: String, handler: Handler) -> Result<u64, String> {
         self.submit_reply(async move { encode_host_reply(&name, handler(args).await) })
     }
@@ -73,14 +89,17 @@ impl Inbox {
         if !self.negotiated {
             return Err("the kernel does not support async host calls version 1".into());
         }
-        if self.outstanding.len() == MAX_PENDING {
+        let mut budget = self.budget.lock().unwrap();
+        if budget.outstanding == MAX_PENDING {
             return Err("too many outstanding async host calls".into());
         }
-        let id = self
+        let id = budget
             .next_id
             .checked_add(1)
             .ok_or("async request IDs exhausted")?;
-        self.next_id = id;
+        budget.next_id = id;
+        budget.outstanding += 1;
+        drop(budget);
         let (abort, registration) = AbortHandle::new_pair();
         self.outstanding.insert(id, abort);
         let operation: Operation = Abortable::new(
@@ -109,9 +128,28 @@ impl Inbox {
 
     pub fn cancel(&mut self, id: u64) {
         if let Some(abort) = self.outstanding.remove(&id) {
+            self.budget.lock().unwrap().outstanding -= 1;
             abort.abort();
             self.queued.retain(|(queued_id, _)| *queued_id != id);
         }
+    }
+
+    fn delivered(&mut self, id: u64) {
+        if self.outstanding.remove(&id).is_some() {
+            self.budget.lock().unwrap().outstanding -= 1;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.budget.lock().unwrap().outstanding -= self.outstanding.len();
+        self.outstanding.clear();
+        self.queued.clear();
+    }
+}
+
+impl Drop for Inbox {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -240,7 +278,7 @@ impl PendingCalls {
     pub fn delivered(&mut self) {
         let mut inbox = self.inbox.lock().unwrap();
         for id in self.batch_ids.drain(..) {
-            inbox.outstanding.remove(&id);
+            inbox.delivered(id);
         }
         self.batch.clear();
     }
@@ -251,8 +289,7 @@ impl PendingCalls {
         self.batch.clear();
         self.batch_ids.clear();
         let mut inbox = self.inbox.lock().unwrap();
-        inbox.queued.clear();
-        inbox.outstanding.clear();
+        inbox.clear();
     }
 }
 
@@ -261,6 +298,77 @@ mod tests {
     use super::*;
     use futures::{FutureExt, future::poll_fn};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn child_engines_poll_only_their_own_operations() {
+        let parent = engine();
+        let mut a = PendingCalls::new(Arc::new(Mutex::new(parent.inbox.lock().unwrap().child())));
+        let mut b = PendingCalls::new(Arc::new(Mutex::new(parent.inbox.lock().unwrap().child())));
+        let (send, receive) = futures::channel::oneshot::channel::<()>();
+        let b_id = b
+            .inbox
+            .lock()
+            .unwrap()
+            .submit_reply(async move {
+                send.send(()).unwrap();
+                vec![0]
+            })
+            .unwrap();
+        let a_id = submit(&a, "a");
+        assert_ne!(a_id, b_id);
+        assert_eq!(poll_fn(|cx| a.poll_batch(cx)).await.unwrap(), Wake::Calls);
+        assert!(receive.now_or_never().is_none());
+        a.delivered();
+        b.inbox.lock().unwrap().cancel(b_id);
+        assert!(poll_fn(|cx| b.poll_batch(cx)).now_or_never().is_none());
+        assert_eq!(
+            parent
+                .inbox
+                .lock()
+                .unwrap()
+                .budget
+                .lock()
+                .unwrap()
+                .outstanding,
+            0
+        );
+    }
+
+    #[test]
+    fn child_queues_share_capacity_and_release_it_exactly_once() {
+        let parent = engine();
+        let mut a = parent.inbox.lock().unwrap().child();
+        let mut b = a.child();
+        let mut first = 0;
+        for i in 0..MAX_PENDING {
+            let id = (if i % 2 == 0 { &mut a } else { &mut b })
+                .submit_reply(std::future::pending())
+                .unwrap();
+            if i == 0 {
+                first = id;
+            }
+        }
+        assert!(a.submit_reply(async { vec![0] }).is_err());
+        assert!(b.submit_reply(async { vec![0] }).is_err());
+        a.cancel(first);
+        a.cancel(first);
+        b.submit_reply(async { vec![0] }).unwrap();
+        assert!(a.submit_reply(async { vec![0] }).is_err());
+        drop(a);
+        drop(b);
+        let budget = parent.inbox.lock().unwrap().budget.clone();
+        assert_eq!(budget.lock().unwrap().outstanding, 0);
+        budget.lock().unwrap().next_id = u64::MAX;
+        assert!(
+            parent
+                .inbox
+                .lock()
+                .unwrap()
+                .submit_reply(async { vec![0] })
+                .is_err()
+        );
+        assert_eq!(budget.lock().unwrap().outstanding, 0);
+    }
 
     #[tokio::test]
     async fn timer_replaces_retains_and_cancels_deadlines() {
@@ -761,7 +869,7 @@ mod tests {
         assert_eq!(engine.batch()[20], crate::HOST_CALL_ERR);
         engine.clear();
         assert!(!engine.is_pending());
-        let previous = engine.inbox.lock().unwrap().next_id;
+        let previous = engine.inbox.lock().unwrap().budget.lock().unwrap().next_id;
         assert!(submit(&engine, "next") > previous);
         engine.clear();
         let mut inbox = engine.inbox.lock().unwrap();
@@ -770,12 +878,13 @@ mod tests {
             crate::closure_handler(|_| futures::future::ready(Ok(String::new())).boxed());
         assert!(inbox.submit("f".into(), String::new(), f.clone()).is_err());
         inbox.negotiated = true;
-        inbox.next_id = u64::MAX;
+        inbox.budget.lock().unwrap().next_id = u64::MAX;
         assert!(inbox.submit("f".into(), String::new(), f.clone()).is_err());
-        inbox.next_id = 0;
+        inbox.budget.lock().unwrap().next_id = 0;
         for id in 1..=MAX_PENDING as u64 {
             inbox.outstanding.insert(id, AbortHandle::new_pair().0);
         }
+        inbox.budget.lock().unwrap().outstanding = MAX_PENDING;
         assert!(inbox.submit("f".into(), String::new(), f).is_err());
     }
 
