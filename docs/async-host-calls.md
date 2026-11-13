@@ -46,8 +46,8 @@ unrelated guest threads. Other devices keep their existing locking.
 
 The runnable [sandbox commands example](../examples/sandbox_commands.rs) starts
 two commands in one sandbox and concurrently awaits their output and exit
-statuses. It then demonstrates a root exiting before its descendant, with the
-stdout handle continuing to drive the descendant until EOF.
+statuses. It then demonstrates root exit automatically terminating a sleeping
+descendant, with output drained concurrently until EOF.
 
 From the repository root on Linux, with Docker, just, GCC, Rust, and KVM:
 
@@ -110,28 +110,26 @@ observe another tree's elapsed guest timers. It does **not** poll that other
 tree's queued embedder or network futures. Guest IPC between independent
 trees may require the host to drive both.
 
-`wait()` reports root exit; `wait_all()` waits for the entire tree and its
-workers. Both return the root's exit status, without aggregating descendant
-exit codes. `try_wait()` observes the root status without driving progress, so
-it can return a status while `wait_all()` is still pending. A long-lived descendant
-can keep `wait_all()` pending indefinitely.
-Pipe EOF is separate from root exit because descendants can inherit writers.
-`wait_with_output()` and `Command::output()` drain both output pipes to EOF and
-return the root status; they do not wait for descendants that no longer hold
-those pipes open. `Command::status()` waits only for the root.
+The root defines the command's lifetime. When it exits, the guest automatically
+sends SIGKILL to all remaining descendants, including reparented descendants
+and descendants in other sessions. Other command trees are unaffected.
+`wait()` waits for the root and command cleanup, returning the root's status
+without aggregating descendant exit codes. `try_wait()` reports the same
+completion condition without driving progress. Output already written is
+forwarded before cleanup finishes, so piped output still needs concurrent draining.
+`wait_with_output()` and `Command::output()` handle both drains and cleanup.
+`Command::status()` waits for command cleanup without draining piped output.
 Cancellation of any wait preserves the execution and prepared
 completion batches. Like a process wait, waiting closes stdin still held in
 the child's `stdin` field; take the handle first to manage its lifetime yourself.
 Dropping a child does not explicitly kill it, but closes any untaken pipes.
-`start_kill()` and `kill()` signal the root only, not its descendants; `kill()`
-waits only for root exit.
-`kill_all()` sends SIGKILL to every guest process with that execution identity,
+`kill()` sends SIGKILL to every guest process with that execution identity,
 including descendants reparented to guest init or moved into a new session.
 It is synchronous: one VM entry stops the tree and its workers, cancelling
 pending host calls without polling them. Stdin is closed, including a taken
 handle. Unforwarded output is discarded; bytes already in the host buffers
 remain readable, followed by EOF. No output draining or Tokio runtime is needed
-to call `kill_all()`. After success, `wait_all()` is immediately ready.
+to call `kill()`. After success, `wait()` is immediately ready.
 Killing an already completed tree needs no VM entry, and other command trees
 are not signalled. As with other VM entries, CPU-bound guest code requires the
 existing interrupt-handle mechanism to preempt.
@@ -152,7 +150,7 @@ there is no shell parsing or PATH search. Stdio defaults to `/dev/null`;
 `Stdio::piped()` opts into a host pipe. Independent roots do not inherit each
 other's command descriptors. Cross-tree socket sharing is not supported.
 
-Command protocol version 2 requires rebuilt C, Rust, Go, or .NET AOT exec
+Command protocol version 3 requires rebuilt C, Rust, Go, or .NET AOT exec
 driver images. Other runtimes and snapshots restored without the command
 handshake are rejected explicitly by `into_commands()`. Command sandboxes
 do not expose snapshots/restores or the legacy interpreter API. Existing
@@ -160,7 +158,7 @@ do not expose snapshots/restores or the legacy interpreter API. Existing
 
 ### Attribution and control wire format
 
-The exec driver negotiates version 2 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
+The exec driver negotiates version 3 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
 Workers attach with `HLCALL_IOC_EXECUTION` (ioctl 5, `u64`). The kernel inherits
 this identity through thread creation. Before a host call whose owner changed,
 the transport sends `ExecutionContext(u64) -> i32` under the same transport
@@ -170,8 +168,8 @@ resource owner's identity, never the currently polled host handle.
 `CommandSpawn` carries one NUL-delimited string: version, execution ID,
 argument count (excluding argv[0]), environment count, piped-stream bitmask
 (stdin/stdout/stderr), cwd, executable, arguments, and `KEY=VALUE` entries.
-The numeric fields are decimal. A final NUL is required. `CommandKill` and
-`CommandKillAll` carry the execution ID as a decimal string. The latter uses
+The numeric fields are decimal. A final NUL is required. `CommandKill`
+carries the execution ID as a decimal string. It uses
 `HLCALL_IOC_EXECUTION_KILL` (ioctl 9, `u64`) to signal all matching processes,
 excluding guest init and the calling driver supervisor. It uses inherited
 execution identity, not current parent PIDs or process groups.
@@ -187,6 +185,10 @@ value)`: kind 0 is a positive root PID or negative spawn errno, kind 1 a raw
 Linux wait status, kind 2 a positive stream error errno, and kind 3/value 0
 closes host stdin when its guest reader is gone. `ExecutionDone()` marks the
 end of all context-owned guest threads, including readiness and pipe workers.
+Before forwarding kind 1, the kernel signals all remaining application
+processes in that execution. Normal root exit leaves output forwarding workers
+alive to drain data already written; the host closes stdin, including taken
+handles, so input forwarding cannot keep the completed command alive.
 
 `HLCALL_IOC_COMMAND_IO` (ioctl 8) contains `u64 stream`, a buffer pointer,
 `u64 len`, and `u64 done`. Streams 1/2 write stdout/stderr; zero length reports

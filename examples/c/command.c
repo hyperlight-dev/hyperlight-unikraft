@@ -21,6 +21,25 @@ static void pause_ms(unsigned long ms)
 	while (nanosleep(&duration, &duration)) {}
 }
 
+static void host_call(const char *name, const char *args)
+{
+	int fd = open("/dev/hlcall", O_RDWR | O_CLOEXEC);
+	assert(fd >= 0);
+	uint8_t reply[4096];
+	struct request {
+		const char *name;
+		uint64_t name_len;
+		const char *args;
+		uint64_t args_len;
+		uint8_t *out;
+		uint64_t cap, len;
+	} request = { name, strlen(name), args, strlen(args), reply, sizeof(reply), 0 };
+	assert(ioctl(fd, _IOWR('H', 3, struct request), &request) == 0);
+	assert(request.len && reply[0] == 0);
+	assert(write(1, reply + 1, request.len - 1) == (ssize_t)request.len - 1);
+	close(fd);
+}
+
 int main(int argc, char **argv)
 {
 	assert(argc >= 2);
@@ -33,25 +52,34 @@ int main(int argc, char **argv)
 			.sin_addr.s_addr = htonl(INADDR_LOOPBACK)
 		};
 		assert(connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0);
-		char number[32];
+		int done[2];
+		assert(pipe(done) == 0);
+		char number[32], completion[32];
 		snprintf(number, sizeof(number), "%d", fd);
+		snprintf(completion, sizeof(completion), "%d", done[1]);
 		pid_t child = vfork();
 		assert(child >= 0);
 		if (!child) {
-			execl(argv[0], argv[0], "socket-child", number, (char *)NULL);
+			close(done[0]);
+			execl(argv[0], argv[0], "socket-child", number, completion, (char *)NULL);
 			_exit(127);
 		}
 		close(fd);
+		close(done[1]);
+		char byte;
+		assert(read(done[0], &byte, 1) == 1);
+		close(done[0]);
 		return 9;
 	}
 	if (!strcmp(argv[1], "socket-child")) {
 		pid_t child = vfork();
 		assert(child >= 0);
 		if (!child) {
-			execl(argv[0], argv[0], "socket-leaf", argv[2], (char *)NULL);
+			execl(argv[0], argv[0], "socket-leaf", argv[2], argv[3], (char *)NULL);
 			_exit(127);
 		}
 		close(atoi(argv[2]));
+		close(atoi(argv[3]));
 		return 0;
 	}
 	if (!strcmp(argv[1], "socket-leaf")) {
@@ -62,6 +90,9 @@ int main(int argc, char **argv)
 		assert(write(fd, &byte, 1) == 1);
 		close(fd);
 		printf("socket-descendant\n");
+		assert(fflush(stdout) == 0);
+		assert(write(atoi(argv[3]), "!", 1) == 1);
+		close(atoi(argv[3]));
 		return 0;
 	}
 	if (!strcmp(argv[1], "args")) {
@@ -100,6 +131,7 @@ int main(int argc, char **argv)
 			_exit(127);
 		}
 		if (!strcmp(argv[2], "live")) pause_ms(60000);
+		else host_call("root-gate", "[]");
 		return 7;
 	}
 	if (!strcmp(argv[1], "kill-middle")) {
@@ -117,21 +149,7 @@ int main(int argc, char **argv)
 			assert(setsid() >= 0);
 			assert(write(1, "before kill\n", 12) == 12);
 		}
-		int fd = open("/dev/hlcall", O_RDWR | O_CLOEXEC);
-		assert(fd >= 0);
-		uint8_t reply[4096];
-		struct request {
-			const char *name;
-			uint64_t name_len;
-			const char *args;
-			uint64_t args_len;
-			uint8_t *out;
-			uint64_t cap, len;
-		} request = { "gate", 4, argv[2], strlen(argv[2]), reply, sizeof(reply), 0 };
-		assert(ioctl(fd, _IOWR('H', 3, struct request), &request) == 0);
-		assert(request.len && reply[0] == 0);
-		assert(write(1, reply + 1, request.len - 1) == (ssize_t)request.len - 1);
-		close(fd);
+		host_call("gate", argv[2]);
 		return 0;
 	}
 	if (!strcmp(argv[1], "tree-host")) {
