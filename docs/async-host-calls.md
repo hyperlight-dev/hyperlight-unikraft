@@ -110,14 +110,21 @@ observe another tree's elapsed guest timers. It does **not** poll that other
 tree's queued embedder or network futures. Guest IPC between independent
 trees may require the host to drive both.
 
-`wait()` reports root exit; `wait_tree()` also waits for descendants and stream
-workers. Pipe EOF is separate from root exit because descendants can inherit
-writers. `wait_with_output()` drains both output pipes to EOF and collects the
-root status. Cancellation of any wait preserves the execution and prepared
+`wait()` waits for the entire tree and its workers; `wait_root()` reports only
+root exit. Both return the root's exit status, without aggregating descendant
+exit codes. `try_wait()` observes the root status without driving progress, so
+it can return a status while `wait()` is still pending. A long-lived descendant
+can keep `wait()` pending indefinitely. The former `wait_tree()` is now `wait()`.
+Pipe EOF is separate from root exit because descendants can inherit writers.
+`wait_with_output()` drains both output pipes to EOF and waits for the whole tree,
+returning the root status. `Command::status()` and `Command::output()` likewise
+wait for whole-tree completion.
+Cancellation of any wait preserves the execution and prepared
 completion batches. Like a process wait, waiting closes stdin still held in
 the child's `stdin` field; take the handle first to manage its lifetime yourself.
 Dropping a child does not explicitly kill it, but closes any untaken pipes.
-`start_kill()` and `kill()` signal the root only, not its descendants.
+`start_kill()` and `kill()` signal the root only, not its descendants; `kill()`
+waits only for root exit.
 Dropping the last handle to a tree stops its host-driven progress; keep a child
 or stream handle to continue driving it. Dropping every sandbox, child, and
 stream handle releases the VM and any unfinished work.

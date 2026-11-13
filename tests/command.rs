@@ -107,7 +107,7 @@ async fn descendant_output_outlives_root_wait() {
         .spawn()
         .unwrap();
     let mut stdout = child.stdout.take().unwrap();
-    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait_root())
         .await
         .unwrap()
         .unwrap();
@@ -119,6 +119,61 @@ async fn descendant_output_outlives_root_wait() {
         .unwrap()
         .unwrap();
     assert_eq!(output, b"descendant\n");
+}
+
+#[tokio::test]
+async fn whole_tree_waits_remain_pending_after_root_exit_without_output_pipes() {
+    for collect_output in [false, true] {
+        let (release, ready) = futures::channel::oneshot::channel::<()>();
+        let ready = Arc::new(Mutex::new(Some(ready)));
+        let sandbox = builder()
+            .async_host_function("gate", move |_| {
+                let ready = ready.lock().unwrap().take().unwrap();
+                async move {
+                    ready.await.map_err(|error| error.to_string())?;
+                    Ok("[]".into())
+                }
+            })
+            .boot()
+            .unwrap()
+            .into_commands()
+            .unwrap();
+        let mut child = sandbox
+            .command("/mnt/bin/command")
+            .arg("tree-host")
+            .spawn()
+            .unwrap();
+        let root = tokio::time::timeout(Duration::from_secs(5), child.wait_root())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.code(), Some(7));
+        assert_eq!(child.try_wait().unwrap(), Some(root));
+        assert_eq!(child.wait_root().now_or_never().unwrap().unwrap(), root);
+        assert!(child.wait().now_or_never().is_none());
+        // Root-only kill must not wait on the still-blocked descendant.
+        child.kill().now_or_never().unwrap().unwrap();
+
+        if collect_output {
+            let mut output = Box::pin(child.wait_with_output());
+            assert!(output.as_mut().now_or_never().is_none());
+            release.send(()).unwrap();
+            let output = tokio::time::timeout(Duration::from_secs(5), output)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(output.status, root);
+            assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        } else {
+            release.send(()).unwrap();
+            let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status, root);
+            assert_eq!(child.wait().now_or_never().unwrap().unwrap(), root);
+        }
+    }
 }
 
 #[tokio::test]
@@ -193,7 +248,7 @@ async fn completed_contexts_do_not_exhaust_the_live_execution_limit() {
                 .args(["sleep", "0", ""])
                 .spawn()
                 .unwrap();
-            assert!(child.wait_tree().await.unwrap().success());
+            assert!(child.wait().await.unwrap().success());
             completed.push(child);
         }
         assert!(
@@ -348,7 +403,7 @@ async fn independent_wait_and_pipe_tasks_do_not_overwrite_wakers() {
         stderr.read_to_end(&mut bytes).await.unwrap();
         bytes
     });
-    let status = tokio::spawn(async move { child.wait_tree().await.unwrap() });
+    let status = tokio::spawn(async move { child.wait().await.unwrap() });
     let (out, err, status) = tokio::time::timeout(Duration::from_secs(5), async {
         futures::join!(out, err, status)
     })
@@ -419,8 +474,8 @@ async fn reparented_grandchildren_keep_their_trees_sockets() {
         let mut bytes_a = Vec::new();
         let mut bytes_b = Vec::new();
         let (a, b, _, _) = futures::try_join!(
-            a.wait_tree(),
-            b.wait_tree(),
+            a.wait(),
+            b.wait(),
             async {
                 out_a
                     .read_to_end(&mut bytes_a)

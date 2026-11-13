@@ -123,12 +123,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .spawn()?;
     let stdout = tree.stdout.take().expect("stdout was configured as piped");
     // This fixture's root deliberately exits with 7 before its descendant.
-    let status = tree.wait().await?;
+    let status = tree.wait_root().await?;
     report_status("tree root", status);
 
     // Reading the taken pipe continues driving descendants after root exit.
     report_lines("tree", Some(stdout), &mut io::stdout()).await?;
-    tree.wait_tree().await?;
+    tree.wait().await?;
     println!("whole tree finished");
     Ok(())
 }

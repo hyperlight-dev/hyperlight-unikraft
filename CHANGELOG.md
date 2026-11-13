@@ -25,6 +25,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Command `Child::wait()` now waits for the whole process tree and returns the
+  root's exit status; `wait_root()` provides the former root-only behavior.
+  `wait_tree()` is removed. `status()`, `output()`, and `wait_with_output()` also
+  wait for whole-tree completion; `try_wait()` and `kill()` remain root-only.
 - **Breaking:** `AppSandbox::run`, `call`, `join` and `step` are async-only.
   The migration's `_async` names are consolidated into these methods and the
   synchronous adapters are removed. `step()` has no timeout argument:

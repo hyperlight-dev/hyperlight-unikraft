@@ -275,7 +275,7 @@ impl Command {
         self.spawn()?.wait_with_output().await
     }
 
-    /// Launch and wait for the root process.
+    /// Launch and wait for the whole process tree, returning the root's status.
     pub async fn status(&mut self) -> Result<ExitStatus> {
         self.spawn()?.wait().await
     }
@@ -443,7 +443,7 @@ impl Child {
     /// Kill the root process and await its exit. Descendants remain independent.
     pub async fn kill(&mut self) -> Result<()> {
         self.start_kill()?;
-        self.wait().await?;
+        self.wait_root().await?;
         Ok(())
     }
     /// Guest root PID once the executable has started.
@@ -451,6 +451,9 @@ impl Child {
         self.execution.process.lock().unwrap().pid
     }
     /// Observe the root status without driving guest work.
+    ///
+    /// This can return a status before [`wait`](Self::wait) completes, while
+    /// descendants or stream workers are still alive.
     pub fn try_wait(&self) -> Result<Option<ExitStatus>> {
         self.coordinator.failure()?;
         self.execution.check()?;
@@ -458,7 +461,7 @@ impl Child {
         Ok(state.status.map(ExitStatus))
     }
     /// Wait for root exit, driving this tree only. Cancellation is safe.
-    pub async fn wait(&mut self) -> Result<ExitStatus> {
+    pub async fn wait_root(&mut self) -> Result<ExitStatus> {
         self.stdin.take();
         let subscription = self.execution.wake.subscribe();
         poll_fn(|cx| {
@@ -478,11 +481,14 @@ impl Child {
         .await
     }
 
-    /// Drive until all guest descendants and their stream workers have exited.
+    /// Wait for the whole process tree and its workers, returning the root's status.
     ///
-    /// Piped output must be drained concurrently. This is separate from
-    /// [`wait`](Self::wait), which reports only the root's exit.
-    pub async fn wait_tree(&mut self) -> Result<ExitStatus> {
+    /// Cancellation is safe. Descendant exit codes are not aggregated. A
+    /// long-lived descendant can keep this wait pending after the root exits;
+    /// use [`wait_root`](Self::wait_root) to wait for only the root.
+    /// Piped output must be drained concurrently or via
+    /// [`wait_with_output`](Self::wait_with_output).
+    pub async fn wait(&mut self) -> Result<ExitStatus> {
         self.stdin.take();
         let subscription = self.execution.wake.subscribe();
         poll_fn(|cx| {
@@ -504,7 +510,7 @@ impl Child {
         })
         .await
     }
-    /// Drain both pipes to EOF and collect the root status.
+    /// Drain both pipes to EOF, wait for the whole tree, and collect the root status.
     ///
     /// Descendants may keep pipes open after the root exits. Collected output
     /// is unbounded, like `std::process::Command::output`.

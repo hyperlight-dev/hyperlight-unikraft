@@ -111,6 +111,15 @@ int main(int argc, char **argv)
 		close(fd);
 		return 0;
 	}
+	if (!strcmp(argv[1], "tree-host")) {
+		pid_t child = vfork();
+		assert(child >= 0);
+		if (!child) {
+			execl(argv[0], argv[0], "host", "[]", (char *)NULL);
+			_exit(127);
+		}
+		return 7;
+	}
 	if (!strcmp(argv[1], "tree")) {
 		pid_t child = vfork();
 		assert(child >= 0);
