@@ -191,7 +191,7 @@ impl Executions {
             "CommandDriverVersion",
             move || -> hyperlight_host::Result<u64> {
                 registry.supported.store(true, Ordering::Relaxed);
-                Ok(2)
+                Ok(3)
             },
         )?;
         let registry = self.clone();
@@ -351,6 +351,9 @@ impl Execution {
             }
         }
         drop(state);
+        if kind == 1 {
+            self.pipes[0].close();
+        }
         self.wake.notify();
         Ok(())
     }

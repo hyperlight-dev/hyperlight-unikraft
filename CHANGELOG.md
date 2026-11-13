@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - An opt-in `AppSandbox::into_commands()` API for concurrent compiled guest
   executables, with structured arguments, environment and cwd, cancellation-safe
-  waits, root exit/whole-tree completion, and bounded stdin/stdout/stderr pipes.
+  waits, root-scoped lifetimes, and bounded stdin/stdout/stderr pipes.
   Each command tree owns its host futures, sockets and timers; polling one
   handle does not poll another tree's queued host operations. Requires rebuilt
   C, Rust, Go or .NET AOT exec driver images; command snapshots are not yet exposed.
@@ -25,13 +25,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Command `Child::wait()` waits for the root; `wait_all()` waits for the whole
-  process tree and returns the root's status. `kill_all()` signals the entire
+- Command root exit automatically kills remaining descendants, including
+  reparented processes. `wait()` and `try_wait()` report command cleanup with the
+  root's status; normal exit preserves output already written. `kill()` signals the entire
   execution, including reparented descendants, and completes cleanup in one
   synchronous VM entry without polling host futures. Unforwarded output is
   discarded; host-buffered output remains readable.
-  `try_wait()`, `status()`, and `kill()` remain root-only; output helpers also
-  drain their captured pipes to EOF. Command protocol v2 requires rebuilt
+  The separate `wait_all()`, `kill_all()`, and `start_kill()` APIs are removed.
+  Output helpers also drain their captured pipes to EOF. Command protocol v3 requires rebuilt
   compiled-runtime driver images.
 - **Breaking:** `AppSandbox::run`, `call`, `join` and `step` are async-only.
   The migration's `_async` names are consolidated into these methods and the
@@ -48,7 +49,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   immediate syscall fallback; POSIX setup, options and errno translation remain.
 - Async driving requires Tokio's time and I/O drivers. Dropping an unfinished
   driving future poisons the sandbox until restore. Boot, submission, snapshots
-  and restore remain synchronous. Updated kernels and snapshot contract 12
+  and restore remain synchronous. Updated kernels and snapshot contract 13
   require fresh snapshots.
 
 ### Fixed

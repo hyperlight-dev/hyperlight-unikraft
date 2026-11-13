@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The Hyperlight Authors.
 
-//! Concurrent commands and descendant output in one sandbox.
+//! Concurrent commands and automatic descendant cleanup in one sandbox.
 //!
 //! From the repository root on Linux, with Docker, just, GCC, Rust, and KVM:
 //!
@@ -122,14 +122,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .stdout(Stdio::piped())
         .spawn()?;
     let stdout = tree.stdout.take().expect("stdout was configured as piped");
-    // This fixture's root deliberately exits with 7 before its descendant.
-    let status = tree.wait().await?;
+    // The root exits with 7; its sleeping descendant is automatically killed.
+    let (status, ()) = futures::try_join!(tree.wait(), async {
+        report_lines("tree", Some(stdout), &mut io::stdout())
+            .await
+            .map_err(hyperlight_unikraft::Error::Wait)
+    },)?;
     report_status("tree root", status);
-
-    // Reading the taken pipe continues driving descendants after root exit.
-    report_lines("tree", Some(stdout), &mut io::stdout()).await?;
-    tree.wait_all().await?;
-    println!("whole tree finished");
+    println!("root exited; all remaining descendants were terminated");
     Ok(())
 }
 

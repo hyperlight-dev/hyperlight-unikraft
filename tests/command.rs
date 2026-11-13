@@ -98,7 +98,7 @@ async fn independent_host_futures_and_cancelled_wait() {
 }
 
 #[tokio::test]
-async fn descendant_output_outlives_root_wait() {
+async fn root_exit_kills_the_descendant_and_closes_taken_output() {
     let sandbox = builder().boot().unwrap().into_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -118,21 +118,15 @@ async fn descendant_output_outlives_root_wait() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(output, b"descendant\n");
+    assert!(output.is_empty());
 }
 
 #[tokio::test]
-async fn whole_tree_waits_remain_pending_after_root_exit_without_output_pipes() {
+async fn root_exit_cancels_descendant_host_calls_without_polling_them() {
     for collect_output in [false, true] {
-        let (release, ready) = futures::channel::oneshot::channel::<()>();
-        let ready = Arc::new(Mutex::new(Some(ready)));
         let sandbox = builder()
-            .async_host_function("gate", move |_| {
-                let ready = ready.lock().unwrap().take().unwrap();
-                async move {
-                    ready.await.map_err(|error| error.to_string())?;
-                    Ok("[]".into())
-                }
+            .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
+                panic!("a descendant must not be driven after root exit");
             })
             .boot()
             .unwrap()
@@ -143,32 +137,22 @@ async fn whole_tree_waits_remain_pending_after_root_exit_without_output_pipes() 
             .arg("tree-host")
             .spawn()
             .unwrap();
-        let root = tokio::time::timeout(Duration::from_secs(5), child.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(root.code(), Some(7));
-        assert_eq!(child.try_wait().unwrap(), Some(root));
-        assert_eq!(child.wait().now_or_never().unwrap().unwrap(), root);
-        assert!(child.wait_all().now_or_never().is_none());
-        // Root-only kill must not wait on the still-blocked descendant.
-        child.kill().now_or_never().unwrap().unwrap();
-
         if collect_output {
-            let mut output = Box::pin(child.wait_with_output());
-            // With no captured pipes, output waits only for the root.
-            let output = output.as_mut().now_or_never().unwrap().unwrap();
-            release.send(()).unwrap();
-            assert_eq!(output.status, root);
-            assert!(output.stdout.is_empty() && output.stderr.is_empty());
-        } else {
-            release.send(()).unwrap();
-            let status = tokio::time::timeout(Duration::from_secs(5), child.wait_all())
+            let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(status, root);
-            assert_eq!(child.wait_all().now_or_never().unwrap().unwrap(), root);
+            assert_eq!(output.status.code(), Some(7));
+            assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        } else {
+            let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.code(), Some(7));
+            assert_eq!(child.try_wait().unwrap(), Some(status));
+            assert_eq!(child.wait().now_or_never().unwrap().unwrap(), status);
+            child.kill().unwrap();
         }
     }
 }
@@ -245,7 +229,7 @@ async fn completed_contexts_do_not_exhaust_the_live_execution_limit() {
                 .args(["sleep", "0", ""])
                 .spawn()
                 .unwrap();
-            assert!(child.wait_all().await.unwrap().success());
+            assert!(child.wait().await.unwrap().success());
             completed.push(child);
         }
         assert!(
@@ -324,10 +308,7 @@ async fn killing_one_root_preserves_other_commands_and_cancelled_waits() {
         .spawn()
         .unwrap();
     assert!(child.wait().now_or_never().is_none());
-    tokio::time::timeout(Duration::from_secs(3), child.kill())
-        .await
-        .unwrap()
-        .unwrap();
+    child.kill().unwrap();
     assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(9));
     let next = sandbox
         .command("/mnt/bin/command")
@@ -370,16 +351,13 @@ async fn killing_a_root_interrupts_and_drops_its_pending_host_call() {
         .unwrap();
     assert!(child.wait().now_or_never().is_none());
     assert!(!dropped.load(Ordering::SeqCst));
-    tokio::time::timeout(Duration::from_secs(3), child.kill())
-        .await
-        .unwrap()
-        .unwrap();
+    child.kill().unwrap();
     assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(9));
     assert!(dropped.load(Ordering::SeqCst));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_all_ends_reparented_descendants_and_drops_their_host_calls() {
+async fn root_exit_and_kill_end_reparented_descendants_and_drop_their_host_calls() {
     use std::sync::atomic::{AtomicBool, Ordering};
     struct Dropped(Arc<AtomicBool>);
     impl Drop for Dropped {
@@ -389,11 +367,20 @@ async fn kill_all_ends_reparented_descendants_and_drops_their_host_calls() {
     }
 
     for root_mode in ["live", "exit"] {
+        let (release_root, root_ready) = futures::channel::oneshot::channel::<()>();
+        let root_ready = Arc::new(Mutex::new(Some(root_ready)));
         let started = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
         let observed_start = started.clone();
         let observed_drop = dropped.clone();
         let sandbox = builder()
+            .async_host_function("root-gate", move |_| {
+                let ready = root_ready.lock().unwrap().take().unwrap();
+                async move {
+                    ready.await.map_err(|error| error.to_string())?;
+                    Ok(String::new())
+                }
+            })
             .async_host_function("gate", move |_| {
                 let started = observed_start.clone();
                 let dropped = observed_drop.clone();
@@ -419,16 +406,17 @@ async fn kill_all_ends_reparented_descendants_and_drops_their_host_calls() {
         let mut stdout = child.stdout.take().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !started.load(Ordering::SeqCst) {
-                assert!(child.wait_all().now_or_never().is_none());
+                assert!(child.wait().now_or_never().is_none());
                 tokio::task::yield_now().await;
             }
             if root_mode == "exit" {
+                release_root.send(()).unwrap();
                 assert_eq!(child.wait().await.unwrap().code(), Some(7));
             } else {
                 assert!(child.try_wait().unwrap().is_none());
+                child.kill().unwrap();
             }
-            child.kill_all().unwrap();
-            let status = child.wait_all().now_or_never().unwrap().unwrap();
+            let status = child.wait().now_or_never().unwrap().unwrap();
             let mut output = Vec::new();
             stdout
                 .read_to_end(&mut output)
@@ -438,12 +426,13 @@ async fn kill_all_ends_reparented_descendants_and_drops_their_host_calls() {
             assert!(b"before kill\n".starts_with(&output));
             if root_mode == "exit" {
                 assert_eq!(status.code(), Some(7));
+                assert_eq!(output, b"before kill\n");
             } else {
                 assert_eq!(status.signal(), Some(9));
             }
             assert!(dropped.load(Ordering::SeqCst));
             assert!(stdin.write_all(b"closed").await.is_err());
-            child.kill_all().unwrap();
+            child.kill().unwrap();
             let next = sandbox
                 .command("/mnt/bin/command")
                 .args(["sleep", "0", "still alive"])
@@ -458,7 +447,7 @@ async fn kill_all_ends_reparented_descendants_and_drops_their_host_calls() {
 }
 
 #[tokio::test]
-async fn synchronous_kill_all_preserves_only_host_buffered_output_in_one_entry() {
+async fn synchronous_kill_preserves_only_host_buffered_output_in_one_entry() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
@@ -484,7 +473,7 @@ async fn synchronous_kill_all_preserves_only_host_buffered_output_in_one_entry()
         .spawn()
         .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), child.wait_all())
+        tokio::time::timeout(Duration::from_millis(50), child.wait())
             .await
             .is_err()
     );
@@ -496,9 +485,9 @@ async fn synchronous_kill_all_preserves_only_host_buffered_output_in_one_entry()
     let entries = Arc::new(AtomicUsize::new(0));
     let subscriber = tracing_subscriber::registry().with(Entries(entries.clone()));
     tracing::subscriber::with_default(subscriber, || {
-        child.kill_all().unwrap();
+        child.kill().unwrap();
         assert_eq!(entries.load(Ordering::SeqCst), 1);
-        let status = child.wait_all().now_or_never().unwrap().unwrap();
+        let status = child.wait().now_or_never().unwrap().unwrap();
         assert_eq!(status.signal(), Some(9));
         stdout
             .read_to_end(&mut out)
@@ -510,7 +499,7 @@ async fn synchronous_kill_all_preserves_only_host_buffered_output_in_one_entry()
             .now_or_never()
             .unwrap()
             .unwrap();
-        child.kill_all().unwrap();
+        child.kill().unwrap();
         assert_eq!(entries.load(Ordering::SeqCst), 1);
     });
     for output in [out, err] {
@@ -520,10 +509,10 @@ async fn synchronous_kill_all_preserves_only_host_buffered_output_in_one_entry()
 }
 
 #[test]
-fn kill_all_without_a_runtime_does_not_poll_queued_host_functions() {
+fn kill_without_a_runtime_does_not_poll_queued_host_functions() {
     let sandbox = builder()
         .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
-            panic!("kill_all must cancel, not poll, the host function");
+            panic!("kill must cancel, not poll, the host function");
         })
         .boot()
         .unwrap()
@@ -538,8 +527,8 @@ fn kill_all_without_a_runtime_does_not_poll_queued_host_functions() {
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
-    child.kill_all().unwrap();
-    let status = child.wait_all().now_or_never().unwrap().unwrap();
+    child.kill().unwrap();
+    let status = child.wait().now_or_never().unwrap().unwrap();
     assert_eq!(status.signal(), Some(9));
     assert!(stdin.write_all(b"closed").now_or_never().unwrap().is_err());
     let mut output = Vec::new();
@@ -552,7 +541,7 @@ fn kill_all_without_a_runtime_does_not_poll_queued_host_functions() {
 }
 
 #[tokio::test]
-async fn kill_all_closes_only_its_trees_inherited_socket() {
+async fn kill_closes_only_its_trees_inherited_socket() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port().to_string();
@@ -567,23 +556,28 @@ async fn kill_all_closes_only_its_trees_inherited_socket() {
             .args(["net-tree", &port])
             .spawn()
             .unwrap();
-        assert_eq!(a.wait().await.unwrap().code(), Some(9));
-        let (peer_a, _) = listener.accept().await.unwrap();
+        let peer_a = match futures::future::select(Box::pin(a.wait()), Box::pin(listener.accept()))
+            .await
+        {
+            futures::future::Either::Right((peer, _)) => peer.unwrap().0,
+            futures::future::Either::Left((status, _)) => panic!("root exited early: {status:?}"),
+        };
         let mut b = sandbox
             .command("/mnt/bin/command")
             .args(["net-tree", &port])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        assert_eq!(b.wait().await.unwrap().code(), Some(9));
-        let (peer_b, _) = listener.accept().await.unwrap();
+        let peer_b = match futures::future::select(Box::pin(b.wait()), Box::pin(listener.accept()))
+            .await
+        {
+            futures::future::Either::Right((peer, _)) => peer.unwrap().0,
+            futures::future::Either::Left((status, _)) => panic!("root exited early: {status:?}"),
+        };
 
-        assert!(a.wait_all().now_or_never().is_none());
-        a.kill_all().unwrap();
-        assert_eq!(
-            a.wait_all().now_or_never().unwrap().unwrap().code(),
-            Some(9)
-        );
+        assert!(a.wait().now_or_never().is_none());
+        a.kill().unwrap();
+        assert_eq!(a.wait().now_or_never().unwrap().unwrap().signal(), Some(9));
         loop {
             peer_a.readable().await.unwrap();
             match peer_a.try_read(&mut [0]) {
@@ -631,7 +625,7 @@ async fn independent_wait_and_pipe_tasks_do_not_overwrite_wakers() {
         stderr.read_to_end(&mut bytes).await.unwrap();
         bytes
     });
-    let status = tokio::spawn(async move { child.wait_all().await.unwrap() });
+    let status = tokio::spawn(async move { child.wait().await.unwrap() });
     let (out, err, status) = tokio::time::timeout(Duration::from_secs(5), async {
         futures::join!(out, err, status)
     })
@@ -702,8 +696,8 @@ async fn reparented_grandchildren_keep_their_trees_sockets() {
         let mut bytes_a = Vec::new();
         let mut bytes_b = Vec::new();
         let (a, b, _, _) = futures::try_join!(
-            a.wait_all(),
-            b.wait_all(),
+            a.wait(),
+            b.wait(),
             async {
                 out_a
                     .read_to_end(&mut bytes_a)

@@ -21,14 +21,11 @@ struct hl_command_io {
 
 struct command_pipe { int fd, stream; };
 struct command {
-	struct command *next;
-	pid_t pid;
 	uint64_t id;
 	char *storage, *cwd;
 	char **argv, **env;
 	unsigned int stdio;
 };
-static struct command *commands;
 
 static void command_event(int control, int kind, int value)
 {
@@ -154,7 +151,6 @@ static void *command_run(void *arg)
 		goto done;
 	}
 	command_event(control, 0, pid);
-	command->pid = pid;
 	for (int i = 0; i < 3; i++) {
 		if (pipes[i].fd < 0) continue;
 		error = pthread_create(&threads[i], NULL, command_pipe, &pipes[i]);
@@ -170,7 +166,6 @@ static void *command_run(void *arg)
 		goto done;
 	}
 	command_event(control, 1, status);
-	command->pid = 0;
 done:
 	if (error) command_event(control, 0, -error);
 	for (int i = 0; i < 3; i++) {
@@ -179,9 +174,6 @@ done:
 		else if (pipes[i].fd >= 0) close(pipes[i].fd);
 	}
 	close(control);
-	struct command **link = &commands;
-	while (*link && *link != command) link = &(*link)->next;
-	if (*link) *link = command->next;
 	command_free(command);
 	return NULL;
 }
@@ -210,8 +202,7 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 {
 	size_t len;
 	const char *data = fc_arg0_string(fc, fc_len, &len);
-	if (fc_name_is(fc, fc_len, "CommandKill") ||
-	    fc_name_is(fc, fc_len, "CommandKillAll")) {
+	if (fc_name_is(fc, fc_len, "CommandKill")) {
 		char *end;
 		uint64_t id;
 
@@ -219,16 +210,8 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 		errno = 0;
 		id = strtoull(data, &end, 10);
 		if (errno || !id || (size_t)(end - data) != len) return -1;
-		if (fc_name_is(fc, fc_len, "CommandKillAll"))
-			return ioctl(g_hl_call_fd, HLCALL_IOC_EXECUTION_KILL, &id) ?
-				-errno : 0;
-		for (struct command *entry = commands; entry; entry = entry->next)
-			if (entry->id == id && entry->pid > 0) {
-				if (kill(entry->pid, SIGKILL) && errno != ESRCH)
-					return -errno;
-				break;
-			}
-		return 0;
+		return ioctl(g_hl_call_fd, HLCALL_IOC_EXECUTION_KILL, &id) ?
+			-errno : 0;
 	}
 	struct command *command = calloc(1, sizeof(*command));
 	uint64_t version, argc, envc, stdio;
@@ -240,7 +223,7 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 	memcpy(command->storage, data, len);
 	char *cursor = command->storage, *end = cursor + len;
 
-	if (command_number(&cursor, end, &version) || version != 2 ||
+	if (command_number(&cursor, end, &version) || version != 3 ||
 	    command_number(&cursor, end, &command->id) || !command->id ||
 	    command_number(&cursor, end, &argc) || argc > len ||
 	    command_number(&cursor, end, &envc) || envc > len ||
@@ -256,10 +239,7 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 	for (uint64_t i = 0; i < envc; i++)
 		if (!(command->env[i] = command_field(&cursor, end))) goto invalid;
 	if (cursor != end || command->argv[0][0] != '/') goto invalid;
-	command->next = commands;
-	commands = command;
 	if (pthread_create(&thread, NULL, command_run, command)) {
-		commands = command->next;
 		goto invalid;
 	}
 	pthread_detach(thread);
@@ -278,7 +258,7 @@ static int command_init(void)
 		fprintf(stderr, "hl_command: negotiation failed: %s\n", strerror(errno));
 		return -1;
 	}
-	if (version != 2) return -1;
+	if (version != 3) return -1;
 	g_hl_command_dispatch = command_dispatch;
 	return 0;
 }

@@ -345,8 +345,7 @@ static inline __attribute__((noreturn)) void hl_driver_run(hl_dispatch_fn_t cb)
 		 * here, rather than run as the kind it is not. */
 		if (g_hl_command_dispatch &&
 		    (fc_name_is(fc, (size_t)n, "CommandSpawn") ||
-		     fc_name_is(fc, (size_t)n, "CommandKill") ||
-		     fc_name_is(fc, (size_t)n, "CommandKillAll"))) {
+		     fc_name_is(fc, (size_t)n, "CommandKill"))) {
 			status = g_hl_command_dispatch(fc, (size_t)n);
 			ran = 1;
 		} else if (fc_name_is(fc, (size_t)n, "Exec") ||
