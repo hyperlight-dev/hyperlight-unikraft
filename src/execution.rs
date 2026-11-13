@@ -66,6 +66,8 @@ impl ArcWake for WakeSet {
 
 pub(crate) struct Execution {
     pub id: u64,
+    pub attachment: Mutex<Attachment>,
+    pub needs_restore: AtomicBool,
     pub failure: Mutex<Option<String>>,
     pub done: AtomicBool,
     pub process: Mutex<ProcessState>,
@@ -75,6 +77,13 @@ pub(crate) struct Execution {
     pub net: Arc<hostnet::Net>,
     pub wake: Arc<WakeSet>,
     pub deadline: Mutex<Option<Instant>>,
+}
+
+pub(crate) struct Attachment {
+    pub attached: bool,
+    pub generation: u64,
+    pub streams: [bool; 3],
+    pub resume: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -91,10 +100,15 @@ impl Executions {
         &self,
         inbox: &Arc<Mutex<async_calls::Inbox>>,
         net: Option<&Arc<hostnet::Net>>,
+        streams: [bool; 3],
     ) -> crate::Result<(u64, Arc<Execution>)> {
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|_, entry| !entry.done.load(Ordering::Relaxed));
-        if entries.len() >= 1024 {
+        if entries
+            .values()
+            .filter(|entry| !entry.done.load(Ordering::Relaxed))
+            .count()
+            >= 1024
+        {
             return Err(HyperlightError::Error("too many command executions".into()).into());
         }
         let mut next = self.next.lock().unwrap();
@@ -105,6 +119,13 @@ impl Executions {
         let inbox = Arc::new(Mutex::new(inbox.lock().unwrap().child()));
         let entry = Arc::new(Execution {
             id,
+            attachment: Mutex::new(Attachment {
+                attached: true,
+                generation: 1,
+                streams,
+                resume: None,
+            }),
+            needs_restore: AtomicBool::new(false),
             failure: Mutex::default(),
             done: AtomicBool::new(false),
             process: Mutex::default(),
@@ -117,6 +138,48 @@ impl Executions {
         });
         entries.insert(id, entry.clone());
         Ok((id, entry))
+    }
+
+    pub fn get(&self, id: u64) -> crate::Result<Arc<Execution>> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Wait(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "unknown command execution",
+                ))
+            })
+    }
+
+    pub fn parked(&self) -> Vec<u64> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| !entry.attachment.lock().unwrap().attached)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    pub fn forget(&self, id: u64) -> crate::Result<()> {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = entries.get(&id).ok_or_else(|| {
+            Error::Wait(io::Error::new(
+                io::ErrorKind::NotFound,
+                "unknown command execution",
+            ))
+        })?;
+        if entry.attachment.lock().unwrap().attached || !entry.done.load(Ordering::Relaxed) {
+            return Err(Error::Wait(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only a detached, completed command can be forgotten",
+            )));
+        }
+        entries.remove(&id);
+        Ok(())
     }
 
     pub fn current(&self) -> hyperlight_host::Result<Option<Arc<Execution>>> {
@@ -155,6 +218,25 @@ impl Executions {
     }
 
     pub fn register(self: &Arc<Self>, target: &mut impl Registerable) -> crate::Result<()> {
+        let registry = self.clone();
+        target.register_host_function(
+            "ExecutionRestore",
+            move || -> hyperlight_host::Result<i32> {
+                let id = registry.active.load(Ordering::Relaxed);
+                let entry = registry
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        HyperlightError::Error("restoring an unknown execution".into())
+                    })?;
+                Ok(i32::from(
+                    entry.needs_restore.swap(false, Ordering::Relaxed),
+                ))
+            },
+        )?;
         let registry = self.clone();
         target.register_host_function(
             "ExecutionActive",
@@ -200,7 +282,7 @@ impl Executions {
             "CommandDriverVersion",
             move || -> hyperlight_host::Result<u64> {
                 registry.supported.store(true, Ordering::Relaxed);
-                Ok(4)
+                Ok(5)
             },
         )?;
         let registry = self.clone();
@@ -282,13 +364,26 @@ impl Pipe {
     }
 
     pub(crate) fn write(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        self.write_min(cx, bytes, 1)
+    }
+
+    fn write_chunk(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        self.write_min(cx, bytes, bytes.len())
+    }
+
+    fn write_min(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        minimum: usize,
+    ) -> Poll<io::Result<usize>> {
         self.writer.register(cx.waker());
         let mut state = self.state.lock().unwrap();
         if state.closed || state.eof {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
         let count = bytes.len().min(PIPE_CAPACITY - state.bytes.len());
-        if count == 0 && !bytes.is_empty() {
+        if count < minimum && !bytes.is_empty() {
             return Poll::Pending;
         }
         state.bytes.extend(&bytes[..count]);
@@ -323,6 +418,31 @@ pub(crate) struct ProcessState {
 }
 
 impl Execution {
+    pub fn check_attachment(&self, generation: u64) -> Result<()> {
+        let state = self.attachment.lock().unwrap();
+        if !state.attached || state.generation != generation {
+            return Err(Error::Wait(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "command handle is detached",
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn park(&self, calls: &mut async_calls::PendingCalls) {
+        if self.attachment.lock().unwrap().attached {
+            return;
+        }
+        let batch = calls.suspend();
+        let mut state = self.attachment.lock().unwrap();
+        if state.resume.is_none() {
+            state.resume = Some(batch);
+        }
+        drop(state);
+        self.net.reset();
+        self.needs_restore.store(true, Ordering::Relaxed);
+    }
+
     pub(crate) fn check(&self) -> Result<()> {
         if let Some(message) = self.failure.lock().unwrap().as_ref() {
             return Err(Error::Wait(io::Error::other(message.clone())));
@@ -397,18 +517,7 @@ impl Execution {
                     Err(error) => Err(error),
                 }
             } else {
-                let mut offset = 0;
-                loop {
-                    match poll_fn(|cx| pipe.write(cx, &bytes[offset..])).await {
-                        Ok(count) => {
-                            offset += count;
-                            if offset == bytes.len() {
-                                break Ok(());
-                            }
-                        }
-                        Err(error) => break Err(error),
-                    }
-                }
+                poll_fn(|cx| pipe.write_chunk(cx, &bytes)).await.map(|_| ())
             };
             match result {
                 Ok(()) => vec![0],

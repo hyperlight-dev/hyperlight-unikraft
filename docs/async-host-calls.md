@@ -122,7 +122,29 @@ forwarded before cleanup finishes, so piped output still needs concurrent draini
 Cancellation of any wait preserves the execution and prepared
 completion batches. Like a process wait, waiting closes stdin still held in
 the child's `stdin` field; take the handle first to manage its lifetime yourself.
-Dropping a child does not explicitly kill it, but closes any untaken pipes.
+Dropping a child parks its execution without entering the VM. Pending host
+futures and host timer registrations are dropped, and host sockets are closed.
+Guest threads cannot run until the execution is reattached and driven again.
+If another task is inside a pipe poll, teardown finishes when that poll returns.
+Taken stream handles become invalid (`BrokenPipe`), including after reattachment.
+Untaken streams and buffered bytes are preserved, not closed.
+
+Save `child.execution_id()` before dropping it, then use
+`sandbox.restore_child(id)` to acquire a new exclusive handle. The first drive
+reconstructs resources and interrupts unfinished calls with `EINTR`; the guest
+chooses whether to retry. List detached executions with `parked_children()`.
+Completed executions and their output remain available until `forget_child(id)`;
+that method requires a detached, completed command. To discard an unfinished
+command, restore it, kill it, drop it, then forget it.
+
+Listeners and unconnected sockets are recreated under the existing network
+policy; established connections become dead (EOF on read, EPIPE on write),
+just as on snapshot restore. Rebinding may fail and is reported by the socket
+restore path. Timer registrations are rebuilt from guest deadlines, not restarted
+for their original duration. Time outside the VM continues to advance.
+Completed data replies are retained, but socket-dependent replies are interrupted
+because their host resources no longer exist. Cancellation cannot undo side
+effects or make arbitrary retries safe.
 `kill()` sends SIGKILL to every guest process with that execution identity,
 including descendants reparented to guest init or moved into a new session.
 It is synchronous: one VM entry stops the tree and its workers, cancelling
@@ -133,8 +155,8 @@ to call `kill()`. After success, `wait()` is immediately ready.
 Killing an already completed tree needs no VM entry, and other command trees
 are not signalled. As with other VM entries, CPU-bound guest code requires the
 existing interrupt-handle mechanism to preempt.
-Dropping the last handle to a tree stops its host-driven progress; keep a child
-or stream handle to continue driving it. Dropping every sandbox, child, and
+Keep the child alive while driving taken stream handles, even after `wait()`
+returns; dropping the child invalidates those handles. Dropping every sandbox, child, and
 stream handle releases the VM and any unfinished work.
 
 Streams implement `futures::io::AsyncRead` / `AsyncWrite`. Each host pipe holds
@@ -150,7 +172,7 @@ there is no shell parsing or PATH search. Stdio defaults to `/dev/null`;
 `Stdio::piped()` opts into a host pipe. Independent roots do not inherit each
 other's command descriptors. Cross-tree socket sharing is not supported.
 
-Command protocol version 4 requires rebuilt C, Rust, Go, or .NET AOT exec
+Command protocol version 5 requires rebuilt C, Rust, Go, or .NET AOT exec
 driver images. Other runtimes and snapshots restored without the command
 handshake are rejected explicitly by `into_commands()`. Command sandboxes
 do not expose snapshots/restores or the legacy interpreter API. Existing
@@ -158,7 +180,7 @@ do not expose snapshots/restores or the legacy interpreter API. Existing
 
 ### Attribution and control wire format
 
-The exec driver negotiates version 4 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
+The exec driver negotiates version 5 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
 Workers attach with `HLCALL_IOC_EXECUTION` (ioctl 5, `u64`). The kernel inherits
 this identity through thread creation. Before a host call whose owner changed,
 the transport sends `ExecutionContext(u64) -> i32` under the same transport
@@ -171,6 +193,14 @@ are eligible to run. Other trees remain queued even when their timers expire;
 their deadlines and socket readiness are not serviced by this entry. Runnable
 foreign threads do not prevent returning to the host. This gate is independent
 of ordinary blocking and wakeups. Spawn and kill select their target too.
+
+`ExecutionRestore() -> i32` marks the first entry after resource teardown.
+After delivering retained completion records, the kernel reconstructs only
+the selected execution's sockets, retires its old request IDs, and finishes
+remaining async waits with `EINTR` before scheduling. An empty version-1
+completion batch is valid for this entry. Pipe workers retry interrupted
+forwarding without closing the channel; host output chunks commit atomically
+so interrupted backpressured writes cannot duplicate a partially forwarded chunk.
 
 `CommandSpawn` carries one NUL-delimited string: version, execution ID,
 argument count (excluding argv[0]), environment count, piped-stream bitmask

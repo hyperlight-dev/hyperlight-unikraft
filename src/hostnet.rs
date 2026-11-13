@@ -721,7 +721,11 @@ impl Net {
                 -errno::EACCES
             })
         };
-        match inbox.lock().unwrap().submit_reply(reply) {
+        match inbox
+            .lock()
+            .unwrap()
+            .submit_resource_reply(async move { Ok(reply.await) })
+        {
             Ok(id) => crate::async_calls::pending_reply(id),
             Err(error) => {
                 tracing::warn!(%error, "cannot queue asynchronous network policy check");
@@ -1432,7 +1436,7 @@ impl Net {
             .await?;
             Ok(int_reply(1))
         };
-        match inbox.lock().unwrap().submit_fallible_reply(reply) {
+        match inbox.lock().unwrap().submit_resource_reply(reply) {
             Ok(id) => crate::async_calls::pending_reply(id),
             Err(error) => {
                 tracing::warn!(%error, "cannot queue asynchronous network wait");
