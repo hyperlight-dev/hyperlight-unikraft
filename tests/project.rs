@@ -88,6 +88,13 @@ fn init_local(
     );
     assert!(out.status.success(), "init failed: {}", text(&out));
     let project = root.join(dir);
+    use_local_rootfs(&project, runtime);
+    project
+}
+
+/// Swap the published image in `project`'s manifest for the local
+/// `runtime` rootfs, as a manifest with `[rootfs] path` would.
+fn use_local_rootfs(project: &Path, runtime: &str) {
     let manifest = project.join("hluk.toml");
     let rootfs = require_rootfs(runtime);
     let rewritten: String = std::fs::read_to_string(&manifest)
@@ -104,7 +111,6 @@ fn init_local(
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(&manifest, rewritten).unwrap();
-    project
 }
 
 #[test]
@@ -538,8 +544,11 @@ fn build_runs_the_command_in_the_project_directory() {
     assert!(text(&out).contains("Hello from built!"));
 }
 
+/// The `rust` template as a user runs it: `hluk init`, then `hluk build`
+/// with the host's cargo, then `hluk run`, warm.  Only on Linux: a build
+/// for another OS stops with an error (#279).
 #[test]
-fn the_rust_template_builds_only_for_linux() {
+fn the_rust_template_builds_only_for_linux_and_runs_warm() {
     let root = temp_dir("project-rust");
     let cache = temp_dir("project-rust-cache");
     let out = hluk(
@@ -559,12 +568,7 @@ fn the_rust_template_builds_only_for_linux() {
         .env_remove("CARGO_TARGET_DIR")
         .output()
         .expect("failed to run hluk");
-    if cfg!(target_os = "linux") {
-        // `hluk build` checks that the program is a PIE for this CPU.
-        assert!(out.status.success(), "build failed: {}", text(&out));
-        let program = std::fs::read(project.join("target/release/app")).unwrap();
-        assert!(program.starts_with(b"\x7fELF"), "not an ELF file");
-    } else {
+    if !cfg!(target_os = "linux") {
         // Refused before cargo makes a binary the guest cannot run.
         assert!(!out.status.success(), "built: {}", text(&out));
         assert!(
@@ -572,7 +576,56 @@ fn the_rust_template_builds_only_for_linux() {
             "got: {}",
             text(&out)
         );
+        return;
     }
+    assert!(out.status.success(), "build failed: {}", text(&out));
+
+    // The program at the path the manifest mounts: a PIE (ET_DYN) for this
+    // CPU, which `hluk build` checks too, linked statically, as the rootfs
+    // has no dynamic loader for it (no PT_INTERP program header).
+    let program = std::fs::read(project.join("target/release/app")).unwrap();
+    assert!(
+        program.starts_with(b"\x7fELF\x02\x01"),
+        "not a 64-bit LE ELF"
+    );
+    let half = |at: usize| u16::from_le_bytes([program[at], program[at + 1]]);
+    let word = |at: usize| u32::from_le_bytes(program[at..at + 4].try_into().unwrap());
+    let machine = if cfg!(target_arch = "aarch64") {
+        183
+    } else {
+        62
+    };
+    assert_eq!(half(18), machine, "e_machine: not built for this CPU");
+    assert_eq!(half(16), 3, "e_type: not a PIE");
+    let phoff = u64::from_le_bytes(program[32..40].try_into().unwrap()) as usize;
+    let (phentsize, phnum) = (half(54) as usize, half(56) as usize);
+    assert!(
+        (0..phnum).all(|i| word(phoff + i * phentsize) != 3),
+        "dynamically linked (PT_INTERP)"
+    );
+
+    // The program runs as the template mounts it, on the local rootfs.
+    // The first run boots and, being `warm = true`, saves the snapshot.
+    use_local_rootfs(&project, "rust");
+    let greeting = "Hello from greeter!";
+    let platform = format!("Rust on linux/{}", std::env::consts::ARCH);
+    let out = hluk(&project, cache.path(), &["run", "--log-level", "info"]);
+    assert!(out.status.success(), "run failed: {}", text(&out));
+    let t = text(&out);
+    assert!(t.contains(greeting) && t.contains(&platform), "got: {t}");
+    assert!(t.contains("restored=false"), "expected a fresh boot: {t}");
+    assert_eq!(
+        snapshots(cache.path()).len(),
+        1,
+        "one warm snapshot in the cache"
+    );
+
+    // The second restores it, and runs the program again.
+    let out = hluk(&project, cache.path(), &["run", "--log-level", "info"]);
+    assert!(out.status.success(), "warm run failed: {}", text(&out));
+    let t = text(&out);
+    assert!(t.contains(greeting) && t.contains(&platform), "got: {t}");
+    assert!(t.contains("restored=true"), "expected a restore: {t}");
 }
 
 #[test]
