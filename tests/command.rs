@@ -173,15 +173,16 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     let pending_info = &entries[0];
     let done_info = &entries[1];
     assert_eq!(pending_info.pid, pending.id());
-    assert!(!pending_info.detached && !pending_info.completed);
+    let observer = pending_info.clone();
+    assert!(!pending_info.detached() && !pending_info.completed());
     assert_eq!(done_info.pid, done_pid);
-    assert!(done_info.detached && done_info.completed);
+    assert!(done_info.detached() && done_info.completed());
     assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::AlreadyExists));
 
-    drop(pending);
-    assert!(!pending_info.detached); // Metadata is an observation, not a live handle.
-    assert!(sandbox.children().iter().all(|entry| entry.detached));
+    std::thread::spawn(move || drop(pending)).join().unwrap();
+    assert!(pending_info.detached() && observer.detached());
+    assert!(sandbox.children().iter().all(|entry| entry.detached()));
     let snapshot = sandbox.snapshot().unwrap();
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .async_host_function("gate", gate)
@@ -191,6 +192,7 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
         .into_commands()
         .unwrap();
     let mut pending = pending_info.restore().unwrap();
+    assert!(!pending_info.detached() && !observer.detached());
     let mut fork_pending = fork
         .children()
         .into_iter()
@@ -201,12 +203,14 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     fork_pending.kill().unwrap();
     drop(fork_pending);
     assert!(pending.try_wait().unwrap().is_none());
-    assert!(!sandbox.children()[0].detached);
+    assert!(!pending_info.detached() && !pending_info.completed());
     assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::AlreadyExists));
     pending.kill().unwrap();
+    assert!(pending_info.completed() && observer.completed());
+    assert!(!pending_info.detached());
     drop(pending);
-    assert!(sandbox.children()[0].completed);
+    assert!(pending_info.detached() && observer.detached());
     sandbox.forget_child(pending_id).unwrap();
     assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::NotFound));
@@ -215,8 +219,35 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     assert!(done.wait().now_or_never().unwrap().unwrap().success());
     drop(done);
     drop(sandbox);
+    assert!(done_info.detached() && done_info.completed());
     assert!(matches!(done_info.restore(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::NotFound));
+}
+
+#[test]
+fn lifecycle_flags_belong_to_the_observed_snapshot_incarnation() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let child = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "60000", "done"])
+        .spawn()
+        .unwrap();
+    let info = sandbox.children().pop().unwrap();
+    drop(child);
+    let snapshot = sandbox.snapshot().unwrap();
+    let mut child = info.restore().unwrap();
+    child.kill().unwrap();
+    drop(child);
+    assert!(info.completed());
+
+    sandbox.restore(&snapshot).unwrap();
+    let restored = sandbox.children().pop().unwrap();
+    assert!(restored.detached() && !restored.completed());
+    let mut child = restored.restore().unwrap();
+    assert!(!restored.detached());
+    assert!(info.detached() && info.completed());
+    child.kill().unwrap();
+    assert!(restored.completed());
 }
 
 #[tokio::test]

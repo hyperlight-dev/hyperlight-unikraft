@@ -113,7 +113,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for child in &children {
         println!(
             "\x1b[1m[execution {:?}]\x1b[0m pid={:?}, detached={}, completed={}",
-            child.execution_id, child.pid, child.detached, child.completed
+            child.execution_id,
+            child.pid,
+            child.detached(),
+            child.completed()
         );
         println!(
             "  program={:?}, args={:?}, cwd={:?}, stdio={:?}, env keys={:?}",

@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::task::{Context, Poll};
 
@@ -36,10 +37,12 @@ pub struct CommandSandbox(Arc<Coordinator>);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExecutionId(u64);
 
-/// An observation of a command, without acquiring a driving handle.
+/// Command metadata and live lifecycle flags, without acquiring a driving handle.
 ///
-/// Metadata may become stale as commands are attached, detached or completed.
-/// This entry does not keep the sandbox alive or prevent snapshots.
+/// Launch metadata and PID are observations; lifecycle methods read shared atomics.
+/// This entry does not keep the sandbox or execution resources alive or prevent
+/// snapshots. After in-place snapshot restoration, obtain new entries to observe
+/// the replacement executions. Old entries retain their original executions' flags.
 #[derive(Clone, Debug)]
 pub struct ChildInfo {
     /// Stable execution identity within the originating sandbox.
@@ -58,18 +61,28 @@ pub struct ChildInfo {
     pub stdio: [Stdio; 3],
     /// Guest root PID, if the executable has started.
     pub pid: Option<u32>,
-    /// Whether there was no child handle when observed. An attached child is not
-    /// necessarily being polled.
-    pub detached: bool,
-    /// Whether the root, descendants and command workers have finished cleanup.
-    pub completed: bool,
+    attached: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
     sandbox: Weak<Coordinator>,
 }
 
 impl ChildInfo {
+    /// Whether this execution currently has no child handle.
+    ///
+    /// An attached child is not necessarily being polled. Detachment may still
+    /// be finishing; this observation does not guarantee restoration will succeed.
+    pub fn detached(&self) -> bool {
+        !self.attached.load(Ordering::Relaxed)
+    }
+
+    /// Whether the root, descendants and command workers have finished cleanup.
+    pub fn completed(&self) -> bool {
+        self.completed.load(Ordering::Relaxed)
+    }
+
     /// Reacquire this command from its originating sandbox without driving it.
     ///
-    /// Rechecks the current state, not the observed `detached` field. Like
+    /// Rechecks the current state rather than relying on a prior status read. Like
     /// [`CommandSandbox::restore_child`], fails if already attached or still
     /// detaching. Also fails if forgotten or the sandbox has been dropped.
     pub fn restore(&self) -> Result<Child> {
@@ -175,7 +188,7 @@ impl CommandSandbox {
             .list()
             .into_iter()
             .map(|execution| {
-                let detached = !execution.attachment.lock().unwrap().attached;
+                let attached = execution.attachment.lock().unwrap().attached.clone();
                 let process = execution.process.lock().unwrap();
                 ChildInfo {
                     execution_id: ExecutionId(execution.id),
@@ -185,8 +198,8 @@ impl CommandSandbox {
                     env: execution.command.env.clone(),
                     stdio: execution.command.stdio,
                     pid: process.pid,
-                    detached,
-                    completed: execution.done.load(std::sync::atomic::Ordering::Relaxed),
+                    attached,
+                    completed: execution.done.clone(),
                     sandbox: Arc::downgrade(&self.0),
                 }
             })
@@ -200,7 +213,14 @@ impl CommandSandbox {
             .executions
             .list()
             .into_iter()
-            .filter(|execution| !execution.attachment.lock().unwrap().attached)
+            .filter(|execution| {
+                !execution
+                    .attachment
+                    .lock()
+                    .unwrap()
+                    .attached
+                    .load(Ordering::Relaxed)
+            })
             .map(|execution| ExecutionId(execution.id))
             .collect()
     }
@@ -226,7 +246,7 @@ impl CommandSandbox {
         };
         {
             let state = execution.attachment.lock().unwrap();
-            if state.attached {
+            if state.attached.load(Ordering::Relaxed) {
                 return Err(Error::Wait(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "command already has a child handle",
@@ -239,7 +259,7 @@ impl CommandSandbox {
             state.generation = state.generation.checked_add(1).ok_or_else(|| {
                 Error::Wait(io::Error::other("command handle generations exhausted"))
             })?;
-            state.attached = true;
+            state.attached.store(true, Ordering::Relaxed);
             state.generation
         };
         drop(calls);
@@ -540,7 +560,7 @@ impl Coordinator {
             calls.clear();
         }
         let mut state = execution.attachment.lock().unwrap();
-        if !state.attached {
+        if !state.attached.load(Ordering::Relaxed) {
             drop(state);
             execution.park(&mut calls);
             state = execution.attachment.lock().unwrap();
@@ -832,11 +852,11 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         {
-            let mut state = self.execution.attachment.lock().unwrap();
+            let state = self.execution.attachment.lock().unwrap();
             if state.generation != self.generation {
                 return;
             }
-            state.attached = false;
+            state.attached.store(false, Ordering::Relaxed);
         }
         match self.execution.calls.try_lock() {
             Ok(mut calls) => self.execution.park(&mut calls),
@@ -862,7 +882,7 @@ struct ChildPipe {
 impl Drop for ChildPipe {
     fn drop(&mut self) {
         let mut state = self.execution.attachment.lock().unwrap();
-        if !state.attached || state.generation != self.generation {
+        if !state.attached.load(Ordering::Relaxed) || state.generation != self.generation {
             return;
         }
         state.streams[self.stream] = false;
@@ -880,7 +900,7 @@ impl ChildPipe {
         action: impl FnOnce(&crate::execution::Pipe) -> Poll<io::Result<T>>,
     ) -> Poll<io::Result<T>> {
         let state = self.execution.attachment.lock().unwrap();
-        if !state.attached || state.generation != self.generation {
+        if !state.attached.load(Ordering::Relaxed) || state.generation != self.generation {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "command pipe is detached",

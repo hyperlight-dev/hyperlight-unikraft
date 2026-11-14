@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   cwd, resolved launch environment and standard stream configuration. Launch
   metadata is preserved across command snapshots. Each metadata entry can
   restore its detached child without driving it or keeping the sandbox alive.
+  Its `detached()` and `completed()` methods read shared atomic lifecycle flags.
 - An opt-in `AppSandbox::into_commands()` API for concurrent compiled guest
   executables, with structured arguments, environment and cwd, cancellation-safe
   waits, root-scoped lifetimes, and bounded stdin/stdout/stderr pipes.

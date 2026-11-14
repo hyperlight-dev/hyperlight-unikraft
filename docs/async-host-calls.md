@@ -134,7 +134,8 @@ Save `child.execution_id()` before dropping it, then use
 reconstructs resources and interrupts unfinished calls with `EINTR`; the guest
 chooses whether to retry. `sandbox.children()` lists all retained commands in
 execution-ID order, including attached and completed commands. Each `ChildInfo`
-reports `execution_id`, the guest `pid` if known, `detached`, and `completed`
+reports `execution_id`, the guest `pid` if known, and live atomic-backed methods
+`detached()` and `completed()`
 (root, descendant and worker cleanup finished). Launch metadata includes
 `program`, `args` (excluding `argv[0]`), `cwd` (`None` inherits the driver's
 working directory), `env` (the complete environment sent after inheritance,
@@ -143,8 +144,11 @@ These are launch values, not live guest state; they survive detachment and
 snapshot restoration, including independent clones. Environment values may
 contain secrets, so avoid logging them or the full debug representation.
 Call `info.restore()` to
-reacquire that command from its originating sandbox. Metadata is an observation,
-not a live status view: restoration rechecks the current attachment state.
+reacquire that command from its originating sandbox. Lifecycle methods share
+the execution's atomic flags, including across cloned entries; other metadata
+remains an observation. Restoration still rechecks the current attachment state.
+After in-place snapshot restoration, obtain new entries for the replacement
+executions; old entries retain their original executions' final flags.
 Listing neither drives commands nor keeps the sandbox alive; entries remain
 usable across detach but fail after forgetting the command or dropping its sandbox.
 An attached child is not necessarily being polled. `parked_children()` remains

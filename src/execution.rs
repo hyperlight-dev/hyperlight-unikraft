@@ -70,7 +70,7 @@ pub(crate) struct Execution {
     pub attachment: Mutex<Attachment>,
     pub needs_restore: AtomicBool,
     pub failure: Mutex<Option<String>>,
-    pub done: AtomicBool,
+    pub done: Arc<AtomicBool>,
     pub process: Mutex<ProcessState>,
     pub pipes: [Arc<Pipe>; 3],
     pub inbox: Arc<Mutex<async_calls::Inbox>>,
@@ -90,7 +90,7 @@ pub(crate) struct CommandMetadata {
 }
 
 pub(crate) struct Attachment {
-    pub attached: bool,
+    pub attached: Arc<AtomicBool>,
     pub generation: u64,
     pub streams: [bool; 3],
     pub resume: Option<Vec<u8>>,
@@ -177,7 +177,14 @@ impl Executions {
                 "unknown command execution",
             ))
         })?;
-        if entry.attachment.lock().unwrap().attached || !entry.done.load(Ordering::Relaxed) {
+        if entry
+            .attachment
+            .lock()
+            .unwrap()
+            .attached
+            .load(Ordering::Relaxed)
+            || !entry.done.load(Ordering::Relaxed)
+        {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "only a detached, completed command can be forgotten",
@@ -192,10 +199,14 @@ impl Executions {
         inbox: &Arc<Mutex<async_calls::Inbox>>,
     ) -> crate::Result<ExecutionSnapshot> {
         let entries: Vec<_> = self.entries.lock().unwrap().values().cloned().collect();
-        if entries
-            .iter()
-            .any(|entry| entry.attachment.lock().unwrap().attached)
-        {
+        if entries.iter().any(|entry| {
+            entry
+                .attachment
+                .lock()
+                .unwrap()
+                .attached
+                .load(Ordering::Relaxed)
+        }) {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "drop all child handles before snapshot or restore",
@@ -253,7 +264,7 @@ impl Executions {
                 })
             });
             let state = entry.attachment.get_mut().unwrap();
-            state.attached = false;
+            state.attached.store(false, Ordering::Relaxed);
             state.resume = Some(image.resume.clone());
             entry.needs_restore.store(true, Ordering::Relaxed);
             entries.insert(image.id, Arc::new(entry));
@@ -523,14 +534,14 @@ impl Execution {
             id,
             command,
             attachment: Mutex::new(Attachment {
-                attached: true,
+                attached: Arc::new(AtomicBool::new(true)),
                 generation: 1,
                 streams,
                 resume: None,
             }),
             needs_restore: AtomicBool::new(false),
             failure: Mutex::default(),
-            done: AtomicBool::new(false),
+            done: Arc::new(AtomicBool::new(false)),
             process: Mutex::default(),
             pipes: std::array::from_fn(|_| Arc::default()),
             calls: Mutex::new(async_calls::PendingCalls::new(inbox.clone())),
@@ -543,7 +554,7 @@ impl Execution {
 
     pub fn check_attachment(&self, generation: u64) -> Result<()> {
         let state = self.attachment.lock().unwrap();
-        if !state.attached || state.generation != generation {
+        if !state.attached.load(Ordering::Relaxed) || state.generation != generation {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "command handle is detached",
@@ -553,7 +564,13 @@ impl Execution {
     }
 
     pub fn park(&self, calls: &mut async_calls::PendingCalls) {
-        if self.attachment.lock().unwrap().attached {
+        if self
+            .attachment
+            .lock()
+            .unwrap()
+            .attached
+            .load(Ordering::Relaxed)
+        {
             return;
         }
         let batch = calls.suspend();
