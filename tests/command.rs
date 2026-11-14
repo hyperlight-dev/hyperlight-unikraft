@@ -174,15 +174,15 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     let done_info = &entries[1];
     assert_eq!(pending_info.pid, pending.id());
     let observer = pending_info.clone();
-    assert!(!pending_info.detached() && !pending_info.completed());
+    assert!(!pending_info.parked() && !pending_info.completed());
     assert_eq!(done_info.pid, done_pid);
-    assert!(done_info.detached() && done_info.completed());
+    assert!(done_info.parked() && done_info.completed());
     assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::AlreadyExists));
 
     std::thread::spawn(move || drop(pending)).join().unwrap();
-    assert!(pending_info.detached() && observer.detached());
-    assert!(sandbox.children().iter().all(|entry| entry.detached()));
+    assert!(pending_info.parked() && observer.parked());
+    assert!(sandbox.children().iter().all(|entry| entry.parked()));
     let snapshot = sandbox.snapshot().unwrap();
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .async_host_function("gate", gate)
@@ -192,7 +192,7 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
         .into_commands()
         .unwrap();
     let mut pending = pending_info.restore().unwrap();
-    assert!(!pending_info.detached() && !observer.detached());
+    assert!(!pending_info.parked() && !observer.parked());
     let mut fork_pending = fork
         .children()
         .into_iter()
@@ -203,14 +203,14 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     fork_pending.kill().unwrap();
     drop(fork_pending);
     assert!(pending.try_wait().unwrap().is_none());
-    assert!(!pending_info.detached() && !pending_info.completed());
+    assert!(!pending_info.parked() && !pending_info.completed());
     assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::AlreadyExists));
     pending.kill().unwrap();
     assert!(pending_info.completed() && observer.completed());
-    assert!(!pending_info.detached());
+    assert!(!pending_info.parked());
     drop(pending);
-    assert!(pending_info.detached() && observer.detached());
+    assert!(pending_info.parked() && observer.parked());
     sandbox.forget_child(pending_id).unwrap();
     assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::NotFound));
@@ -219,7 +219,7 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     assert!(done.wait().now_or_never().unwrap().unwrap().success());
     drop(done);
     drop(sandbox);
-    assert!(done_info.detached() && done_info.completed());
+    assert!(done_info.parked() && done_info.completed());
     assert!(matches!(done_info.restore(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::NotFound));
 }
@@ -242,10 +242,10 @@ fn lifecycle_flags_belong_to_the_observed_snapshot_incarnation() {
 
     sandbox.restore(&snapshot).unwrap();
     let restored = sandbox.children().pop().unwrap();
-    assert!(restored.detached() && !restored.completed());
+    assert!(restored.parked() && !restored.completed());
     let mut child = restored.restore().unwrap();
-    assert!(!restored.detached());
-    assert!(info.detached() && info.completed());
+    assert!(!restored.parked());
+    assert!(info.parked() && info.completed());
     child.kill().unwrap();
     assert!(restored.completed());
 }
@@ -845,7 +845,7 @@ async fn snapshot_forks_interrupt_pending_calls_without_starting_handlers_at_boo
 }
 
 #[test]
-fn snapshot_and_reattachment_reject_a_poll_still_finishing_detachment() {
+fn snapshot_and_reattachment_reject_a_poll_still_finishing_parking() {
     use std::sync::{
         Barrier,
         atomic::{AtomicUsize, Ordering},

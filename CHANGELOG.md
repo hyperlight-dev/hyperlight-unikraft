@@ -10,8 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   guest PID, attachment state, completion state, executable, arguments, requested
   cwd, resolved launch environment and standard stream configuration. Launch
   metadata is preserved across command snapshots. Each metadata entry can
-  restore its detached child without driving it or keeping the sandbox alive.
-  Its `detached()` and `completed()` methods read shared atomic lifecycle flags.
+  restore its parked child without driving it or keeping the sandbox alive.
+  Its `parked()` and `completed()` methods read shared atomic lifecycle flags.
 - An opt-in `AppSandbox::into_commands()` API for concurrent compiled guest
   executables, with structured arguments, environment and cwd, cancellation-safe
   waits, root-scoped lifetimes, and bounded stdin/stdout/stderr pipes.
@@ -19,14 +19,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   handle runs only its own guest tree and host operations, plus shared supervisor
   infrastructure. Requires rebuilt C, Rust, Go or .NET AOT exec driver images.
 - Dropped command children are parked and can be reacquired by execution ID.
-  Detachment releases host futures, sockets and timer registrations without VM
+  Parking releases host futures, sockets and timer registrations without VM
   entry, invalidates taken stream handles, and preserves logical streams and data.
   Reattachment reconstructs resources and interrupts pending calls with `EINTR`.
   Completed data replies survive; established connections do not.
 - In-memory command snapshots capture the whole guest plus parked execution
   metadata, pipe buffers and retained replies. Restore in place with
   `CommandSandbox::restore`, or boot an independent clone with
-  `SandboxBuilder::from_command_snapshot`. All children must be detached first.
+  `SandboxBuilder::from_command_snapshot`. All children must be parked first.
 - An opt-in async driving release benchmark, including
   latency, throughput, CPU use and VM-entry counts for calls, timers, fan-out
   and ready/delayed TCP and UDP peers.

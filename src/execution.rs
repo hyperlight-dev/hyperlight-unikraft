@@ -187,7 +187,7 @@ impl Executions {
         {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "only a detached, completed command can be forgotten",
+                "only a parked, completed command can be forgotten",
             )));
         }
         entries.remove(&id);
@@ -219,7 +219,7 @@ impl Executions {
                 Err(std::sync::TryLockError::WouldBlock) => {
                     return Err(Error::Wait(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "a command poll is still detaching",
+                        "a command poll is still parking",
                     )));
                 }
                 Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
@@ -557,7 +557,7 @@ impl Execution {
         if !state.attached.load(Ordering::Relaxed) || state.generation != generation {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "command handle is detached",
+                "command handle was invalidated by parking",
             )));
         }
         Ok(())

@@ -67,11 +67,11 @@ pub struct ChildInfo {
 }
 
 impl ChildInfo {
-    /// Whether this execution currently has no child handle.
+    /// Whether this execution is parked (has no child driving handle).
     ///
-    /// An attached child is not necessarily being polled. Detachment may still
+    /// An attached child is not necessarily being polled. Parking may still
     /// be finishing; this observation does not guarantee restoration will succeed.
-    pub fn detached(&self) -> bool {
+    pub fn parked(&self) -> bool {
         !self.attached.load(Ordering::Relaxed)
     }
 
@@ -84,7 +84,7 @@ impl ChildInfo {
     ///
     /// Rechecks the current state rather than relying on a prior status read. Like
     /// [`CommandSandbox::restore_child`], fails if already attached or still
-    /// detaching. Also fails if forgotten or the sandbox has been dropped.
+    /// parking. Also fails if forgotten or the sandbox has been dropped.
     pub fn restore(&self) -> Result<Child> {
         let coordinator = self.sandbox.upgrade().ok_or_else(|| {
             Error::Wait(io::Error::new(
@@ -147,7 +147,7 @@ impl CommandSandbox {
     /// Capture every parked command and the shared guest VM without driving it.
     ///
     /// Drop every child first. Taken pipes are already invalidated by that drop.
-    /// Returns `WouldBlock` through [`Error::Wait`] if a poll is still detaching.
+    /// Returns `WouldBlock` through [`Error::Wait`] if a poll is still parking.
     /// The original sandbox remains usable and its commands stay parked.
     pub fn snapshot(&self) -> Result<CommandSnapshot> {
         let _transition = self.0.transition()?;
@@ -179,7 +179,7 @@ impl CommandSandbox {
 
     /// Observe all retained commands in execution-ID order without driving them.
     ///
-    /// Includes attached, detached and completed commands until forgotten.
+    /// Includes attached, parked and completed commands until forgotten.
     /// Each entry can reacquire its child through [`ChildInfo::restore`].
     /// Observations are not an atomic snapshot of concurrent lifecycle changes.
     pub fn children(&self) -> Vec<ChildInfo> {
@@ -206,7 +206,7 @@ impl CommandSandbox {
             .collect()
     }
 
-    /// List detached executions, including completed commands not yet forgotten.
+    /// List parked executions, including completed commands not yet forgotten.
     /// Use [`children`](Self::children) for metadata and per-entry restoration.
     pub fn parked_children(&self) -> Vec<ExecutionId> {
         self.0
@@ -225,11 +225,11 @@ impl CommandSandbox {
             .collect()
     }
 
-    /// Reacquire a detached command. Resources are reconstructed when first driven.
+    /// Reacquire a parked command. Resources are reconstructed when first driven.
     ///
     /// Previously taken pipe handles remain invalid; the returned child owns new
     /// handles to the preserved streams. Fails if a handle is already attached,
-    /// or an in-flight poll has not yet finished detaching.
+    /// or an in-flight poll has not yet finished parking.
     pub fn restore_child(&self, id: ExecutionId) -> Result<Child> {
         let _transition = self.0.transition()?;
         self.0.failure()?;
@@ -266,7 +266,7 @@ impl CommandSandbox {
         Ok(Child::attach(self.0.clone(), execution, generation))
     }
 
-    /// Release retained metadata and output for a detached, completed command.
+    /// Release retained metadata and output for a parked, completed command.
     /// Restore and kill unfinished commands before forgetting them.
     pub fn forget_child(&self, id: ExecutionId) -> Result<()> {
         let _transition = self.0.transition()?;
@@ -903,7 +903,7 @@ impl ChildPipe {
         if !state.attached.load(Ordering::Relaxed) || state.generation != self.generation {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "command pipe is detached",
+                "command pipe was invalidated by parking",
             )));
         }
         if let Err(error) = self

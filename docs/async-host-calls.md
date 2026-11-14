@@ -135,12 +135,13 @@ reconstructs resources and interrupts unfinished calls with `EINTR`; the guest
 chooses whether to retry. `sandbox.children()` lists all retained commands in
 execution-ID order, including attached and completed commands. Each `ChildInfo`
 reports `execution_id`, the guest `pid` if known, and live atomic-backed methods
-`detached()` and `completed()`
-(root, descendant and worker cleanup finished). Launch metadata includes
+`parked()` (no child driving handle) and `completed()`
+(root, descendant and worker cleanup finished). Parked commands do not run
+independently in the background. Launch metadata includes
 `program`, `args` (excluding `argv[0]`), `cwd` (`None` inherits the driver's
 working directory), `env` (the complete environment sent after inheritance,
 overrides, removals and `env_clear()`), and `stdio` (stdin, stdout, stderr).
-These are launch values, not live guest state; they survive detachment and
+These are launch values, not live guest state; they survive parking and
 snapshot restoration, including independent clones. Environment values may
 contain secrets, so avoid logging them or the full debug representation.
 Call `info.restore()` to
@@ -150,11 +151,11 @@ remains an observation. Restoration still rechecks the current attachment state.
 After in-place snapshot restoration, obtain new entries for the replacement
 executions; old entries retain their original executions' final flags.
 Listing neither drives commands nor keeps the sandbox alive; entries remain
-usable across detach but fail after forgetting the command or dropping its sandbox.
+usable across parking but fail after forgetting the command or dropping its sandbox.
 An attached child is not necessarily being polled. `parked_children()` remains
-a convenience for listing only detached execution IDs.
+a convenience for listing only parked execution IDs.
 Completed executions and their output remain available until `forget_child(id)`;
-that method requires a detached, completed command. To discard an unfinished
+that method requires a parked, completed command. To discard an unfinished
 command, restore it, kill it, drop it, then forget it.
 
 Listeners and unconnected sockets are recreated under the existing network
@@ -229,13 +230,13 @@ marks, so IDs from discarded branches are not reused for new commands.
 The `CommandSnapshot` object is an in-memory snapshot; it is not the raw
 `Snapshot` accepted by the legacy disk/OCI helpers. Its command metadata must not
 be omitted. Guest timer deadlines follow the existing snapshot clock policy;
-live detach/reattach does not restart their duration. Connections are not cloned,
+live parking/reattachment does not restart their duration. Connections are not cloned,
 and pending resource-dependent operations are interrupted on first drive.
 
 Snapshots reject attached children. A concurrent lifecycle transition or an
-in-flight poll still finishing detachment returns `Error::Wait` with
+in-flight poll still finishing parking returns `Error::Wait` with
 `WouldBlock`; retry after that operation finishes. Taken handles from before a
-detach or restore remain invalid and cannot consume restored output.
+parking or restore remain invalid and cannot consume restored output.
 
 ### Attribution and control wire format
 

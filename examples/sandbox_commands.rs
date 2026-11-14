@@ -112,10 +112,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let children = sandbox.children();
     for child in &children {
         println!(
-            "\x1b[1m[execution {:?}]\x1b[0m pid={:?}, detached={}, completed={}",
+            "\x1b[1m[execution {:?}]\x1b[0m pid={:?}, parked={}, completed={}",
             child.execution_id,
             child.pid,
-            child.detached(),
+            child.parked(),
             child.completed()
         );
         println!(
