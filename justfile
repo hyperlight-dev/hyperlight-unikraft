@@ -1390,6 +1390,52 @@ bench runtime *mode:
     Write-Output ""
     Write-Output "  JSON: $jsonFile"
 
+# ── Coverage ─────────────────────────────────────────────────────
+
+# Run the tests `just test` runs, instrumented, and keep their profiles in
+# target/ for `just coverage`, `coverage-html` and `coverage-lcov` to report
+# on (the integration tests need the rootfs CPIOs and the test binaries, as
+# there).  What is measured is the host side: the library, and hluk, which
+# the tests also run as a program.  The guest (the kernel and the drivers)
+# is not.  It is line coverage, from the pinned toolchain: branch coverage
+# needs a nightly one.  Takes cargo test's arguments, as `just test` does:
+# `just coverage-run -- snapshot` runs the tests named with `snapshot`.
+[unix]
+coverage-run *args: ensure-cargo-llvm-cov
+    cargo llvm-cov clean --workspace --manifest-path "{{root_dir}}/Cargo.toml"
+    cargo llvm-cov --no-report --all-targets --manifest-path "{{root_dir}}/Cargo.toml" {{args}}
+
+# Install cargo-llvm-cov when missing, and the pinned toolchain's
+# llvm-tools, which it reads the profiles with.
+[unix]
+ensure-cargo-llvm-cov:
+    cargo llvm-cov --version >/dev/null 2>&1 || cargo install cargo-llvm-cov --locked
+    rustup component add llvm-tools
+
+# Print the coverage of each file and in total (after `just coverage-run`).
+[unix]
+coverage:
+    cargo llvm-cov report --manifest-path "{{root_dir}}/Cargo.toml"
+
+# Write an HTML report to target/coverage/html/ (after `just coverage-run`).
+[unix]
+coverage-html:
+    cargo llvm-cov report --manifest-path "{{root_dir}}/Cargo.toml" --html --output-dir "{{root_dir}}/target/coverage"
+
+# Write an LCOV report to target/coverage/lcov.info (after `just coverage-run`).
+[unix]
+coverage-lcov:
+    mkdir -p "{{root_dir}}/target/coverage"
+    cargo llvm-cov report --manifest-path "{{root_dir}}/Cargo.toml" --lcov --output-path "{{root_dir}}/target/coverage/lcov.info"
+
+# What coverage.yml runs: `just coverage-run` with these arguments, then
+# all three reports, the summary also in target/coverage/summary.txt.
+[unix]
+coverage-ci *args: (coverage-run args) coverage-html coverage-lcov
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo llvm-cov report --manifest-path "{{root_dir}}/Cargo.toml" | tee "{{root_dir}}/target/coverage/summary.txt"
+
 # ── Conformance ─────────────────────────────────────────────────
 
 # Build a conformance rootfs (includes upstream test suite).

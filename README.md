@@ -92,6 +92,8 @@ just build-all-rootfs      # build every guest rootfs
 just test                  # unit + integration tests (need the rootfs CPIOs)
 just conformance python    # run a tier-1 runtime's upstream test suite
 just ci                    # lint, license headers, tests, and demo smoke tests
+just coverage-run          # the tests, measuring the host side's coverage
+just coverage-html         #   then its report, in target/coverage/html/
 ```
 
 ## Benchmarks

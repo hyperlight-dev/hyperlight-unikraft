@@ -4,6 +4,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Added
+
+- Code coverage (#123): `coverage.yml` measures how much of the library and `hluk` the Rust tests cover, weekly on `main`, running them as tier 1's Linux test job does; `hluk` is measured where the integration tests run it as a program too. The run's page has the summary, per file, and its artifacts an HTML report, per line, and an LCOV file. `ci-report.yml` reports a failed run as it does a failed CI run on `main`. Locally, `just coverage-run` runs the tests instrumented, and `just coverage`, `just coverage-html` or `just coverage-lcov` reports on them (see [`docs/ci.md`](docs/ci.md)).
+
 ### Fixed
 
 - `hluk run` and `hluk snapshot run` called a script they could not read a compiled binary: a directory, or a file `hluk` may not read, got the hint for running one, which for a bare name (`app`) suggested `--mount :/mnt/bin`, a mount `hluk` refuses. A manifest's `[run] script` was only looked for, so one that is not text booted the guest before failing; `hluk snapshot run` restored the snapshot before reading its script; and a script from a pipe (`<(…)`) was said not to exist. The script, from the command line or the manifest, is now read before the guest boots or is restored, and runs as the text read: the error says it does not exist, is a directory, or cannot be read (with the reason), and only text that is not UTF-8 gets the hint, with `.` for a bare name's directory. A script too large for a guest function call is refused then too.
