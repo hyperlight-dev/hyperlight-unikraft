@@ -199,20 +199,22 @@ handshake are rejected explicitly by `into_commands()`. Command sandboxes
 do not expose the legacy interpreter API. Existing `AppSandbox` driving and
 snapshot behavior remain unchanged.
 
-### Parked command snapshots
+### Command snapshots
 
-Drop every child before calling `CommandSandbox::snapshot()`. This captures
+`CommandSandbox::snapshot()` accepts parked children and live driving handles. It captures
 the whole VM and the host-side command registry: execution IDs, root statuses,
 stream states and buffered bytes, and retained completion records. It contains
-no futures or live host I/O resources. The original commands remain parked and
-can be reacquired independently of the snapshot.
+no futures or live host I/O resources. Taking a snapshot does not drive or park
+the original commands, cancel their host calls, close sockets, or invalidate
+child and pipe handles. Original commands continue normally. All commands in a
+restored copy start parked; unfinished calls receive `EINTR` when first driven.
+Completed data replies are preserved, except replies tied to sockets that cannot
+survive restoration. Cancellation or retry in the copy does not undo external effects.
 
 ```rust,ignore
 let id = child.execution_id();
-drop(child);
 let snapshot = sandbox.snapshot()?;
 
-let child = sandbox.restore_child(id)?;
 let output = child.wait_with_output().await?;
 
 // All children must be dropped before replacing the current guest state.
@@ -233,10 +235,12 @@ be omitted. Guest timer deadlines follow the existing snapshot clock policy;
 live parking/child restoration does not restart their duration. Connections are not cloned,
 and pending resource-dependent operations are interrupted on first drive.
 
-Snapshots reject children with driving handles. A concurrent lifecycle transition or an
-in-flight poll still finishing parking returns `Error::Wait` with
-`WouldBlock`; retry after that operation finishes. Taken handles from before a
-parking or restore remain invalid and cannot consume restored output.
+Snapshot capture excludes concurrent VM entries, host-call polls, and handle/pipe
+operations. If a lifecycle transition or operation prevents a consistent capture,
+it returns `Error::Wait` with `WouldBlock`; retry after that operation finishes.
+Replacing the current sandbox with `restore()` still requires dropping all child
+handles first. Taken handles from before parking or restore remain invalid and
+cannot consume restored output.
 
 ### Attribution and control wire format
 

@@ -107,8 +107,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .stderr(Stdio::piped())
         .spawn()?;
     let first_id = first.execution_id();
-    drop(first);
+    // Snapshotting preserves this handle and its pending timer.
     let checkpoint = sandbox.snapshot()?;
+    drop(first);
     let children = sandbox.children();
     for child in &children {
         println!(

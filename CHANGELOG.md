@@ -23,10 +23,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   entry, invalidates taken stream handles, and preserves logical streams and data.
   Child restoration reconstructs resources and interrupts pending calls with `EINTR`.
   Completed data replies survive; established connections do not.
-- In-memory command snapshots capture the whole guest plus parked execution
+- In-memory command snapshots capture the whole guest plus execution
   metadata, pipe buffers and retained replies. Restore in place with
   `CommandSandbox::restore`, or boot an independent clone with
-  `SandboxBuilder::from_command_snapshot`. All children must be parked first.
+  `SandboxBuilder::from_command_snapshot`. Snapshot capture also accepts unparked
+  children without changing their handles, pipes, sockets or pending host calls.
+  Restored copies start parked; in-place restore still requires dropping all children.
 - An opt-in async driving release benchmark, including
   latency, throughput, CPU use and VM-entry counts for calls, timers, fan-out
   and ready/delayed TCP and UDP peers.

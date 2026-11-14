@@ -28,8 +28,8 @@ use crate::{
 ///
 /// There is no background executor. Poll a child's wait or its pipes to drive
 /// that tree's host operations and guest threads. Other command trees do not run.
-/// Snapshots require all child handles to be dropped. The legacy interpreter
-/// API is intentionally unavailable.
+/// Snapshots preserve existing child handles; replacing the current guest from a
+/// snapshot requires dropping them first. The legacy interpreter API is unavailable.
 #[derive(Clone)]
 pub struct CommandSandbox(Arc<Coordinator>);
 
@@ -96,7 +96,7 @@ impl ChildInfo {
     }
 }
 
-/// A whole-VM snapshot plus parked command metadata, streams and retained replies.
+/// A whole-VM snapshot plus command metadata, streams and retained replies.
 ///
 /// Contains no live host futures, sockets, timers or pipe handles. Restore in
 /// place with [`CommandSandbox::restore`] or boot a separate sandbox with
@@ -144,18 +144,27 @@ impl AppSandbox {
 }
 
 impl CommandSandbox {
-    /// Capture every parked command and the shared guest VM without driving it.
+    /// Capture every command and the shared guest VM without driving it.
     ///
-    /// Drop every child first. Taken pipes are already invalidated by that drop.
-    /// Returns `WouldBlock` through [`Error::Wait`] if a poll is still parking.
-    /// The original sandbox remains usable and its commands stay parked.
+    /// Children may be parked or have driving handles. Original handles, pipes,
+    /// sockets and pending host calls are unchanged. Restored copies start parked;
+    /// unfinished calls there are interrupted when driven. Completed data replies
+    /// are retained, but replies tied to reset sockets are not.
+    /// Returns `WouldBlock` through [`Error::Wait`] if a VM entry, child poll or
+    /// handle/pipe operation prevents a consistent capture. Retry when it finishes.
     pub fn snapshot(&self) -> Result<CommandSnapshot> {
         let _transition = self.0.transition()?;
         self.0.failure()?;
-        // Quiesce outside the VM lock: dropping user futures may call host code.
-        let inbox = self.0.try_sandbox()?.config.async_inbox.clone();
-        let executions = self.0.executions.snapshot(&inbox)?;
-        let guest = self.0.try_sandbox()?.snapshot()?;
+        let result = {
+            let mut sandbox = self.0.try_sandbox()?;
+            let inbox = sandbox.config.async_inbox.clone();
+            self.0.executions.snapshot(&inbox, || sandbox.snapshot())
+        };
+        // Polls that encountered our locks must get another chance to run.
+        for execution in self.0.executions.list() {
+            execution.wake.notify();
+        }
+        let (executions, guest) = result?;
         Ok(CommandSnapshot { guest, executions })
     }
 
@@ -166,7 +175,7 @@ impl CommandSandbox {
     pub fn restore(&self, snapshot: &CommandSnapshot) -> Result<()> {
         let _transition = self.0.transition()?;
         let inbox = self.0.try_sandbox()?.config.async_inbox.clone();
-        self.0.executions.snapshot(&inbox)?;
+        self.0.executions.prepare_restore()?;
         let mut sandbox = self.0.try_sandbox()?;
         self.0
             .executions
@@ -727,7 +736,10 @@ impl Child {
     /// remain readable, followed by EOF. Taken stdin handles are closed too.
     /// After success, `wait()` is immediately ready with the root's status.
     /// Like other VM entries, this cannot preempt CPU-bound guest code.
+    /// Returns `WouldBlock` if another lifecycle operation (such as snapshot
+    /// capture) is in progress.
     pub fn kill(&mut self) -> Result<()> {
+        let _transition = self.coordinator.transition()?;
         self.execution.check_driver(self.generation)?;
         self.coordinator.failure()?;
         if !self

@@ -189,10 +189,7 @@ impl Executions {
         Ok(())
     }
 
-    pub fn snapshot(
-        &self,
-        inbox: &Arc<Mutex<async_calls::Inbox>>,
-    ) -> crate::Result<ExecutionSnapshot> {
+    pub fn prepare_restore(&self) -> crate::Result<()> {
         let entries: Vec<_> = self.entries.lock().unwrap().values().cloned().collect();
         if entries
             .iter()
@@ -203,7 +200,6 @@ impl Executions {
                 "drop all child handles before snapshot or restore",
             )));
         }
-        let mut images = Vec::with_capacity(entries.len());
         for entry in entries {
             let mut calls = match entry.calls.try_lock() {
                 Ok(calls) => calls,
@@ -216,7 +212,44 @@ impl Executions {
                 Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
             };
             entry.park(&mut calls);
-            let state = entry.driving.lock().unwrap();
+        }
+        Ok(())
+    }
+
+    pub fn snapshot<T>(
+        &self,
+        inbox: &Arc<Mutex<async_calls::Inbox>>,
+        capture_guest: impl FnOnce() -> crate::Result<T>,
+    ) -> crate::Result<(ExecutionSnapshot, T)> {
+        let entries = self.list();
+        // Hold every engine and stream-access gate through the guest capture.
+        // The caller holds the VM and lifecycle locks; never wait for an active poll.
+        let mut calls = Vec::with_capacity(entries.len());
+        let mut driving = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            calls.push(match entry.calls.try_lock() {
+                Ok(calls) => calls,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(Error::Wait(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "a command is still being driven or parked",
+                    )));
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
+            });
+            driving.push(match entry.driving.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(Error::Wait(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "a command handle or pipe operation is in progress",
+                    )));
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
+            });
+        }
+        let mut images = Vec::with_capacity(entries.len());
+        for ((entry, calls), state) in entries.iter().zip(&calls).zip(&driving) {
             images.push(ExecutionImage {
                 id: entry.id,
                 command: entry.command.clone(),
@@ -225,14 +258,19 @@ impl Executions {
                 process: entry.process.lock().unwrap().clone(),
                 pipes: std::array::from_fn(|i| entry.pipes[i].state.lock().unwrap().clone()),
                 streams: state.streams,
-                resume: state.resume.clone().unwrap(),
+                resume: state
+                    .resume
+                    .clone()
+                    .unwrap_or_else(|| calls.snapshot_batch()),
             });
         }
-        Ok(ExecutionSnapshot {
+        let executions = ExecutionSnapshot {
             next: *self.next.lock().unwrap(),
             next_request: inbox.lock().unwrap().next_id(),
             entries: images,
-        })
+        };
+        let guest = capture_guest()?;
+        Ok((executions, guest))
     }
 
     pub fn restore(

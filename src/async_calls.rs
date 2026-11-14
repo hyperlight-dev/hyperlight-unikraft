@@ -316,6 +316,12 @@ impl PendingCalls {
     }
 
     pub fn suspend(&mut self) -> Vec<u8> {
+        let batch = self.snapshot_batch();
+        self.clear();
+        batch
+    }
+
+    pub fn snapshot_batch(&self) -> Vec<u8> {
         let mut batch: Vec<_> = [VERSION as u32, 0]
             .into_iter()
             .flat_map(u32::to_le_bytes)
@@ -337,7 +343,6 @@ impl PendingCalls {
             }
         }
         batch[4..8].copy_from_slice(&count.to_le_bytes());
-        self.clear();
         batch
     }
 }
@@ -998,10 +1003,14 @@ mod tests {
             Wake::Calls
         );
         assert_eq!(engine.batch_ids.len(), 2);
-        let batch = engine.suspend();
+        let batch = engine.snapshot_batch();
         assert_eq!(u32::from_le_bytes(batch[4..8].try_into().unwrap()), 1);
         assert_eq!(u64::from_le_bytes(batch[8..16].try_into().unwrap()), kept);
         assert_eq!(&batch[20..], b"\0completed");
+        assert!(!sender.is_canceled());
+        assert!(engine.is_pending());
+        assert_eq!(engine.batch_ids.len(), 2);
+        assert_eq!(engine.suspend(), batch);
         assert!(sender.is_canceled());
         assert!(!engine.is_pending());
     }
