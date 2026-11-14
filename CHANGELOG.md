@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `CommandSandbox::children()` lists retained commands with execution ID,
-  guest PID, attachment state, completion state, executable, arguments, requested
+  guest PID, parking state, completion state, executable, arguments, requested
   cwd, resolved launch environment and standard stream configuration. Launch
   metadata is preserved across command snapshots. Each metadata entry can
   restore its parked child without driving it or keeping the sandbox alive.
@@ -21,7 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Dropped command children are parked and can be reacquired by execution ID.
   Parking releases host futures, sockets and timer registrations without VM
   entry, invalidates taken stream handles, and preserves logical streams and data.
-  Reattachment reconstructs resources and interrupts pending calls with `EINTR`.
+  Child restoration reconstructs resources and interrupts pending calls with `EINTR`.
   Completed data replies survive; established connections do not.
 - In-memory command snapshots capture the whole guest plus parked execution
   metadata, pipe buffers and retained replies. Restore in place with

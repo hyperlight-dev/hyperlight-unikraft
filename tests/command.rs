@@ -845,7 +845,7 @@ async fn snapshot_forks_interrupt_pending_calls_without_starting_handlers_at_boo
 }
 
 #[test]
-fn snapshot_and_reattachment_reject_a_poll_still_finishing_parking() {
+fn snapshot_and_child_restoration_reject_a_poll_still_finishing_parking() {
     use std::sync::{
         Barrier,
         atomic::{AtomicUsize, Ordering},

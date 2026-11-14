@@ -124,16 +124,16 @@ completion batches. Like a process wait, waiting closes stdin still held in
 the child's `stdin` field; take the handle first to manage its lifetime yourself.
 Dropping a child parks its execution without entering the VM. Pending host
 futures and host timer registrations are dropped, and host sockets are closed.
-Guest threads cannot run until the execution is reattached and driven again.
+Guest threads cannot run until the child is restored and driven again.
 If another task is inside a pipe poll, teardown finishes when that poll returns.
-Taken stream handles become invalid (`BrokenPipe`), including after reattachment.
+Taken stream handles become invalid (`BrokenPipe`), including after child restoration.
 Untaken streams and buffered bytes are preserved, not closed.
 
 Save `child.execution_id()` before dropping it, then use
 `sandbox.restore_child(id)` to acquire a new exclusive handle. The first drive
 reconstructs resources and interrupts unfinished calls with `EINTR`; the guest
 chooses whether to retry. `sandbox.children()` lists all retained commands in
-execution-ID order, including attached and completed commands. Each `ChildInfo`
+execution-ID order, including commands with driving handles and completed commands. Each `ChildInfo`
 reports `execution_id`, the guest `pid` if known, and live atomic-backed methods
 `parked()` (no child driving handle) and `completed()`
 (root, descendant and worker cleanup finished). Parked commands do not run
@@ -147,12 +147,12 @@ contain secrets, so avoid logging them or the full debug representation.
 Call `info.restore()` to
 reacquire that command from its originating sandbox. Lifecycle methods share
 the execution's atomic flags, including across cloned entries; other metadata
-remains an observation. Restoration still rechecks the current attachment state.
+remains an observation. Restoration still rechecks whether a driving handle exists.
 After in-place snapshot restoration, obtain new entries for the replacement
 executions; old entries retain their original executions' final flags.
 Listing neither drives commands nor keeps the sandbox alive; entries remain
 usable across parking but fail after forgetting the command or dropping its sandbox.
-An attached child is not necessarily being polled. `parked_children()` remains
+A child with a driving handle is not necessarily being polled. `parked_children()` remains
 a convenience for listing only parked execution IDs.
 Completed executions and their output remain available until `forget_child(id)`;
 that method requires a parked, completed command. To discard an unfinished
@@ -230,10 +230,10 @@ marks, so IDs from discarded branches are not reused for new commands.
 The `CommandSnapshot` object is an in-memory snapshot; it is not the raw
 `Snapshot` accepted by the legacy disk/OCI helpers. Its command metadata must not
 be omitted. Guest timer deadlines follow the existing snapshot clock policy;
-live parking/reattachment does not restart their duration. Connections are not cloned,
+live parking/child restoration does not restart their duration. Connections are not cloned,
 and pending resource-dependent operations are interrupted on first drive.
 
-Snapshots reject attached children. A concurrent lifecycle transition or an
+Snapshots reject children with driving handles. A concurrent lifecycle transition or an
 in-flight poll still finishing parking returns `Error::Wait` with
 `WouldBlock`; retry after that operation finishes. Taken handles from before a
 parking or restore remain invalid and cannot consume restored output.

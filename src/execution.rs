@@ -67,7 +67,7 @@ impl ArcWake for WakeSet {
 pub(crate) struct Execution {
     pub id: u64,
     pub command: CommandMetadata,
-    pub attachment: Mutex<Attachment>,
+    pub driving: Mutex<DrivingState>,
     pub needs_restore: AtomicBool,
     pub failure: Mutex<Option<String>>,
     pub done: Arc<AtomicBool>,
@@ -89,8 +89,8 @@ pub(crate) struct CommandMetadata {
     pub stdio: [crate::command::Stdio; 3],
 }
 
-pub(crate) struct Attachment {
-    pub attached: Arc<AtomicBool>,
+pub(crate) struct DrivingState {
+    pub parked: Arc<AtomicBool>,
     pub generation: u64,
     pub streams: [bool; 3],
     pub resume: Option<Vec<u8>>,
@@ -177,12 +177,7 @@ impl Executions {
                 "unknown command execution",
             ))
         })?;
-        if entry
-            .attachment
-            .lock()
-            .unwrap()
-            .attached
-            .load(Ordering::Relaxed)
+        if !entry.driving.lock().unwrap().parked.load(Ordering::Relaxed)
             || !entry.done.load(Ordering::Relaxed)
         {
             return Err(Error::Wait(io::Error::new(
@@ -199,14 +194,10 @@ impl Executions {
         inbox: &Arc<Mutex<async_calls::Inbox>>,
     ) -> crate::Result<ExecutionSnapshot> {
         let entries: Vec<_> = self.entries.lock().unwrap().values().cloned().collect();
-        if entries.iter().any(|entry| {
-            entry
-                .attachment
-                .lock()
-                .unwrap()
-                .attached
-                .load(Ordering::Relaxed)
-        }) {
+        if entries
+            .iter()
+            .any(|entry| !entry.driving.lock().unwrap().parked.load(Ordering::Relaxed))
+        {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "drop all child handles before snapshot or restore",
@@ -225,7 +216,7 @@ impl Executions {
                 Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
             };
             entry.park(&mut calls);
-            let state = entry.attachment.lock().unwrap();
+            let state = entry.driving.lock().unwrap();
             images.push(ExecutionImage {
                 id: entry.id,
                 command: entry.command.clone(),
@@ -263,8 +254,8 @@ impl Executions {
                     ..Pipe::default()
                 })
             });
-            let state = entry.attachment.get_mut().unwrap();
-            state.attached.store(false, Ordering::Relaxed);
+            let state = entry.driving.get_mut().unwrap();
+            state.parked.store(true, Ordering::Relaxed);
             state.resume = Some(image.resume.clone());
             entry.needs_restore.store(true, Ordering::Relaxed);
             entries.insert(image.id, Arc::new(entry));
@@ -533,8 +524,8 @@ impl Execution {
         Self {
             id,
             command,
-            attachment: Mutex::new(Attachment {
-                attached: Arc::new(AtomicBool::new(true)),
+            driving: Mutex::new(DrivingState {
+                parked: Arc::new(AtomicBool::new(false)),
                 generation: 1,
                 streams,
                 resume: None,
@@ -552,9 +543,9 @@ impl Execution {
         }
     }
 
-    pub fn check_attachment(&self, generation: u64) -> Result<()> {
-        let state = self.attachment.lock().unwrap();
-        if !state.attached.load(Ordering::Relaxed) || state.generation != generation {
+    pub fn check_driver(&self, generation: u64) -> Result<()> {
+        let state = self.driving.lock().unwrap();
+        if state.parked.load(Ordering::Relaxed) || state.generation != generation {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "command handle was invalidated by parking",
@@ -564,17 +555,11 @@ impl Execution {
     }
 
     pub fn park(&self, calls: &mut async_calls::PendingCalls) {
-        if self
-            .attachment
-            .lock()
-            .unwrap()
-            .attached
-            .load(Ordering::Relaxed)
-        {
+        if !self.driving.lock().unwrap().parked.load(Ordering::Relaxed) {
             return;
         }
         let batch = calls.suspend();
-        let mut state = self.attachment.lock().unwrap();
+        let mut state = self.driving.lock().unwrap();
         if state.resume.is_none() {
             state.resume = Some(batch);
         }

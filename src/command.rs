@@ -61,7 +61,7 @@ pub struct ChildInfo {
     pub stdio: [Stdio; 3],
     /// Guest root PID, if the executable has started.
     pub pid: Option<u32>,
-    attached: Arc<AtomicBool>,
+    parked: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
     sandbox: Weak<Coordinator>,
 }
@@ -69,10 +69,10 @@ pub struct ChildInfo {
 impl ChildInfo {
     /// Whether this execution is parked (has no child driving handle).
     ///
-    /// An attached child is not necessarily being polled. Parking may still
+    /// A child with a driving handle is not necessarily being polled. Parking may still
     /// be finishing; this observation does not guarantee restoration will succeed.
     pub fn parked(&self) -> bool {
-        !self.attached.load(Ordering::Relaxed)
+        self.parked.load(Ordering::Relaxed)
     }
 
     /// Whether the root, descendants and command workers have finished cleanup.
@@ -83,8 +83,8 @@ impl ChildInfo {
     /// Reacquire this command from its originating sandbox without driving it.
     ///
     /// Rechecks the current state rather than relying on a prior status read. Like
-    /// [`CommandSandbox::restore_child`], fails if already attached or still
-    /// parking. Also fails if forgotten or the sandbox has been dropped.
+    /// [`CommandSandbox::restore_child`], fails if a driving handle exists or parking
+    /// is still in progress. Also fails if forgotten or the sandbox has been dropped.
     pub fn restore(&self) -> Result<Child> {
         let coordinator = self.sandbox.upgrade().ok_or_else(|| {
             Error::Wait(io::Error::new(
@@ -179,7 +179,8 @@ impl CommandSandbox {
 
     /// Observe all retained commands in execution-ID order without driving them.
     ///
-    /// Includes attached, parked and completed commands until forgotten.
+    /// Includes commands with driving handles, parked commands and completed commands
+    /// until forgotten.
     /// Each entry can reacquire its child through [`ChildInfo::restore`].
     /// Observations are not an atomic snapshot of concurrent lifecycle changes.
     pub fn children(&self) -> Vec<ChildInfo> {
@@ -188,7 +189,7 @@ impl CommandSandbox {
             .list()
             .into_iter()
             .map(|execution| {
-                let attached = execution.attachment.lock().unwrap().attached.clone();
+                let parked = execution.driving.lock().unwrap().parked.clone();
                 let process = execution.process.lock().unwrap();
                 ChildInfo {
                     execution_id: ExecutionId(execution.id),
@@ -198,7 +199,7 @@ impl CommandSandbox {
                     env: execution.command.env.clone(),
                     stdio: execution.command.stdio,
                     pid: process.pid,
-                    attached,
+                    parked,
                     completed: execution.done.clone(),
                     sandbox: Arc::downgrade(&self.0),
                 }
@@ -214,11 +215,11 @@ impl CommandSandbox {
             .list()
             .into_iter()
             .filter(|execution| {
-                !execution
-                    .attachment
+                execution
+                    .driving
                     .lock()
                     .unwrap()
-                    .attached
+                    .parked
                     .load(Ordering::Relaxed)
             })
             .map(|execution| ExecutionId(execution.id))
@@ -228,7 +229,7 @@ impl CommandSandbox {
     /// Reacquire a parked command. Resources are reconstructed when first driven.
     ///
     /// Previously taken pipe handles remain invalid; the returned child owns new
-    /// handles to the preserved streams. Fails if a handle is already attached,
+    /// handles to the preserved streams. Fails if a driving handle already exists,
     /// or an in-flight poll has not yet finished parking.
     pub fn restore_child(&self, id: ExecutionId) -> Result<Child> {
         let _transition = self.0.transition()?;
@@ -245,8 +246,8 @@ impl CommandSandbox {
             Err(TryLockError::Poisoned(error)) => panic!("{error}"),
         };
         {
-            let state = execution.attachment.lock().unwrap();
-            if state.attached.load(Ordering::Relaxed) {
+            let state = execution.driving.lock().unwrap();
+            if !state.parked.load(Ordering::Relaxed) {
                 return Err(Error::Wait(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "command already has a child handle",
@@ -255,15 +256,15 @@ impl CommandSandbox {
         }
         execution.park(&mut calls);
         let generation = {
-            let mut state = execution.attachment.lock().unwrap();
+            let mut state = execution.driving.lock().unwrap();
             state.generation = state.generation.checked_add(1).ok_or_else(|| {
                 Error::Wait(io::Error::other("command handle generations exhausted"))
             })?;
-            state.attached.store(true, Ordering::Relaxed);
+            state.parked.store(false, Ordering::Relaxed);
             state.generation
         };
         drop(calls);
-        Ok(Child::attach(self.0.clone(), execution, generation))
+        Ok(Child::new(self.0.clone(), execution, generation))
     }
 
     /// Release retained metadata and output for a parked, completed command.
@@ -469,7 +470,7 @@ impl Command {
         drop(sandbox);
         coordinator.executions.wake_all();
         result?;
-        let child = Child::attach(coordinator.clone(), execution, 1);
+        let child = Child::new(coordinator.clone(), execution, 1);
         child.try_wait()?;
         Ok(child)
     }
@@ -539,7 +540,7 @@ impl Coordinator {
         generation: u64,
         cx: &mut Context<'_>,
     ) -> Poll<Result<()>> {
-        if let Err(error) = execution.check_attachment(generation) {
+        if let Err(error) = execution.check_driver(generation) {
             return Poll::Ready(Err(error));
         }
         if let Err(error) = self.failure() {
@@ -559,11 +560,11 @@ impl Coordinator {
         {
             calls.clear();
         }
-        let mut state = execution.attachment.lock().unwrap();
-        if !state.attached.load(Ordering::Relaxed) {
+        let mut state = execution.driving.lock().unwrap();
+        if state.parked.load(Ordering::Relaxed) {
             drop(state);
             execution.park(&mut calls);
-            state = execution.attachment.lock().unwrap();
+            state = execution.driving.lock().unwrap();
         }
         drop(calls);
         drop(state);
@@ -580,7 +581,7 @@ impl Coordinator {
         cx: &mut Context<'_>,
         calls: &mut async_calls::PendingCalls,
     ) -> Poll<Result<()>> {
-        let resuming = execution.attachment.lock().unwrap().resume.is_some();
+        let resuming = execution.driving.lock().unwrap().resume.is_some();
         let polled = if resuming {
             Poll::Ready(Ok(async_calls::Wake::Calls))
         } else {
@@ -588,7 +589,7 @@ impl Coordinator {
             // Poll embedder futures without the VM lock.
             execution.wake.with_context(|cx| calls.poll_batch(cx))
         };
-        if let Err(error) = execution.check_attachment(generation) {
+        if let Err(error) = execution.check_driver(generation) {
             return Poll::Ready(Err(error));
         }
         if execution.done.load(std::sync::atomic::Ordering::Relaxed) {
@@ -624,7 +625,7 @@ impl Coordinator {
         } = &mut *sandbox;
         let result = if wake == async_calls::Wake::Calls {
             let batch = if resuming {
-                execution.attachment.lock().unwrap().resume.take().unwrap()
+                execution.driving.lock().unwrap().resume.take().unwrap()
             } else {
                 calls.take_batch()
             };
@@ -694,8 +695,8 @@ pub struct Child {
 }
 
 impl Child {
-    fn attach(coordinator: Arc<Coordinator>, execution: Arc<Execution>, generation: u64) -> Self {
-        let streams = execution.attachment.lock().unwrap().streams;
+    fn new(coordinator: Arc<Coordinator>, execution: Arc<Execution>, generation: u64) -> Self {
+        let streams = execution.driving.lock().unwrap().streams;
         let pipe = |stream| ChildPipe {
             subscription: execution.wake.subscribe(),
             coordinator: coordinator.clone(),
@@ -727,7 +728,7 @@ impl Child {
     /// After success, `wait()` is immediately ready with the root's status.
     /// Like other VM entries, this cannot preempt CPU-bound guest code.
     pub fn kill(&mut self) -> Result<()> {
-        self.execution.check_attachment(self.generation)?;
+        self.execution.check_driver(self.generation)?;
         self.coordinator.failure()?;
         if !self
             .execution
@@ -780,7 +781,7 @@ impl Child {
     /// Returns the root's status only after descendant and worker cleanup,
     /// matching [`wait`](Self::wait).
     pub fn try_wait(&self) -> Result<Option<ExitStatus>> {
-        self.execution.check_attachment(self.generation)?;
+        self.execution.check_driver(self.generation)?;
         self.coordinator.failure()?;
         self.execution.check()?;
         if !self
@@ -852,11 +853,11 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         {
-            let state = self.execution.attachment.lock().unwrap();
+            let state = self.execution.driving.lock().unwrap();
             if state.generation != self.generation {
                 return;
             }
-            state.attached.store(false, Ordering::Relaxed);
+            state.parked.store(true, Ordering::Relaxed);
         }
         match self.execution.calls.try_lock() {
             Ok(mut calls) => self.execution.park(&mut calls),
@@ -881,8 +882,8 @@ struct ChildPipe {
 
 impl Drop for ChildPipe {
     fn drop(&mut self) {
-        let mut state = self.execution.attachment.lock().unwrap();
-        if !state.attached.load(Ordering::Relaxed) || state.generation != self.generation {
+        let mut state = self.execution.driving.lock().unwrap();
+        if state.parked.load(Ordering::Relaxed) || state.generation != self.generation {
             return;
         }
         state.streams[self.stream] = false;
@@ -899,8 +900,8 @@ impl ChildPipe {
         &self,
         action: impl FnOnce(&crate::execution::Pipe) -> Poll<io::Result<T>>,
     ) -> Poll<io::Result<T>> {
-        let state = self.execution.attachment.lock().unwrap();
-        if !state.attached.load(Ordering::Relaxed) || state.generation != self.generation {
+        let state = self.execution.driving.lock().unwrap();
+        if state.parked.load(Ordering::Relaxed) || state.generation != self.generation {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "command pipe was invalidated by parking",
