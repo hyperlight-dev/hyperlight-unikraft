@@ -1,0 +1,40 @@
+[package]
+name = "hyperlight-unikraft-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+# The library alone, with the module the targets drive the host functions
+# through
+hyperlight-unikraft = { path = "..", default-features = false, features = ["fuzzing"] }
+# Arbitrary parameter values, for calls of the wrong shape; the version the
+# library's hyperlight-host uses
+hyperlight-common = { version = "0.19", features = ["fuzzing"] }
+tempfile = "3"
+
+[[bin]]
+name = "fuzz_hostfs"
+path = "fuzz_targets/hostfs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_hostnet"
+path = "fuzz_targets/hostnet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false

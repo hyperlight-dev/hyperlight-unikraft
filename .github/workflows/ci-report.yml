@@ -1,7 +1,7 @@
 name: CI report
 
 # The reporter of failures on main (docs/ci.md): the nightly arm64 run's,
-# the weekly coverage run's, and those of the CI and arm64 runs of a push to
+# each weekly run's, and those of the CI and arm64 runs of a push to
 # main.  A failed run is re-run once, its failed jobs only; a job that fails
 # again gets an issue, one per job (labelled ci/nightly for the nightly run,
 # ci/main for the others), which each later run it fails in comments on
@@ -17,7 +17,7 @@ name: CI report
 # run and attempt, looked for in closed issues too.
 on:
   workflow_run:
-    workflows: [arm64, CI, Coverage]
+    workflows: [arm64, CI, Coverage, Fuzzing]
     types: [completed]
     branches: [main]
   schedule:
@@ -291,4 +291,5 @@ jobs:
           sweep ci.yml push "the CI run of a push to main" "CI on main" ci/main ci.yml
           sweep arm64.yml push "the arm64 run of a push to main" "arm64 on main" ci/main "arm64.yml, arm64-jobs.yml"
           sweep coverage.yml schedule "the weekly coverage run" "weekly coverage" ci/main coverage.yml
+          sweep fuzz.yml schedule "the weekly fuzzing run" "weekly fuzzing" ci/main fuzz.yml
           exit "$status"

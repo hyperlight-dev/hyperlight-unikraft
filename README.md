@@ -94,6 +94,7 @@ just conformance python    # run a tier-1 runtime's upstream test suite
 just ci                    # lint, license headers, tests, and demo smoke tests
 just coverage-run          # the tests, measuring the host side's coverage
 just coverage-html         #   then its report, in target/coverage/html/
+just fuzz fuzz_hostfs      # fuzz the host functions a guest calls (fuzz/README.md)
 ```
 
 ## Benchmarks

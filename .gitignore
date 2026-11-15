@@ -16,5 +16,10 @@ publish/
 /examples/wasmtime/calculator/target
 /examples/wasmtime/hello-p3/target
 /integrations/clickhouse/target
+# cargo-fuzz's build, corpus, crash artifacts and coverage (fuzz/README.md)
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
 # Desktop Extensions packed by integrations/mcp/pack_mcpb.py
 *.mcpb
