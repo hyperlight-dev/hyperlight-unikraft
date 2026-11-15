@@ -282,10 +282,10 @@ impl CommandSandbox {
     ///
     /// Includes commands with driving handles, parked commands and completed
     /// commands. Does not drive or acquire the child; use [`ChildInfo::restore`]
-    /// to restore it. Returns `NotFound` through [`Error::Wait`] for an unknown name.
-    pub fn get_child_by_name(&self, name: &str) -> Result<ChildInfo> {
+    /// to restore it. Returns `None` for an unknown name.
+    pub fn get_child_by_name(&self, name: &str) -> Option<ChildInfo> {
         let execution = self.0.executions.get_by_name(name)?;
-        Ok(ChildInfo::new(&self.0, &execution))
+        Some(ChildInfo::new(&self.0, &execution))
     }
 
     /// Release retained metadata and output for a parked, completed command.

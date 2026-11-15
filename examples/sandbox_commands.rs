@@ -146,7 +146,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     futures::try_join!(report("first", first), report("second", second))?;
 
     sandbox.restore(&checkpoint)?;
-    report("restored", sandbox.get_child_by_name("first")?.restore()?).await?;
+    let first = sandbox
+        .get_child_by_name("first")
+        .expect("the snapshot retains the named child")
+        .restore()?;
+    report("restored", first).await?;
 
     let mut tree = sandbox
         .command("/mnt/bin/command")

@@ -188,19 +188,13 @@ impl Executions {
         self.entries.lock().unwrap().values().cloned().collect()
     }
 
-    pub fn get_by_name(&self, name: &str) -> crate::Result<Arc<Execution>> {
+    pub fn get_by_name(&self, name: &str) -> Option<Arc<Execution>> {
         self.entries
             .lock()
             .unwrap()
             .values()
             .find(|entry| entry.command.name.as_deref() == Some(name))
             .cloned()
-            .ok_or_else(|| {
-                Error::Wait(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "unknown command name",
-                ))
-            })
     }
 
     pub fn forget(&self, id: u64) -> crate::Result<()> {

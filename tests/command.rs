@@ -490,10 +490,7 @@ async fn named_children_restore_independently_and_reserve_names_until_forgotten(
         .into_commands()
         .unwrap();
     for source in [&sandbox, &fork] {
-        assert!(
-            matches!(source.get_child_by_name("Worker"), Err(Error::Wait(error))
-            if error.kind() == ErrorKind::NotFound)
-        );
+        assert!(source.get_child_by_name("Worker").is_none());
         let child = source
             .get_child_by_name("worker")
             .unwrap()
@@ -511,10 +508,7 @@ async fn named_children_restore_independently_and_reserve_names_until_forgotten(
     assert!(matches!(command.spawn(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::AlreadyExists));
     sandbox.forget_child(id).unwrap();
-    assert!(
-        matches!(sandbox.get_child_by_name("worker"), Err(Error::Wait(error))
-        if error.kind() == ErrorKind::NotFound)
-    );
+    assert!(sandbox.get_child_by_name("worker").is_none());
     let replacement = command.spawn().unwrap();
     assert_ne!(replacement.execution_id(), id);
     drop(replacement);
