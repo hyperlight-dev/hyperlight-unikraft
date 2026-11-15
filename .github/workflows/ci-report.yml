@@ -1,23 +1,23 @@
 name: CI report
 
 # The reporter of failures on main (docs/ci.md): the nightly arm64 run's,
-# and those of the CI and arm64 runs of a push to main.  A failed run is
-# re-run once, its failed jobs only; a job that fails again gets an issue,
-# one per job (labelled ci/nightly for the nightly run, ci/main for a push),
-# which each later run it fails in comments on while it is open.  A job that
-# reaches its timeout fails; one cancelled by hand, or by a newer run, does
-# not.  A run that does not start (GitHub refused the workflow file) gets an
-# issue at once.  Of a push's runs, the newest of each workflow alone is
-# re-run, and an older one reported once it failed again.  This runs when
-# such a run completes and every two hours as well: GitHub starts no
-# workflow for most of what GITHUB_TOKEN does, so the end of a re-run asked
-# for here may start none.  Each pass looks at the runs that ended in the
-# last two days, and acts on each attempt once: a run being re-run is not
-# completed, and a report carries a marker naming its run and attempt,
-# looked for in closed issues too.
+# the weekly coverage run's, and those of the CI and arm64 runs of a push to
+# main.  A failed run is re-run once, its failed jobs only; a job that fails
+# again gets an issue, one per job (labelled ci/nightly for the nightly run,
+# ci/main for the others), which each later run it fails in comments on
+# while it is open.  A job that reaches its timeout fails; one cancelled by
+# hand, or by a newer run, does not.  A run that does not start (GitHub
+# refused the workflow file) gets an issue at once.  Of a push's runs, the
+# newest of each workflow alone is re-run, and an older one reported once it
+# failed again.  This runs when such a run completes and every two hours as
+# well: GitHub starts no workflow for most of what GITHUB_TOKEN does, so the
+# end of a re-run asked for here may start none.  Each pass looks at the
+# runs that ended in the last two days, and acts on each attempt once: a run
+# being re-run is not completed, and a report carries a marker naming its
+# run and attempt, looked for in closed issues too.
 on:
   workflow_run:
-    workflows: [arm64, CI]
+    workflows: [arm64, CI, Coverage]
     types: [completed]
     branches: [main]
   schedule:
@@ -32,8 +32,8 @@ permissions:
 
 jobs:
   report:
-    # Only the end of a nightly run, or of a push's: not of a pull request's
-    # run, or of one started by hand.
+    # Only the end of a scheduled run, or of a push's: not of a pull
+    # request's run, or of one started by hand.
     if: >-
       github.event_name != 'workflow_run' ||
       github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'push'
@@ -290,4 +290,5 @@ jobs:
           sweep arm64.yml schedule "the nightly arm64 run" "arm64 nightly" ci/nightly "arm64.yml, arm64-jobs.yml"
           sweep ci.yml push "the CI run of a push to main" "CI on main" ci/main ci.yml
           sweep arm64.yml push "the arm64 run of a push to main" "arm64 on main" ci/main "arm64.yml, arm64-jobs.yml"
+          sweep coverage.yml schedule "the weekly coverage run" "weekly coverage" ci/main coverage.yml
           exit "$status"
