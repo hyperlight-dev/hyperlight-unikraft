@@ -69,6 +69,7 @@ pub(crate) struct Execution {
     pub command: CommandMetadata,
     pub driving: Mutex<DrivingState>,
     pub needs_restore: AtomicBool,
+    pub kill_requested: AtomicBool,
     pub failure: Mutex<Option<String>>,
     pub done: Arc<AtomicBool>,
     pub process: Mutex<ProcessState>,
@@ -197,7 +198,7 @@ impl Executions {
         {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "drop all child handles before snapshot or restore",
+                "park or drop all child handles before restore",
             )));
         }
         for entry in entries {
@@ -250,6 +251,12 @@ impl Executions {
         }
         let mut images = Vec::with_capacity(entries.len());
         for ((entry, calls), state) in entries.iter().zip(&calls).zip(&driving) {
+            if entry.kill_requested.load(Ordering::Relaxed) {
+                return Err(Error::Wait(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "a dropped command is awaiting termination",
+                )));
+            }
             images.push(ExecutionImage {
                 id: entry.id,
                 command: entry.command.clone(),
@@ -597,6 +604,7 @@ impl Execution {
                 resume: None,
             }),
             needs_restore: AtomicBool::new(false),
+            kill_requested: AtomicBool::new(false),
             failure: Mutex::default(),
             done: Arc::new(AtomicBool::new(false)),
             process: Mutex::default(),

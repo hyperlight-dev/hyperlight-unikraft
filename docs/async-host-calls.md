@@ -119,17 +119,20 @@ completion condition without driving progress. Output already written is
 forwarded before cleanup finishes, so piped output still needs concurrent draining.
 `wait_with_output()` and `Command::output()` handle both drains and cleanup.
 `Command::status()` waits for command cleanup without draining piped output.
-Cancellation of any wait preserves the execution and prepared
-completion batches. Like a process wait, waiting closes stdin still held in
+Cancellation of a borrowed `child.wait()` preserves the execution and prepared
+completion batches. Cancelling an owning operation such as `wait_with_output()`,
+`Command::output()` or `Command::status()` drops its child and terminates the tree.
+Like a process wait, waiting closes stdin still held in
 the child's `stdin` field; take the handle first to manage its lifetime yourself.
-Dropping a child parks its execution without entering the VM. Pending host
+`child.park()` consumes the child and returns its execution ID without killing
+the tree or entering the VM. Pending host
 futures and host timer registrations are dropped, and host sockets are closed.
 Guest threads cannot run until the child is restored and driven again.
 If another task is inside a pipe poll, teardown finishes when that poll returns.
 Taken stream handles become invalid (`BrokenPipe`), including after child restoration.
 Untaken streams and buffered bytes are preserved, not closed.
 
-Save `child.execution_id()` before dropping it, then use
+Use `let id = child.park()`, then
 `sandbox.restore_child(id)` to acquire a new exclusive handle. The first drive
 reconstructs resources and interrupts unfinished calls with `EINTR`; the guest
 chooses whether to retry. `sandbox.children()` lists all retained commands in
@@ -188,9 +191,14 @@ to call `kill()`. After success, `wait()` is immediately ready.
 Killing an already completed tree needs no VM entry, and other command trees
 are not signalled. As with other VM entries, CPU-bound guest code requires the
 existing interrupt-handle mechanism to preempt.
+Dropping a child terminates its tree, normally synchronously in one VM entry
+without polling host futures. If a VM entry or lifecycle operation is in progress,
+termination is queued until that operation releases its locks, including drops
+from host callbacks. Failures are logged and retained as execution errors; use
+`kill()` when the caller needs to receive termination errors directly.
 Keep the child alive while driving taken stream handles, even after `wait()`
-returns; dropping the child invalidates those handles. Dropping every sandbox, child, and
-stream handle releases the VM and any unfinished work.
+returns; dropping or parking the child invalidates those handles. Dropping the
+sandbox owner releases the VM and any unfinished work.
 
 Streams implement `futures::io::AsyncRead` / `AsyncWrite`. Each host pipe holds
 at most 64 KiB, with 4 KiB transport chunks and ordinary backpressure. Drain
@@ -229,7 +237,7 @@ let snapshot = sandbox.snapshot()?;
 
 let output = child.wait_with_output().await?;
 
-// All children must be dropped before replacing the current guest state.
+// Park or drop all children before replacing the current guest state.
 sandbox.restore(&snapshot)?;
 let child = sandbox.restore_child(id)?;
 ```
@@ -250,8 +258,8 @@ and pending resource-dependent operations are interrupted on first drive.
 Snapshot capture excludes concurrent VM entries, host-call polls, and handle/pipe
 operations. If a lifecycle transition or operation prevents a consistent capture,
 it returns `Error::Wait` with `WouldBlock`; retry after that operation finishes.
-Replacing the current sandbox with `restore()` still requires dropping all child
-handles first. Taken handles from before parking or restore remain invalid and
+Replacing the current sandbox with `restore()` still requires parking or dropping
+all child handles first. Taken handles from before parking or restore remain invalid and
 cannot consume restored output.
 
 ### Attribution and control wire format

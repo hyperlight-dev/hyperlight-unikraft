@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let first_id = first.execution_id();
     // Snapshotting preserves this handle and its pending timer.
     let checkpoint = sandbox.snapshot()?;
-    drop(first);
+    first.park();
     let children = sandbox.children();
     for child in &children {
         println!(

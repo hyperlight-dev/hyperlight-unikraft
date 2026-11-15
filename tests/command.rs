@@ -219,6 +219,243 @@ async fn host_future_can_drop_the_last_sandbox_owner() {
 }
 
 #[tokio::test]
+async fn dropping_a_child_kills_only_its_tree_and_cancels_pending_calls() {
+    let (sender, receiver) = futures::channel::oneshot::channel::<String>();
+    let receiver = Mutex::new(Some(receiver));
+    let sandbox = builder()
+        .async_host_function("gate", move |_| {
+            let receiver = receiver.lock().unwrap().take().unwrap();
+            async move { receiver.await.map_err(|error| error.to_string()) }
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let id = child.execution_id();
+    let mut stdout = child.stdout.take().unwrap();
+    assert!(child.wait().now_or_never().is_none());
+    let mut other = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "20", "other"])
+        .spawn()
+        .unwrap();
+    drop(child);
+    assert!(sender.is_canceled());
+    assert!(stdout.read(&mut [0]).await.is_err());
+    let mut dead = sandbox.restore_child(id).unwrap();
+    assert_eq!(
+        dead.wait().now_or_never().unwrap().unwrap().signal(),
+        Some(9)
+    );
+    assert!(other.try_wait().unwrap().is_none());
+    assert!(other.wait().await.unwrap().success());
+}
+
+#[test]
+fn dropping_a_tree_needs_no_runtime_and_does_not_drive_host_handlers() {
+    let sandbox = builder()
+        .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
+            panic!("drop must not poll host handlers");
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    for args in [vec!["host", "[]"], vec!["sleep-tree", "60000"]] {
+        let child = sandbox
+            .command("/mnt/bin/command")
+            .args(args)
+            .spawn()
+            .unwrap();
+        let id = child.execution_id();
+        drop(child);
+        let mut dead = sandbox.restore_child(id).unwrap();
+        assert_eq!(
+            dead.wait().now_or_never().unwrap().unwrap().signal(),
+            Some(9)
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelling_owned_output_kills_but_cancelling_borrowed_wait_does_not() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "60000", "done"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let info = sandbox.children().pop().unwrap();
+    assert!(child.wait().now_or_never().is_none());
+    assert!(!info.completed() && !info.parked());
+    assert!(child.wait_with_output().now_or_never().is_none());
+    assert!(info.completed() && info.parked());
+    assert_eq!(
+        info.restore()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .unwrap()
+            .signal(),
+        Some(9)
+    );
+}
+
+#[tokio::test]
+async fn host_future_can_drop_its_own_child_and_terminate_without_deadlocking() {
+    let slot = Arc::new(Mutex::new(None));
+    let owned = slot.clone();
+    let sandbox = builder()
+        .async_host_function("gate", move |_| {
+            drop(owned.lock().unwrap().take());
+            std::future::ready(Ok("not delivered".into()))
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let id = child.execution_id();
+    let mut stdout = child.stdout.take().unwrap();
+    *slot.lock().unwrap() = Some(child);
+    assert!(stdout.read(&mut [0]).await.is_err());
+    assert_eq!(
+        sandbox
+            .restore_child(id)
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .unwrap()
+            .signal(),
+        Some(9)
+    );
+}
+
+#[test]
+fn host_callback_can_drop_another_tree_during_a_vm_entry() {
+    let victim = Arc::new(Mutex::new(None));
+    let owned = victim.clone();
+    let sandbox = builder()
+        .host_function("gate", move |_| {
+            drop(owned.lock().unwrap().take());
+            Ok("done".into())
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let child = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep-tree", "60000"])
+        .spawn()
+        .unwrap();
+    let info = sandbox.children().pop().unwrap();
+    *victim.lock().unwrap() = Some(child);
+    let mut caller = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .spawn()
+        .unwrap();
+    assert!(caller.wait().now_or_never().unwrap().unwrap().success());
+    assert!(victim.lock().unwrap().is_none());
+    assert!(info.completed());
+    assert_eq!(
+        info.restore()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .unwrap()
+            .signal(),
+        Some(9)
+    );
+}
+
+#[tokio::test]
+async fn drop_during_snapshot_wakeup_is_terminated_before_snapshot_returns() {
+    use hyperlight_unikraft::command::{Child, ChildInfo};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Context;
+
+    struct DropOnWake {
+        armed: AtomicBool,
+        child: Mutex<Option<Child>>,
+        info: ChildInfo,
+    }
+    impl futures::task::ArcWake for DropOnWake {
+        fn wake_by_ref(this: &Arc<Self>) {
+            if this.armed.swap(false, Ordering::SeqCst) {
+                drop(this.child.lock().unwrap().take());
+                assert!(
+                    !this.info.completed(),
+                    "termination must wait for the snapshot lock"
+                );
+            }
+        }
+    }
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let victim = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "60000", "victim"])
+        .spawn()
+        .unwrap();
+    let info = sandbox.children().pop().unwrap();
+    let mut observer = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "60000", "observer"])
+        .spawn()
+        .unwrap();
+    let wake = Arc::new(DropOnWake {
+        armed: AtomicBool::new(false),
+        child: Mutex::new(Some(victim)),
+        info: info.clone(),
+    });
+    let waker = futures::task::waker(wake.clone());
+    let mut wait = Box::pin(observer.wait());
+    assert!(
+        wait.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    // Rearm after the initial VM entry has notified the first registration.
+    assert!(
+        wait.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    wake.armed.store(true, Ordering::SeqCst);
+    let snapshot = sandbox.snapshot().unwrap();
+    assert!(info.completed());
+    assert_eq!(
+        info.restore()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .unwrap()
+            .signal(),
+        Some(9)
+    );
+    let fork = SandboxBuilder::from_command_snapshot(&snapshot)
+        .echo_output(false)
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    assert!(!fork.children()[0].completed());
+}
+
+#[tokio::test]
 async fn structured_command_and_distinct_streams() {
     let sandbox = builder().boot().unwrap().into_commands().unwrap();
     let out = tokio::time::timeout(
@@ -279,7 +516,7 @@ fn child_launch_metadata_survives_builder_reuse_and_snapshot_restore() {
     assert_eq!(info.env["OVERRIDE"], "a=b");
     assert!(!info.env.contains_key("REMOVE"));
     assert_eq!(info.stdio, [Stdio::Null; 3]);
-    drop(first);
+    first.park();
     let snapshot = sandbox.snapshot().unwrap();
 
     let second = command
@@ -317,7 +554,7 @@ fn child_launch_metadata_survives_builder_reuse_and_snapshot_restore() {
         assert_eq!(restored.cwd, info.cwd);
         assert_eq!(restored.env, info.env);
         assert_eq!(restored.stdio, info.stdio);
-        drop(child);
+        child.park();
     }
     sandbox.restore(&snapshot).unwrap();
     let restored = sandbox.children().pop().unwrap();
@@ -380,7 +617,7 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
 
     sandbox.snapshot().unwrap();
     assert!(!pending_info.parked());
-    std::thread::spawn(move || drop(pending)).join().unwrap();
+    std::thread::spawn(move || pending.park()).join().unwrap();
     assert!(pending_info.parked() && observer.parked());
     assert!(sandbox.children().iter().all(|entry| entry.parked()));
     let snapshot = sandbox.snapshot().unwrap();
@@ -409,7 +646,7 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     pending.kill().unwrap();
     assert!(pending_info.completed() && observer.completed());
     assert!(!pending_info.parked());
-    drop(pending);
+    pending.park();
     assert!(pending_info.parked() && observer.parked());
     sandbox.forget_child(pending_id).unwrap();
     assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
@@ -433,11 +670,11 @@ fn lifecycle_flags_belong_to_the_observed_snapshot_incarnation() {
         .spawn()
         .unwrap();
     let info = sandbox.children().pop().unwrap();
-    drop(child);
+    child.park();
     let snapshot = sandbox.snapshot().unwrap();
     let mut child = info.restore().unwrap();
     child.kill().unwrap();
-    drop(child);
+    child.park();
     assert!(info.completed());
 
     sandbox.restore(&snapshot).unwrap();
@@ -561,7 +798,7 @@ async fn root_exit_kills_the_descendant_and_closes_taken_output() {
 }
 
 #[tokio::test]
-async fn dropping_a_child_cancels_calls_and_restoring_retries_with_eintr() {
+async fn parking_a_child_cancels_calls_and_restoring_retries_with_eintr() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let (sender, receiver) = futures::channel::oneshot::channel::<String>();
     let receiver = Arc::new(Mutex::new(Some(receiver)));
@@ -592,7 +829,7 @@ async fn dropping_a_child_cancels_calls_and_restoring_retries_with_eintr() {
     assert!(sandbox.restore_child(id).is_err());
     assert!(child.wait().now_or_never().is_none());
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    drop(child);
+    child.park();
     assert!(sender.is_canceled());
     assert_eq!(sandbox.parked_children(), [id]);
     assert!(sandbox.forget_child(id).is_err());
@@ -607,7 +844,7 @@ async fn dropping_a_child_cancels_calls_and_restoring_retries_with_eintr() {
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
     let child = sandbox.restore_child(id).unwrap();
-    drop(child);
+    child.park();
     let child = sandbox.restore_child(id).unwrap();
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
@@ -647,7 +884,7 @@ async fn parking_preserves_backpressured_output_and_invalidates_taken_pipes() {
     let mut first = [0];
     old_stdout.read_exact(&mut first).await.unwrap();
     assert!(child.wait().now_or_never().is_none());
-    drop(child);
+    child.park();
     assert!(old_stdout.read(&mut first).await.is_err());
     let snapshot = sandbox.snapshot().unwrap();
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
@@ -802,7 +1039,7 @@ async fn parking_closes_host_connections_without_entering_the_vm() {
             .is_none(),
         "taking a snapshot must not close the original connection"
     );
-    drop(child);
+    child.park();
     let mut byte = [0];
     let mut buffer = tokio::io::ReadBuf::new(&mut byte);
     tokio::time::timeout(
@@ -873,7 +1110,7 @@ async fn parking_releases_a_listener_and_restores_it_on_first_drive() {
     let id = child.execution_id();
     let mut stdout = child.stdout.take().unwrap();
     stdout.read_exact(&mut [0; 6]).await.unwrap();
-    drop(child);
+    child.park();
     assert!(sender.is_canceled());
     let reservation = std::net::TcpListener::bind(address).unwrap();
     let mut child = sandbox.restore_child(id).unwrap();
@@ -908,8 +1145,7 @@ fn parked_child_can_be_restored_and_killed_without_a_runtime() {
         .args(["host", "[]"])
         .spawn()
         .unwrap();
-    let id = child.execution_id();
-    drop(child);
+    let id = child.park();
     let mut child = sandbox.restore_child(id).unwrap();
     child.kill().unwrap();
     assert_eq!(
@@ -927,7 +1163,7 @@ async fn restoring_a_parked_timer_does_not_restart_its_duration() {
         .spawn()
         .unwrap();
     let id = child.execution_id();
-    drop(child);
+    child.park();
     let snapshot = sandbox.snapshot().unwrap();
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .echo_output(false)
@@ -945,12 +1181,12 @@ async fn restoring_a_parked_timer_does_not_restart_its_duration() {
 }
 
 #[tokio::test]
-async fn host_future_can_drop_its_own_child_without_deadlocking() {
-    let slot = Arc::new(Mutex::new(None));
+async fn host_future_can_park_its_own_child_without_deadlocking() {
+    let slot = Arc::new(Mutex::new(None::<hyperlight_unikraft::command::Child>));
     let owned = slot.clone();
     let sandbox = builder()
         .async_host_function("gate", move |_| {
-            drop(owned.lock().unwrap().take());
+            owned.lock().unwrap().take().unwrap().park();
             std::future::ready(Ok("completed".into()))
         })
         .boot()
@@ -1021,7 +1257,7 @@ async fn snapshots_restore_parked_commands_streams_and_completed_status() {
     assert!(done.wait().await.unwrap().success());
     let snapshot = sandbox.snapshot().unwrap();
     assert!(sandbox.children().iter().all(|info| !info.parked()));
-    drop(echo);
+    echo.park();
     drop(done);
 
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
@@ -1034,7 +1270,7 @@ async fn snapshots_restore_parked_commands_streams_and_completed_status() {
     assert_eq!(fork.parked_children(), [echo_id, done_id]);
     let active = sandbox.restore_child(echo_id).unwrap();
     assert!(sandbox.restore(&snapshot).is_err());
-    drop(active);
+    active.park();
     for restored in [&fork, &sandbox] {
         let echo = restored.restore_child(echo_id).unwrap();
         let done = restored.restore_child(done_id).unwrap();
@@ -1179,7 +1415,7 @@ fn snapshot_and_child_restoration_reject_a_poll_still_finishing_parking() {
         matches!(sandbox.snapshot(), Err(hyperlight_unikraft::Error::Wait(error))
         if error.kind() == std::io::ErrorKind::WouldBlock)
     );
-    drop(child);
+    child.park();
     for result in [
         sandbox.restore_child(id).map(|_| ()),
         sandbox.snapshot().map(|_| ()),

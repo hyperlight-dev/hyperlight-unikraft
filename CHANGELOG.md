@@ -18,7 +18,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Each command tree owns its host futures, sockets and timers; polling one
   handle runs only its own guest tree and host operations, plus shared supervisor
   infrastructure. Requires rebuilt C, Rust, Go or .NET AOT exec driver images.
-- Dropped command children are parked and can be reacquired by execution ID.
+- `Child::park(self)` consumes the handle and returns its execution ID so the
+  command can be reacquired later. Dropping a child instead terminates its tree;
+  termination during a busy VM entry or lifecycle operation is deferred until
+  that operation finishes. Owning output/status futures terminate on cancellation,
+  while cancelling a borrowed wait preserves the child.
   Parking releases host futures, sockets and timer registrations without VM
   entry, invalidates taken stream handles, and preserves logical streams and data.
   Child restoration reconstructs resources and interrupts pending calls with `EINTR`.
@@ -34,7 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `CommandSandbox::restore`, or boot an independent clone with
   `SandboxBuilder::from_command_snapshot`. Snapshot capture also accepts unparked
   children without changing their handles, pipes, sockets or pending host calls.
-  Restored copies start parked; in-place restore still requires dropping all children.
+  Restored copies start parked; in-place restore requires parking or dropping all children.
 - An opt-in async driving release benchmark, including
   latency, throughput, CPU use and VM-entry counts for calls, timers, fan-out
   and ready/delayed TCP and UDP peers.
