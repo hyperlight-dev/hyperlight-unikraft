@@ -551,6 +551,34 @@ pub(crate) struct ProcessState {
 }
 
 impl Execution {
+    pub fn shutdown(&self) {
+        // All polls and handle mutations hold a temporary coordinator reference,
+        // so coordinator destruction cannot race an operation on this engine.
+        let mut calls = match self.calls.lock() {
+            Ok(calls) => calls,
+            Err(error) => {
+                tracing::error!("command driver panicked; cancelling its host work on shutdown");
+                error.into_inner()
+            }
+        };
+        calls.clear();
+        drop(calls);
+        self.net.reset();
+        if !self.done.load(Ordering::Relaxed) {
+            self.process.lock().unwrap().status = Some(9);
+        }
+        self.done.store(true, Ordering::Relaxed);
+        self.driving
+            .lock()
+            .unwrap()
+            .parked
+            .store(true, Ordering::Relaxed);
+        self.pipes[0].close();
+        self.pipes[1].eof();
+        self.pipes[2].eof();
+        self.wake.notify();
+    }
+
     fn new(
         id: u64,
         inbox: &Arc<Mutex<async_calls::Inbox>>,

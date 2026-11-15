@@ -115,6 +115,14 @@ struct Coordinator {
     failure: Mutex<Option<String>>,
 }
 
+impl Drop for Coordinator {
+    fn drop(&mut self) {
+        for execution in self.executions.list() {
+            execution.shutdown();
+        }
+    }
+}
+
 impl AppSandbox {
     /// Consume an idle compiled-runtime sandbox, enabling concurrent commands.
     pub fn into_commands(self) -> Result<CommandSandbox> {
@@ -688,12 +696,16 @@ pub struct Output {
 /// An in-flight pipe poll finishes the teardown when it returns. Taken pipes
 /// become invalid. Restore using [`CommandSandbox::restore_child`].
 /// Root exit automatically kills any remaining descendants.
+/// This handle and its pipes do not keep the sandbox alive. When its last owner
+/// is dropped, unfinished commands report SIGKILL (9) without a guest VM entry;
+/// completed commands retain their status. Buffered output can be drained to EOF.
+/// A synchronous operation already in progress may finish before teardown.
 /// Waiting does not drain piped output; drain concurrently or use
 /// [`wait_with_output`](Self::wait_with_output).
 pub struct Child {
     id: u64,
     generation: u64,
-    coordinator: Arc<Coordinator>,
+    coordinator: Weak<Coordinator>,
     execution: Arc<Execution>,
     /// Piped stdin, when requested. Drop it to send EOF.
     pub stdin: Option<ChildStdin>,
@@ -705,6 +717,7 @@ pub struct Child {
 
 impl Child {
     fn new(coordinator: Arc<Coordinator>, execution: Arc<Execution>, generation: u64) -> Self {
+        let coordinator = Arc::downgrade(&coordinator);
         let streams = execution.driving.lock().unwrap().streams;
         let pipe = |stream| ChildPipe {
             subscription: execution.wake.subscribe(),
@@ -739,16 +752,19 @@ impl Child {
     /// Returns `WouldBlock` if another lifecycle operation (such as snapshot
     /// capture) is in progress.
     pub fn kill(&mut self) -> Result<()> {
-        let _transition = self.coordinator.transition()?;
+        let Some(coordinator) = self.coordinator.upgrade() else {
+            return Ok(());
+        };
+        let _transition = coordinator.transition()?;
         self.execution.check_driver(self.generation)?;
-        self.coordinator.failure()?;
+        coordinator.failure()?;
         if !self
             .execution
             .done
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let mut sandbox = self.coordinator.sandbox.lock().unwrap();
-            self.coordinator.executions.before_entry(self.id);
+            let mut sandbox = coordinator.sandbox.lock().unwrap();
+            coordinator.executions.before_entry(self.id);
             let AppSandbox {
                 config,
                 sandbox: vm,
@@ -759,9 +775,9 @@ impl Child {
                 "CommandKill",
                 (self.id.to_string(), config.env_version()),
             );
-            let result = self.coordinator.entered(result);
+            let result = coordinator.entered(result);
             drop(sandbox);
-            self.coordinator.executions.wake_all();
+            coordinator.executions.wake_all();
             result?;
         }
         if !self
@@ -793,8 +809,11 @@ impl Child {
     /// Returns the root's status only after descendant and worker cleanup,
     /// matching [`wait`](Self::wait).
     pub fn try_wait(&self) -> Result<Option<ExitStatus>> {
+        let Some(coordinator) = self.coordinator.upgrade() else {
+            return Ok(Some(self.terminated_status()));
+        };
         self.execution.check_driver(self.generation)?;
-        self.coordinator.failure()?;
+        coordinator.failure()?;
         self.execution.check()?;
         if !self
             .execution
@@ -812,6 +831,15 @@ impl Child {
             .ok_or_else(|| Error::Wait(io::Error::other("execution ended without a root status")))
     }
 
+    fn terminated_status(&self) -> ExitStatus {
+        if self.execution.done.load(Ordering::Relaxed)
+            && let Some(status) = self.execution.process.lock().unwrap().status
+        {
+            return ExitStatus(status);
+        }
+        ExitStatus(9)
+    }
+
     /// Wait for root exit and command cleanup, returning the root's status.
     ///
     /// Root exit automatically kills remaining descendants, including reparented
@@ -824,11 +852,13 @@ impl Child {
         let subscription = self.execution.wake.subscribe();
         poll_fn(|cx| {
             subscription.register(cx.waker());
+            let Some(coordinator) = self.coordinator.upgrade() else {
+                return Poll::Ready(Ok(self.terminated_status()));
+            };
             if let Some(status) = self.try_wait()? {
                 return Poll::Ready(Ok(status));
             }
-            if let Poll::Ready(Err(error)) =
-                self.coordinator.poll(&self.execution, self.generation, cx)
+            if let Poll::Ready(Err(error)) = coordinator.poll(&self.execution, self.generation, cx)
             {
                 return Poll::Ready(Err(error));
             }
@@ -864,6 +894,9 @@ impl Child {
 
 impl Drop for Child {
     fn drop(&mut self) {
+        let Some(_coordinator) = self.coordinator.upgrade() else {
+            return;
+        };
         {
             let state = self.execution.driving.lock().unwrap();
             if state.generation != self.generation {
@@ -886,7 +919,7 @@ impl Drop for Child {
 
 struct ChildPipe {
     subscription: Subscription,
-    coordinator: Arc<Coordinator>,
+    coordinator: Weak<Coordinator>,
     execution: Arc<Execution>,
     generation: u64,
     stream: usize,
@@ -894,6 +927,9 @@ struct ChildPipe {
 
 impl Drop for ChildPipe {
     fn drop(&mut self) {
+        let Some(_coordinator) = self.coordinator.upgrade() else {
+            return;
+        };
         let mut state = self.execution.driving.lock().unwrap();
         if state.parked.load(Ordering::Relaxed) || state.generation != self.generation {
             return;
@@ -910,6 +946,7 @@ impl Drop for ChildPipe {
 impl ChildPipe {
     fn access<T>(
         &self,
+        coordinator: &Coordinator,
         action: impl FnOnce(&crate::execution::Pipe) -> Poll<io::Result<T>>,
     ) -> Poll<io::Result<T>> {
         let state = self.execution.driving.lock().unwrap();
@@ -919,11 +956,7 @@ impl ChildPipe {
                 "command pipe was invalidated by parking",
             )));
         }
-        if let Err(error) = self
-            .coordinator
-            .failure()
-            .and_then(|_| self.execution.check())
-        {
+        if let Err(error) = coordinator.failure().and_then(|_| self.execution.check()) {
             return Poll::Ready(Err(io::Error::other(error)));
         }
         action(&self.execution.pipes[self.stream])
@@ -937,22 +970,31 @@ impl AsyncRead for ChildPipe {
         out: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         self.subscription.register(cx.waker());
-        if let Poll::Ready(result) = self.access(|pipe| pipe.read(cx, out)) {
+        let Some(coordinator) = self.coordinator.upgrade() else {
+            let pipe = &self.execution.pipes[self.stream];
+            pipe.eof();
+            return pipe.read(cx, out);
+        };
+        if let Poll::Ready(result) = self.access(&coordinator, |pipe| pipe.read(cx, out)) {
             return Poll::Ready(result);
         }
-        if let Poll::Ready(Err(error)) = self.coordinator.poll(&self.execution, self.generation, cx)
-        {
+        if let Poll::Ready(Err(error)) = coordinator.poll(&self.execution, self.generation, cx) {
             return Poll::Ready(Err(io::Error::other(error)));
         }
-        self.access(|pipe| pipe.read(cx, out))
+        self.access(&coordinator, |pipe| pipe.read(cx, out))
     }
 }
 
 /// A command's piped standard input; implements `futures::io::AsyncWrite`.
+/// Does not keep the sandbox alive. After sandbox destruction, writes and
+/// flushes return `BrokenPipe`; closing is successful.
 pub struct ChildStdin(ChildPipe);
 /// A command's piped standard output; implements `futures::io::AsyncRead`.
+/// Does not keep the sandbox alive. After sandbox destruction, buffered bytes
+/// remain readable, followed by EOF.
 pub struct ChildStdout(ChildPipe);
 /// A command's piped standard error; implements `futures::io::AsyncRead`.
+/// Has the same sandbox lifetime and EOF behavior as [`ChildStdout`].
 pub struct ChildStderr(ChildPipe);
 
 impl AsyncRead for ChildStdout {
@@ -980,23 +1022,35 @@ impl AsyncWrite for ChildStdin {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.0.subscription.register(cx.waker());
-        if let Poll::Ready(result) = self.0.access(|pipe| pipe.write(cx, bytes)) {
+        let Some(coordinator) = self.0.coordinator.upgrade() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "command sandbox has been dropped",
+            )));
+        };
+        if let Poll::Ready(result) = self.0.access(&coordinator, |pipe| pipe.write(cx, bytes)) {
             return Poll::Ready(result);
         }
-        if let Poll::Ready(Err(error)) =
-            self.0
-                .coordinator
-                .poll(&self.0.execution, self.0.generation, cx)
+        if let Poll::Ready(Err(error)) = coordinator.poll(&self.0.execution, self.0.generation, cx)
         {
             return Poll::Ready(Err(io::Error::other(error)));
         }
-        self.0.access(|pipe| pipe.write(cx, bytes))
+        self.0.access(&coordinator, |pipe| pipe.write(cx, bytes))
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0.access(|_| Poll::Ready(Ok(())))
+        let Some(coordinator) = self.0.coordinator.upgrade() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "command sandbox has been dropped",
+            )));
+        };
+        self.0.access(&coordinator, |_| Poll::Ready(Ok(())))
     }
     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0.access(|pipe| {
+        let Some(coordinator) = self.0.coordinator.upgrade() else {
+            return Poll::Ready(Ok(()));
+        };
+        self.0.access(&coordinator, |pipe| {
             pipe.eof();
             Poll::Ready(Ok(()))
         })

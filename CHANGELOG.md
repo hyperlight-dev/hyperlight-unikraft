@@ -23,6 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   entry, invalidates taken stream handles, and preserves logical streams and data.
   Child restoration reconstructs resources and interrupts pending calls with `EINTR`.
   Completed data replies survive; established connections do not.
+- Child and pipe handles hold weak sandbox references. Dropping the last sandbox
+  owner cancels host work, releases sockets, wakes waiters and reports unfinished
+  commands as SIGKILL. Completed statuses and already-buffered output are retained;
+  output reaches EOF and input writes fail with `BrokenPipe`.
 - In-memory command snapshots capture the whole guest plus execution
   metadata, pipe buffers and retained replies. Restore in place with
   `CommandSandbox::restore`, or boot an independent clone with

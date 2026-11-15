@@ -21,6 +21,202 @@ fn builder() -> SandboxBuilder {
 }
 
 #[tokio::test]
+async fn dropping_last_sandbox_wakes_children_and_pipes_and_cancels_host_work() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Context;
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl futures::task::ArcWake for WakeCount {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let (sender, receiver) = futures::channel::oneshot::channel::<String>();
+    let receiver = Mutex::new(Some(receiver));
+    let sandbox = builder()
+        .async_host_function("gate", move |_| {
+            let receiver = receiver.lock().unwrap().take().unwrap();
+            async move { receiver.await.map_err(|error| error.to_string()) }
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let last_owner = sandbox.clone();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let info = sandbox.children().pop().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut wait = Box::pin(child.wait());
+    let mut out = [0];
+    let mut err = [0];
+    let mut read = Box::pin(stdout.read(&mut out));
+    let mut read_err = Box::pin(stderr.read(&mut err));
+    let input = vec![b'x'; 1024 * 1024];
+    let mut write = Box::pin(stdin.write_all(&input));
+    let counts: Vec<_> = (0..4).map(|_| Arc::new(WakeCount::default())).collect();
+    let wakers: Vec<_> = counts.iter().cloned().map(futures::task::waker).collect();
+    assert!(
+        wait.as_mut()
+            .poll(&mut Context::from_waker(&wakers[0]))
+            .is_pending()
+    );
+    assert!(
+        read.as_mut()
+            .poll(&mut Context::from_waker(&wakers[1]))
+            .is_pending()
+    );
+    assert!(
+        read_err
+            .as_mut()
+            .poll(&mut Context::from_waker(&wakers[2]))
+            .is_pending()
+    );
+    assert!(
+        write
+            .as_mut()
+            .poll(&mut Context::from_waker(&wakers[3]))
+            .is_pending()
+    );
+    drop(sandbox);
+    assert!(!sender.is_canceled());
+    assert!(!info.completed());
+    // Input forwarding can wake the wait task; rearm it before testing shutdown.
+    assert!(
+        wait.as_mut()
+            .poll(&mut Context::from_waker(&wakers[0]))
+            .is_pending()
+    );
+    for count in &counts {
+        count.0.store(0, Ordering::SeqCst);
+    }
+    std::thread::spawn(move || drop(last_owner)).join().unwrap();
+    assert!(sender.is_canceled());
+    assert!(
+        counts
+            .iter()
+            .all(|count| count.0.load(Ordering::SeqCst) > 0)
+    );
+    assert!(info.completed() && info.parked());
+    assert_eq!(wait.now_or_never().unwrap().unwrap().signal(), Some(9));
+    assert_eq!(read.now_or_never().unwrap().unwrap(), 0);
+    assert_eq!(read_err.now_or_never().unwrap().unwrap(), 0);
+    assert_eq!(
+        write.now_or_never().unwrap().unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        stdin.flush().await.unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    stdin.close().await.unwrap();
+    assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(9));
+    child.kill().unwrap();
+    assert!(info.restore().is_err());
+}
+
+#[tokio::test]
+async fn sandbox_drop_preserves_completed_status_and_buffered_output() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "0", "retained"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(child.wait().await.unwrap().success());
+    let pid = child.id();
+    drop(sandbox);
+    assert_eq!(child.id(), pid);
+    let output = child.wait_with_output().await.unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"retained\n");
+}
+
+#[tokio::test]
+async fn sandbox_drop_closes_sockets_even_with_taken_pipes_alive() {
+    use tokio::io::AsyncRead as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let sandbox = builder()
+        .network(hyperlight_unikraft::NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .args(["park-socket", &port])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut ready = [0; 6];
+    tokio::time::timeout(Duration::from_secs(5), stdout.read_exact(&mut ready))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&ready, b"ready\n");
+    let (mut socket, _) = listener.accept().await.unwrap();
+    drop(sandbox);
+    let mut byte = [0];
+    let mut buffer = tokio::io::ReadBuf::new(&mut byte);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::poll_fn(|cx| std::pin::Pin::new(&mut socket).poll_read(cx, &mut buffer)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(buffer.filled().is_empty());
+    assert_eq!(child.wait().await.unwrap().signal(), Some(9));
+    drop(child);
+    assert_eq!(stdout.read(&mut byte).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn host_future_can_drop_the_last_sandbox_owner() {
+    let owner = Arc::new(Mutex::new(None));
+    let release = owner.clone();
+    let (sender, receiver) = futures::channel::oneshot::channel::<String>();
+    let receiver = Mutex::new(Some(receiver));
+    let sandbox = builder()
+        .async_host_function("gate", move |_| {
+            drop(release.lock().unwrap().take());
+            let receiver = receiver.lock().unwrap().take().unwrap();
+            async move { receiver.await.map_err(|error| error.to_string()) }
+        })
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    let child = sandbox
+        .command("/mnt/bin/command")
+        .args(["host", "[]"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    *owner.lock().unwrap() = Some(sandbox);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.signal(), Some(9));
+    assert!(sender.is_canceled());
+    assert!(owner.lock().unwrap().is_none());
+}
+
+#[tokio::test]
 async fn structured_command_and_distinct_streams() {
     let sandbox = builder().boot().unwrap().into_commands().unwrap();
     let out = tokio::time::timeout(

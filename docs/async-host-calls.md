@@ -158,6 +158,17 @@ Completed executions and their output remain available until `forget_child(id)`;
 that method requires a parked, completed command. To discard an unfinished
 command, restore it, kill it, drop it, then forget it.
 
+Children and their pipe handles hold weak references to the sandbox. Keep a
+`CommandSandbox` owner alive while driving them (clones and command builders
+also retain ownership). Dropping the last owner destroys the VM without a guest
+entry, cancels host futures and timers, closes sockets, and wakes pending waits
+and pipe operations. Unfinished children report synthetic SIGKILL (signal 9);
+completed children retain their exit status. Buffered stdout/stderr can still
+be drained to EOF, stdin writes/flushes return `BrokenPipe`, and `kill()` is
+already satisfied. A synchronous poll or operation that has temporarily upgraded
+its weak reference may finish before teardown; a pending future does not retain
+that reference between polls.
+
 Listeners and unconnected sockets are recreated under the existing network
 policy; established connections become dead (EOF on read, EPIPE on write),
 just as on snapshot restore. Rebinding may fail and is reported by the socket
