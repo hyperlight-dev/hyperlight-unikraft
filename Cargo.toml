@@ -36,6 +36,9 @@ cli = [
 mshv = ["hyperlight-host/mshv3"]
 # `cpio::from_tar`, building an initrd from a tar without a host `cpio`.
 cpio = ["dep:tar"]
+# The `fuzzing` module the fuzz targets in fuzz/ drive the host functions
+# through; not a stable API.
+fuzzing = []
 
 [dependencies]
 hyperlight-common = "0.19"

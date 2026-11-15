@@ -1436,6 +1436,35 @@ coverage-ci *args: (coverage-run args) coverage-html coverage-lcov
     set -euo pipefail
     cargo llvm-cov report --manifest-path "{{root_dir}}/Cargo.toml" | tee "{{root_dir}}/target/coverage/summary.txt"
 
+# ── Fuzzing ──────────────────────────────────────────────────────
+
+# The nightly cargo-fuzz builds the targets with (its sanitizer flags are
+# unstable), pinned as hyperlight pins its own.
+nightly_toolchain := "nightly-2026-09-22"
+# The memory a fuzz target may use, as hyperlight's: past it libFuzzer stops
+# and reports the input.
+fuzz_rss_limit_mb := "4096"
+
+# Fuzz `target` (fuzz_hostfs, fuzz_hostnet or fuzz_dns, see fuzz/README.md)
+# until an input fails or it is stopped, from the corpus in
+# fuzz/corpus/<target>; a failing input is saved in fuzz/artifacts/<target>.
+# With debug assertions, and so overflow checks, on.  Takes libFuzzer's
+# arguments: `just fuzz fuzz_dns -max_total_time=60`.
+[unix]
+fuzz target *args: ensure-cargo-fuzz
+    cd "{{root_dir}}" && cargo +{{nightly_toolchain}} fuzz run --debug-assertions {{target}} -- -rss_limit_mb={{fuzz_rss_limit_mb}} {{args}}
+
+# Build every fuzz target.
+[unix]
+fuzz-build: ensure-cargo-fuzz
+    cd "{{root_dir}}" && cargo +{{nightly_toolchain}} fuzz build --debug-assertions
+
+# Install the pinned nightly and cargo-fuzz when missing.
+[unix]
+ensure-cargo-fuzz:
+    rustup toolchain list | grep -q '^{{nightly_toolchain}}' || rustup toolchain install {{nightly_toolchain}} --profile minimal
+    cargo fuzz --version >/dev/null 2>&1 || cargo install cargo-fuzz --locked
+
 # ── Conformance ─────────────────────────────────────────────────
 
 # Build a conformance rootfs (includes upstream test suite).

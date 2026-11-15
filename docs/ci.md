@@ -44,9 +44,17 @@ It runs the tests as tier 1's Linux test job does, on a hosted x86_64 runner wit
 
 Locally, on Linux or macOS, with the rootfs CPIOs and test binaries `just test` needs: `just coverage-run` runs the tests instrumented, with cargo-llvm-cov, which it installs when missing, and then `just coverage` prints the summary, `just coverage-html` writes `target/coverage/html/` and `just coverage-lcov` `target/coverage/lcov.info`. It takes cargo test's arguments, as `just test` does: `just coverage-run -- snapshot` runs the tests whose names have `snapshot` in them.
 
+## Fuzzing
+
+[`fuzz.yml`](../.github/workflows/fuzz.yml) fuzzes what a guest can send the host: the `fs_*` and `net_*` host functions, and the DNS messages the network policy reads (the targets are described in [`fuzz/README.md`](../fuzz/README.md)). It runs each target for an hour at 04:43 UTC on Sundays on `main`, and for five minutes on a pull request that changes the targets, the workflow, or the code they fuzz (`src/hostfs.rs`, `src/hostnet.rs`, `src/net_policy.rs`, `src/errno.rs`, `src/fuzzing.rs`); to run it on a branch, start it by hand (Actions, Run workflow). It blocks nothing. It also lints the fuzz crate, which `ci.yml`'s lint does not build.
+
+Each target starts from the corpus the last run on `main` left, kept in the Actions cache. A target that fails uploads the input that failed it as the `fuzz-artifacts-<target>` artifact, and adds it to the corpus, so the next run, the re-run of a failed weekly run included, starts with it.
+
+Locally, on Linux or macOS: `just fuzz <target>` fuzzes a target until it fails or is stopped, with the pinned nightly toolchain and cargo-fuzz, which it installs when missing, and takes libFuzzer's arguments: `just fuzz fuzz_hostnet -max_total_time=60`.
+
 ## Failures on main
 
-[`ci-report.yml`](../.github/workflows/ci-report.yml) handles a failed run on `main`: the nightly arm64 run, the weekly coverage run, and the CI and arm64 runs of a push.
+[`ci-report.yml`](../.github/workflows/ci-report.yml) handles a failed run on `main`: the nightly arm64 run, the weekly coverage and fuzzing runs, and the CI and arm64 runs of a push.
 
 1. It re-runs the failed jobs once.
 2. Each job that fails again gets an issue with the job's link, the commit and the end of its log. Each later run it fails in comments on that issue while the issue is open.
@@ -57,5 +65,6 @@ Locally, on Linux or macOS, with the rootfs CPIOs and test binaries `just test` 
 | CI, on a push | `CI on main: <job> fails` | `ci/main` |
 | arm64, on a push (the images' cache) | `arm64 on main: <job> fails` | `ci/main` |
 | weekly coverage | `weekly coverage: <job> fails` | `ci/main` |
+| weekly fuzzing | `weekly fuzzing: <job> fails` | `ci/main` |
 
 Of a push's runs, only the newest of each workflow is re-run: an older commit's re-run would cancel the newer one's, and its failures may be fixed already. An older run is reported only when it failed again. A CI run that passes on its re-run may start no dev build, as GitHub starts no workflow for most of what a workflow's token does: the next push's run does, or start `dev.yml` by hand. A job that reaches its timeout counts as failed; a run cancelled by hand, or by a newer push, does not. `ci-passed` is reported only when it fails alone. A run that does not start, because GitHub refused the workflow file or an action it uses, gets an issue at once. The reporter runs when such a run ends and every two hours, and reports each failed job once per attempt of a run.

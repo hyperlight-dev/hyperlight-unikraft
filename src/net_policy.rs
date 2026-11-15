@@ -789,7 +789,7 @@ pub(crate) fn dns_question_names(data: &[u8]) -> Option<Vec<String>> {
 /// `None` if `data` is no response with answers.  Minimal parser: handles
 /// standard A (type 1) and AAAA (type 28) answers, and credits every one to
 /// the name asked, through any CNAME chain.
-fn dns_answer_ips(data: &[u8]) -> Option<(String, Vec<IpAddr>)> {
+pub(crate) fn dns_answer_ips(data: &[u8]) -> Option<(String, Vec<IpAddr>)> {
     if data.len() < 12 {
         return None;
     }

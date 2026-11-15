@@ -57,6 +57,23 @@ updates:
       - dependency-name: hyperlight-*
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
+  # The fuzz targets' crate, apart as ClickHouse's: fuzz.yml runs it on
+  # Linux alone.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    labels: [dependencies]
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: hyperlight-*
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
   # The Python integrations, libraries whose ranges CI tests at both ends
   # (the integrations job's oldest and newest legs): widened, never raised,
   # so a new major past a cap comes as a pull request and the floors stay.

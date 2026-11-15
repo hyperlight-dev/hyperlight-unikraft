@@ -41,6 +41,9 @@ mod cgroup;
 #[cfg(feature = "cpio")]
 pub mod cpio;
 mod errno;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod hostfs;
 mod hostnet;
 pub mod net_policy;
