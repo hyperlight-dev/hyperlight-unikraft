@@ -106,10 +106,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .args(["sleep", "150", "hello from the first command"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .await?;
     let first_id = first.execution_id();
     // Snapshotting preserves this handle and its pending timer.
-    let checkpoint = sandbox.snapshot()?;
+    let checkpoint = sandbox.snapshot().await?;
     first.park();
     let children = sandbox.children();
     for child in &children {
@@ -131,31 +132,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     let first = sandbox
-        .get_child_by_id(first_id)
+        .children()
+        .by_id(first_id)
         .expect("the parked child is listed")
-        .restore()?;
+        .restore()
+        .await?;
     let second = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "25", "hello from the second command"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .await?;
 
     // Both waits are polled concurrently, including their output drains.
     futures::try_join!(report("first", first), report("second", second))?;
 
-    sandbox.restore(&checkpoint)?;
+    sandbox.restore(&checkpoint).await?;
     let first = sandbox
-        .get_child_by_name("first")
+        .children()
+        .by_name("first")
         .expect("the snapshot retains the named child")
-        .restore()?;
+        .restore()
+        .await?;
     report("restored", first).await?;
 
     let mut tree = sandbox
         .command("/mnt/bin/command")
         .arg("tree")
         .stdout(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .await?;
     let stdout = tree.stdout.take().expect("stdout was configured as piped");
     // The root exits with 7; its sleeping descendant is automatically killed.
     let (status, ()) = futures::try_join!(tree.wait(), async {

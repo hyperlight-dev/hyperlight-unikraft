@@ -6,13 +6,19 @@
 //! Await handles on a Tokio runtime with its time and I/O drivers enabled.
 //! VM entries are synchronous; executor timeouts cannot interrupt CPU-bound
 //! guest code. The existing builder interrupt-handle hook remains available.
+//!
+//! Lifecycle operations await lock availability without holding locks or a strong
+//! sandbox reference while pending. Do not synchronously wait for these futures
+//! from a callback entered by the same VM. Async host callbacks may await kills,
+//! but must not await snapshot capture or restoration that needs their own driver.
 
 use std::collections::BTreeMap;
 use std::io;
+use std::ops::{Deref, DerefMut, Index};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use futures::{
     future::poll_fn,
@@ -21,18 +27,21 @@ use futures::{
 
 use crate::{
     AppSandbox, Error, Result, Yield, async_calls,
-    execution::{CommandMetadata, Execution, Subscription},
+    execution::{CommandMetadata, Execution, Subscription, WakeSet},
 };
 
 /// A sandbox dedicated to independently polled command trees.
 ///
-/// There is no background executor. Poll a child's wait or its pipes to drive
-/// that tree's host operations and guest threads. Other command trees do not run.
+/// There is no background executor. Poll a child's wait to drive that tree's
+/// host operations and guest threads. Pipes only access host-side buffers;
+/// poll their I/O concurrently with the wait. Other command trees do not run.
 /// Snapshots preserve existing child handles; replacing the current guest from a
-/// snapshot requires parking or dropping them first. The legacy interpreter API is unavailable.
+/// snapshot requires parking or dropping unfinished children first.
+/// The legacy interpreter API is unavailable.
 ///
-/// This owner cannot be cloned. Command builders, children and pipes hold weak
-/// references; keep this value alive while using them.
+/// This owner cannot be cloned. Command builders and children hold weak
+/// references. Pipes share only host-side state, with no sandbox reference.
+/// Keep this value alive to run commands.
 ///
 /// ```compile_fail
 /// use hyperlight_unikraft::command::CommandSandbox;
@@ -45,6 +54,100 @@ pub struct CommandSandbox(Arc<Coordinator>);
 /// Stable execution identity within a command sandbox, distinct from a guest PID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExecutionId(u64);
+
+/// An eagerly collected, read-only listing in execution-ID order.
+///
+/// Membership, order and metadata stay fixed even as commands are spawned or
+/// completed. Each entry's lifecycle flags remain live. The collection does not
+/// retain the sandbox or execution resources. Collect again to refresh the listing.
+#[derive(Clone, Debug)]
+pub struct Children {
+    entries: Vec<ChildInfo>,
+}
+
+impl Children {
+    /// Number of entries captured in this listing.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether this listing has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate over the captured entries in execution-ID order.
+    pub fn iter(&self) -> std::slice::Iter<'_, ChildInfo> {
+        self.entries.iter()
+    }
+
+    /// Look up an entry by its zero-based position.
+    pub fn get(&self, index: usize) -> Option<&ChildInfo> {
+        self.entries.get(index)
+    }
+
+    /// Look up a captured entry by execution ID, even if it has since completed.
+    pub fn by_id(&self, id: ExecutionId) -> Option<&ChildInfo> {
+        self.entries
+            .binary_search_by_key(&id, |entry| entry.execution_id)
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+
+    /// Look up a captured entry by its exact, case-sensitive launch name.
+    pub fn by_name(&self, name: &str) -> Option<&ChildInfo> {
+        self.entries
+            .iter()
+            .find(|entry| entry.name.as_deref() == Some(name))
+    }
+}
+
+impl Index<usize> for Children {
+    type Output = ChildInfo;
+
+    /// Panics if the position is out of bounds.
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.entries[index]
+    }
+}
+
+impl Index<ExecutionId> for Children {
+    type Output = ChildInfo;
+
+    /// Panics if the execution ID is absent from this listing.
+    fn index(&self, id: ExecutionId) -> &Self::Output {
+        self.by_id(id)
+            .expect("execution ID is absent from child listing")
+    }
+}
+
+impl Index<&str> for Children {
+    type Output = ChildInfo;
+
+    /// Panics if the name is absent from this listing.
+    fn index(&self, name: &str) -> &Self::Output {
+        self.by_name(name)
+            .expect("name is absent from child listing")
+    }
+}
+
+impl IntoIterator for Children {
+    type Item = ChildInfo;
+    type IntoIter = std::vec::IntoIter<ChildInfo>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Children {
+    type Item = &'a ChildInfo;
+    type IntoIter = std::slice::Iter<'a, ChildInfo>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
 
 /// Command metadata and live lifecycle flags, without acquiring a driving handle.
 ///
@@ -79,6 +182,7 @@ pub struct ChildInfo {
 
 impl ChildInfo {
     fn new(coordinator: &Arc<Coordinator>, execution: &Execution) -> Self {
+        let _notify = NotifyOnDrop(&coordinator.state.activity);
         let parked = execution.driving.lock().unwrap().parked.clone();
         let process = execution.process.lock().unwrap();
         Self {
@@ -112,31 +216,60 @@ impl ChildInfo {
     /// Reacquire this command from its originating sandbox without driving it.
     ///
     /// Rechecks the current state rather than relying on a prior status read.
-    /// Fails if a driving handle exists or parking
-    /// is still in progress. Also fails if forgotten or the sandbox has been dropped.
+    /// Waits for in-flight operations; fails if a driving handle still exists,
+    /// the command has completed, or the sandbox has been dropped.
     /// Previously taken pipe handles remain invalid; the returned child owns new
     /// handles to the preserved streams. Resources are reconstructed when first driven.
-    pub fn restore(&self) -> Result<Child> {
-        self.coordinator()?.restore_child(self.execution_id)
-    }
-
-    /// Release this command's retained metadata, output and name.
-    ///
-    /// Requires a parked, completed command and rechecks the current state.
-    /// Fails if already forgotten or the originating sandbox has been dropped.
-    pub fn forget(&self) -> Result<()> {
-        let coordinator = self.coordinator()?;
-        let _transition = coordinator.transition()?;
-        coordinator.executions.forget(self.execution_id.0)
-    }
-
-    fn coordinator(&self) -> Result<Arc<Coordinator>> {
-        self.sandbox.upgrade().ok_or_else(|| {
-            Error::Wait(io::Error::new(
-                io::ErrorKind::NotFound,
-                "command sandbox has been dropped",
-            ))
+    pub async fn restore(&self) -> Result<Child> {
+        Coordinator::retry(&self.sandbox, |coordinator, attempt| {
+            coordinator.restore_child(self.execution_id, attempt)
         })
+        .await
+    }
+
+    /// Terminate this command, whether parked or holding a child handle.
+    ///
+    /// Like [`Child::kill`], stops the entire tree without polling host futures.
+    /// Existing child handles retain the root status and buffered output; stdin
+    /// closes and output reaches EOF. Successful termination removes the command
+    /// from fresh listings and releases its name.
+    ///
+    /// Already completed commands and dropped sandboxes are successful no-ops.
+    /// Waits for lifecycle and VM access. Cancelling while waiting does not request
+    /// termination. Returns `NotFound` if snapshot restoration has
+    /// replaced this execution. An old entry never kills its replacement.
+    pub async fn kill(&self) -> Result<()> {
+        if self.completed() {
+            return Ok(());
+        }
+        let result = Coordinator::retry(&self.sandbox, |coordinator, attempt| {
+            let _transition = coordinator.transition(attempt)?;
+            if self.completed() {
+                return Ok(());
+            }
+            let execution = coordinator
+                .executions
+                .get(self.execution_id.0)
+                .filter(|execution| Arc::ptr_eq(&execution.done, &self.completed))
+                .ok_or_else(|| {
+                    Error::Wait(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "command execution is no longer present",
+                    ))
+                })?;
+            let result = {
+                let mut sandbox = coordinator.try_sandbox(attempt)?;
+                coordinator.kill_execution(&execution, &mut sandbox)
+            };
+            coordinator.executions.wake_all();
+            result
+        })
+        .await;
+        if self.sandbox.upgrade().is_none() {
+            Ok(())
+        } else {
+            result
+        }
     }
 }
 
@@ -156,26 +289,109 @@ struct Coordinator {
     lifecycle: Mutex<()>,
     sandbox: Mutex<AppSandbox>,
     executions: Arc<crate::execution::Executions>,
+    state: Arc<CoordinatorState>,
+}
+
+#[derive(Default)]
+struct CoordinatorState {
     failure: Mutex<Option<String>>,
+    dropped: AtomicBool,
+    lifecycle: Arc<WakeSet>,
+    vm: Arc<WakeSet>,
+    activity: Arc<WakeSet>,
+}
+
+impl CoordinatorState {
+    fn check(&self) -> Result<()> {
+        match self.failure.lock().unwrap().as_ref() {
+            Some(message) => Err(Error::Wait(io::Error::other(message.clone()))),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Drop for Coordinator {
     fn drop(&mut self) {
+        self.state.dropped.store(true, Ordering::Release);
         for execution in self.executions.list() {
             execution.shutdown();
         }
+        self.state.lifecycle.notify();
+        self.state.vm.notify();
+        self.state.activity.notify();
     }
 }
 
 struct CleanupGuard<'a> {
     coordinator: &'a Coordinator,
     lifecycle: Option<MutexGuard<'a, ()>>,
+    activity: bool,
 }
 
 impl Drop for CleanupGuard<'_> {
     fn drop(&mut self) {
-        drop(self.lifecycle.take());
+        let lifecycle = self.lifecycle.take();
+        let held_lifecycle = lifecycle.is_some();
+        drop(lifecycle);
         self.coordinator.finish_pending_kills();
+        if held_lifecycle {
+            self.coordinator.state.lifecycle.notify();
+        }
+        if self.activity {
+            self.coordinator.state.activity.notify();
+        }
+    }
+}
+
+struct Attempt<'a> {
+    waker: &'a Waker,
+    subscription: &'a mut Option<Subscription>,
+}
+
+impl Attempt<'_> {
+    // Register before trying the lock, then discard the subscription on success
+    // so releasing our own guard cannot repeatedly wake a contended operation.
+    fn watch(&mut self, wake: &Arc<WakeSet>) {
+        let subscription = wake.subscribe();
+        subscription.register(self.waker);
+        *self.subscription = Some(subscription);
+    }
+
+    fn acquired(&mut self) {
+        self.subscription.take();
+    }
+}
+
+struct NotifyingGuard<'a, T> {
+    guard: Option<MutexGuard<'a, T>>,
+    wake: &'a WakeSet,
+}
+
+impl<T> Deref for NotifyingGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.guard.as_ref().unwrap()
+    }
+}
+
+impl<T> DerefMut for NotifyingGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.guard.as_mut().unwrap()
+    }
+}
+
+impl<T> Drop for NotifyingGuard<'_, T> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.wake.notify();
+    }
+}
+
+struct NotifyOnDrop<'a>(&'a WakeSet);
+
+impl Drop for NotifyOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.notify();
     }
 }
 
@@ -202,7 +418,7 @@ impl AppSandbox {
             lifecycle: Mutex::new(()),
             executions: self.config.executions.clone(),
             sandbox: Mutex::new(self),
-            failure: Mutex::new(None),
+            state: Arc::default(),
         })))
     }
 }
@@ -214,75 +430,70 @@ impl CommandSandbox {
     /// sockets and pending host calls are unchanged. Restored copies start parked;
     /// unfinished calls there are interrupted when driven. Completed data replies
     /// are retained, but replies tied to reset sockets are not.
-    /// Returns `WouldBlock` through [`Error::Wait`] if a VM entry, child poll or
-    /// handle/pipe operation prevents a consistent capture. Retry when it finishes.
-    pub fn snapshot(&self) -> Result<CommandSnapshot> {
-        let _transition = self.0.transition()?;
-        self.0.failure()?;
-        let result = {
-            let mut sandbox = self.0.try_sandbox()?;
-            let inbox = sandbox.config.async_inbox.clone();
-            self.0.executions.snapshot(&inbox, || sandbox.snapshot())
-        };
-        // Polls that encountered our locks must get another chance to run.
-        for execution in self.0.executions.list() {
-            execution.wake.notify();
-        }
-        let (executions, guest) = result?;
-        Ok(CommandSnapshot { guest, executions })
+    /// Waits until concurrent VM entries, child polls and handle/pipe operations
+    /// permit a consistent capture, without driving command futures.
+    pub async fn snapshot(&self) -> Result<CommandSnapshot> {
+        Coordinator::retry(&Arc::downgrade(&self.0), |_, attempt| {
+            let _transition = self.0.transition(attempt)?;
+            self.0.failure()?;
+            let result = {
+                let mut sandbox = self.0.try_sandbox(attempt)?;
+                let inbox = sandbox.config.async_inbox.clone();
+                attempt.watch(&self.0.state.activity);
+                self.0.executions.snapshot(&inbox, || sandbox.snapshot())
+            };
+            // Polls that encountered our locks must get another chance to run.
+            for execution in self.0.executions.list() {
+                execution.wake.notify();
+            }
+            let (executions, guest) = result?;
+            Ok(CommandSnapshot { guest, executions })
+        })
+        .await
     }
 
     /// Replace the guest and command state with a snapshot. All commands restore
     /// parked; use their saved execution IDs to reacquire handles.
     ///
-    /// All current children must be parked or dropped first. Old pipe handles remain invalid.
-    pub fn restore(&self, snapshot: &CommandSnapshot) -> Result<()> {
-        let _transition = self.0.transition()?;
-        let inbox = self.0.try_sandbox()?.config.async_inbox.clone();
-        self.0.executions.prepare_restore()?;
-        let mut sandbox = self.0.try_sandbox()?;
-        self.0
-            .executions
-            .restore(&snapshot.executions, &inbox, sandbox.config.net.as_ref());
-        let result = sandbox.restore(snapshot.guest.clone());
-        self.0.executions.negotiate(&inbox);
-        *self.0.failure.lock().unwrap() = result.as_ref().err().map(ToString::to_string);
-        result
+    /// All unfinished children must be parked or dropped first. Completed handles
+    /// retain their status and buffered output independently of the restored state.
+    /// Previously parked pipe handles remain invalid.
+    /// Waits for in-flight operations before replacing the current state.
+    pub async fn restore(&self, snapshot: &CommandSnapshot) -> Result<()> {
+        Coordinator::retry(&Arc::downgrade(&self.0), |_, attempt| {
+            let _transition = self.0.transition(attempt)?;
+            let inbox = self.0.try_sandbox(attempt)?.config.async_inbox.clone();
+            attempt.watch(&self.0.state.activity);
+            self.0.executions.prepare_restore()?;
+            let mut sandbox = self.0.try_sandbox(attempt)?;
+            self.0
+                .executions
+                .restore(&snapshot.executions, &inbox, sandbox.config.net.as_ref());
+            let result = sandbox.restore(snapshot.guest.clone());
+            self.0.executions.negotiate(&inbox);
+            *self.0.state.failure.lock().unwrap() = result.as_ref().err().map(ToString::to_string);
+            result
+        })
+        .await
     }
 
     /// Observe all retained commands in execution-ID order without driving them.
     ///
-    /// Includes commands with driving handles, parked commands and completed commands
-    /// until forgotten.
+    /// Includes unfinished commands with driving handles and parked commands.
+    /// Commands already completed are excluded. This listing eagerly copies
+    /// metadata and keeps fixed membership; collect again to observe new changes.
     /// Each entry can reacquire its child through [`ChildInfo::restore`].
     /// Observations are not an atomic snapshot of concurrent lifecycle changes.
-    pub fn children(&self) -> Vec<ChildInfo> {
-        self.0
-            .executions
-            .list()
-            .into_iter()
-            .map(|execution| ChildInfo::new(&self.0, &execution))
-            .collect()
-    }
-
-    /// Observe a retained command by its sandbox-local execution ID.
-    ///
-    /// Like [`children`](Self::children), does not drive or acquire the child.
-    /// Returns `None` if unknown or forgotten. Use [`ChildInfo::restore`] to
-    /// reacquire it or [`ChildInfo::forget`] to release a completed record.
-    pub fn get_child_by_id(&self, id: ExecutionId) -> Option<ChildInfo> {
-        let execution = self.0.executions.get(id.0)?;
-        Some(ChildInfo::new(&self.0, &execution))
-    }
-
-    /// Observe a retained command by its exact, case-sensitive launch name.
-    ///
-    /// Includes commands with driving handles, parked commands and completed
-    /// commands. Does not drive or acquire the child; use [`ChildInfo::restore`]
-    /// to restore it. Returns `None` for an unknown name.
-    pub fn get_child_by_name(&self, name: &str) -> Option<ChildInfo> {
-        let execution = self.0.executions.get_by_name(name)?;
-        Some(ChildInfo::new(&self.0, &execution))
+    pub fn children(&self) -> Children {
+        Children {
+            entries: self
+                .0
+                .executions
+                .list()
+                .into_iter()
+                .map(|execution| ChildInfo::new(&self.0, &execution))
+                .collect(),
+        }
     }
 
     /// Build a command using an absolute guest executable path.
@@ -318,7 +529,7 @@ pub struct Command {
 pub enum Stdio {
     /// Connect to `/dev/null` (the default).
     Null,
-    /// Expose a bounded, independently pollable host pipe.
+    /// Expose a bounded, passive host pipe. Poll the child's wait concurrently.
     Piped,
 }
 
@@ -337,8 +548,8 @@ impl Command {
     /// Assign a sandbox-local name, retained across parking and snapshots.
     ///
     /// Names are case-sensitive and must be nonempty and contain no NUL.
-    /// Spawn rejects duplicates with `AlreadyExists`, including retained completed
-    /// commands. Forget the old command before reusing its name.
+    /// Spawn rejects duplicates with `AlreadyExists`. Completion or successful
+    /// termination releases the name, even while the old child handle still exists.
     /// This host-side label does not change the guest executable or arguments.
     pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
         self.name = Some(name.into());
@@ -394,17 +605,24 @@ impl Command {
     /// Launch without polling any command's host futures.
     ///
     /// Requires an absolute executable path; there is no PATH search. Accepted
-    /// commands remain owned by the sandbox if their handles are dropped.
-    pub fn spawn(&mut self) -> Result<Child> {
-        let coordinator = self.sandbox.upgrade().ok_or_else(|| {
-            Error::Wait(io::Error::new(
-                io::ErrorKind::NotFound,
-                "command sandbox has been dropped",
-            ))
-        })?;
-        let _transition = coordinator.transition()?;
+    /// commands remain owned by the sandbox while parked. Dropping a child kills it.
+    /// Waits for lifecycle and VM access. Cancelling while waiting launches nothing.
+    pub async fn spawn(&mut self) -> Result<Child> {
+        let source = self.sandbox.clone();
+        Coordinator::retry(&source, |coordinator, attempt| {
+            self.spawn_once(coordinator, attempt)
+        })
+        .await
+    }
+
+    fn spawn_once(
+        &self,
+        coordinator: &Arc<Coordinator>,
+        attempt: &mut Attempt<'_>,
+    ) -> Result<Child> {
+        let _transition = coordinator.transition(attempt)?;
         coordinator.failure()?;
-        let mut sandbox = coordinator.sandbox.lock().unwrap();
+        let mut sandbox = coordinator.try_sandbox(attempt)?;
         let mut env = BTreeMap::new();
         if !self.clear_env {
             for entry in sandbox
@@ -509,18 +727,52 @@ impl Command {
     /// Capture stdout and stderr while waiting, closing stdin.
     pub async fn output(&mut self) -> Result<Output> {
         self.stdout(Stdio::Piped).stderr(Stdio::Piped);
-        self.spawn()?.wait_with_output().await
+        self.spawn().await?.wait_with_output().await
     }
 
     /// Launch and wait for root exit and command cleanup.
     pub async fn status(&mut self) -> Result<ExitStatus> {
-        self.spawn()?.wait().await
+        self.spawn().await?.wait().await
     }
 }
 
 impl Coordinator {
-    fn restore_child(self: &Arc<Self>, id: ExecutionId) -> Result<Child> {
-        let _transition = self.transition()?;
+    async fn retry<T>(
+        source: &Weak<Self>,
+        mut action: impl FnMut(&Arc<Self>, &mut Attempt<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut subscription = None;
+        poll_fn(|cx| {
+            subscription.take();
+            let Some(coordinator) = source.upgrade() else {
+                return Poll::Ready(Err(Error::Wait(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "command sandbox has been dropped",
+                ))));
+            };
+            let result = action(
+                &coordinator,
+                &mut Attempt {
+                    waker: cx.waker(),
+                    subscription: &mut subscription,
+                },
+            );
+            match result {
+                Err(Error::Wait(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Poll::Pending
+                }
+                result => Poll::Ready(result),
+            }
+        })
+        .await
+    }
+
+    fn restore_child(
+        self: &Arc<Self>,
+        id: ExecutionId,
+        attempt: &mut Attempt<'_>,
+    ) -> Result<Child> {
+        let _transition = self.transition(attempt)?;
         self.failure()?;
         let execution = self.executions.get(id.0).ok_or_else(|| {
             Error::Wait(io::Error::new(
@@ -528,6 +780,7 @@ impl Coordinator {
                 "unknown command execution",
             ))
         })?;
+        attempt.watch(&self.state.activity);
         if execution.kill_requested.load(Ordering::Relaxed) {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -544,6 +797,7 @@ impl Coordinator {
             }
             Err(TryLockError::Poisoned(error)) => panic!("{error}"),
         };
+        attempt.acquired();
         {
             let state = execution.driving.lock().unwrap();
             if !state.parked.load(Ordering::Relaxed) {
@@ -566,9 +820,16 @@ impl Coordinator {
         Ok(Child::new(self.clone(), execution, generation))
     }
 
-    fn try_sandbox(&self) -> Result<MutexGuard<'_, AppSandbox>> {
+    fn try_sandbox(&self, attempt: &mut Attempt<'_>) -> Result<NotifyingGuard<'_, AppSandbox>> {
+        attempt.watch(&self.state.vm);
         match self.sandbox.try_lock() {
-            Ok(guard) => Ok(guard),
+            Ok(guard) => {
+                attempt.acquired();
+                Ok(NotifyingGuard {
+                    guard: Some(guard),
+                    wake: &self.state.vm,
+                })
+            }
             Err(TryLockError::WouldBlock) => Err(Error::Wait(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "a VM entry is still in progress",
@@ -577,13 +838,18 @@ impl Coordinator {
         }
     }
 
-    fn transition(&self) -> Result<CleanupGuard<'_>> {
+    fn transition(&self, attempt: &mut Attempt<'_>) -> Result<CleanupGuard<'_>> {
         self.finish_pending_kills();
+        attempt.watch(&self.state.lifecycle);
         match self.lifecycle.try_lock() {
-            Ok(guard) => Ok(CleanupGuard {
-                coordinator: self,
-                lifecycle: Some(guard),
-            }),
+            Ok(guard) => {
+                attempt.acquired();
+                Ok(CleanupGuard {
+                    coordinator: self,
+                    lifecycle: Some(guard),
+                    activity: false,
+                })
+            }
             Err(TryLockError::WouldBlock) => Err(Error::Wait(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "another command lifecycle transition is in progress",
@@ -636,16 +902,25 @@ impl Coordinator {
                 return;
             }
             let lifecycle = match self.lifecycle.try_lock() {
-                Ok(guard) => guard,
+                Ok(guard) => NotifyingGuard {
+                    guard: Some(guard),
+                    wake: &self.state.lifecycle,
+                },
                 Err(TryLockError::WouldBlock) => return,
                 Err(TryLockError::Poisoned(error)) => {
                     tracing::error!("cannot terminate dropped commands: lifecycle lock poisoned");
-                    error.into_inner()
+                    NotifyingGuard {
+                        guard: Some(error.into_inner()),
+                        wake: &self.state.lifecycle,
+                    }
                 }
             };
             for execution in pending {
                 let mut sandbox = match self.sandbox.try_lock() {
-                    Ok(sandbox) => sandbox,
+                    Ok(sandbox) => NotifyingGuard {
+                        guard: Some(sandbox),
+                        wake: &self.state.vm,
+                    },
                     Err(TryLockError::WouldBlock) => return,
                     Err(TryLockError::Poisoned(error)) => {
                         tracing::error!("cannot terminate dropped command: VM lock poisoned");
@@ -664,6 +939,7 @@ impl Coordinator {
                     *execution.failure.lock().unwrap() = Some(error.to_string());
                 }
                 self.executions.wake_all();
+                self.state.activity.notify();
             }
             // Recheck after releasing the gate: a callback may have dropped another child.
             drop(lifecycle);
@@ -682,16 +958,15 @@ impl Coordinator {
             Err(error) => Err(error),
         };
         if let Err(error) = &result {
-            *self.failure.lock().unwrap() = Some(error.to_string());
+            *self.state.failure.lock().unwrap() = Some(error.to_string());
+        } else {
+            self.executions.complete_entry();
         }
         result
     }
 
     fn failure(&self) -> Result<()> {
-        match self.failure.lock().unwrap().as_ref() {
-            Some(message) => Err(Error::Wait(io::Error::other(message.clone()))),
-            None => Ok(()),
-        }
+        self.state.check()
     }
 
     fn poll(
@@ -703,6 +978,7 @@ impl Coordinator {
         let _cleanup = CleanupGuard {
             coordinator: self,
             lifecycle: None,
+            activity: true,
         };
         if let Err(error) = execution.check_driver(generation) {
             return Poll::Ready(Err(error));
@@ -720,7 +996,7 @@ impl Coordinator {
         };
         let result = self.poll_locked(execution, generation, cx, &mut calls);
         if execution.done.load(std::sync::atomic::Ordering::Relaxed)
-            || self.failure.lock().unwrap().is_some()
+            || self.state.failure.lock().unwrap().is_some()
         {
             calls.clear();
         }
@@ -745,6 +1021,10 @@ impl Coordinator {
         cx: &mut Context<'_>,
         calls: &mut async_calls::PendingCalls,
     ) -> Poll<Result<()>> {
+        if execution.done.load(Ordering::Relaxed) {
+            calls.clear();
+            return Poll::Pending;
+        }
         let resuming = execution.driving.lock().unwrap().resume.is_some();
         let polled = if resuming {
             Poll::Ready(Ok(async_calls::Wake::Calls))
@@ -771,7 +1051,10 @@ impl Coordinator {
             Poll::Ready(Ok(wake)) => wake,
         };
         let mut sandbox = match self.sandbox.try_lock() {
-            Ok(sandbox) => sandbox,
+            Ok(sandbox) => NotifyingGuard {
+                guard: Some(sandbox),
+                wake: &self.state.vm,
+            },
             Err(TryLockError::WouldBlock) => {
                 // Prepared call batches stay in the engine until delivered.
                 if wake == async_calls::Wake::Timer {
@@ -781,6 +1064,10 @@ impl Coordinator {
             }
             Err(TryLockError::Poisoned(error)) => panic!("{error}"),
         };
+        // A concurrent kill may have completed while host futures were polled.
+        if execution.done.load(Ordering::Relaxed) {
+            return Poll::Pending;
+        }
         self.executions.before_entry(execution.id);
         let AppSandbox {
             config,
@@ -840,13 +1127,15 @@ pub struct Output {
 ///
 /// Dropping a borrowed wait future is safe. Dropping this handle terminates its
 /// tree and invalidates taken pipes. Use [`park`](Self::park) to consume the handle
-/// without killing the tree, then look it up with [`CommandSandbox::get_child_by_id`]
+/// without killing the tree, then look it up with [`Children::by_id`]
 /// and restore using [`ChildInfo::restore`].
 /// Drop normally terminates synchronously without polling host futures. If a VM
 /// entry or lifecycle operation is in progress, termination is deferred until it
 /// releases its locks. Drop failures are logged and retained as execution errors;
 /// use [`kill`](Self::kill) to receive errors directly.
-/// Root exit automatically kills any remaining descendants.
+/// Root exit automatically kills any remaining descendants. Completion removes
+/// the command from sandbox lookup and future snapshots and releases its name;
+/// this handle retains the exit status and buffered output.
 /// This handle and its pipes do not keep the sandbox alive. When its last owner
 /// is dropped, unfinished commands report SIGKILL (9) without a guest VM entry;
 /// completed commands retain their status. Buffered output can be drained to EOF.
@@ -868,11 +1157,12 @@ pub struct Child {
 
 impl Child {
     fn new(coordinator: Arc<Coordinator>, execution: Arc<Execution>, generation: u64) -> Self {
+        let state = coordinator.state.clone();
         let coordinator = Arc::downgrade(&coordinator);
         let streams = execution.driving.lock().unwrap().streams;
         let pipe = |stream| ChildPipe {
             subscription: execution.wake.subscribe(),
-            coordinator: coordinator.clone(),
+            state: state.clone(),
             execution: execution.clone(),
             generation,
             stream,
@@ -902,31 +1192,41 @@ impl Child {
     ///
     /// Cancels pending host work and releases host sockets and timers without VM
     /// entry. Taken pipes become invalid; logical streams and buffered data remain
-    /// available to a restored child. An in-flight poll finishes parking on return.
+    /// available to a restored child.
+    /// A completed child is already removed and cannot be restored using this ID.
     pub fn park(self) -> ExecutionId {
         self.release(false);
         self.execution_id()
     }
 
-    /// Synchronously stop the root, all descendants, and their workers.
+    /// Stop the root, all descendants, and their workers.
     ///
     /// Uses one VM entry, without polling host futures or draining output.
     /// Unforwarded output is discarded; bytes already in host pipe buffers
     /// remain readable, followed by EOF. Taken stdin handles are closed too.
     /// After success, `wait()` is immediately ready with the root's status.
+    /// The command is removed from sandbox lookup and future snapshots, freeing
+    /// its name. This handle and its pipes retain status and buffered output.
     /// Like other VM entries, this cannot preempt CPU-bound guest code.
-    /// Returns `WouldBlock` if another lifecycle operation (such as snapshot
-    /// capture) is in progress.
-    pub fn kill(&mut self) -> Result<()> {
-        let Some(coordinator) = self.coordinator.upgrade() else {
-            return Ok(());
-        };
-        let _transition = coordinator.transition()?;
-        self.execution.check_driver(self.generation)?;
-        let result =
-            coordinator.kill_execution(&self.execution, &mut coordinator.sandbox.lock().unwrap());
-        coordinator.executions.wake_all();
-        result
+    /// Waits for lifecycle and VM access. Cancelling while waiting does not request
+    /// termination. Once admitted, the VM entry and cleanup run synchronously.
+    pub async fn kill(&mut self) -> Result<()> {
+        let result = Coordinator::retry(&self.coordinator, |coordinator, attempt| {
+            let _transition = coordinator.transition(attempt)?;
+            self.execution.check_driver(self.generation)?;
+            let result = {
+                let mut sandbox = coordinator.try_sandbox(attempt)?;
+                coordinator.kill_execution(&self.execution, &mut sandbox)
+            };
+            coordinator.executions.wake_all();
+            result
+        })
+        .await;
+        if self.coordinator.upgrade().is_none() {
+            Ok(())
+        } else {
+            result
+        }
     }
     /// Guest root PID once the executable has started.
     pub fn id(&self) -> Option<u32> {
@@ -940,6 +1240,7 @@ impl Child {
         let Some(coordinator) = self.coordinator.upgrade() else {
             return Ok(Some(self.terminated_status()));
         };
+        let _notify = NotifyOnDrop(&coordinator.state.activity);
         self.execution.check_driver(self.generation)?;
         coordinator.failure()?;
         self.execution.check()?;
@@ -973,6 +1274,8 @@ impl Child {
     /// Root exit automatically kills remaining descendants, including reparented
     /// ones. Output already written is forwarded before cleanup completes.
     /// Cancellation is safe. Descendant exit codes are not aggregated.
+    /// Polling this future drives guest execution and host futures. Pipes are
+    /// passive buffers and make no execution progress on their own.
     /// Piped output must be drained concurrently or via
     /// [`wait_with_output`](Self::wait_with_output).
     pub async fn wait(&mut self) -> Result<ExitStatus> {
@@ -1025,6 +1328,7 @@ impl Child {
         let Some(coordinator) = self.coordinator.upgrade() else {
             return;
         };
+        let _notify = NotifyOnDrop(&coordinator.state.activity);
         {
             let state = self.execution.driving.lock().unwrap();
             if state.generation != self.generation || state.parked.load(Ordering::Relaxed) {
@@ -1059,7 +1363,7 @@ impl Drop for Child {
 
 struct ChildPipe {
     subscription: Subscription,
-    coordinator: Weak<Coordinator>,
+    state: Arc<CoordinatorState>,
     execution: Arc<Execution>,
     generation: u64,
     stream: usize,
@@ -1067,39 +1371,47 @@ struct ChildPipe {
 
 impl Drop for ChildPipe {
     fn drop(&mut self) {
-        let Some(_coordinator) = self.coordinator.upgrade() else {
-            return;
-        };
+        let _notify = NotifyOnDrop(&self.state.activity);
         let mut state = self.execution.driving.lock().unwrap();
+        if self.state.dropped.load(Ordering::Acquire) {
+            return;
+        }
         if state.parked.load(Ordering::Relaxed) || state.generation != self.generation {
             return;
         }
         state.streams[self.stream] = false;
         if self.stream == 0 {
-            self.execution.pipes[0].eof();
+            self.execution.pipes[0].set_eof();
         } else {
-            self.execution.pipes[self.stream].close();
+            self.execution.pipes[self.stream].set_closed();
         }
+        drop(state);
+        self.execution.pipes[self.stream].notify();
     }
 }
 
 impl ChildPipe {
+    // Actions only access buffers. Wake after releasing the driving gate because
+    // a user waker can drop the sandbox and synchronously shut down executions.
     fn access<T>(
         &self,
-        coordinator: &Coordinator,
-        action: impl FnOnce(&crate::execution::Pipe) -> Poll<io::Result<T>>,
+        action: impl FnOnce(&crate::execution::Pipe, bool) -> Poll<io::Result<T>>,
     ) -> Poll<io::Result<T>> {
+        let _notify = NotifyOnDrop(&self.state.activity);
         let state = self.execution.driving.lock().unwrap();
+        if self.state.dropped.load(Ordering::Acquire) {
+            return action(&self.execution.pipes[self.stream], true);
+        }
         if state.parked.load(Ordering::Relaxed) || state.generation != self.generation {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "command pipe was invalidated by parking",
             )));
         }
-        if let Err(error) = coordinator.failure().and_then(|_| self.execution.check()) {
+        if let Err(error) = self.state.check().and_then(|_| self.execution.check()) {
             return Poll::Ready(Err(io::Error::other(error)));
         }
-        action(&self.execution.pipes[self.stream])
+        action(&self.execution.pipes[self.stream], false)
     }
 }
 
@@ -1110,26 +1422,26 @@ impl AsyncRead for ChildPipe {
         out: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         self.subscription.register(cx.waker());
-        let Some(coordinator) = self.coordinator.upgrade() else {
-            let pipe = &self.execution.pipes[self.stream];
-            pipe.eof();
-            return pipe.read(cx, out);
-        };
-        if let Poll::Ready(result) = self.access(&coordinator, |pipe| pipe.read(cx, out)) {
-            return Poll::Ready(result);
+        let result = self.access(|pipe, dropped| {
+            if dropped {
+                pipe.set_eof();
+            }
+            pipe.read_buffer(cx, out)
+        });
+        if matches!(result, Poll::Ready(Ok(count)) if count != 0) {
+            self.execution.pipes[self.stream].notify();
         }
-        if let Poll::Ready(Err(error)) = coordinator.poll(&self.execution, self.generation, cx) {
-            return Poll::Ready(Err(io::Error::other(error)));
-        }
-        self.access(&coordinator, |pipe| pipe.read(cx, out))
+        result
     }
 }
 
 /// A command's piped standard input; implements `futures::io::AsyncWrite`.
+/// Writes only buffer input; poll [`Child::wait`] concurrently to consume it.
 /// Does not keep the sandbox alive. After sandbox destruction, writes and
 /// flushes return `BrokenPipe`; closing is successful.
 pub struct ChildStdin(ChildPipe);
 /// A command's piped standard output; implements `futures::io::AsyncRead`.
+/// Reads only consume buffered output; poll [`Child::wait`] concurrently to produce it.
 /// Does not keep the sandbox alive. After sandbox destruction, buffered bytes
 /// remain readable, followed by EOF.
 pub struct ChildStdout(ChildPipe);
@@ -1162,37 +1474,36 @@ impl AsyncWrite for ChildStdin {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.0.subscription.register(cx.waker());
-        let Some(coordinator) = self.0.coordinator.upgrade() else {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "command sandbox has been dropped",
-            )));
-        };
-        if let Poll::Ready(result) = self.0.access(&coordinator, |pipe| pipe.write(cx, bytes)) {
-            return Poll::Ready(result);
+        let result = self.0.access(|pipe, dropped| {
+            if dropped {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            pipe.write_buffer(cx, bytes)
+        });
+        if matches!(result, Poll::Ready(Ok(count)) if count != 0) {
+            self.0.execution.pipes[self.0.stream].notify();
         }
-        if let Poll::Ready(Err(error)) = coordinator.poll(&self.0.execution, self.0.generation, cx)
-        {
-            return Poll::Ready(Err(io::Error::other(error)));
-        }
-        self.0.access(&coordinator, |pipe| pipe.write(cx, bytes))
+        result
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let Some(coordinator) = self.0.coordinator.upgrade() else {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "command sandbox has been dropped",
-            )));
-        };
-        self.0.access(&coordinator, |_| Poll::Ready(Ok(())))
+        self.0.access(|_, dropped| {
+            Poll::Ready(if dropped {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            })
+        })
     }
     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let Some(coordinator) = self.0.coordinator.upgrade() else {
-            return Poll::Ready(Ok(()));
-        };
-        self.0.access(&coordinator, |pipe| {
-            pipe.eof();
+        let result = self.0.access(|pipe, dropped| {
+            if !dropped {
+                pipe.set_eof();
+            }
             Poll::Ready(Ok(()))
-        })
+        });
+        if matches!(result, Poll::Ready(Ok(()))) {
+            self.0.execution.pipes[self.0.stream].notify();
+        }
+        result
     }
 }

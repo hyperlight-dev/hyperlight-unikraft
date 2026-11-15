@@ -81,8 +81,8 @@ let sandbox = SandboxBuilder::from_initrd("build-elfloader/c-rootfs.cpio")
 let first = sandbox.command("/usr/local/bin/first")
     .arg("one argument with spaces")
     .stdout(Stdio::piped())
-    .spawn()?;
-let second = sandbox.command("/usr/local/bin/second").spawn()?;
+    .spawn().await?;
+let second = sandbox.command("/usr/local/bin/second").spawn().await?;
 let (first, second) = futures::try_join!(
     first.wait_with_output(),
     second.wait_with_output(),
@@ -91,6 +91,22 @@ assert!(first.status.success() && second.status.success());
 # Ok(())
 # }
 ```
+
+Command lifecycle methods are async: `Command::spawn`, `Child::kill`,
+`ChildInfo::kill`/`restore`, and `CommandSandbox::snapshot`/`restore`.
+They await internal contention instead of returning `WouldBlock`, registering
+wakeups rather than polling in a retry loop. Pending operations hold neither locks
+nor a strong sandbox reference. Cancelling a queued spawn or kill has no launch
+or termination side effect. Parking, dropping, listing and `try_wait()` remain
+synchronous; boot and the legacy `AppSandbox` snapshot/restore API are unchanged.
+Uncontended lifecycle operations can complete on their first poll without a Tokio
+runtime, but VM entries themselves remain synchronous and non-preemptible.
+
+Do not block a synchronous host callback waiting for a lifecycle future on the
+same sandbox: the callback runs inside the VM lock that the operation needs.
+Async host callbacks run outside that lock and may await `kill()`. They must not
+await snapshot capture or restoration that requires their own active driver to
+be released; have an external task perform those operations instead.
 
 Each host-launched root and all its descendants share one execution identity.
 It survives guest `exec` and reparenting. That execution owns its future set,
@@ -102,8 +118,12 @@ buffered output.
 Execution contexts separate progress and resource ownership, not guest security
 boundaries.
 
-Polling a child's wait, stdin, stdout, or stderr drives that tree's host
-operations. There is no background task or sandbox-wide async runner. VM entry
+Polling a child's `wait()` drives that tree's guest execution and host
+operations. Pipes are passive: reads consume buffered output, and writes enqueue
+input, waiting for data or capacity without driving the guest or polling host
+futures. Poll `wait()` concurrently with pipe I/O; awaiting pipe I/O alone can
+stall indefinitely. `wait_with_output()` already drives the wait and drains both
+output pipes concurrently. There is no background task or sandbox-wide async runner. VM entry
 is serialized, and embedder futures are polled outside the VM lock. Entering
 for one tree can still schedule runnable guest threads from another, or
 observe another tree's elapsed guest timers. It does **not** poll that other
@@ -128,16 +148,24 @@ the child's `stdin` field; take the handle first to manage its lifetime yourself
 the tree or entering the VM. Pending host
 futures and host timer registrations are dropped, and host sockets are closed.
 Guest threads cannot run until the child is restored and driven again.
-If another task is inside a pipe poll, teardown finishes when that poll returns.
+Parking serializes with pipe-buffer accesses.
 Taken stream handles become invalid (`BrokenPipe`), including after child restoration.
 Untaken streams and buffered bytes are preserved, not closed.
 
 Use `let id = child.park()`, then
-`sandbox.get_child_by_id(id)` to retrieve `Option<ChildInfo>` and `info.restore()`
+`let children = sandbox.children()` and `children.by_id(id)` to retrieve
+`Option<&ChildInfo>`, then `info.restore().await`
 to acquire a new exclusive handle. The first drive
 reconstructs resources and interrupts unfinished calls with `EINTR`; the guest
 chooses whether to retry. `sandbox.children()` lists all retained commands in
-execution-ID order, including commands with driving handles and completed commands. Each `ChildInfo`
+execution-ID order, including unfinished commands with driving handles and parked
+commands. The read-only `Children` collection eagerly copies all metadata:
+membership, order and `len()` stay fixed, while lifecycle flags remain live.
+Use `iter()`, `for info in &children`, or consume it with `into_iter()`.
+`get(index)`, `by_id(id)` and `by_name(name)` return `Option<&ChildInfo>`.
+Indexing with `children[index]`, `children[id]` or `children["worker"]` borrows
+an entry and panics if absent. There is no `Deref` or mutation API.
+Collect a fresh listing to observe new commands or removals. Each `ChildInfo`
 reports `execution_id`, the guest `pid` if known, and live atomic-backed methods
 `parked()` (no child driving handle) and `completed()`
 (root, descendant and worker cleanup finished). Parked commands do not run
@@ -150,36 +178,51 @@ snapshot restoration, including independent clones. Environment values may
 contain secrets, so avoid logging them or the full debug representation.
 
 Optionally assign a name with `sandbox.command("/mnt/bin/command").name("worker")`
-before spawning. `sandbox.get_child_by_name("worker")` returns `Option<ChildInfo>`, with
+before spawning. `children.by_name("worker")` returns `Option<&ChildInfo>`, with
 `Some(info)` containing metadata just
 like an entry from `children()`, without driving or acquiring the child. Inspect
-its metadata and live status, then call `info.restore()` after parking the child
+its metadata and live status, then call `info.restore().await` after parking the child
 to reacquire it without saving the ID. `child.name()` and `ChildInfo::name` expose
 the launch name. Names are exact and case-sensitive, cannot be empty or contain
-NUL, and must be unique among retained commands (including completed ones).
+NUL, and must be unique among unfinished commands.
 Duplicate names fail at spawn with `AlreadyExists`; an unknown lookup returns
-`None`. Restoration through `info.restore()` still returns a `Result`.
+`None`. Awaiting `info.restore()` still returns a `Result`.
 Names survive snapshots and are local to each sandbox, so independent
-snapshot copies can restore the same name independently. Forgetting a completed
-command releases its name. Names do not alter guest arguments or process titles.
+snapshot copies can restore the same name independently. Completion or successful
+termination releases the name, even while the old child handle exists.
+Names do not alter guest arguments or process titles.
 
-Call `info.restore()` to
+Call `info.restore().await` to
 reacquire that command from its originating sandbox. Lifecycle methods share
 the execution's atomic flags, including across cloned entries; other metadata
 remains an observation. Restoration still rechecks whether a driving handle exists.
 After in-place snapshot restoration, obtain new entries for the replacement
 executions; old entries retain their original executions' final flags.
 Listing neither drives commands nor keeps the sandbox alive; entries remain
-usable across parking but fail after forgetting the command or dropping its sandbox.
+usable across parking but restoration fails after completion or dropping its sandbox.
 A child with a driving handle is not necessarily being polled. Filter `children()`
 with `info.parked()` to list only parked commands.
-Completed executions and their output remain available until `info.forget()`;
-that method requires a parked, completed command. To discard an unfinished
-command, restore it, kill it, drop it, then forget it.
+Normal completion and successful termination automatically remove the command
+from fresh listings, their ID/name lookups, and future snapshots. Previously
+collected listings keep their entries. Existing `ChildInfo` values
+still observe completion, but cannot restore the removed command. Existing child
+handles retain their exit status and buffered output until dropped. There is no
+forget API. To discard a parked command, call `info.kill().await`, or restore it and
+kill or drop its child.
+Parking an already completed child does not retain it for restoration.
 
-Command builders, children and their pipe handles hold weak references to the
-sandbox. `CommandSandbox` cannot be cloned; keep that owner alive while using
-them. Spawning from a builder after the owner is dropped returns `NotFound`.
+`info.kill().await` terminates the command directly, whether parked or owned by a live
+child handle. Existing handles still report the root status and can drain buffered
+output to EOF. It is a successful no-op after completion or sandbox destruction.
+Busy lifecycle operations or VM entries are awaited internally.
+An entry from before in-place snapshot replacement cannot kill the replacement:
+an unfinished stale entry returns `NotFound`. Use a fresh listing to target it.
+
+Command builders and children hold weak references to the sandbox. Pipes hold
+only shared host-side buffers, lifecycle/error state and wakeups, with no sandbox
+reference; pipe operations cannot prolong the VM's lifetime.
+`CommandSandbox` cannot be cloned; keep that owner alive to run commands.
+Spawning from a builder after the owner is dropped returns `NotFound`.
 Dropping the owner destroys the VM without a guest
 entry, cancels host futures and timers, closes sockets, and wakes pending waits
 and pipe operations. Unfinished children report synthetic SIGKILL (signal 9);
@@ -199,11 +242,13 @@ because their host resources no longer exist. Cancellation cannot undo side
 effects or make arbitrary retries safe.
 `kill()` sends SIGKILL to every guest process with that execution identity,
 including descendants reparented to guest init or moved into a new session.
-It is synchronous: one VM entry stops the tree and its workers, cancelling
+Await `kill()` for lifecycle and VM access; one synchronous VM entry then stops
+the tree and its workers, cancelling
 pending host calls without polling them. Stdin is closed, including a taken
 handle. Unforwarded output is discarded; bytes already in the host buffers
 remain readable, followed by EOF. No output draining or Tokio runtime is needed
-to call `kill()`. After success, `wait()` is immediately ready.
+to poll an uncontended `kill()`. After success, `wait()` is immediately ready and the command is
+removed from the registry. Failed termination does not discard an unfinished tree.
 Killing an already completed tree needs no VM entry, and other command trees
 are not signalled. As with other VM entries, CPU-bound guest code requires the
 existing interrupt-handle mechanism to preempt.
@@ -211,7 +256,7 @@ Dropping a child terminates its tree, normally synchronously in one VM entry
 without polling host futures. If a VM entry or lifecycle operation is in progress,
 termination is queued until that operation releases its locks, including drops
 from host callbacks. Failures are logged and retained as execution errors; use
-`kill()` when the caller needs to receive termination errors directly.
+`kill().await` when the caller needs to receive termination errors directly.
 Keep the child alive while driving taken stream handles, even after `wait()`
 returns; dropping or parking the child invalidates those handles. Dropping the
 sandbox owner releases the VM and any unfinished work.
@@ -246,23 +291,26 @@ child and pipe handles. Original commands continue normally. All commands in a
 restored copy start parked; unfinished calls receive `EINTR` when first driven.
 Completed data replies are preserved, except replies tied to sockets that cannot
 survive restoration. Cancellation or retry in the copy does not undo external effects.
+Commands that have finished cleanup are excluded, even if their child handles
+still retain unread output. Those completed handles remain usable after in-place
+restore and cannot drive or kill a restored execution with the same ID.
 
 ```rust,ignore
 let id = child.execution_id();
-let snapshot = sandbox.snapshot()?;
+let snapshot = sandbox.snapshot().await?;
 
 let output = child.wait_with_output().await?;
 
-// Park or drop all children before replacing the current guest state.
-sandbox.restore(&snapshot)?;
-let child = sandbox.get_child_by_id(id).expect("snapshot retains the child").restore()?;
+// Park or drop all unfinished children before replacing the current guest state.
+sandbox.restore(&snapshot).await?;
+let child = sandbox.children()[id].restore().await?;
 ```
 
 `SandboxBuilder::from_command_snapshot(&snapshot)` boots an independent clone.
 Supply host functions, mounts, network policy and listening ports on that builder,
 then call `boot()?.into_commands()?`. Boot and restore do not run command threads
-or invoke their async handlers. Use `children()`, `get_child_by_id(id)` or
-`get_child_by_name(name)` to obtain metadata, then `info.restore()` to drive them.
+or invoke their async handlers. Use `children()` and its `by_id(id)` or
+`by_name(name)` methods to obtain metadata, then `info.restore().await` to reacquire them.
 In-place restore preserves execution-ID allocation high-water
 marks, so IDs from discarded branches are not reused for new commands.
 
@@ -273,10 +321,9 @@ live parking/child restoration does not restart their duration. Connections are 
 and pending resource-dependent operations are interrupted on first drive.
 
 Snapshot capture excludes concurrent VM entries, host-call polls, and handle/pipe
-operations. If a lifecycle transition or operation prevents a consistent capture,
-it returns `Error::Wait` with `WouldBlock`; retry after that operation finishes.
-Replacing the current sandbox with `restore()` still requires parking or dropping
-all child handles first. Taken handles from before parking or restore remain invalid and
+operations, awaiting availability if another operation prevents a consistent capture.
+Replacing the current sandbox with `restore().await` still requires parking or dropping
+all unfinished child handles first. Taken handles from before parking or restore remain invalid and
 cannot consume restored output.
 
 ### Attribution and control wire format

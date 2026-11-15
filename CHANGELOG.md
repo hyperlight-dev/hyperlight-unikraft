@@ -6,13 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Child lookup is unified around `ChildInfo`: `get_child_by_id` and
-  `get_child_by_name` return optional metadata, while `children()` lists all entries.
-  Use `info.restore()` and `info.forget()` instead of sandbox-level restoration
-  and forgetting; filter by `info.parked()` instead of `parked_children()`.
+- `ChildInfo::kill()` terminates parked or active commands without restoring or
+  acquiring a child handle. Existing handles retain status and buffered output;
+  stale metadata cannot terminate a snapshot replacement.
+- `CommandSandbox::children()` returns a read-only `Children` collection with
+  eagerly captured metadata, stable membership, and live lifecycle flags.
+  Supports owned/borrowed iteration, indexing by position, execution ID or name,
+  and optional `get`, `by_id` and `by_name` lookups. Replaces the sandbox's direct
+  `get_child_by_id` and `get_child_by_name` methods.
+  Use `info.restore()` instead of sandbox-level restoration;
+  filter by `info.parked()` instead of `parked_children()`.
 - Optional command names via `Command::name`, exposed by `Child::name()` and
-  `ChildInfo::name`. `CommandSandbox::get_child_by_name` looks up metadata by
-  unique sandbox-local names, returning `Option<ChildInfo>` (`None` if absent).
+  `ChildInfo::name`. `Children::by_name` looks up captured metadata by
+  unique sandbox-local names, returning `Option<&ChildInfo>` (`None` if absent).
   Names are preserved across snapshots; use `info.restore()`
   to reacquire a parked command.
 - `CommandSandbox::children()` lists retained commands with execution ID,
@@ -36,7 +42,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   entry, invalidates taken stream handles, and preserves logical streams and data.
   Child restoration reconstructs resources and interrupts pending calls with `EINTR`.
   Completed data replies survive; established connections do not.
-- Child and pipe handles hold weak sandbox references. Dropping the last sandbox
+- Child handles hold weak sandbox references; passive pipes hold only shared
+  host-side state and no sandbox reference. Dropping the last sandbox
   owner cancels host work, releases sockets, wakes waiters and reports unfinished
   commands as SIGKILL. Completed statuses and already-buffered output are retained;
   output reaches EOF and input writes fail with `BrokenPipe`.
@@ -47,7 +54,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `CommandSandbox::restore`, or boot an independent clone with
   `SandboxBuilder::from_command_snapshot`. Snapshot capture also accepts unparked
   children without changing their handles, pipes, sockets or pending host calls.
-  Restored copies start parked; in-place restore requires parking or dropping all children.
+  Restored copies start parked; in-place restore requires parking or dropping unfinished children.
 - An opt-in async driving release benchmark, including
   latency, throughput, CPU use and VM-entry counts for calls, timers, fan-out
   and ready/delayed TCP and UDP peers.
@@ -62,6 +69,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Command lifecycle operations are async: await spawn, kill, child restoration,
+  and command snapshot capture/restoration. Internal contention waits for wakeups
+  instead of returning `WouldBlock`. Pending operations do not retain the sandbox;
+  cancellation while waiting does not launch or kill a command. Drop cleanup
+  remains nonblocking, and the legacy `AppSandbox` snapshot API is unchanged.
+- Command pipes are passive buffers: reads and writes no longer drive guest
+  execution or host futures. Poll `Child::wait()` concurrently with pipe I/O, or
+  use `wait_with_output()` to drive and drain together.
+- Normal command completion and successful kill/drop automatically remove the
+  child from listing, ID/name lookup, and future snapshots, releasing its name.
+  Existing child handles retain their exit status and buffered output.
+  The explicit `ChildInfo::forget()` API is removed.
 - Command root exit automatically kills remaining descendants, including
   reparented processes. `wait()` and `try_wait()` report command cleanup with the
   root's status; normal exit preserves output already written. `kill()` signals the entire

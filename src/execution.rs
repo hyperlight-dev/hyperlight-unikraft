@@ -124,6 +124,7 @@ pub(crate) struct Executions {
     active: AtomicU64,
     next: Mutex<u64>,
     entries: Mutex<BTreeMap<u64, Arc<Execution>>>,
+    completed: Mutex<Vec<Arc<Execution>>>,
 }
 
 impl Executions {
@@ -178,33 +179,19 @@ impl Executions {
         self.entries.lock().unwrap().values().cloned().collect()
     }
 
-    pub fn get_by_name(&self, name: &str) -> Option<Arc<Execution>> {
-        self.entries
-            .lock()
-            .unwrap()
-            .values()
-            .find(|entry| entry.command.name.as_deref() == Some(name))
-            .cloned()
-    }
-
-    pub fn forget(&self, id: u64) -> crate::Result<()> {
+    pub fn complete_entry(&self) {
+        // Detach under the VM lock, but drop futures and notify waiters only
+        // after leaving it: embedder destructors and wakers may reenter.
         let mut entries = self.entries.lock().unwrap();
-        let entry = entries.get(&id).ok_or_else(|| {
-            Error::Wait(io::Error::new(
-                io::ErrorKind::NotFound,
-                "unknown command execution",
-            ))
-        })?;
-        if !entry.driving.lock().unwrap().parked.load(Ordering::Relaxed)
-            || !entry.done.load(Ordering::Relaxed)
-        {
-            return Err(Error::Wait(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "only a parked, completed command can be forgotten",
-            )));
-        }
-        entries.remove(&id);
-        Ok(())
+        let mut completed = self.completed.lock().unwrap();
+        entries.retain(|_, entry| {
+            if entry.done.load(Ordering::Relaxed) {
+                completed.push(entry.clone());
+                false
+            } else {
+                true
+            }
+        });
     }
 
     pub fn prepare_restore(&self) -> crate::Result<()> {
@@ -361,6 +348,19 @@ impl Executions {
     }
 
     pub fn wake_all(&self) {
+        let completed = std::mem::take(&mut *self.completed.lock().unwrap());
+        for entry in completed {
+            match entry.calls.try_lock() {
+                Ok(mut calls) => calls.clear(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
+            }
+            entry.net.reset();
+            entry.pipes[0].close();
+            entry.pipes[1].eof();
+            entry.pipes[2].eof();
+            entry.wake.notify();
+        }
         let entries: Vec<_> = self.entries.lock().unwrap().values().cloned().collect();
         for entry in entries {
             if entry.done.load(Ordering::Relaxed) {
@@ -501,6 +501,18 @@ pub(crate) struct Pipe {
 
 impl Pipe {
     pub(crate) fn read(&self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<io::Result<usize>> {
+        let result = self.read_buffer(cx, out);
+        if matches!(result, Poll::Ready(Ok(count)) if count != 0) {
+            self.writer.wake();
+        }
+        result
+    }
+
+    pub(crate) fn read_buffer(
+        &self,
+        cx: &mut Context<'_>,
+        out: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         self.reader.register(cx.waker());
         let mut state = self.state.lock().unwrap();
         if out.is_empty() {
@@ -513,15 +525,20 @@ impl Pipe {
         for byte in &mut out[..count] {
             *byte = state.bytes.pop_front().unwrap();
         }
-        drop(state);
-        if count != 0 {
-            self.writer.wake();
-        }
         Poll::Ready(Ok(count))
     }
 
-    pub(crate) fn write(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+    #[cfg(test)]
+    fn write(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
         self.write_min(cx, bytes, 1)
+    }
+
+    pub(crate) fn write_buffer(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.write_min_buffer(cx, bytes, 1)
     }
 
     fn write_chunk(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
@@ -529,6 +546,19 @@ impl Pipe {
     }
 
     fn write_min(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        minimum: usize,
+    ) -> Poll<io::Result<usize>> {
+        let result = self.write_min_buffer(cx, bytes, minimum);
+        if matches!(result, Poll::Ready(Ok(count)) if count != 0) {
+            self.reader.wake();
+        }
+        result
+    }
+
+    fn write_min_buffer(
         &self,
         cx: &mut Context<'_>,
         bytes: &[u8],
@@ -544,26 +574,32 @@ impl Pipe {
             return Poll::Pending;
         }
         state.bytes.extend(&bytes[..count]);
-        drop(state);
-        if count != 0 {
-            self.reader.wake();
-        }
         Poll::Ready(Ok(count))
     }
 
     pub(crate) fn eof(&self) {
+        self.set_eof();
+        self.notify();
+    }
+
+    pub(crate) fn set_eof(&self) {
         self.state.lock().unwrap().eof = true;
+    }
+
+    pub(crate) fn notify(&self) {
         self.reader.wake();
         self.writer.wake();
     }
 
     pub(crate) fn close(&self) {
+        self.set_closed();
+        self.notify();
+    }
+
+    pub(crate) fn set_closed(&self) {
         let mut state = self.state.lock().unwrap();
         state.closed = true;
         state.bytes.clear();
-        drop(state);
-        self.reader.wake();
-        self.writer.wake();
     }
 }
 
@@ -576,8 +612,8 @@ pub(crate) struct ProcessState {
 
 impl Execution {
     pub fn shutdown(&self) {
-        // All polls and handle mutations hold a temporary coordinator reference,
-        // so coordinator destruction cannot race an operation on this engine.
+        // Driver polls hold a temporary coordinator reference, so coordinator
+        // destruction cannot race an operation on this engine.
         let mut calls = match self.calls.lock() {
             Ok(calls) => calls,
             Err(error) => {
