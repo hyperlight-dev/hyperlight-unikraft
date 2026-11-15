@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Optional command names via `Command::name`, exposed by `Child::name()` and
+  `ChildInfo::name`. `CommandSandbox::get_child_by_name` looks up metadata by
+  unique sandbox-local names, preserved across snapshots; use `info.restore()`
+  to reacquire a parked command.
 - `CommandSandbox::children()` lists retained commands with execution ID,
   guest PID, parking state, completion state, executable, arguments, requested
   cwd, resolved launch environment and standard stream configuration. Launch

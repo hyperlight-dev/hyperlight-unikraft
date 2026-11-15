@@ -56,6 +56,8 @@ pub struct ExecutionId(u64);
 pub struct ChildInfo {
     /// Stable execution identity within the originating sandbox.
     pub execution_id: ExecutionId,
+    /// Optional sandbox-local name assigned at launch.
+    pub name: Option<String>,
     /// Absolute guest executable path supplied at launch.
     pub program: String,
     /// Arguments supplied at launch, excluding the executable name (`argv[0]`).
@@ -76,6 +78,24 @@ pub struct ChildInfo {
 }
 
 impl ChildInfo {
+    fn new(coordinator: &Arc<Coordinator>, execution: &Execution) -> Self {
+        let parked = execution.driving.lock().unwrap().parked.clone();
+        let process = execution.process.lock().unwrap();
+        Self {
+            execution_id: ExecutionId(execution.id),
+            name: execution.command.name.clone(),
+            program: execution.command.program.clone(),
+            args: execution.command.args.clone(),
+            cwd: execution.command.cwd.clone(),
+            env: execution.command.env.clone(),
+            stdio: execution.command.stdio,
+            pid: process.pid,
+            parked,
+            completed: execution.done.clone(),
+            sandbox: Arc::downgrade(coordinator),
+        }
+    }
+
     /// Whether this execution is parked (has no child driving handle).
     ///
     /// A child with a driving handle is not necessarily being polled. Parking may still
@@ -226,22 +246,7 @@ impl CommandSandbox {
             .executions
             .list()
             .into_iter()
-            .map(|execution| {
-                let parked = execution.driving.lock().unwrap().parked.clone();
-                let process = execution.process.lock().unwrap();
-                ChildInfo {
-                    execution_id: ExecutionId(execution.id),
-                    program: execution.command.program.clone(),
-                    args: execution.command.args.clone(),
-                    cwd: execution.command.cwd.clone(),
-                    env: execution.command.env.clone(),
-                    stdio: execution.command.stdio,
-                    pid: process.pid,
-                    parked,
-                    completed: execution.done.clone(),
-                    sandbox: Arc::downgrade(&self.0),
-                }
-            })
+            .map(|execution| ChildInfo::new(&self.0, &execution))
             .collect()
     }
 
@@ -273,6 +278,16 @@ impl CommandSandbox {
         self.0.restore_child(id)
     }
 
+    /// Observe a retained command by its exact, case-sensitive launch name.
+    ///
+    /// Includes commands with driving handles, parked commands and completed
+    /// commands. Does not drive or acquire the child; use [`ChildInfo::restore`]
+    /// to restore it. Returns `NotFound` through [`Error::Wait`] for an unknown name.
+    pub fn get_child_by_name(&self, name: &str) -> Result<ChildInfo> {
+        let execution = self.0.executions.get_by_name(name)?;
+        Ok(ChildInfo::new(&self.0, &execution))
+    }
+
     /// Release retained metadata and output for a parked, completed command.
     /// Restore and kill unfinished commands before forgetting them.
     pub fn forget_child(&self, id: ExecutionId) -> Result<()> {
@@ -284,6 +299,7 @@ impl CommandSandbox {
     pub fn command(&self, program: impl Into<String>) -> Command {
         Command {
             sandbox: Arc::downgrade(&self.0),
+            name: None,
             program: program.into(),
             args: Vec::new(),
             env: BTreeMap::new(),
@@ -298,6 +314,7 @@ impl CommandSandbox {
 /// Holds a weak sandbox reference; spawning fails if the sandbox has been dropped.
 pub struct Command {
     sandbox: Weak<Coordinator>,
+    name: Option<String>,
     program: String,
     args: Vec<String>,
     env: BTreeMap<String, Option<String>>,
@@ -327,6 +344,17 @@ impl Stdio {
 }
 
 impl Command {
+    /// Assign a sandbox-local name, retained across parking and snapshots.
+    ///
+    /// Names are case-sensitive and must be nonempty and contain no NUL.
+    /// Spawn rejects duplicates with `AlreadyExists`, including retained completed
+    /// commands. Forget the old command before reusing its name.
+    /// This host-side label does not change the guest executable or arguments.
+    pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
+        self.name = Some(name.into());
+        self
+    }
+
     /// Append one argument without shell parsing.
     pub fn arg(&mut self, value: impl Into<String>) -> &mut Self {
         self.args.push(value.into());
@@ -462,6 +490,7 @@ impl Command {
             sandbox.config.net.as_ref(),
             self.stdio.map(|mode| mode == Stdio::Piped),
             CommandMetadata {
+                name: self.name.clone(),
                 program: self.program.clone(),
                 args: self.args.clone(),
                 cwd: self.cwd.clone(),
@@ -866,6 +895,11 @@ impl Child {
     /// Identity used to reacquire this command after parking its handle.
     pub fn execution_id(&self) -> ExecutionId {
         ExecutionId(self.id)
+    }
+
+    /// Optional sandbox-local name assigned at launch.
+    pub fn name(&self) -> Option<&str> {
+        self.execution.command.name.as_deref()
     }
 
     /// Consume this handle without killing the tree, returning its execution ID.

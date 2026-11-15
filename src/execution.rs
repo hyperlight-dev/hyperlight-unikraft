@@ -83,6 +83,7 @@ pub(crate) struct Execution {
 
 #[derive(Clone)]
 pub(crate) struct CommandMetadata {
+    pub name: Option<String>,
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
@@ -134,6 +135,23 @@ impl Executions {
         command: CommandMetadata,
     ) -> crate::Result<(u64, Arc<Execution>)> {
         let mut entries = self.entries.lock().unwrap();
+        if let Some(name) = &command.name {
+            if name.is_empty() || name.contains('\0') {
+                return Err(Error::Wait(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command name must be nonempty and contain no NUL",
+                )));
+            }
+            if entries
+                .values()
+                .any(|entry| entry.command.name.as_ref() == Some(name))
+            {
+                return Err(Error::Wait(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "command name is already in use",
+                )));
+            }
+        }
         if entries
             .values()
             .filter(|entry| !entry.done.load(Ordering::Relaxed))
@@ -168,6 +186,21 @@ impl Executions {
 
     pub fn list(&self) -> Vec<Arc<Execution>> {
         self.entries.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn get_by_name(&self, name: &str) -> crate::Result<Arc<Execution>> {
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .find(|entry| entry.command.name.as_deref() == Some(name))
+            .cloned()
+            .ok_or_else(|| {
+                Error::Wait(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "unknown command name",
+                ))
+            })
     }
 
     pub fn forget(&self, id: u64) -> crate::Result<()> {

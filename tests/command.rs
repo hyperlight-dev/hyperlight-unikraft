@@ -456,6 +456,103 @@ async fn drop_during_snapshot_wakeup_is_terminated_before_snapshot_returns() {
 }
 
 #[tokio::test]
+async fn named_children_restore_independently_and_reserve_names_until_forgotten() {
+    use hyperlight_unikraft::Error;
+    use std::io::ErrorKind;
+
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut command = sandbox.command("/mnt/bin/command");
+    command
+        .name("worker")
+        .args(["sleep", "0", "named"])
+        .stdout(Stdio::piped());
+    let child = command.spawn().unwrap();
+    let id = child.execution_id();
+    assert_eq!(child.name(), Some("worker"));
+    assert_eq!(sandbox.children()[0].name.as_deref(), Some("worker"));
+    let info = sandbox.get_child_by_name("worker").unwrap();
+    assert_eq!(info.execution_id, id);
+    assert_eq!(info.program, "/mnt/bin/command");
+    assert!(!info.parked());
+    assert!(matches!(info.restore(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::AlreadyExists));
+    assert!(matches!(command.spawn(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::AlreadyExists));
+    assert_eq!(child.park(), id);
+    assert!(info.parked());
+    let snapshot = sandbox.snapshot().unwrap();
+    assert!(matches!(command.spawn(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::AlreadyExists));
+    let fork = SandboxBuilder::from_command_snapshot(&snapshot)
+        .echo_output(false)
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    for source in [&sandbox, &fork] {
+        assert!(
+            matches!(source.get_child_by_name("Worker"), Err(Error::Wait(error))
+            if error.kind() == ErrorKind::NotFound)
+        );
+        let child = source
+            .get_child_by_name("worker")
+            .unwrap()
+            .restore()
+            .unwrap();
+        assert_eq!(child.execution_id(), id);
+        assert_eq!(child.name(), Some("worker"));
+        let out = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"named\n");
+    }
+    assert!(matches!(command.spawn(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::AlreadyExists));
+    sandbox.forget_child(id).unwrap();
+    assert!(
+        matches!(sandbox.get_child_by_name("worker"), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::NotFound)
+    );
+    let replacement = command.spawn().unwrap();
+    assert_ne!(replacement.execution_id(), id);
+    drop(replacement);
+    sandbox.restore(&snapshot).unwrap();
+    let restored = sandbox
+        .get_child_by_name("worker")
+        .unwrap()
+        .restore()
+        .unwrap();
+    assert_eq!(restored.execution_id(), id);
+    assert_eq!(restored.name(), Some("worker"));
+}
+
+#[test]
+fn invalid_names_do_not_register_children_and_unnamed_children_remain_supported() {
+    use hyperlight_unikraft::Error;
+    use std::io::ErrorKind;
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    for name in ["", "bad\0name"] {
+        assert!(matches!(sandbox.command("/mnt/bin/command").name(name)
+            .args(["sleep", "0", "done"]).spawn(), Err(Error::Wait(error))
+            if error.kind() == ErrorKind::InvalidInput));
+        assert!(sandbox.children().is_empty());
+    }
+    for _ in 0..2 {
+        let child = sandbox
+            .command("/mnt/bin/command")
+            .args(["sleep", "0", "done"])
+            .spawn()
+            .unwrap();
+        assert_eq!(child.name(), None);
+        child.park();
+    }
+    assert_eq!(sandbox.children().len(), 2);
+    assert!(sandbox.children().iter().all(|info| info.name.is_none()));
+}
+
+#[tokio::test]
 async fn structured_command_and_distinct_streams() {
     let sandbox = builder().boot().unwrap().into_commands().unwrap();
     let out = tokio::time::timeout(

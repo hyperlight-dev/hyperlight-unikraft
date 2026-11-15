@@ -147,6 +147,19 @@ overrides, removals and `env_clear()`), and `stdio` (stdin, stdout, stderr).
 These are launch values, not live guest state; they survive parking and
 snapshot restoration, including independent clones. Environment values may
 contain secrets, so avoid logging them or the full debug representation.
+
+Optionally assign a name with `sandbox.command("/mnt/bin/command").name("worker")`
+before spawning. `sandbox.get_child_by_name("worker")` returns `ChildInfo`, just
+like an entry from `children()`, without driving or acquiring the child. Inspect
+its metadata and live status, then call `info.restore()` after parking the child
+to reacquire it without saving the ID. `child.name()` and `ChildInfo::name` expose
+the launch name. Names are exact and case-sensitive, cannot be empty or contain
+NUL, and must be unique among retained commands (including completed ones).
+Duplicate names fail at spawn with `AlreadyExists`; an unknown lookup returns
+`NotFound`. Names survive snapshots and are local to each sandbox, so independent
+snapshot copies can restore the same name independently. Forgetting a completed
+command releases its name. Names do not alter guest arguments or process titles.
+
 Call `info.restore()` to
 reacquire that command from its originating sandbox. Lifecycle methods share
 the execution's atomic flags, including across cloned entries; other metadata

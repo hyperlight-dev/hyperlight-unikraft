@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let first = sandbox
         .command("/mnt/bin/command")
+        .name("first")
         .args(["sleep", "150", "hello from the first command"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -120,7 +121,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             child.completed()
         );
         println!(
-            "  program={:?}, args={:?}, cwd={:?}, stdio={:?}, env keys={:?}",
+            "  name={:?}, program={:?}, args={:?}, cwd={:?}, stdio={:?}, env keys={:?}",
+            child.name,
             child.program,
             child.args,
             child.cwd,
@@ -144,7 +146,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     futures::try_join!(report("first", first), report("second", second))?;
 
     sandbox.restore(&checkpoint)?;
-    report("restored", sandbox.restore_child(first_id)?).await?;
+    report("restored", sandbox.get_child_by_name("first")?.restore()?).await?;
 
     let mut tree = sandbox
         .command("/mnt/bin/command")
