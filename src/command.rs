@@ -111,17 +111,32 @@ impl ChildInfo {
 
     /// Reacquire this command from its originating sandbox without driving it.
     ///
-    /// Rechecks the current state rather than relying on a prior status read. Like
-    /// [`CommandSandbox::restore_child`], fails if a driving handle exists or parking
+    /// Rechecks the current state rather than relying on a prior status read.
+    /// Fails if a driving handle exists or parking
     /// is still in progress. Also fails if forgotten or the sandbox has been dropped.
+    /// Previously taken pipe handles remain invalid; the returned child owns new
+    /// handles to the preserved streams. Resources are reconstructed when first driven.
     pub fn restore(&self) -> Result<Child> {
-        let coordinator = self.sandbox.upgrade().ok_or_else(|| {
+        self.coordinator()?.restore_child(self.execution_id)
+    }
+
+    /// Release this command's retained metadata, output and name.
+    ///
+    /// Requires a parked, completed command and rechecks the current state.
+    /// Fails if already forgotten or the originating sandbox has been dropped.
+    pub fn forget(&self) -> Result<()> {
+        let coordinator = self.coordinator()?;
+        let _transition = coordinator.transition()?;
+        coordinator.executions.forget(self.execution_id.0)
+    }
+
+    fn coordinator(&self) -> Result<Arc<Coordinator>> {
+        self.sandbox.upgrade().ok_or_else(|| {
             Error::Wait(io::Error::new(
                 io::ErrorKind::NotFound,
                 "command sandbox has been dropped",
             ))
-        })?;
-        coordinator.restore_child(self.execution_id)
+        })
     }
 }
 
@@ -250,32 +265,14 @@ impl CommandSandbox {
             .collect()
     }
 
-    /// List parked executions, including completed commands not yet forgotten.
-    /// Use [`children`](Self::children) for metadata and per-entry restoration.
-    pub fn parked_children(&self) -> Vec<ExecutionId> {
-        self.0
-            .executions
-            .list()
-            .into_iter()
-            .filter(|execution| {
-                execution
-                    .driving
-                    .lock()
-                    .unwrap()
-                    .parked
-                    .load(Ordering::Relaxed)
-            })
-            .map(|execution| ExecutionId(execution.id))
-            .collect()
-    }
-
-    /// Reacquire a parked command. Resources are reconstructed when first driven.
+    /// Observe a retained command by its sandbox-local execution ID.
     ///
-    /// Previously taken pipe handles remain invalid; the returned child owns new
-    /// handles to the preserved streams. Fails if a driving handle already exists,
-    /// or an in-flight poll has not yet finished parking.
-    pub fn restore_child(&self, id: ExecutionId) -> Result<Child> {
-        self.0.restore_child(id)
+    /// Like [`children`](Self::children), does not drive or acquire the child.
+    /// Returns `None` if unknown or forgotten. Use [`ChildInfo::restore`] to
+    /// reacquire it or [`ChildInfo::forget`] to release a completed record.
+    pub fn get_child_by_id(&self, id: ExecutionId) -> Option<ChildInfo> {
+        let execution = self.0.executions.get(id.0)?;
+        Some(ChildInfo::new(&self.0, &execution))
     }
 
     /// Observe a retained command by its exact, case-sensitive launch name.
@@ -286,13 +283,6 @@ impl CommandSandbox {
     pub fn get_child_by_name(&self, name: &str) -> Option<ChildInfo> {
         let execution = self.0.executions.get_by_name(name)?;
         Some(ChildInfo::new(&self.0, &execution))
-    }
-
-    /// Release retained metadata and output for a parked, completed command.
-    /// Restore and kill unfinished commands before forgetting them.
-    pub fn forget_child(&self, id: ExecutionId) -> Result<()> {
-        let _transition = self.0.transition()?;
-        self.0.executions.forget(id.0)
     }
 
     /// Build a command using an absolute guest executable path.
@@ -532,7 +522,12 @@ impl Coordinator {
     fn restore_child(self: &Arc<Self>, id: ExecutionId) -> Result<Child> {
         let _transition = self.transition()?;
         self.failure()?;
-        let execution = self.executions.get(id.0)?;
+        let execution = self.executions.get(id.0).ok_or_else(|| {
+            Error::Wait(io::Error::new(
+                io::ErrorKind::NotFound,
+                "unknown command execution",
+            ))
+        })?;
         if execution.kill_requested.load(Ordering::Relaxed) {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -845,7 +840,8 @@ pub struct Output {
 ///
 /// Dropping a borrowed wait future is safe. Dropping this handle terminates its
 /// tree and invalidates taken pipes. Use [`park`](Self::park) to consume the handle
-/// without killing the tree, then restore using [`CommandSandbox::restore_child`].
+/// without killing the tree, then look it up with [`CommandSandbox::get_child_by_id`]
+/// and restore using [`ChildInfo::restore`].
 /// Drop normally terminates synchronously without polling host futures. If a VM
 /// entry or lifecycle operation is in progress, termination is deferred until it
 /// releases its locks. Drop failures are logged and retained as execution errors;

@@ -170,18 +170,8 @@ impl Executions {
         Ok((id, entry))
     }
 
-    pub fn get(&self, id: u64) -> crate::Result<Arc<Execution>> {
-        self.entries
-            .lock()
-            .unwrap()
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| {
-                Error::Wait(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "unknown command execution",
-                ))
-            })
+    pub fn get(&self, id: u64) -> Option<Arc<Execution>> {
+        self.entries.lock().unwrap().get(&id).cloned()
     }
 
     pub fn list(&self) -> Vec<Arc<Execution>> {

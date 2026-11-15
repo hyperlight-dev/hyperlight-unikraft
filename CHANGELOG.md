@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Child lookup is unified around `ChildInfo`: `get_child_by_id` and
+  `get_child_by_name` return optional metadata, while `children()` lists all entries.
+  Use `info.restore()` and `info.forget()` instead of sandbox-level restoration
+  and forgetting; filter by `info.parked()` instead of `parked_children()`.
 - Optional command names via `Command::name`, exposed by `Child::name()` and
   `ChildInfo::name`. `CommandSandbox::get_child_by_name` looks up metadata by
   unique sandbox-local names, returning `Option<ChildInfo>` (`None` if absent).

@@ -248,7 +248,7 @@ async fn dropping_a_child_kills_only_its_tree_and_cancels_pending_calls() {
     drop(child);
     assert!(sender.is_canceled());
     assert!(stdout.read(&mut [0]).await.is_err());
-    let mut dead = sandbox.restore_child(id).unwrap();
+    let mut dead = sandbox.get_child_by_id(id).unwrap().restore().unwrap();
     assert_eq!(
         dead.wait().now_or_never().unwrap().unwrap().signal(),
         Some(9)
@@ -275,7 +275,7 @@ fn dropping_a_tree_needs_no_runtime_and_does_not_drive_host_handlers() {
             .unwrap();
         let id = child.execution_id();
         drop(child);
-        let mut dead = sandbox.restore_child(id).unwrap();
+        let mut dead = sandbox.get_child_by_id(id).unwrap().restore().unwrap();
         assert_eq!(
             dead.wait().now_or_never().unwrap().unwrap().signal(),
             Some(9)
@@ -333,7 +333,9 @@ async fn host_future_can_drop_its_own_child_and_terminate_without_deadlocking() 
     assert!(stdout.read(&mut [0]).await.is_err());
     assert_eq!(
         sandbox
-            .restore_child(id)
+            .get_child_by_id(id)
+            .unwrap()
+            .restore()
             .unwrap()
             .try_wait()
             .unwrap()
@@ -507,7 +509,7 @@ async fn named_children_restore_independently_and_reserve_names_until_forgotten(
     }
     assert!(matches!(command.spawn(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::AlreadyExists));
-    sandbox.forget_child(id).unwrap();
+    sandbox.get_child_by_id(id).unwrap().forget().unwrap();
     assert!(sandbox.get_child_by_name("worker").is_none());
     let replacement = command.spawn().unwrap();
     assert_ne!(replacement.execution_id(), id);
@@ -638,7 +640,7 @@ fn child_launch_metadata_survives_builder_reuse_and_snapshot_restore() {
     edited.args.clear();
     edited.env.clear();
     for source in [&sandbox, &fork] {
-        let child = source.restore_child(id).unwrap();
+        let child = source.get_child_by_id(id).unwrap().restore().unwrap();
         let restored = source.children().remove(0);
         assert_eq!(restored.program, info.program);
         assert_eq!(restored.args, info.args);
@@ -698,6 +700,13 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     );
     let pending_info = &entries[0];
     let done_info = &entries[1];
+    let by_id = sandbox.get_child_by_id(pending_id).unwrap();
+    assert_eq!(by_id.execution_id, pending_info.execution_id);
+    assert_eq!(by_id.program, pending_info.program);
+    assert_eq!(by_id.pid, pending_info.pid);
+    assert!(!by_id.parked() && !by_id.completed());
+    assert!(matches!(by_id.forget(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::InvalidInput));
     assert_eq!(pending_info.pid, pending.id());
     let observer = pending_info.clone();
     assert!(!pending_info.parked() && !pending_info.completed());
@@ -710,6 +719,9 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     assert!(!pending_info.parked());
     std::thread::spawn(move || pending.park()).join().unwrap();
     assert!(pending_info.parked() && observer.parked());
+    assert!(by_id.parked());
+    assert!(matches!(by_id.forget(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::InvalidInput));
     assert!(sandbox.children().iter().all(|entry| entry.parked()));
     let snapshot = sandbox.snapshot().unwrap();
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
@@ -721,13 +733,7 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
         .unwrap();
     let mut pending = pending_info.restore().unwrap();
     assert!(!pending_info.parked() && !observer.parked());
-    let mut fork_pending = fork
-        .children()
-        .into_iter()
-        .find(|entry| entry.execution_id == pending_id)
-        .unwrap()
-        .restore()
-        .unwrap();
+    let mut fork_pending = fork.get_child_by_id(pending_id).unwrap().restore().unwrap();
     fork_pending.kill().unwrap();
     drop(fork_pending);
     assert!(pending.try_wait().unwrap().is_none());
@@ -739,7 +745,14 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     assert!(!pending_info.parked());
     pending.park();
     assert!(pending_info.parked() && observer.parked());
-    sandbox.forget_child(pending_id).unwrap();
+    sandbox
+        .get_child_by_id(pending_id)
+        .unwrap()
+        .forget()
+        .unwrap();
+    assert!(sandbox.get_child_by_id(pending_id).is_none());
+    assert!(matches!(by_id.forget(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::NotFound));
     assert!(matches!(pending_info.restore(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::NotFound));
     assert_eq!(sandbox.children().len(), 1);
@@ -749,6 +762,8 @@ fn listing_children_observes_lifecycle_and_restores_from_the_originating_sandbox
     drop(sandbox);
     assert!(done_info.parked() && done_info.completed());
     assert!(matches!(done_info.restore(), Err(Error::Wait(error))
+        if error.kind() == ErrorKind::NotFound));
+    assert!(matches!(done_info.forget(), Err(Error::Wait(error))
         if error.kind() == ErrorKind::NotFound));
 }
 
@@ -917,13 +932,21 @@ async fn parking_a_child_cancels_calls_and_restoring_retries_with_eintr() {
         .spawn()
         .unwrap();
     let id = child.execution_id();
-    assert!(sandbox.restore_child(id).is_err());
+    assert!(sandbox.get_child_by_id(id).unwrap().restore().is_err());
     assert!(child.wait().now_or_never().is_none());
     assert_eq!(count.load(Ordering::SeqCst), 1);
     child.park();
     assert!(sender.is_canceled());
-    assert_eq!(sandbox.parked_children(), [id]);
-    assert!(sandbox.forget_child(id).is_err());
+    assert_eq!(
+        sandbox
+            .children()
+            .into_iter()
+            .filter(|info| info.parked())
+            .map(|info| info.execution_id)
+            .collect::<Vec<_>>(),
+        [id]
+    );
+    assert!(sandbox.get_child_by_id(id).unwrap().forget().is_err());
     assert!(
         sandbox
             .command("/mnt/bin/command")
@@ -934,9 +957,9 @@ async fn parking_a_child_cancels_calls_and_restoring_retries_with_eintr() {
             .success()
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    let child = sandbox.restore_child(id).unwrap();
+    let child = sandbox.get_child_by_id(id).unwrap().restore().unwrap();
     child.park();
-    let child = sandbox.restore_child(id).unwrap();
+    let child = sandbox.get_child_by_id(id).unwrap().restore().unwrap();
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
         .unwrap()
@@ -946,15 +969,17 @@ async fn parking_a_child_cancels_calls_and_restoring_retries_with_eintr() {
     assert_eq!(count.load(Ordering::SeqCst), 2);
     assert!(
         sandbox
-            .restore_child(id)
+            .get_child_by_id(id)
+            .unwrap()
+            .restore()
             .unwrap()
             .try_wait()
             .unwrap()
             .unwrap()
             .success()
     );
-    sandbox.forget_child(id).unwrap();
-    assert!(sandbox.restore_child(id).is_err());
+    sandbox.get_child_by_id(id).unwrap().forget().unwrap();
+    assert!(sandbox.get_child_by_id(id).is_none());
 }
 
 #[tokio::test]
@@ -984,7 +1009,7 @@ async fn parking_preserves_backpressured_output_and_invalidates_taken_pipes() {
         .unwrap()
         .into_commands()
         .unwrap();
-    let child = sandbox.restore_child(id).unwrap();
+    let child = sandbox.get_child_by_id(id).unwrap().restore().unwrap();
     assert!(old_stdout.read(&mut first).await.is_err());
     drop(old_stdout);
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
@@ -997,7 +1022,11 @@ async fn parking_preserves_backpressured_output_and_invalidates_taken_pipes() {
     assert_eq!(output.stderr, vec![b'x'; 80 * 4096]);
     let fork_output = tokio::time::timeout(
         Duration::from_secs(5),
-        fork.restore_child(id).unwrap().wait_with_output(),
+        fork.get_child_by_id(id)
+            .unwrap()
+            .restore()
+            .unwrap()
+            .wait_with_output(),
     )
     .await
     .unwrap()
@@ -1039,7 +1068,11 @@ async fn snapshot_keeps_taken_pipes_usable_and_forks_buffered_input() {
     assert!(fork.children()[0].parked());
     let copy = tokio::time::timeout(
         Duration::from_secs(5),
-        fork.restore_child(id).unwrap().wait_with_output(),
+        fork.get_child_by_id(id)
+            .unwrap()
+            .restore()
+            .unwrap()
+            .wait_with_output(),
     )
     .await
     .unwrap()
@@ -1085,7 +1118,11 @@ async fn snapshot_of_unparked_backpressure_preserves_output_in_both_branches() {
         .unwrap();
     let copy = tokio::time::timeout(
         Duration::from_secs(5),
-        fork.restore_child(id).unwrap().wait_with_output(),
+        fork.get_child_by_id(id)
+            .unwrap()
+            .restore()
+            .unwrap()
+            .wait_with_output(),
     )
     .await
     .unwrap()
@@ -1148,7 +1185,7 @@ async fn parking_closes_host_connections_without_entering_the_vm() {
         .unwrap()
         .into_commands()
         .unwrap();
-    let child = sandbox.restore_child(id).unwrap();
+    let child = sandbox.get_child_by_id(id).unwrap().restore().unwrap();
     drop(output);
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
@@ -1158,7 +1195,11 @@ async fn parking_closes_host_connections_without_entering_the_vm() {
     assert_eq!(output.stdout, b"closed\n");
     let fork_output = tokio::time::timeout(
         Duration::from_secs(5),
-        fork.restore_child(id).unwrap().wait_with_output(),
+        fork.get_child_by_id(id)
+            .unwrap()
+            .restore()
+            .unwrap()
+            .wait_with_output(),
     )
     .await
     .unwrap()
@@ -1204,7 +1245,7 @@ async fn parking_releases_a_listener_and_restores_it_on_first_drive() {
     child.park();
     assert!(sender.is_canceled());
     let reservation = std::net::TcpListener::bind(address).unwrap();
-    let mut child = sandbox.restore_child(id).unwrap();
+    let mut child = sandbox.get_child_by_id(id).unwrap().restore().unwrap();
     drop(reservation);
     assert!(child.wait().now_or_never().is_none());
     let (connection, output) = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1237,7 +1278,7 @@ fn parked_child_can_be_restored_and_killed_without_a_runtime() {
         .spawn()
         .unwrap();
     let id = child.park();
-    let mut child = sandbox.restore_child(id).unwrap();
+    let mut child = sandbox.get_child_by_id(id).unwrap().restore().unwrap();
     child.kill().unwrap();
     assert_eq!(
         child.wait().now_or_never().unwrap().unwrap().signal(),
@@ -1264,7 +1305,7 @@ async fn restoring_a_parked_timer_does_not_restart_its_duration() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     for restored in [&sandbox, &fork] {
-        let mut child = restored.restore_child(id).unwrap();
+        let mut child = restored.get_child_by_id(id).unwrap().restore().unwrap();
         assert!(child.try_wait().unwrap().is_none());
         let _ = child.wait().now_or_never();
         assert!(child.try_wait().unwrap().unwrap().success());
@@ -1306,7 +1347,11 @@ async fn host_future_can_park_its_own_child_without_deadlocking() {
         .unwrap();
     let fork_output = tokio::time::timeout(
         Duration::from_secs(5),
-        fork.restore_child(id).unwrap().wait_with_output(),
+        fork.get_child_by_id(id)
+            .unwrap()
+            .restore()
+            .unwrap()
+            .wait_with_output(),
     )
     .await
     .unwrap()
@@ -1315,7 +1360,12 @@ async fn host_future_can_park_its_own_child_without_deadlocking() {
     assert_eq!(fork_output.stdout, b"completed");
     let output = tokio::time::timeout(
         Duration::from_secs(5),
-        sandbox.restore_child(id).unwrap().wait_with_output(),
+        sandbox
+            .get_child_by_id(id)
+            .unwrap()
+            .restore()
+            .unwrap()
+            .wait_with_output(),
     )
     .await
     .unwrap()
@@ -1358,13 +1408,28 @@ async fn snapshots_restore_parked_commands_streams_and_completed_status() {
         .unwrap()
         .into_commands()
         .unwrap();
-    assert_eq!(fork.parked_children(), [echo_id, done_id]);
-    let active = sandbox.restore_child(echo_id).unwrap();
+    assert_eq!(
+        fork.children()
+            .into_iter()
+            .filter(|info| info.parked())
+            .map(|info| info.execution_id)
+            .collect::<Vec<_>>(),
+        [echo_id, done_id]
+    );
+    let active = sandbox.get_child_by_id(echo_id).unwrap().restore().unwrap();
     assert!(sandbox.restore(&snapshot).is_err());
     active.park();
     for restored in [&fork, &sandbox] {
-        let echo = restored.restore_child(echo_id).unwrap();
-        let done = restored.restore_child(done_id).unwrap();
+        let echo = restored
+            .get_child_by_id(echo_id)
+            .unwrap()
+            .restore()
+            .unwrap();
+        let done = restored
+            .get_child_by_id(done_id)
+            .unwrap()
+            .restore()
+            .unwrap();
         assert!(done.try_wait().unwrap().unwrap().success());
         let (echo, done) = tokio::time::timeout(Duration::from_secs(5), async {
             futures::try_join!(echo.wait_with_output(), done.wait_with_output())
@@ -1385,12 +1450,22 @@ async fn snapshots_restore_parked_commands_streams_and_completed_status() {
     let later_id = later.execution_id();
     drop(later);
     sandbox.restore(&snapshot).unwrap();
-    assert_eq!(sandbox.parked_children(), [echo_id, done_id]);
-    assert!(sandbox.restore_child(later_id).is_err());
+    assert_eq!(
+        sandbox
+            .children()
+            .into_iter()
+            .filter(|info| info.parked())
+            .map(|info| info.execution_id)
+            .collect::<Vec<_>>(),
+        [echo_id, done_id]
+    );
+    assert!(sandbox.get_child_by_id(later_id).is_none());
     assert!(old_stdin.write_all(b"stale").await.is_err());
     drop(old_stdin);
     let echo = sandbox
-        .restore_child(echo_id)
+        .get_child_by_id(echo_id)
+        .unwrap()
+        .restore()
         .unwrap()
         .wait_with_output()
         .await
@@ -1448,7 +1523,7 @@ async fn snapshot_forks_interrupt_pending_calls_without_starting_handlers_at_boo
             .into_commands()
             .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
-        let child = fork.restore_child(id).unwrap();
+        let child = fork.get_child_by_id(id).unwrap().restore().unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
         let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
             .await
@@ -1508,7 +1583,7 @@ fn snapshot_and_child_restoration_reject_a_poll_still_finishing_parking() {
     );
     child.park();
     for result in [
-        sandbox.restore_child(id).map(|_| ()),
+        sandbox.get_child_by_id(id).unwrap().restore().map(|_| ()),
         sandbox.snapshot().map(|_| ()),
     ] {
         assert!(
@@ -1527,7 +1602,7 @@ fn snapshot_and_child_restoration_reject_a_poll_still_finishing_parking() {
     assert!(poller.join().unwrap().unwrap().is_err());
     assert_eq!(count.load(Ordering::SeqCst), 1);
     sandbox.snapshot().unwrap();
-    let mut child = sandbox.restore_child(id).unwrap();
+    let mut child = sandbox.get_child_by_id(id).unwrap().restore().unwrap();
     child.kill().unwrap();
 }
 

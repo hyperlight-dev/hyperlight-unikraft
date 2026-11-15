@@ -130,9 +130,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             child.env.keys().collect::<Vec<_>>()
         );
     }
-    let first = children
-        .iter()
-        .find(|child| child.execution_id == first_id)
+    let first = sandbox
+        .get_child_by_id(first_id)
         .expect("the parked child is listed")
         .restore()?;
     let second = sandbox

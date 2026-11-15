@@ -133,7 +133,8 @@ Taken stream handles become invalid (`BrokenPipe`), including after child restor
 Untaken streams and buffered bytes are preserved, not closed.
 
 Use `let id = child.park()`, then
-`sandbox.restore_child(id)` to acquire a new exclusive handle. The first drive
+`sandbox.get_child_by_id(id)` to retrieve `Option<ChildInfo>` and `info.restore()`
+to acquire a new exclusive handle. The first drive
 reconstructs resources and interrupts unfinished calls with `EINTR`; the guest
 chooses whether to retry. `sandbox.children()` lists all retained commands in
 execution-ID order, including commands with driving handles and completed commands. Each `ChildInfo`
@@ -170,9 +171,9 @@ After in-place snapshot restoration, obtain new entries for the replacement
 executions; old entries retain their original executions' final flags.
 Listing neither drives commands nor keeps the sandbox alive; entries remain
 usable across parking but fail after forgetting the command or dropping its sandbox.
-A child with a driving handle is not necessarily being polled. `parked_children()` remains
-a convenience for listing only parked execution IDs.
-Completed executions and their output remain available until `forget_child(id)`;
+A child with a driving handle is not necessarily being polled. Filter `children()`
+with `info.parked()` to list only parked commands.
+Completed executions and their output remain available until `info.forget()`;
 that method requires a parked, completed command. To discard an unfinished
 command, restore it, kill it, drop it, then forget it.
 
@@ -254,14 +255,15 @@ let output = child.wait_with_output().await?;
 
 // Park or drop all children before replacing the current guest state.
 sandbox.restore(&snapshot)?;
-let child = sandbox.restore_child(id)?;
+let child = sandbox.get_child_by_id(id).expect("snapshot retains the child").restore()?;
 ```
 
 `SandboxBuilder::from_command_snapshot(&snapshot)` boots an independent clone.
 Supply host functions, mounts, network policy and listening ports on that builder,
 then call `boot()?.into_commands()?`. Boot and restore do not run command threads
-or invoke their async handlers. Use `parked_children()` and `restore_child(id)`
-to drive them. In-place restore preserves execution-ID allocation high-water
+or invoke their async handlers. Use `children()`, `get_child_by_id(id)` or
+`get_child_by_name(name)` to obtain metadata, then `info.restore()` to drive them.
+In-place restore preserves execution-ID allocation high-water
 marks, so IDs from discarded branches are not reused for new commands.
 
 The `CommandSnapshot` object is an in-memory snapshot; it is not the raw
