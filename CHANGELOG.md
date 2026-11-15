@@ -27,6 +27,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   owner cancels host work, releases sockets, wakes waiters and reports unfinished
   commands as SIGKILL. Completed statuses and already-buffered output are retained;
   output reaches EOF and input writes fail with `BrokenPipe`.
+- `CommandSandbox` is non-cloneable. Command builders also hold weak references
+  and return `NotFound` when spawned after their sandbox is dropped.
 - In-memory command snapshots capture the whole guest plus execution
   metadata, pipe buffers and retained replies. Restore in place with
   `CommandSandbox::restore`, or boot an independent clone with

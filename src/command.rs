@@ -30,7 +30,16 @@ use crate::{
 /// that tree's host operations and guest threads. Other command trees do not run.
 /// Snapshots preserve existing child handles; replacing the current guest from a
 /// snapshot requires dropping them first. The legacy interpreter API is unavailable.
-#[derive(Clone)]
+///
+/// This owner cannot be cloned. Command builders, children and pipes hold weak
+/// references; keep this value alive while using them.
+///
+/// ```compile_fail
+/// use hyperlight_unikraft::command::CommandSandbox;
+/// fn duplicate(sandbox: CommandSandbox) {
+///     let other = sandbox.clone();
+/// }
+/// ```
 pub struct CommandSandbox(Arc<Coordinator>);
 
 /// Stable execution identity within a command sandbox, distinct from a guest PID.
@@ -92,7 +101,7 @@ impl ChildInfo {
                 "command sandbox has been dropped",
             ))
         })?;
-        CommandSandbox(coordinator).restore_child(self.execution_id)
+        coordinator.restore_child(self.execution_id)
     }
 }
 
@@ -249,39 +258,7 @@ impl CommandSandbox {
     /// handles to the preserved streams. Fails if a driving handle already exists,
     /// or an in-flight poll has not yet finished parking.
     pub fn restore_child(&self, id: ExecutionId) -> Result<Child> {
-        let _transition = self.0.transition()?;
-        self.0.failure()?;
-        let execution = self.0.executions.get(id.0)?;
-        let mut calls = match execution.calls.try_lock() {
-            Ok(calls) => calls,
-            Err(TryLockError::WouldBlock) => {
-                return Err(Error::Wait(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "command is still being driven",
-                )));
-            }
-            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
-        };
-        {
-            let state = execution.driving.lock().unwrap();
-            if !state.parked.load(Ordering::Relaxed) {
-                return Err(Error::Wait(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "command already has a child handle",
-                )));
-            }
-        }
-        execution.park(&mut calls);
-        let generation = {
-            let mut state = execution.driving.lock().unwrap();
-            state.generation = state.generation.checked_add(1).ok_or_else(|| {
-                Error::Wait(io::Error::other("command handle generations exhausted"))
-            })?;
-            state.parked.store(false, Ordering::Relaxed);
-            state.generation
-        };
-        drop(calls);
-        Ok(Child::new(self.0.clone(), execution, generation))
+        self.0.restore_child(id)
     }
 
     /// Release retained metadata and output for a parked, completed command.
@@ -294,7 +271,7 @@ impl CommandSandbox {
     /// Build a command using an absolute guest executable path.
     pub fn command(&self, program: impl Into<String>) -> Command {
         Command {
-            sandbox: self.clone(),
+            sandbox: Arc::downgrade(&self.0),
             program: program.into(),
             args: Vec::new(),
             env: BTreeMap::new(),
@@ -306,8 +283,9 @@ impl CommandSandbox {
 }
 
 /// Configuration for an executable, not an interpreter request or shell string.
+/// Holds a weak sandbox reference; spawning fails if the sandbox has been dropped.
 pub struct Command {
-    sandbox: CommandSandbox,
+    sandbox: Weak<Coordinator>,
     program: String,
     args: Vec<String>,
     env: BTreeMap<String, Option<String>>,
@@ -388,7 +366,12 @@ impl Command {
     /// Requires an absolute executable path; there is no PATH search. Accepted
     /// commands remain owned by the sandbox if their handles are dropped.
     pub fn spawn(&mut self) -> Result<Child> {
-        let coordinator = &self.sandbox.0;
+        let coordinator = self.sandbox.upgrade().ok_or_else(|| {
+            Error::Wait(io::Error::new(
+                io::ErrorKind::NotFound,
+                "command sandbox has been dropped",
+            ))
+        })?;
         let _transition = coordinator.transition()?;
         coordinator.failure()?;
         let mut sandbox = coordinator.sandbox.lock().unwrap();
@@ -505,6 +488,42 @@ impl Command {
 }
 
 impl Coordinator {
+    fn restore_child(self: &Arc<Self>, id: ExecutionId) -> Result<Child> {
+        let _transition = self.transition()?;
+        self.failure()?;
+        let execution = self.executions.get(id.0)?;
+        let mut calls = match execution.calls.try_lock() {
+            Ok(calls) => calls,
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::Wait(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "command is still being driven",
+                )));
+            }
+            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+        };
+        {
+            let state = execution.driving.lock().unwrap();
+            if !state.parked.load(Ordering::Relaxed) {
+                return Err(Error::Wait(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "command already has a child handle",
+                )));
+            }
+        }
+        execution.park(&mut calls);
+        let generation = {
+            let mut state = execution.driving.lock().unwrap();
+            state.generation = state.generation.checked_add(1).ok_or_else(|| {
+                Error::Wait(io::Error::other("command handle generations exhausted"))
+            })?;
+            state.parked.store(false, Ordering::Relaxed);
+            state.generation
+        };
+        drop(calls);
+        Ok(Child::new(self.clone(), execution, generation))
+    }
+
     fn try_sandbox(&self) -> Result<MutexGuard<'_, AppSandbox>> {
         match self.sandbox.try_lock() {
             Ok(guard) => Ok(guard),

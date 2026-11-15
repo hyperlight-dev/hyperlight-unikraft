@@ -44,9 +44,8 @@ async fn dropping_last_sandbox_wakes_children_and_pipes_and_cancels_host_work() 
         .unwrap()
         .into_commands()
         .unwrap();
-    let last_owner = sandbox.clone();
-    let mut child = sandbox
-        .command("/mnt/bin/command")
+    let mut command = sandbox.command("/mnt/bin/command");
+    let mut child = command
         .args(["host", "[]"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -88,7 +87,6 @@ async fn dropping_last_sandbox_wakes_children_and_pipes_and_cancels_host_work() 
             .poll(&mut Context::from_waker(&wakers[3]))
             .is_pending()
     );
-    drop(sandbox);
     assert!(!sender.is_canceled());
     assert!(!info.completed());
     // Input forwarding can wake the wait task; rearm it before testing shutdown.
@@ -100,7 +98,11 @@ async fn dropping_last_sandbox_wakes_children_and_pipes_and_cancels_host_work() 
     for count in &counts {
         count.0.store(0, Ordering::SeqCst);
     }
-    std::thread::spawn(move || drop(last_owner)).join().unwrap();
+    std::thread::spawn(move || drop(sandbox)).join().unwrap();
+    assert!(
+        matches!(command.spawn(), Err(hyperlight_unikraft::Error::Wait(error))
+        if error.kind() == std::io::ErrorKind::NotFound)
+    );
     assert!(sender.is_canceled());
     assert!(
         counts

@@ -158,9 +158,10 @@ Completed executions and their output remain available until `forget_child(id)`;
 that method requires a parked, completed command. To discard an unfinished
 command, restore it, kill it, drop it, then forget it.
 
-Children and their pipe handles hold weak references to the sandbox. Keep a
-`CommandSandbox` owner alive while driving them (clones and command builders
-also retain ownership). Dropping the last owner destroys the VM without a guest
+Command builders, children and their pipe handles hold weak references to the
+sandbox. `CommandSandbox` cannot be cloned; keep that owner alive while using
+them. Spawning from a builder after the owner is dropped returns `NotFound`.
+Dropping the owner destroys the VM without a guest
 entry, cancels host futures and timers, closes sockets, and wakes pending waits
 and pipe operations. Unfinished children report synthetic SIGKILL (signal 9);
 completed children retain their exit status. Buffered stdout/stderr can still
