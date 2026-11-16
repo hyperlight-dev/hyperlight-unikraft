@@ -15,6 +15,11 @@
 #include <stdint.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
+#include <sys/uio.h>
+#include <poll.h>
+#include <signal.h>
+#include <pthread.h>
 
 static void pause_ms(unsigned long ms)
 {
@@ -47,9 +52,98 @@ static void host_call(const char *name, const char *args)
 	close(fd);
 }
 
+static void *exit_root(void *arg)
+{
+	(void)arg;
+	pause_ms(1);
+	_exit(23);
+}
+
 int main(int argc, char **argv)
 {
 	assert(argc >= 2);
+	if (!strcmp(argv[1], "thread-exit")) {
+		pid_t child = vfork();
+		assert(child >= 0);
+		if (!child) {
+			execl(argv[0], argv[0], "sleep", "60000", "leaked", (char *)NULL);
+			_exit(127);
+		}
+		pthread_t thread;
+		assert(pthread_create(&thread, NULL, exit_root, NULL) == 0);
+		pause_ms(60000);
+		return 99;
+	}
+	if (!strcmp(argv[1], "stdio-poll")) {
+		assert(fcntl(0, F_SETFL, O_NONBLOCK) == 0);
+		char bytes[11];
+		assert(read(0, bytes, 1) == -1 && errno == EAGAIN);
+		struct pollfd input = { .fd = 0, .events = POLLIN };
+		assert(poll(&input, 1, 0) == 0);
+		int ep = epoll_create1(EPOLL_CLOEXEC);
+		assert(ep >= 0);
+		struct epoll_event event = { .events = EPOLLIN | EPOLLET };
+		assert(epoll_ctl(ep, EPOLL_CTL_ADD, 0, &event) == 0);
+		assert(write(1, "ready\n", 6) == 6);
+		assert(epoll_wait(ep, &event, 1, -1) == 1);
+		assert(event.events & EPOLLIN);
+		struct iovec inputv[] = {
+			{bytes, 1}, {bytes + 1, 2}, {bytes + 3, 4}
+		};
+		assert(readv(0, inputv, 3) == 7);
+		for (int i = 7; i < 11; i++) assert(read(0, bytes + i, 1) == 1);
+		assert(memcmp(bytes, "abcdefghijk", sizeof(bytes)) == 0);
+		struct iovec outputv[] = {{bytes, 3}, {bytes + 3, 8}};
+		assert(writev(1, outputv, 2) == sizeof(bytes));
+		assert(lseek(0, 0, SEEK_CUR) == -1 && errno == ESPIPE);
+		close(ep);
+		return 0;
+	}
+	if (!strcmp(argv[1], "stdio-backpressure")) {
+		assert(fcntl(1, F_SETFL, O_NONBLOCK) == 0);
+		char bytes[4096];
+		memset(bytes, 'x', sizeof(bytes));
+		ssize_t count;
+		do { count = write(1, bytes, sizeof(bytes)); } while (count > 0);
+		assert(count == -1 && errno == EAGAIN);
+		assert(write(1, bytes, 0) == 0);
+		struct pollfd output = { .fd = 1, .events = POLLOUT };
+		assert(poll(&output, 1, 0) == 0);
+		assert(write(2, "blocked\n", 8) == 8);
+		assert(poll(&output, 1, -1) == 1);
+		assert(output.revents & POLLOUT);
+		assert(write(1, "!", 1) == 1);
+		return 0;
+	}
+	if (!strcmp(argv[1], "stdio-dup")) {
+		int output = dup(1);
+		assert(output >= 0);
+		char byte;
+		assert(read(0, &byte, 1) == 1);
+		assert(close(1) == 0);
+		assert(write(output, "kept", 4) == 4);
+		assert(close(output) == 0);
+		assert(dup2(2, 1) == 1);
+		assert(write(1, "redirected", 10) == 10);
+		assert(read(0, &byte, 1) == 0);
+		return 0;
+	}
+	if (!strcmp(argv[1], "stdio-close-poll")) {
+		struct pollfd input = { .fd = 0, .events = POLLIN };
+		assert(poll(&input, 1, 0) == 0);
+		assert(close(0) == 0);
+		assert(write(1, "closed\n", 7) == 7);
+		pause_ms(20);
+		return 0;
+	}
+	if (!strcmp(argv[1], "stdio-broken-output")) {
+		assert(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
+		char byte;
+		assert(read(0, &byte, 1) == 1);
+		assert(write(1, "x", 1) == -1 && errno == EPIPE);
+		assert(write(2, "broken\n", 7) == 7);
+		return 0;
+	}
 	if (!strcmp(argv[1], "park-socket") || !strcmp(argv[1], "park-listener")) {
 		int fd = socket(AF_INET, SOCK_STREAM, 0);
 		assert(fd >= 0);
@@ -157,7 +251,11 @@ int main(int argc, char **argv)
 		assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 		return 0;
 	}
-	if (!strcmp(argv[1], "echo")) {
+	if (!strcmp(argv[1], "echo") || !strcmp(argv[1], "host-echo")) {
+		if (!strcmp(argv[1], "host-echo")) {
+			assert(argc == 3);
+			host_call("gate", argv[2]);
+		}
 		char buffer[4096];
 		ssize_t n;
 		while ((n = read(0, buffer, sizeof(buffer))) > 0) {

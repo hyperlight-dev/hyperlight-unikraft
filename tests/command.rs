@@ -22,7 +22,7 @@ fn builder() -> SandboxBuilder {
 
 async fn read_while_running(
     child: &mut hyperlight_unikraft::command::Child,
-    stdout: &mut hyperlight_unikraft::command::ChildStdout,
+    stdout: &mut (impl futures::io::AsyncRead + Unpin),
     bytes: &mut [u8],
 ) {
     let result = tokio::time::timeout(
@@ -37,6 +37,184 @@ async fn read_while_running(
             panic!("command exited before producing expected output: {status:?}")
         }
     }
+}
+
+#[tokio::test]
+async fn root_exit_from_another_thread_cleans_up_without_a_supervisor() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut other = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "60000", "other"])
+        .spawn()
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        sandbox
+            .command("/mnt/bin/command")
+            .arg("thread-exit")
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert_eq!(sandbox.children().len(), 1);
+    assert!(other.try_wait().unwrap().is_none());
+    other.kill().await.unwrap();
+    assert_eq!(other.wait().await.unwrap().signal(), Some(9));
+    assert!(
+        sandbox
+            .command("/mnt/bin/command")
+            .args(["sleep", "0", "done"])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+}
+
+#[tokio::test]
+async fn guest_stdio_epoll_and_short_vectored_reads_preserve_input() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("stdio-poll")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"abcdefghijk").await.unwrap();
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"ready\nabcdefghijk");
+}
+
+#[tokio::test]
+async fn guest_stdio_nonblocking_backpressure_wakes_poll_without_committing_failed_writes() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("stdio-backpressure")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut marker = [0; 8];
+    read_while_running(&mut child, &mut stderr, &mut marker).await;
+    assert_eq!(&marker, b"blocked\n");
+    assert!(child.try_wait().unwrap().is_none());
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 64 * 1024 + 1);
+    assert!(output.stdout[..64 * 1024].iter().all(|&byte| byte == b'x'));
+    assert_eq!(output.stdout.last(), Some(&b'!'));
+}
+
+#[tokio::test]
+async fn guest_stdio_eof_waits_for_last_duplicate_but_not_process_exit() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("stdio-dup")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    stdin.write_all(b"g").await.unwrap();
+    let mut bytes = Vec::new();
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::select(
+            Box::pin(stdout.read_to_end(&mut bytes)),
+            Box::pin(child.wait()),
+        ),
+    )
+    .await
+    .unwrap()
+    {
+        futures::future::Either::Left((result, _)) => {
+            result.unwrap();
+        }
+        futures::future::Either::Right((result, _)) => {
+            panic!("exited before stdin EOF: {result:?}")
+        }
+    }
+    assert_eq!(bytes, b"kept");
+    assert!(child.try_wait().unwrap().is_none());
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stderr, b"redirected");
+}
+
+#[tokio::test]
+async fn closing_guest_stdio_cancels_its_pending_readiness_watch() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("stdio-close-poll")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    assert_eq!(
+        stdin.write_all(b"x").await.unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"closed\n");
+    assert!(sandbox.children().is_empty());
+}
+
+#[tokio::test]
+async fn closing_host_output_returns_epipe_to_the_guest_writer() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("stdio-broken-output")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    drop(child.stdout.take().unwrap());
+    stdin.write_all(b"x").await.unwrap();
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stderr, b"broken\n");
 }
 
 #[tokio::test]
@@ -653,9 +831,17 @@ async fn named_children_restore_independently_and_release_names_on_completion() 
     let mut command = sandbox.command("/mnt/bin/command");
     command
         .name("worker")
-        .args(["sleep", "0", "named"])
+        .arg("echo")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped());
-    let child = command.spawn().await.unwrap();
+    let mut child = command.spawn().await.unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"named\n")
+        .await
+        .unwrap();
     let id = child.execution_id();
     assert_eq!(child.name(), Some("worker"));
     assert_eq!(sandbox.children()[0].name.as_deref(), Some("worker"));
@@ -725,7 +911,8 @@ async fn completion_and_kill_release_names_while_old_handles_remain_usable() {
         let mut child = sandbox
             .command("/mnt/bin/command")
             .name("worker")
-            .args(["sleep", if kill { "60000" } else { "0" }, "done"])
+            .arg("echo")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .await
@@ -738,6 +925,13 @@ async fn completion_and_kill_release_names_while_old_handles_remain_usable() {
         if kill {
             child.kill().await.unwrap();
         } else {
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"done\n")
+                .await
+                .unwrap();
             let (status, read) = futures::join!(child.wait(), stdout.read_to_end(&mut output));
             assert!(status.unwrap().success());
             read.unwrap();
@@ -1106,7 +1300,8 @@ async fn structured_command_and_distinct_streams() {
         .spawn()
         .await
         .unwrap();
-    let info = sandbox.children().into_iter().last().unwrap();
+    assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(17));
+    assert!(sandbox.children().is_empty());
     let snapshot = sandbox.snapshot().await.unwrap();
     let out = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
@@ -1119,17 +1314,8 @@ async fn structured_command_and_distinct_streams() {
     );
     assert_eq!(out.stderr, b"stderr\n");
     assert!(sandbox.children().is_empty());
-    assert!(info.completed());
-    assert_eq!(info.program, "/mnt/bin/command");
-    assert_eq!(info.args, ["args", "a b", "", "quoted\"text"]);
-    assert_eq!(info.cwd.as_deref(), Some("/tmp"));
-    assert_eq!(
-        info.env,
-        [("COMMAND_TEST".to_owned(), "one value".to_owned())].into()
-    );
-    assert_eq!(info.stdio, [Stdio::Null, Stdio::Piped, Stdio::Piped]);
     sandbox.restore(&snapshot).await.unwrap();
-    assert_eq!(sandbox.children()[0].stdio, info.stdio);
+    assert!(sandbox.children().is_empty());
 }
 
 #[tokio::test]
@@ -1902,6 +2088,7 @@ async fn parking_releases_a_listener_and_restores_it_on_first_drive() {
     let id = child.execution_id();
     let mut stdout = child.stdout.take().unwrap();
     read_while_running(&mut child, &mut stdout, &mut [0; 6]).await;
+    assert!(child.wait().now_or_never().is_none());
     child.park();
     assert!(sender.is_canceled());
     let reservation = std::net::TcpListener::bind(address).unwrap();
@@ -2160,12 +2347,14 @@ async fn parking_preserves_completed_host_replies() {
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
-        .args(["host", "[]"])
+        .args(["host-echo", "[]"])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .await
         .unwrap();
     let id = child.execution_id();
+    let _stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
     assert!(child.wait().now_or_never().is_none());
     child.park();
@@ -2426,12 +2615,14 @@ async fn snapshot_and_child_restoration_wait_for_an_active_poll() {
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
-        .args(["host", "[]"])
+        .args(["host-echo", "[]"])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .await
         .unwrap();
     let id = child.execution_id();
+    let _stdin = child.stdin.take().unwrap();
     let poller = std::thread::spawn(move || {
         let result = child.wait().now_or_never();
         (child, result)

@@ -4,9 +4,6 @@
 #ifndef HL_COMMAND_H
 #define HL_COMMAND_H
 
-#include <pthread.h>
-#include <signal.h>
-
 #define HLCALL_IOC_EXECUTION _IOW('H', 5, uint64_t)
 #define HLCALL_IOC_COMMAND_DRIVER _IOR('H', 6, uint64_t)
 struct hl_command_event { int32_t kind, value; };
@@ -18,8 +15,10 @@ struct hl_command_io {
 #define HLCALL_IOC_COMMAND_EVENT _IOW('H', 7, struct hl_command_event)
 #define HLCALL_IOC_COMMAND_IO _IOWR('H', 8, struct hl_command_io)
 #define HLCALL_IOC_EXECUTION_KILL _IOW('H', 9, uint64_t)
+struct hl_command_stdio { uint64_t stream, fd; };
+#define HLCALL_IOC_COMMAND_STDIO _IOWR('H', 10, struct hl_command_stdio)
 
-struct command_pipe { int fd, stream; };
+static int command_null[2];
 struct command {
 	uint64_t id;
 	char *storage, *cwd;
@@ -37,67 +36,6 @@ static void command_event(int control, int kind, int value)
 	}
 }
 
-static void *command_pipe(void *arg)
-{
-	struct command_pipe *pipe = arg;
-	int control = open(HL_CALL_DEVICE, O_RDWR | O_CLOEXEC);
-	if (control < 0) { perror("hl_command: control"); _exit(125); }
-	char bytes[4096];
-	struct hl_command_io io = {
-		.stream = pipe->stream, .buf = bytes, .len = sizeof(bytes)
-	};
-	int error = 0;
-	sigset_t blocked;
-
-	sigemptyset(&blocked);
-	sigaddset(&blocked, SIGPIPE);
-	error = pthread_sigmask(SIG_BLOCK, &blocked, NULL);
-	if (error) goto done;
-
-	for (;;) {
-		ssize_t count;
-		int rc;
-
-		if (pipe->stream) {
-			do { count = read(pipe->fd, bytes, sizeof(bytes)); }
-			while (count < 0 && errno == EINTR);
-			if (count < 0) { error = errno; break; }
-			io.len = count;
-			do { rc = ioctl(control, HLCALL_IOC_COMMAND_IO, &io); }
-			while (rc && errno == EINTR);
-			if (rc) {
-				if (errno != EPIPE) error = errno;
-				break;
-			}
-			if (!count) break;
-		} else {
-			do { rc = ioctl(control, HLCALL_IOC_COMMAND_IO, &io); }
-			while (rc && errno == EINTR);
-			if (rc) {
-				error = errno; break;
-			}
-			if (!io.done) break;
-			size_t sent = 0;
-
-			while (sent < io.done) {
-				count = write(pipe->fd, bytes + sent, io.done - sent);
-				if (count < 0 && errno == EINTR) continue;
-				if (count <= 0) {
-					if (errno != EPIPE) error = errno;
-					goto done;
-				}
-				sent += count;
-			}
-		}
-	}
-done:
-	close(pipe->fd);
-	if (!pipe->stream) command_event(control, 3, 0);
-	if (error) command_event(control, 2, error);
-	close(control);
-	return NULL;
-}
-
 static void command_free(struct command *command)
 {
 	free(command->argv);
@@ -106,18 +44,13 @@ static void command_free(struct command *command)
 	free(command);
 }
 
-static void *command_run(void *arg)
+static void command_run(struct command *command)
 {
-	struct command *command = arg;
-	int control = open(HL_CALL_DEVICE, O_RDWR | O_CLOEXEC);
-	if (control < 0) { perror("hl_command: control"); _exit(125); }
+	int control = g_hl_call_fd;
 	int childfd[3] = { -1, -1, -1 };
-	struct command_pipe pipes[3] = { { -1, 0 }, { -1, 1 }, { -1, 2 } };
-	pthread_t threads[3];
-	int started[3] = { 0, 0, 0 };
 	volatile int exec_error = 0;
 	pid_t pid = -1;
-	int error = 0, status;
+	int error = 0;
 
 	if (ioctl(control, HLCALL_IOC_EXECUTION, &command->id)) {
 		fprintf(stderr, "hl_command: cannot attach execution: %s\n", strerror(errno));
@@ -125,14 +58,15 @@ static void *command_run(void *arg)
 	}
 	for (int i = 0; i < 3; i++) {
 		if (command->stdio & (1u << i)) {
-			int fds[2];
+			struct hl_command_stdio io = { .stream = i };
 
-			if (pipe2(fds, O_CLOEXEC)) { error = errno; goto done; }
-			childfd[i] = fds[i == 0 ? 0 : 1];
-			pipes[i].fd = fds[i == 0 ? 1 : 0];
+			if (ioctl(control, HLCALL_IOC_COMMAND_STDIO, &io)) {
+				error = errno;
+				goto done;
+			}
+			childfd[i] = io.fd;
 		} else {
-			childfd[i] = open("/dev/null", (i ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
-			if (childfd[i] < 0) { error = errno; goto done; }
+			childfd[i] = command_null[i != 0];
 		}
 	}
 	pid = vfork();
@@ -147,40 +81,17 @@ static void *command_run(void *arg)
 	}
 	if (pid < 0) { error = errno; goto done; }
 	for (int i = 0; i < 3; i++) {
-		close(childfd[i]);
+		if (command->stdio & (1u << i)) close(childfd[i]);
 		childfd[i] = -1;
 	}
-	if (exec_error) {
-		error = exec_error;
-		while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-		goto done;
-	}
-	command_event(control, 0, pid);
-	for (int i = 0; i < 3; i++) {
-		if (pipes[i].fd < 0) continue;
-		error = pthread_create(&threads[i], NULL, command_pipe, &pipes[i]);
-		if (error) {
-			kill(pid, SIGKILL);
-			break;
-		}
-		started[i] = 1;
-	}
-	while (waitpid(pid, &status, 0) < 0) {
-		if (errno == EINTR) continue;
-		error = errno;
-		goto done;
-	}
-	command_event(control, 1, status);
+	error = exec_error;
 done:
-	if (error) command_event(control, 0, -error);
 	for (int i = 0; i < 3; i++) {
-		if (childfd[i] >= 0) close(childfd[i]);
-		if (started[i]) pthread_join(threads[i], NULL);
-		else if (pipes[i].fd >= 0) close(pipes[i].fd);
+		if (childfd[i] >= 0 && (command->stdio & (1u << i)))
+			close(childfd[i]);
 	}
-	close(control);
+	command_event(control, 0, error ? -error : pid);
 	command_free(command);
-	return NULL;
 }
 
 static char *command_field(char **cursor, char *end)
@@ -220,7 +131,6 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 	}
 	struct command *command = calloc(1, sizeof(*command));
 	uint64_t version, argc, envc, stdio;
-	pthread_t thread;
 
 	if (!command || !data || !len) { free(command); return -1; }
 	command->storage = malloc(len);
@@ -228,7 +138,7 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 	memcpy(command->storage, data, len);
 	char *cursor = command->storage, *end = cursor + len;
 
-	if (command_number(&cursor, end, &version) || version != 5 ||
+	if (command_number(&cursor, end, &version) || version != 7 ||
 	    command_number(&cursor, end, &command->id) || !command->id ||
 	    command_number(&cursor, end, &argc) || argc > len ||
 	    command_number(&cursor, end, &envc) || envc > len ||
@@ -244,10 +154,7 @@ static int command_dispatch(const uint8_t *fc, size_t fc_len)
 	for (uint64_t i = 0; i < envc; i++)
 		if (!(command->env[i] = command_field(&cursor, end))) goto invalid;
 	if (cursor != end || command->argv[0][0] != '/') goto invalid;
-	if (pthread_create(&thread, NULL, command_run, command)) {
-		goto invalid;
-	}
-	pthread_detach(thread);
+	command_run(command);
 	return 0;
 invalid:
 	command_free(command);
@@ -263,7 +170,10 @@ static int command_init(void)
 		fprintf(stderr, "hl_command: negotiation failed: %s\n", strerror(errno));
 		return -1;
 	}
-	if (version != 5) return -1;
+	if (version != 7) return -1;
+	command_null[0] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	command_null[1] = open("/dev/null", O_WRONLY | O_CLOEXEC);
+	if (command_null[0] < 0 || command_null[1] < 0) return -1;
 	g_hl_command_dispatch = command_dispatch;
 	return 0;
 }

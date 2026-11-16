@@ -9,12 +9,13 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use futures::{
+    FutureExt,
     future::poll_fn,
     task::{ArcWake, waker_ref},
 };
 use hyperlight_host::{HyperlightError, func::Registerable};
 
-use crate::{Error, Result, async_calls, hostnet};
+use crate::{Error, Result, async_calls, errno, hostnet};
 
 #[derive(Default)]
 pub(crate) struct WakeSet(Mutex<Vec<Weak<Mutex<Option<Waker>>>>>);
@@ -377,6 +378,36 @@ impl Executions {
     pub fn register(self: &Arc<Self>, target: &mut impl Registerable) -> crate::Result<()> {
         let registry = self.clone();
         target.register_host_function(
+            "ExecutionEnter",
+            move || -> hyperlight_host::Result<Vec<u8>> {
+                let id = registry.active.load(Ordering::Relaxed);
+                let restore = if id == 0 {
+                    false
+                } else {
+                    registry
+                        .get(id)
+                        .ok_or_else(|| {
+                            HyperlightError::Error("entering an unknown execution".into())
+                        })?
+                        .needs_restore
+                        .swap(false, Ordering::Relaxed)
+                };
+                let mut reply = Vec::with_capacity(9);
+                reply.extend_from_slice(&id.to_le_bytes());
+                reply.push(u8::from(restore));
+                Ok(reply)
+            },
+        )?;
+        let registry = self.clone();
+        target.register_host_function(
+            "ExecutionEvents",
+            move |bytes: Vec<u8>| -> hyperlight_host::Result<i32> {
+                registry.events(&bytes)?;
+                Ok(0)
+            },
+        )?;
+        let registry = self.clone();
+        target.register_host_function(
             "ExecutionRestore",
             move || -> hyperlight_host::Result<i32> {
                 let id = registry.active.load(Ordering::Relaxed);
@@ -436,10 +467,46 @@ impl Executions {
         )?;
         let registry = self.clone();
         target.register_host_function(
+            "CommandRead",
+            move |count: u64| -> hyperlight_host::Result<Vec<u8>> {
+                registry
+                    .current()?
+                    .ok_or_else(|| HyperlightError::Error("command read without execution".into()))?
+                    .stdio_read(count)
+            },
+        )?;
+        let registry = self.clone();
+        target.register_host_function(
+            "CommandWrite",
+            move |stream: u64, bytes: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
+                registry
+                    .current()?
+                    .ok_or_else(|| {
+                        HyperlightError::Error("command write without execution".into())
+                    })?
+                    .stdio_write(stream, &bytes)
+            },
+        )?;
+        let registry = self.clone();
+        target.register_host_function(
+            "CommandPoll",
+            move |stream: u64| -> hyperlight_host::Result<Vec<u8>> {
+                registry
+                    .current()?
+                    .ok_or_else(|| HyperlightError::Error("command poll without execution".into()))?
+                    .stdio_poll(stream)
+            },
+        )?;
+        target.register_host_function(
             "CommandDriverVersion",
-            move || -> hyperlight_host::Result<u64> {
+            || -> hyperlight_host::Result<u64> { Ok(7) },
+        )?;
+        let registry = self.clone();
+        target.register_host_function(
+            "CommandDriverReady",
+            move || -> hyperlight_host::Result<i32> {
                 registry.supported.store(true, Ordering::Relaxed);
-                Ok(5)
+                Ok(0)
             },
         )?;
         let registry = self.clone();
@@ -480,6 +547,58 @@ impl Executions {
         )?;
         Ok(())
     }
+
+    pub fn events(&self, bytes: &[u8]) -> hyperlight_host::Result<()> {
+        let (records, tail) = bytes.as_chunks::<24>();
+        if !tail.is_empty() {
+            return Err(HyperlightError::Error("malformed execution events".into()));
+        }
+        let entries = self.entries.lock().unwrap();
+        for record in records {
+            let id = u64::from_le_bytes(record[..8].try_into().unwrap());
+            let pid = i32::from_le_bytes(record[8..12].try_into().unwrap());
+            let error = i32::from_le_bytes(record[16..20].try_into().unwrap());
+            let flags = u32::from_le_bytes(record[20..].try_into().unwrap());
+            if !entries.contains_key(&id)
+                || flags & !127 != 0
+                || (flags & 1 != 0 && pid <= 0)
+                || (flags & 64 != 0 && error <= 0)
+            {
+                return Err(HyperlightError::Error("invalid execution event".into()));
+            }
+        }
+        drop(entries);
+        for record in records {
+            let id = u64::from_le_bytes(record[..8].try_into().unwrap());
+            let entry = self
+                .get(id)
+                .ok_or_else(|| HyperlightError::Error(format!("unknown execution {id}")))?;
+            let flags = u32::from_le_bytes(record[20..].try_into().unwrap());
+            if flags & 1 != 0 {
+                entry.event(0, i32::from_le_bytes(record[8..12].try_into().unwrap()))?;
+            }
+            if flags & 2 != 0 {
+                entry.event(1, i32::from_le_bytes(record[12..16].try_into().unwrap()))?;
+            }
+            if flags & 64 != 0 {
+                entry.event(0, -i32::from_le_bytes(record[16..20].try_into().unwrap()))?;
+            }
+            for (stream, pipe) in entry.pipes.iter().enumerate() {
+                if flags & (8 << stream) != 0 {
+                    if stream == 0 {
+                        pipe.close();
+                    } else {
+                        pipe.eof();
+                    }
+                }
+            }
+            if flags & 4 != 0 {
+                entry.done.store(true, Ordering::Relaxed);
+            }
+            entry.wake.notify();
+        }
+        Ok(())
+    }
 }
 
 const PIPE_CAPACITY: usize = 64 * 1024;
@@ -497,6 +616,7 @@ pub(crate) struct Pipe {
     state: Mutex<PipeState>,
     reader: futures::task::AtomicWaker,
     writer: futures::task::AtomicWaker,
+    readiness: futures::task::AtomicWaker,
 }
 
 impl Pipe {
@@ -504,6 +624,7 @@ impl Pipe {
         let result = self.read_buffer(cx, out);
         if matches!(result, Poll::Ready(Ok(count)) if count != 0) {
             self.writer.wake();
+            self.readiness.wake();
         }
         result
     }
@@ -522,9 +643,11 @@ impl Pipe {
         if count == 0 && !state.eof && !state.closed {
             return Poll::Pending;
         }
-        for byte in &mut out[..count] {
-            *byte = state.bytes.pop_front().unwrap();
-        }
+        let (first, second) = state.bytes.as_slices();
+        let n = count.min(first.len());
+        out[..n].copy_from_slice(&first[..n]);
+        out[n..count].copy_from_slice(&second[..count - n]);
+        state.bytes.drain(..count);
         Poll::Ready(Ok(count))
     }
 
@@ -554,6 +677,7 @@ impl Pipe {
         let result = self.write_min_buffer(cx, bytes, minimum);
         if matches!(result, Poll::Ready(Ok(count)) if count != 0) {
             self.reader.wake();
+            self.readiness.wake();
         }
         result
     }
@@ -589,6 +713,7 @@ impl Pipe {
     pub(crate) fn notify(&self) {
         self.reader.wake();
         self.writer.wake();
+        self.readiness.wake();
     }
 
     pub(crate) fn close(&self) {
@@ -611,6 +736,87 @@ pub(crate) struct ProcessState {
 }
 
 impl Execution {
+    fn stdio_error(errno: i32) -> Vec<u8> {
+        let mut reply = vec![1];
+        reply.extend_from_slice(&errno.to_le_bytes());
+        reply
+    }
+
+    fn stdio_read(&self, count: u64) -> hyperlight_host::Result<Vec<u8>> {
+        if count > IO_CHUNK as u64 {
+            return Ok(Self::stdio_error(errno::EINVAL));
+        }
+        let mut reply = vec![0; count as usize + 1];
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        match self.pipes[0].read(&mut cx, &mut reply[1..]) {
+            Poll::Ready(Ok(count)) => {
+                reply.truncate(count + 1);
+                Ok(reply)
+            }
+            Poll::Ready(Err(_)) => Ok(Self::stdio_error(errno::EPIPE)),
+            Poll::Pending => Ok(Self::stdio_error(errno::EAGAIN)),
+        }
+    }
+
+    fn stdio_write(&self, stream: u64, bytes: &[u8]) -> hyperlight_host::Result<Vec<u8>> {
+        if !(1..=2).contains(&stream) || bytes.len() > IO_CHUNK {
+            return Ok(Self::stdio_error(errno::EINVAL));
+        }
+        if bytes.is_empty() {
+            return Ok(vec![0]);
+        }
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        match self.pipes[stream as usize].write_chunk(&mut cx, bytes) {
+            Poll::Ready(Ok(_)) => Ok(vec![0]),
+            Poll::Ready(Err(_)) => Ok(Self::stdio_error(errno::EPIPE)),
+            Poll::Pending => Ok(Self::stdio_error(errno::EAGAIN)),
+        }
+    }
+
+    fn stdio_poll(&self, stream: u64) -> hyperlight_host::Result<Vec<u8>> {
+        let Some(pipe) = self.pipes.get(stream as usize).cloned() else {
+            return Ok(Self::stdio_error(errno::EINVAL));
+        };
+        let mut reply = Box::pin(poll_fn(move |cx| {
+            pipe.readiness.register(cx.waker());
+            let state = pipe.state.lock().unwrap();
+            // Linux poll bits on the guest wire, independent of the host OS.
+            let events: u32 = if stream == 0 {
+                if state.eof || state.closed {
+                    1 | 16
+                } else if !state.bytes.is_empty() {
+                    1
+                } else {
+                    0
+                }
+            } else if state.closed || state.eof {
+                8
+            } else if PIPE_CAPACITY - state.bytes.len() >= IO_CHUNK {
+                4
+            } else {
+                0
+            };
+            if events == 0 {
+                Poll::Pending
+            } else {
+                let mut reply = vec![0];
+                reply.extend_from_slice(&events.to_le_bytes());
+                Poll::Ready(reply)
+            }
+        }));
+        if let Some(reply) = reply.as_mut().now_or_never() {
+            return Ok(reply);
+        }
+        match self.inbox.lock().unwrap().submit_reply(reply) {
+            Ok(id) => {
+                let mut reply = vec![2];
+                reply.extend_from_slice(&id.to_le_bytes());
+                Ok(reply)
+            }
+            Err(_) => Ok(Self::stdio_error(crate::errno::ENOBUFS)),
+        }
+    }
+
     pub fn shutdown(&self) {
         // Driver polls hold a temporary coordinator reference, so coordinator
         // destruction cannot race an operation on this engine.
@@ -758,7 +964,7 @@ impl Execution {
             pipe.eof();
             return Ok(vec![0]);
         }
-        let id = self.inbox.lock().unwrap().submit_reply(async move {
+        let mut reply = Box::pin(async move {
             let result = if stream == 0 {
                 let mut reply = vec![0; IO_CHUNK + 1];
                 match poll_fn(|cx| pipe.read(cx, &mut reply[1..])).await {
@@ -781,6 +987,11 @@ impl Execution {
                 }
             }
         });
+        // Only buffer I/O is polled here, never embedder host futures.
+        if let Some(reply) = reply.as_mut().now_or_never() {
+            return Ok(reply);
+        }
+        let id = self.inbox.lock().unwrap().submit_reply(reply);
         let id = match id {
             Ok(id) => id,
             Err(error) => {
@@ -799,7 +1010,280 @@ impl Execution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::FutureExt;
+
+    fn execution() -> Arc<Execution> {
+        let inbox = Arc::new(Mutex::new(async_calls::Inbox::default()));
+        inbox.lock().unwrap().negotiated = true;
+        Arc::new(Execution::new(
+            1,
+            &inbox,
+            None,
+            [true; 3],
+            CommandMetadata {
+                name: None,
+                program: "/test".into(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                stdio: [crate::command::Stdio::piped(); 3],
+            },
+        ))
+    }
+
+    #[test]
+    fn batched_lifecycle_preserves_early_eof_and_final_status() {
+        let registry = Executions::default();
+        let entry = execution();
+        registry.entries.lock().unwrap().insert(1, entry.clone());
+        entry.io(1, b"kept".to_vec()).unwrap();
+        let record = |pid: i32, status: i32, flags: u32| {
+            [
+                1u64.to_le_bytes().as_slice(),
+                pid.to_le_bytes().as_slice(),
+                status.to_le_bytes().as_slice(),
+                0i32.to_le_bytes().as_slice(),
+                flags.to_le_bytes().as_slice(),
+            ]
+            .concat()
+        };
+        registry.events(&record(42, 0, 1 | 16)).unwrap();
+        assert_eq!(entry.process.lock().unwrap().pid, Some(42));
+        assert!(!entry.done.load(Ordering::Relaxed));
+        let mut bytes = [0; 8];
+        assert_eq!(
+            poll_fn(|cx| entry.pipes[1].read(cx, &mut bytes))
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            4
+        );
+        assert_eq!(&bytes[..4], b"kept");
+        assert_eq!(
+            poll_fn(|cx| entry.pipes[1].read(cx, &mut bytes))
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        registry
+            .events(&record(42, 17 << 8, 2 | 4 | 8 | 32))
+            .unwrap();
+        assert_eq!(entry.process.lock().unwrap().status, Some(17 << 8));
+        assert!(entry.done.load(Ordering::Relaxed));
+        registry.complete_entry();
+        assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn malformed_lifecycle_batch_does_not_publish_earlier_records() {
+        let registry = Executions::default();
+        let entry = execution();
+        registry.entries.lock().unwrap().insert(1, entry.clone());
+        let mut record = [0u8; 24];
+        record[..8].copy_from_slice(&1u64.to_le_bytes());
+        record[8..12].copy_from_slice(&42i32.to_le_bytes());
+        record[20..].copy_from_slice(&1u32.to_le_bytes());
+        let mut batch = record.to_vec();
+        record[..8].copy_from_slice(&2u64.to_le_bytes());
+        batch.extend_from_slice(&record);
+        assert!(registry.events(&batch).is_err());
+        assert!(registry.events(&batch[..25]).is_err());
+        assert!(entry.process.lock().unwrap().pid.is_none());
+    }
+
+    #[test]
+    fn ready_command_io_does_not_queue_async_replies() {
+        let execution = execution();
+        assert_eq!(execution.io(1, b"output".to_vec()).unwrap(), [0]);
+        assert_eq!(
+            poll_fn(|cx| execution.pipes[0].write(cx, b"input"))
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            5
+        );
+        assert_eq!(execution.io(0, Vec::new()).unwrap(), b"\0input");
+        execution.pipes[0].eof();
+        assert_eq!(execution.io(0, Vec::new()).unwrap(), [0]);
+        execution.pipes[2].close();
+        assert_eq!(execution.io(2, vec![1]).unwrap(), [1, 32, 0, 0, 0]);
+        let inbox = execution.inbox.lock().unwrap();
+        assert!(!inbox.is_pending());
+        assert_eq!(inbox.next_id(), 0);
+    }
+
+    #[test]
+    fn direct_stdio_short_reads_and_failed_writes_do_not_consume_extra_data() {
+        let execution = execution();
+        execution.pipes[0]
+            .state
+            .lock()
+            .unwrap()
+            .bytes
+            .extend(b"abcdef");
+        assert_eq!(execution.stdio_read(1).unwrap(), b"\0a");
+        assert_eq!(execution.stdio_read(2).unwrap(), b"\0bc");
+        assert_eq!(execution.stdio_read(4096).unwrap(), b"\0def");
+        assert_eq!(execution.stdio_read(1).unwrap(), [1, 11, 0, 0, 0]);
+        execution.pipes[0].eof();
+        assert_eq!(execution.stdio_read(1).unwrap(), [0]);
+
+        let pipe = &execution.pipes[1];
+        pipe.state.lock().unwrap().bytes.resize(PIPE_CAPACITY, b'x');
+        assert_eq!(execution.stdio_write(1, b"!").unwrap(), [1, 11, 0, 0, 0]);
+        assert_eq!(execution.stdio_write(1, b"").unwrap(), [0]);
+        assert!(!pipe.state.lock().unwrap().eof);
+        assert!(!execution.inbox.lock().unwrap().is_pending());
+        let mut bytes = vec![0; PIPE_CAPACITY];
+        poll_fn(|cx| pipe.read(cx, &mut bytes))
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        assert!(bytes.iter().all(|&byte| byte == b'x'));
+        pipe.close();
+        assert_eq!(execution.stdio_write(1, b"!").unwrap(), [1, 32, 0, 0, 0]);
+    }
+
+    #[test]
+    fn direct_stdio_readiness_waits_without_consuming_or_committing_io() {
+        for stream in 0..3 {
+            let execution = execution();
+            let pipe = &execution.pipes[stream];
+            if stream != 0 {
+                pipe.state.lock().unwrap().bytes.resize(PIPE_CAPACITY, b'x');
+            }
+            assert_eq!(execution.stdio_poll(stream as u64).unwrap()[0], 2);
+            let mut calls = execution.calls.lock().unwrap();
+            assert!(poll_fn(|cx| calls.poll_batch(cx)).now_or_never().is_none());
+            if stream == 0 {
+                poll_fn(|cx| pipe.write(cx, b"input"))
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+            } else {
+                let mut bytes = [0; IO_CHUNK];
+                poll_fn(|cx| pipe.read(cx, &mut bytes))
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(
+                poll_fn(|cx| calls.poll_batch(cx))
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap(),
+                async_calls::Wake::Calls
+            );
+            assert_eq!(
+                &calls.take_batch()[20..],
+                &[0, if stream == 0 { 1 } else { 4 }, 0, 0, 0]
+            );
+            assert_eq!(
+                pipe.state.lock().unwrap().bytes.len(),
+                if stream == 0 {
+                    5
+                } else {
+                    PIPE_CAPACITY - IO_CHUNK
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn backpressured_command_io_completes_once_after_space_or_close() {
+        for close in [false, true] {
+            let execution = execution();
+            let pipe = &execution.pipes[1];
+            poll_fn(|cx| pipe.write(cx, &vec![b'a'; PIPE_CAPACITY]))
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            assert_eq!(execution.io(1, b"next".to_vec()).unwrap()[0], 2);
+            let mut calls = execution.calls.lock().unwrap();
+            assert!(poll_fn(|cx| calls.poll_batch(cx)).now_or_never().is_none());
+            if close {
+                pipe.close();
+            } else {
+                let mut first = [0; 4];
+                assert_eq!(
+                    poll_fn(|cx| pipe.read(cx, &mut first))
+                        .now_or_never()
+                        .unwrap()
+                        .unwrap(),
+                    4
+                );
+                assert_eq!(&first, b"aaaa");
+            }
+            assert_eq!(
+                poll_fn(|cx| calls.poll_batch(cx))
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap(),
+                async_calls::Wake::Calls
+            );
+            let batch = calls.take_batch();
+            assert_eq!(
+                &batch[20..],
+                if close {
+                    &[1, 32, 0, 0, 0][..]
+                } else {
+                    &[0][..]
+                }
+            );
+            calls.delivered();
+            assert!(!execution.inbox.lock().unwrap().is_pending());
+            assert!(poll_fn(|cx| calls.poll_batch(cx)).now_or_never().is_none());
+            if !close {
+                let mut bytes = vec![0; PIPE_CAPACITY];
+                assert_eq!(
+                    poll_fn(|cx| pipe.read(cx, &mut bytes))
+                        .now_or_never()
+                        .unwrap()
+                        .unwrap(),
+                    PIPE_CAPACITY
+                );
+                assert!(bytes[..PIPE_CAPACITY - 4].iter().all(|&b| b == b'a'));
+                assert_eq!(&bytes[PIPE_CAPACITY - 4..], b"next");
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_read_preserves_wrapped_and_partially_drained_bytes() {
+        let pipe = Pipe::default();
+        let mut bytes = VecDeque::with_capacity(8);
+        bytes.extend(0..8);
+        bytes.drain(..3);
+        bytes.extend(8..11);
+        assert!(!bytes.as_slices().1.is_empty());
+        pipe.state.lock().unwrap().bytes = bytes;
+        pipe.eof();
+        let mut first = [0; 4];
+        assert_eq!(
+            poll_fn(|cx| pipe.read(cx, &mut first))
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            4
+        );
+        assert_eq!(first, [3, 4, 5, 6]);
+        let mut rest = [0; 8];
+        assert_eq!(
+            poll_fn(|cx| pipe.read(cx, &mut rest))
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            4
+        );
+        assert_eq!(&rest[..4], &[7, 8, 9, 10]);
+        assert_eq!(
+            poll_fn(|cx| pipe.read(cx, &mut rest))
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn pipe_capacity_backpressures_and_eof_preserves_queued_bytes() {

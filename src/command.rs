@@ -411,7 +411,7 @@ impl AppSandbox {
         {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "this rootfs does not support command protocol version 5",
+                "this rootfs does not support command protocol version 7",
             )));
         }
         Ok(CommandSandbox(Arc::new(Coordinator {
@@ -602,7 +602,7 @@ impl Command {
         self
     }
 
-    /// Launch without polling any command's host futures.
+    /// Launch without polling embedder host futures.
     ///
     /// Requires an absolute executable path; there is no PATH search. Accepted
     /// commands remain owned by the sandbox while parked. Dropping a child kills it.
@@ -667,7 +667,7 @@ impl Command {
             )));
         }
         let mut fields = vec![
-            "5".to_owned(),
+            "7".to_owned(),
             "0".to_owned(),
             self.args.len().to_string(),
             env.len().to_string(),

@@ -218,7 +218,7 @@ impl PendingCalls {
             let (abort, registration) = AbortHandle::new_pair();
             let timer: Operation = Abortable::new(
                 Box::pin(async move {
-                    tokio::time::sleep_until(at.into()).await;
+                    crate::timer::sleep_until(at).await;
                     CompletionEvent::Timer(at)
                 }),
                 registration,

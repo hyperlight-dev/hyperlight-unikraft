@@ -135,8 +135,9 @@ sends SIGKILL to all remaining descendants, including reparented descendants
 and descendants in other sessions. Other command trees are unaffected.
 `wait()` waits for the root and command cleanup, returning the root's status
 without aggregating descendant exit codes. `try_wait()` reports the same
-completion condition without driving progress. Output already written is
-forwarded before cleanup finishes, so piped output still needs concurrent draining.
+completion condition without driving progress. Successful guest output writes
+have already reached the host buffers; piped output still needs concurrent draining
+to let a blocked writer finish.
 `wait_with_output()` and `Command::output()` handle both drains and cleanup.
 `Command::status()` waits for command cleanup without draining piped output.
 Cancellation of a borrowed `child.wait()` preserves the execution and prepared
@@ -274,7 +275,7 @@ there is no shell parsing or PATH search. Stdio defaults to `/dev/null`;
 `Stdio::piped()` opts into a host pipe. Independent roots do not inherit each
 other's command descriptors. Cross-tree socket sharing is not supported.
 
-Command protocol version 5 requires rebuilt C, Rust, Go, or .NET AOT exec
+Command protocol version 7 requires rebuilt C, Rust, Go, or .NET AOT exec
 driver images. Other runtimes and snapshots restored without the command
 handshake are rejected explicitly by `into_commands()`. Command sandboxes
 do not expose the legacy interpreter API. Existing `AppSandbox` driving and
@@ -328,15 +329,22 @@ cannot consume restored output.
 
 ### Attribution and control wire format
 
-The exec driver negotiates version 5 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
-Workers attach with `HLCALL_IOC_EXECUTION` (ioctl 5, `u64`). The kernel inherits
-this identity through thread creation. Before a host call whose owner changed,
+The exec driver negotiates version 7 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
+The kernel acknowledges a matching version with `CommandDriverReady() -> i32`;
+querying the version alone does not enable the Command API on an older kernel.
+The driver temporarily attaches with `HLCALL_IOC_EXECUTION` (ioctl 5, `u64`) while
+setting up descriptors and calling `vfork`/`execve`. The child inherits this
+identity; the driver detaches when it reports launch success or failure.
+There is no per-command supervisor thread or blocking `waitpid`: kernel
+process-exit hooks record root status, reap it, and terminate descendants.
+Before a host call whose owner changed,
 the transport sends `ExecutionContext(u64) -> i32` under the same transport
 lock as the following call. Socket rescans and resource destruction use the
 resource owner's identity, never the currently polled host handle.
 
-Before scheduling on each entry, `ExecutionActive() -> u64` selects the command
-being driven. Only that execution's threads and execution-zero infrastructure
+Before scheduling on each entry, `ExecutionEnter() -> bytes` returns a
+little-endian `u64` execution ID followed by a one-byte resource-restore flag.
+Only that execution's threads and execution-zero infrastructure
 are eligible to run. Other trees remain queued even when their timers expire;
 their deadlines and socket readiness are not serviced by this entry. Runnable
 foreign threads do not prevent returning to the host. This gate is independent
@@ -346,13 +354,14 @@ application threads. This is scheduling isolation, not a PID/filesystem namespac
 applications deliberately synchronizing across trees still require both trees
 to be driven. CPU-bound guest code still requires the interrupt handle to preempt.
 
-`ExecutionRestore() -> i32` marks the first entry after resource teardown.
+The restore flag marks the first entry after resource teardown.
 After delivering retained completion records, the kernel reconstructs only
 the selected execution's sockets, retires its old request IDs, and finishes
 remaining async waits with `EINTR` before scheduling. An empty version-1
-completion batch is valid for this entry. Pipe workers retry interrupted
-forwarding without closing the channel; host output chunks commit atomically
-so interrupted backpressured writes cannot duplicate a partially forwarded chunk.
+completion batch is valid for this entry. Stdio readiness watches are rearmed
+against the restored host buffers without closing descriptors. Readiness waits
+never consume input or commit output, so interrupted waits cannot lose or
+duplicate a transfer.
 
 `CommandSpawn` carries one NUL-delimited string: version, execution ID,
 argument count (excluding argv[0]), environment count, piped-stream bitmask
@@ -360,36 +369,64 @@ argument count (excluding argv[0]), environment count, piped-stream bitmask
 The numeric fields are decimal. A final NUL is required. `CommandKill`
 carries the execution ID as a decimal string. It uses
 `HLCALL_IOC_EXECUTION_KILL` (ioctl 9, `u64`) to signal all matching processes,
-excluding guest init and the calling driver supervisor. It uses inherited
+excluding guest init and the launch driver. It uses inherited
 execution identity, not current parent PIDs or process groups.
 During whole-tree termination, the kernel cancels execution-owned async waits
-and refuses new forwarding operations so cleanup does not need another host
+and refuses new I/O waits so cleanup does not need another host
 completion batch. Socket readiness workers stop waiting on the host while
 process teardown closes their sockets.
 The normal named-call completion
 acknowledges control delivery, **not** process exit.
 
-`HLCALL_IOC_COMMAND_EVENT` (ioctl 7, two `i32`s) forwards `CommandEvent(kind,
-value)`: kind 0 is a positive root PID or negative spawn errno, kind 1 a raw
-Linux wait status, kind 2 a positive stream error errno, and kind 3/value 0
-closes host stdin when its guest reader is gone. `ExecutionDone()` marks the
-end of all context-owned guest threads, including readiness and pipe workers.
-Before forwarding kind 1, the kernel signals all remaining application
-processes in that execution. Normal root exit leaves output forwarding workers
-alive to drain data already written; the host closes stdin, including taken
-handles, so input forwarding cannot keep the completed command alive.
+`HLCALL_IOC_COMMAND_EVENT` (ioctl 7, two `i32`s) commits the launch: kind 0,
+with a positive root PID or negative spawn errno, then detaches the driver.
+This ioctl makes no host call. Root exit kills remaining application processes
+and cancels their pending async waits; completion still waits for all
+execution-owned threads, including socket readiness workers.
+
+`CommandYield(ns, flags, status, result, records)` carries the usual `Yield`
+fields plus lifecycle records. Each 24-byte little-endian record contains
+`u64 execution_id, i32 pid, i32 wait_status, i32 errno, u32 flags`.
+Flags are started (1), root exited (2), all threads completed (4),
+stdin/stdout/stderr closed (8/16/32), and launch failed (64).
+Up to 64 records ride on the yield; overflow batches use `ExecutionEvents(bytes)`.
+Events are observable at the same host boundary as before, including EOF
+before process exit. The host closes stdin on root exit, including taken handles.
+
+The driver borrows its existing control descriptor and caches `/dev/null`
+descriptors. Piped streams use `HLCALL_IOC_COMMAND_STDIO` (ioctl 10, two `u64`s:
+stream in, descriptor out) to create execution-owned, close-on-exec file
+descriptors. The child installs them with `dup2`. They implement ordinary
+blocking/nonblocking and vectored I/O, `poll`/`epoll`, and non-seekable FIFO
+metadata without guest POSIX pipes or per-stream forwarding threads.
+Duplicated/inherited descriptors share the file lifetime; only the last close
+reports stream EOF or closes host stdin.
+
+`CommandRead(u64 count) -> bytes` reads at most the requested count from stdin.
+`CommandWrite(u64 stream, bytes) -> bytes` writes one atomic output chunk.
+Both use tag 0 for success (followed by input bytes for reads), or tag 1 plus
+a little-endian Linux errno. Empty/full buffers return internal `EAGAIN`
+without consuming input or queuing a write. Guest blocking I/O then waits on
+file readiness; this does not change the public async Rust API.
+`CommandPoll(u64 stream) -> bytes` returns tag 0 plus Linux poll bits as a
+little-endian `u32`, or tag 2 plus an async request ID. A kernel callback,
+not a thread, publishes readiness and wakes file waiters when that future
+completes. Closing the file cancels its watch, killing cancels all execution
+watches, and restore invalidates old IDs and rechecks readiness.
 
 `HLCALL_IOC_COMMAND_IO` (ioctl 8) contains `u64 stream`, a buffer pointer,
 `u64 len`, and `u64 done`. Streams 1/2 write stdout/stderr; zero length reports
 EOF. Stream 0 reads stdin in chunks of up to 4096 bytes. `CommandIo` replies
 use tag 0 plus read bytes (empty for writes), tag 1 plus a little-endian Linux
 errno, or the standard tag 2 pending ID. These futures belong to the same
-execution as the requesting worker.
+execution as the requesting thread. The direct descriptor implementation instead batches final-close events into
+`CommandYield`; normal zero-length `write()` calls do not signal EOF.
 
 Each boundary reports `ExecutionTimers(Vec<u8>)`: pairs of little-endian
 `u64 execution_id, u64 nanoseconds_until_wakeup`. The host takes the earliest
 deadline for the selected execution, replacing its previous boundary's set; absent timers
-are removed. Legacy execution zero retains the original `Yield` protocol.
+are removed. Execution zero uses the legacy deadline in the yield fields;
+kernels without Command negotiation continue to call the original `Yield`.
 The control device releases its read vnode lock while the supervisor waits,
 so control ioctls and independent worker opens cannot deadlock behind it.
 
@@ -440,6 +477,11 @@ operations may have external side effects already.
 
 Internal scheduler timers and socket registrations are rebound when driving
 moves to a different Tokio runtime, even if the scheduler deadline is unchanged.
+On Linux, scheduler deadlines use high-resolution `timerfd` readiness through
+Tokio. Windows and macOS retain Tokio timers; Linux also falls back to Tokio
+if native timer setup or waiting fails. Fallbacks retain the original deadline,
+but their precision depends on Tokio and the host platform. No timer blocks
+the executor or spins while waiting.
 This does not migrate runtime-bound resources captured by user futures or
 reconstruct pending DNS lookups. Complete pending host calls, or discard them
 through cancellation/restore, before destroying their runtime.

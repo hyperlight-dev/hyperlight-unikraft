@@ -69,6 +69,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Command protocol v7 removes per-command supervisor threads. The driver launches
+  and returns; kernel process-exit hooks reap roots and terminate descendants.
+  Lifecycle and stream-close events are batched into the yield boundary, and
+  execution selection and restore checks share one call.
+- Command stdio replaces guest pipes and forwarding threads with
+  direct host-backed descriptors, preserving poll/epoll, nonblocking I/O,
+  descriptor lifetime and snapshot behavior. Exec drivers reuse their control
+  descriptor and cache `/dev/null`; compiled-runtime rootfs images must be rebuilt.
+- Command pipe I/O completes synchronously when buffers are ready, retaining
+  asynchronous backpressure otherwise. Buffered output is copied in bulk.
+- Linux guest scheduler timers use high-resolution `timerfd` readiness through
+  Tokio, with Tokio timer fallback on native errors and on Windows/macOS.
 - Command lifecycle operations are async: await spawn, kill, child restoration,
   and command snapshot capture/restoration. Internal contention waits for wakeups
   instead of returning `WouldBlock`. Pending operations do not retain the sandbox;

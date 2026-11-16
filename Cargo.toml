@@ -88,6 +88,7 @@ sha2 = { version = "0.11", optional = true }
 #   macOS   — Hypervisor.framework via the default `hvf` feature.
 [target.'cfg(target_os = "linux")'.dependencies]
 hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight.git", branch = "main", default-features = false, features = ["kvm", "build-metadata"] }
+rustix = { version = "1", features = ["time"] }
 
 # Non-Linux keeps hyperlight's defaults: HVF (macOS) is on, WHP (Windows) is
 # unconditional, and the Linux-only kvm/mshv3 features are inert here.

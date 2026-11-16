@@ -55,6 +55,7 @@ mod hostfs;
 mod hostnet;
 pub mod net_policy;
 mod profile;
+mod timer;
 
 pub use cgroup::{CONTAINER_SCRATCH_HEADROOM_MB, cgroup_memory_limit_mb, scratch_mb_within};
 pub use hostfs::{DirEntry, FileStat, FsBackend, S_IFDIR, S_IFMT, S_IFREG};
@@ -1726,36 +1727,47 @@ impl GuestConfig {
         let events = self.events.clone();
         let prof = self.profile.clone();
         let result = self.result.clone();
+        let report_yield = move |ns: u64,
+                                 flags: i32,
+                                 status: i32,
+                                 bytes: Vec<u8>|
+              -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("Yield");
+            let mut events = events.lock().unwrap();
+            // What the entry saw of the call in flight rides on its
+            // Yield, so a call costs no exit of its own: still running,
+            // or returned with its status and result.
+            if flags & YIELD_CALL_STARTED != 0 {
+                events.push(Event::CallStarted);
+            }
+            if flags & YIELD_CALL_DONE != 0 {
+                if !bytes.is_empty() {
+                    *result.lock().unwrap() = Some(bytes);
+                }
+                events.push(Event::Outcome(if status == 0 {
+                    Yield::CallDone
+                } else {
+                    Yield::CallFailed { status }
+                }));
+            }
+            // Keep the absolute deadline so time the host spends elsewhere
+            // counts against it and the guest timer still fires on schedule.
+            let until = (ns != 0).then(|| Instant::now() + Duration::from_nanos(ns));
+            events.push(Event::Outcome(Yield::Blocked { until }));
+            Ok(0)
+        };
+        target.register_host_function("Yield", report_yield.clone())?;
+        let executions = self.executions.clone();
         target.register_host_function(
-            "Yield",
+            "CommandYield",
             move |ns: u64,
                   flags: i32,
                   status: i32,
-                  bytes: Vec<u8>|
+                  bytes: Vec<u8>,
+                  records: Vec<u8>|
                   -> hyperlight_host::Result<i32> {
-                let _profile = prof.host("Yield");
-                let mut events = events.lock().unwrap();
-                // What the entry saw of the call in flight rides on its
-                // Yield, so a call costs no exit of its own: still running,
-                // or returned with its status and result.
-                if flags & YIELD_CALL_STARTED != 0 {
-                    events.push(Event::CallStarted);
-                }
-                if flags & YIELD_CALL_DONE != 0 {
-                    if !bytes.is_empty() {
-                        *result.lock().unwrap() = Some(bytes);
-                    }
-                    events.push(Event::Outcome(if status == 0 {
-                        Yield::CallDone
-                    } else {
-                        Yield::CallFailed { status }
-                    }));
-                }
-                // Keep the absolute deadline so time the host spends elsewhere
-                // counts against it and the guest timer still fires on schedule.
-                let until = (ns != 0).then(|| Instant::now() + Duration::from_nanos(ns));
-                events.push(Event::Outcome(Yield::Blocked { until }));
-                Ok(0)
+                executions.events(&records)?;
+                report_yield(ns, flags, status, bytes)
             },
         )?;
         let events = self.events.clone();
