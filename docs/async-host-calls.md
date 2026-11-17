@@ -262,11 +262,45 @@ Keep the child alive while driving taken stream handles, even after `wait()`
 returns; dropping or parking the child invalidates those handles. Dropping the
 sandbox owner releases the VM and any unfinished work.
 
-Streams implement `futures::io::AsyncRead` / `AsyncWrite`. Each host pipe holds
-at most 64 KiB, with 4 KiB transport chunks and ordinary backpressure. Drain
-piped output concurrently with `wait()` to avoid a full-pipe deadlock.
+Streams implement both `futures::io` and `tokio::io` `AsyncRead` / `AsyncWrite`,
+so Tokio utilities such as `tokio::io::copy` work without a compatibility adapter.
+Tokio's stdin `shutdown()` sends EOF, just like futures' `close()`.
+Import only one family's extension traits per scope, or qualify overlapping
+methods such as `write_all` explicitly.
+`Stdio::piped()` holds at most 64 KiB per pipe, with 4 KiB transport chunks and
+ordinary backpressure. Drain piped output concurrently with `wait()` to avoid a
+full-pipe deadlock. Stdout/stderr also support non-backpressuring modes:
+
+| Mode | Behavior when unread output fills the buffer |
+|---|---|
+| `Stdio::head(capacity)` | Retain buffered bytes; discard incoming overflow |
+| `Stdio::tail(capacity)` | Evict oldest bytes; retain newest output |
+| `Stdio::unbounded()` | Grow to retain all unread output |
+
+Head/tail capacity is measured in bytes, not characters; zero capacity discards
+all output. Reads free space for later writes. Without concurrent reads, these
+modes retain the first/last `capacity` bytes of the complete output. They can be
+drained after `child.wait().await`, as long as the child remains alive. Dropping
+the reader still closes the pipe and fails subsequent guest writes; overflow
+alone does not close it or terminate the command. These modes are output-only;
+configuring them for stdin makes `spawn()` return `InvalidInput`.
+
+`ChildStdout::dropped_bytes()` and `ChildStderr::dropped_bytes()` report cumulative
+bytes discarded by head/tail policies (saturating at `u64::MAX`). Reads do not
+reset the counters. Modes, unread bytes and counters survive parking and command
+snapshots. `Output::stdout_dropped` and `Output::stderr_dropped` report the same
+counts when using the collection helpers.
+
+> **Warning:** `Stdio::unbounded()` allows guest output to exhaust host memory.
+> Prefer head/tail buffering for untrusted workloads unless an independent host
+> memory budget is enforced.
+
 `output()` and `wait_with_output()` collect into unbounded host vectors, like
-the corresponding standard-library APIs. Separate stream and wait handles
+the corresponding standard-library APIs. `output()` preserves configured output
+pipe modes, replacing null outputs with ordinary pipes. Head/tail capacities
+bound unread buffers, not a continuously draining collector: to obtain a bounded
+final head/tail, spawn, wait without draining, then read the retained bytes.
+Separate stream and wait handles
 can be polled on separate tasks without replacing each other's wakeups.
 
 The initial API accepts UTF-8 arguments, per-command environment overrides,

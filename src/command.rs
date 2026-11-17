@@ -531,6 +531,17 @@ pub enum Stdio {
     Null,
     /// Expose a bounded, passive host pipe. Poll the child's wait concurrently.
     Piped,
+    /// Retain up to this many unread output bytes, discarding incoming overflow.
+    /// Does not backpressure the guest. Only valid for stdout/stderr.
+    Head(usize),
+    /// Retain the newest unread output bytes, evicting older bytes on overflow.
+    /// Does not backpressure the guest. Only valid for stdout/stderr.
+    Tail(usize),
+    /// Retain all unread output without backpressure. Only valid for stdout/stderr.
+    ///
+    /// > **Warning:** Untrusted guests can exhaust host memory. Use bounded
+    /// > modes unless an independent host memory budget is enforced.
+    Unbounded,
 }
 
 impl Stdio {
@@ -541,6 +552,37 @@ impl Stdio {
     /// Create a host pipe.
     pub fn piped() -> Self {
         Self::Piped
+    }
+
+    /// Retain up to `capacity` unread bytes, dropping incoming overflow.
+    ///
+    /// Reads free space for later writes. Without concurrent reads, retains the
+    /// first `capacity` output bytes. Zero capacity discards all output.
+    /// Only valid for stdout/stderr; writes never wait for buffer space.
+    pub fn head(capacity: usize) -> Self {
+        Self::Head(capacity)
+    }
+
+    /// Retain up to `capacity` unread bytes, dropping the oldest on overflow.
+    ///
+    /// Reads free space for later writes. Without concurrent reads, retains the
+    /// last `capacity` output bytes. Zero capacity discards all output.
+    /// Only valid for stdout/stderr; writes never wait for buffer space.
+    pub fn tail(capacity: usize) -> Self {
+        Self::Tail(capacity)
+    }
+
+    /// Retain all unread output in a growing buffer without backpressure.
+    ///
+    /// Only valid for stdout/stderr. The child can be awaited before draining.
+    ///
+    /// # Security
+    ///
+    /// > **Warning:** A guest can exhaust host memory by producing unlimited
+    /// > output. Prefer [`Self::head`] or [`Self::tail`] for untrusted workloads
+    /// > unless an independent host memory budget is enforced.
+    pub fn unbounded() -> Self {
+        Self::Unbounded
     }
 }
 
@@ -586,7 +628,8 @@ impl Command {
         self.cwd = Some(path.into());
         self
     }
-    /// Configure stdin.
+    /// Configure stdin. Only [`Stdio::null`] and [`Stdio::piped`] are supported.
+    /// Other modes are rejected by [`Self::spawn`].
     pub fn stdin(&mut self, stdio: Stdio) -> &mut Self {
         self.stdio[0] = stdio;
         self
@@ -622,6 +665,12 @@ impl Command {
     ) -> Result<Child> {
         let _transition = coordinator.transition(attempt)?;
         coordinator.failure()?;
+        if !matches!(self.stdio[0], Stdio::Null | Stdio::Piped) {
+            return Err(Error::Wait(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "head, tail and unbounded pipes are only supported for stdout/stderr",
+            )));
+        }
         let mut sandbox = coordinator.try_sandbox(attempt)?;
         let mut env = BTreeMap::new();
         if !self.clear_env {
@@ -675,7 +724,7 @@ impl Command {
                 .iter()
                 .enumerate()
                 .fold(0u8, |bits, (i, mode)| {
-                    bits | (u8::from(*mode == Stdio::Piped) << i)
+                    bits | (u8::from(*mode != Stdio::Null) << i)
                 })
                 .to_string(),
             self.cwd.clone().unwrap_or_default(),
@@ -696,7 +745,7 @@ impl Command {
         let (id, execution) = coordinator.executions.create(
             &sandbox.config.async_inbox,
             sandbox.config.net.as_ref(),
-            self.stdio.map(|mode| mode == Stdio::Piped),
+            self.stdio.map(|mode| mode != Stdio::Null),
             CommandMetadata {
                 name: self.name.clone(),
                 program: self.program.clone(),
@@ -725,8 +774,17 @@ impl Command {
     }
 
     /// Capture stdout and stderr while waiting, closing stdin.
+    ///
+    /// Null outputs become piped; other output modes are preserved. Collection
+    /// drains concurrently and is unbounded, even for head/tail pipes. To retain
+    /// only a bounded head/tail, spawn, wait without draining, then read the pipes
+    /// while keeping the child alive.
     pub async fn output(&mut self) -> Result<Output> {
-        self.stdout(Stdio::Piped).stderr(Stdio::Piped);
+        for mode in &mut self.stdio[1..] {
+            if *mode == Stdio::Null {
+                *mode = Stdio::Piped;
+            }
+        }
         self.spawn().await?.wait_with_output().await
     }
 
@@ -1121,6 +1179,12 @@ pub struct Output {
     pub stdout: Vec<u8>,
     /// Captured stderr, including descendants.
     pub stderr: Vec<u8>,
+    /// Bytes discarded by stdout's head/tail policy, saturating at `u64::MAX`.
+    /// Includes drops before collection began, even if stdout was taken.
+    pub stdout_dropped: u64,
+    /// Bytes discarded by stderr's head/tail policy, saturating at `u64::MAX`.
+    /// Includes drops before collection began, even if stderr was taken.
+    pub stderr_dropped: u64,
 }
 
 /// A root process and handles driving its entire guest process tree.
@@ -1140,8 +1204,9 @@ pub struct Output {
 /// is dropped, unfinished commands report SIGKILL (9) without a guest VM entry;
 /// completed commands retain their status. Buffered output can be drained to EOF.
 /// A synchronous operation already in progress may finish before teardown.
-/// Waiting does not drain piped output; drain concurrently or use
-/// [`wait_with_output`](Self::wait_with_output).
+/// Waiting does not drain output. For [`Stdio::piped`], drain concurrently or use
+/// [`wait_with_output`](Self::wait_with_output). Head, tail and unbounded pipes
+/// can be drained after waiting, while keeping this child alive.
 pub struct Child {
     id: u64,
     generation: u64,
@@ -1300,6 +1365,7 @@ impl Child {
     /// Drain both pipes to EOF, wait for command cleanup, and collect the root status.
     ///
     /// Collected output is unbounded, like `std::process::Command::output`.
+    /// Head/tail capacities bound unread pipe buffers, not this collector.
     pub async fn wait_with_output(mut self) -> Result<Output> {
         let stdout = self.stdout.take();
         let stderr = self.stderr.take();
@@ -1319,6 +1385,8 @@ impl Child {
             status,
             stdout,
             stderr,
+            stdout_dropped: self.execution.pipes[1].dropped_bytes(),
+            stderr_dropped: self.execution.pipes[2].dropped_bytes(),
         })
     }
 }
@@ -1435,19 +1503,47 @@ impl AsyncRead for ChildPipe {
     }
 }
 
-/// A command's piped standard input; implements `futures::io::AsyncWrite`.
+impl tokio::io::AsyncRead for ChildPipe {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let count = std::task::ready!(AsyncRead::poll_read(self, cx, out.initialize_unfilled()))?;
+        out.advance(count);
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A command's piped standard input; implements futures and Tokio `AsyncWrite`.
 /// Writes only buffer input; poll [`Child::wait`] concurrently to consume it.
 /// Does not keep the sandbox alive. After sandbox destruction, writes and
 /// flushes return `BrokenPipe`; closing is successful.
 pub struct ChildStdin(ChildPipe);
-/// A command's piped standard output; implements `futures::io::AsyncRead`.
+/// A command's piped standard output; implements futures and Tokio `AsyncRead`.
 /// Reads only consume buffered output; poll [`Child::wait`] concurrently to produce it.
 /// Does not keep the sandbox alive. After sandbox destruction, buffered bytes
 /// remain readable, followed by EOF.
 pub struct ChildStdout(ChildPipe);
-/// A command's piped standard error; implements `futures::io::AsyncRead`.
+/// A command's piped standard error; implements futures and Tokio `AsyncRead`.
 /// Has the same sandbox lifetime and EOF behavior as [`ChildStdout`].
 pub struct ChildStderr(ChildPipe);
+
+impl ChildStdout {
+    /// Total bytes discarded by the head/tail policy, saturating at `u64::MAX`.
+    /// Reading does not reset the count. Returns zero for non-lossy modes.
+    pub fn dropped_bytes(&self) -> u64 {
+        self.0.execution.pipes[1].dropped_bytes()
+    }
+}
+
+impl ChildStderr {
+    /// Total bytes discarded by the head/tail policy, saturating at `u64::MAX`.
+    /// Reading does not reset the count. Returns zero for non-lossy modes.
+    pub fn dropped_bytes(&self) -> u64 {
+        self.0.execution.pipes[2].dropped_bytes()
+    }
+}
 
 impl AsyncRead for ChildStdout {
     fn poll_read(
@@ -1465,6 +1561,24 @@ impl AsyncRead for ChildStderr {
         out: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.0).poll_read(cx, out)
+    }
+}
+impl tokio::io::AsyncRead for ChildStdout {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(Pin::new(&mut self.0), cx, out)
+    }
+}
+impl tokio::io::AsyncRead for ChildStderr {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(Pin::new(&mut self.0), cx, out)
     }
 }
 impl AsyncWrite for ChildStdin {
@@ -1505,5 +1619,23 @@ impl AsyncWrite for ChildStdin {
             self.0.execution.pipes[self.0.stream].notify();
         }
         result
+    }
+}
+
+impl tokio::io::AsyncWrite for ChildStdin {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        AsyncWrite::poll_write(self, cx, bytes)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_flush(self, cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_close(self, cx)
     }
 }

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `Stdio::head(capacity)`, `tail(capacity)` and `unbounded()` output pipes let
+  commands finish without concurrent output draining. Head/tail expose dropped
+  byte counts; buffer policies and counts survive command snapshots.
+  Unbounded output is opt-in and can exhaust host memory.
+- Command stdin/stdout/stderr pipes implement Tokio's `AsyncWrite` / `AsyncRead`
+  directly, while retaining their futures I/O implementations.
 - `ChildInfo::kill()` terminates parked or active commands without restoring or
   acquiring a child handle. Existing handles retain status and buffered output;
   stale metadata cannot terminate a snapshot replacement.

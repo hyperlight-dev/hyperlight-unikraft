@@ -2,6 +2,7 @@
 // Copyright 2026 The Hyperlight Authors.
 
 //! Concurrent commands, parking, snapshots, and descendant cleanup in one sandbox.
+//! For a minimal single-command example, see `basic_command.rs`.
 //!
 //! From the repository root on Linux, with Docker, just, GCC, Rust, and KVM:
 //!

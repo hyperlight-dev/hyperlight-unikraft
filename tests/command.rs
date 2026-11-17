@@ -40,6 +40,220 @@ async fn read_while_running(
 }
 
 #[tokio::test]
+async fn output_modes_complete_without_readers_and_preserve_drop_counts() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    for mode in [
+        Stdio::head(0),
+        Stdio::tail(0),
+        Stdio::head(5000),
+        Stdio::tail(5000),
+        Stdio::unbounded(),
+    ] {
+        let mut child = sandbox
+            .command("/mnt/bin/command")
+            .arg("large")
+            .stdout(mode)
+            .stderr(mode)
+            .spawn()
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        let retained = match mode {
+            Stdio::Head(n) | Stdio::Tail(n) => n,
+            _ => 320 * 1024,
+        };
+        let dropped = (320 * 1024 - retained) as u64;
+        assert_eq!(child.stdout.as_ref().unwrap().dropped_bytes(), dropped);
+        assert_eq!(child.stderr.as_ref().unwrap().dropped_bytes(), dropped);
+        let output = child.wait_with_output().await.unwrap();
+        assert_eq!(output.stdout, vec![b'x'; retained]);
+        assert_eq!(output.stderr, output.stdout);
+        assert_eq!(output.stdout_dropped, dropped);
+        assert_eq!(output.stderr_dropped, dropped);
+    }
+}
+
+#[tokio::test]
+async fn output_preserves_configured_modes_and_rejects_output_only_stdin() {
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let output = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "0", "abcdef"])
+        .stdout(Stdio::head(3))
+        .stderr(Stdio::tail(0))
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"abc");
+    assert_eq!(output.stdout_dropped, 4);
+    assert_eq!(output.stderr_dropped, 0);
+    for mode in [Stdio::head(3), Stdio::tail(3), Stdio::unbounded()] {
+        assert!(matches!(
+            sandbox.command("/mnt/bin/command").stdin(mode).spawn().await,
+            Err(hyperlight_unikraft::Error::Wait(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+    }
+    assert!(sandbox.children().is_empty());
+}
+
+#[tokio::test]
+async fn output_modes_and_loss_counters_survive_snapshot_restore() {
+    let sandbox = builder()
+        .host_function("gate", |_| Ok("abcdefgh".into()))
+        .boot()
+        .unwrap()
+        .into_commands()
+        .unwrap();
+    for (mode, expected, dropped) in [
+        (Stdio::head(3), &b"abc"[..], 8),
+        (Stdio::tail(3), &b"XYZ"[..], 8),
+        (Stdio::unbounded(), &b"abcdefghXYZ"[..], 0),
+    ] {
+        let child = sandbox
+            .command("/mnt/bin/command")
+            .args(["host-echo", "gate"])
+            .stdin(Stdio::piped())
+            .stdout(mode)
+            .spawn()
+            .await
+            .unwrap();
+        let id = child.execution_id();
+        let initial_dropped = if mode == Stdio::Unbounded { 0 } else { 5 };
+        assert_eq!(
+            child.stdout.as_ref().unwrap().dropped_bytes(),
+            initial_dropped
+        );
+        child.park();
+        let snapshot = sandbox.snapshot().await.unwrap();
+        sandbox.restore(&snapshot).await.unwrap();
+        assert_eq!(sandbox.children().by_id(id).unwrap().stdio[1], mode);
+        let mut child = sandbox
+            .children()
+            .by_id(id)
+            .unwrap()
+            .restore()
+            .await
+            .unwrap();
+        assert_eq!(
+            child.stdout.as_ref().unwrap().dropped_bytes(),
+            initial_dropped
+        );
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"XYZ").await.unwrap();
+        stdin.close().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        let output = child.wait_with_output().await.unwrap();
+        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stdout_dropped, dropped);
+    }
+}
+
+#[tokio::test]
+async fn tokio_pipes_echo_with_backpressure_and_stdin_shutdown() {
+    use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
+
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("echo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let input: Vec<u8> = (0..=255).cycle().take(256 * 1024).collect();
+    let mut output = Vec::new();
+    let (status, (), copied) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            child.wait(),
+            async {
+                TokioAsyncWriteExt::write_all(&mut stdin, &input)
+                    .await
+                    .unwrap();
+                TokioAsyncWriteExt::flush(&mut stdin).await.unwrap();
+                stdin.shutdown().await.unwrap();
+            },
+            tokio::io::copy(&mut stdout, &mut output),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(status.unwrap().success());
+    assert_eq!(copied.unwrap(), input.len() as u64);
+    assert_eq!(output, input);
+    assert_eq!(
+        TokioAsyncWriteExt::write_all(&mut stdin, b"x")
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+}
+
+#[tokio::test]
+async fn tokio_output_preserves_read_buf_contents_and_drains_both_streams() {
+    use std::{mem::MaybeUninit, pin::Pin};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("large")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut storage = [MaybeUninit::uninit(); 16];
+    let mut buffer = ReadBuf::uninit(&mut storage);
+    buffer.put_slice(b"prefix");
+    futures::future::poll_fn(|cx| Pin::new(&mut stdout).poll_read(cx, &mut buffer))
+        .await
+        .unwrap();
+    assert_eq!(buffer.filled(), b"prefixxxxxxxxxxx");
+    let mut output = buffer.filled()[6..].to_vec();
+    let mut errors = Vec::new();
+    let (status, copied, copied_errors) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            child.wait(),
+            tokio::io::copy(&mut stdout, &mut output),
+            tokio::io::copy(&mut stderr, &mut errors),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(status.unwrap().success());
+    assert_eq!(copied.unwrap(), 320 * 1024 - 10);
+    assert_eq!(copied_errors.unwrap(), 320 * 1024);
+    assert_eq!(output, vec![b'x'; 320 * 1024]);
+    assert_eq!(errors, output);
+    buffer.clear();
+    buffer.put_slice(b"prefix");
+    futures::future::poll_fn(|cx| Pin::new(&mut stdout).poll_read(cx, &mut buffer))
+        .await
+        .unwrap();
+    assert_eq!(buffer.filled(), b"prefix");
+}
+
+#[tokio::test]
 async fn root_exit_from_another_thread_cleans_up_without_a_supervisor() {
     let sandbox = builder().boot().unwrap().into_commands().unwrap();
     let mut other = sandbox

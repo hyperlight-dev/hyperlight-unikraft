@@ -604,11 +604,25 @@ impl Executions {
 const PIPE_CAPACITY: usize = 64 * 1024;
 const IO_CHUNK: usize = 4096;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct PipeState {
     bytes: VecDeque<u8>,
     eof: bool,
     closed: bool,
+    mode: crate::command::Stdio,
+    dropped: u64,
+}
+
+impl Default for PipeState {
+    fn default() -> Self {
+        Self {
+            bytes: VecDeque::new(),
+            eof: false,
+            closed: false,
+            mode: crate::command::Stdio::Piped,
+            dropped: 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -620,6 +634,20 @@ pub(crate) struct Pipe {
 }
 
 impl Pipe {
+    fn new(mode: crate::command::Stdio) -> Self {
+        Self {
+            state: Mutex::new(PipeState {
+                mode,
+                ..PipeState::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn dropped_bytes(&self) -> u64 {
+        self.state.lock().unwrap().dropped
+    }
+
     pub(crate) fn read(&self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<io::Result<usize>> {
         let result = self.read_buffer(cx, out);
         if matches!(result, Poll::Ready(Ok(count)) if count != 0) {
@@ -693,12 +721,34 @@ impl Pipe {
         if state.closed || state.eof {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
-        let count = bytes.len().min(PIPE_CAPACITY - state.bytes.len());
-        if count < minimum && !bytes.is_empty() {
-            return Poll::Pending;
+        use crate::command::Stdio;
+        match state.mode {
+            Stdio::Head(capacity) => {
+                let count = bytes.len().min(capacity - state.bytes.len());
+                state.bytes.extend(&bytes[..count]);
+                state.dropped = state.dropped.saturating_add((bytes.len() - count) as u64);
+            }
+            Stdio::Tail(capacity) => {
+                let retained = bytes.len().min(capacity);
+                let evicted = state.bytes.len().saturating_sub(capacity - retained);
+                state.bytes.drain(..evicted);
+                state.bytes.extend(&bytes[bytes.len() - retained..]);
+                state.dropped = state.dropped.saturating_add(evicted as u64);
+                state.dropped = state
+                    .dropped
+                    .saturating_add((bytes.len() - retained) as u64);
+            }
+            Stdio::Unbounded => state.bytes.extend(bytes),
+            Stdio::Null | Stdio::Piped => {
+                let count = bytes.len().min(PIPE_CAPACITY - state.bytes.len());
+                if count < minimum && !bytes.is_empty() {
+                    return Poll::Pending;
+                }
+                state.bytes.extend(&bytes[..count]);
+                return Poll::Ready(Ok(count));
+            }
         }
-        state.bytes.extend(&bytes[..count]);
-        Poll::Ready(Ok(count))
+        Poll::Ready(Ok(bytes.len()))
     }
 
     pub(crate) fn eof(&self) {
@@ -791,7 +841,13 @@ impl Execution {
                 }
             } else if state.closed || state.eof {
                 8
-            } else if PIPE_CAPACITY - state.bytes.len() >= IO_CHUNK {
+            } else if matches!(
+                state.mode,
+                crate::command::Stdio::Head(_)
+                    | crate::command::Stdio::Tail(_)
+                    | crate::command::Stdio::Unbounded
+            ) || PIPE_CAPACITY - state.bytes.len() >= IO_CHUNK
+            {
                 4
             } else {
                 0
@@ -853,6 +909,7 @@ impl Execution {
         command: CommandMetadata,
     ) -> Self {
         let inbox = Arc::new(Mutex::new(inbox.lock().unwrap().child()));
+        let pipes = command.stdio.map(|mode| Arc::new(Pipe::new(mode)));
         Self {
             id,
             command,
@@ -867,7 +924,7 @@ impl Execution {
             failure: Mutex::default(),
             done: Arc::new(AtomicBool::new(false)),
             process: Mutex::default(),
-            pipes: std::array::from_fn(|_| Arc::default()),
+            pipes,
             calls: Mutex::new(async_calls::PendingCalls::new(inbox.clone())),
             inbox,
             net: Arc::new(net.map_or_else(hostnet::Net::disabled, |net| net.fork())),
@@ -1283,6 +1340,84 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn lossy_pipes_preserve_head_or_tail_across_reads_and_oversized_writes() {
+        use crate::command::Stdio;
+
+        fn ready(result: Poll<io::Result<usize>>) -> io::Result<usize> {
+            match result {
+                Poll::Ready(value) => value,
+                Poll::Pending => panic!("lossy pipe unexpectedly backpressured"),
+            }
+        }
+
+        for (mode, first, middle, last) in [
+            (Stdio::head(4), b"abcd", b"cdgh", b"cdgh"),
+            (Stdio::tail(4), b"cdef", b"hijk", b"6789"),
+        ] {
+            let pipe = Pipe::new(mode);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert_eq!(ready(pipe.write_chunk(&mut cx, b"abcdef")).unwrap(), 6);
+            assert_eq!(pipe.state.lock().unwrap().bytes, first.as_slice());
+            assert_eq!(pipe.dropped_bytes(), 2);
+            let mut read = [0; 2];
+            assert_eq!(ready(pipe.read(&mut cx, &mut read)).unwrap(), 2);
+            assert_eq!(read, first[..2]);
+            assert_eq!(ready(pipe.write_chunk(&mut cx, b"ghijk")).unwrap(), 5);
+            assert_eq!(pipe.state.lock().unwrap().bytes, middle.as_slice());
+            assert_eq!(pipe.dropped_bytes(), 5);
+            assert_eq!(ready(pipe.write_chunk(&mut cx, b"0123456789")).unwrap(), 10);
+            assert_eq!(pipe.dropped_bytes(), 15);
+            assert_eq!(ready(pipe.write_chunk(&mut cx, b"")).unwrap(), 0);
+            assert_eq!(pipe.dropped_bytes(), 15);
+            pipe.eof();
+            let mut read = [0; 8];
+            assert_eq!(ready(pipe.read(&mut cx, &mut read)).unwrap(), 4);
+            assert_eq!(&read[..4], last);
+            assert_eq!(ready(pipe.read(&mut cx, &mut read)).unwrap(), 0);
+            assert_eq!(
+                ready(pipe.write_chunk(&mut cx, b"x")).unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
+    }
+
+    #[test]
+    fn nonbackpressuring_output_modes_stay_writable_until_closed() {
+        use crate::command::Stdio;
+
+        for mode in [
+            Stdio::head(0),
+            Stdio::tail(0),
+            Stdio::head(3),
+            Stdio::tail(3),
+            Stdio::unbounded(),
+        ] {
+            let mut execution = execution();
+            Arc::get_mut(&mut execution).unwrap().pipes[1] = Arc::new(Pipe::new(mode));
+            let bytes = vec![b'x'; IO_CHUNK];
+            for _ in 0..32 {
+                assert_eq!(execution.stdio_write(1, &bytes).unwrap(), [0]);
+            }
+            assert_eq!(execution.stdio_poll(1).unwrap(), [0, 4, 0, 0, 0]);
+            let pipe = &execution.pipes[1];
+            let retained = match mode {
+                Stdio::Head(n) | Stdio::Tail(n) => n,
+                _ => 32 * IO_CHUNK,
+            };
+            assert_eq!(pipe.state.lock().unwrap().bytes.len(), retained);
+            assert_eq!(pipe.dropped_bytes(), (32 * IO_CHUNK - retained) as u64);
+            // The older CommandIo transport must use the same policy.
+            assert_eq!(execution.io(1, b"x".to_vec()).unwrap(), [0]);
+            pipe.close();
+            assert_eq!(execution.stdio_poll(1).unwrap(), [0, 8, 0, 0, 0]);
+            assert_eq!(
+                execution.stdio_write(1, b"x").unwrap(),
+                Execution::stdio_error(errno::EPIPE)
+            );
+        }
     }
 
     #[test]
