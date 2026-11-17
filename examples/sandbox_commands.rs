@@ -98,8 +98,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .mount(Mount::ro(root.join("build-elfloader/bins/c"), "/mnt/bin"))
         .scratch_mb(128)
         .echo_output(false)
-        .boot()?
-        .into_commands()?;
+        .boot_commands()?;
 
     let first = sandbox
         .command("/mnt/bin/command")

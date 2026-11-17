@@ -5,13 +5,14 @@
 	branch = feat/async-host-calls
 [submodule "kernel/app-elfloader"]
 	path = kernel/app-elfloader
-	# The fork, for five fixes: arm64 AT_HWCAP (upstream has it in another
+	# The fork, for fixes: arm64 AT_HWCAP (upstream has it in another
 	# form, which needs a Unikraft change our plat-hyperlight-v2 kernel
 	# lacks), AT_RANDOM and AT_EXECFN on the program's stack, empty
 	# argument and environment strings, and freeing the ELF program record
-	# after exec, until they are upstream.
-	url = https://github.com/danbugs/app-elfloader.git
-	branch = plat-hyperlight-v2
+	# after exec, and kernel-time libelf initialization for command-only
+	# boot, until they are upstream.
+	url = https://github.com/jprendes/app-elfloader.git
+	branch = feat/sandbox-command
 [submodule "kernel/libs/libelf"]
 	path = kernel/libs/libelf
 	url = https://github.com/unikraft/lib-libelf.git

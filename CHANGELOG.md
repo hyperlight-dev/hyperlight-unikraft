@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `SandboxBuilder::boot_commands()` boots directly into a `CommandSandbox`,
+  ignoring explicit entries and auto-detected drivers. No boot application runs,
+  and the sandbox stays alive with zero commands. Command snapshots restore
+  through the same method using a typed `CommandSandboxBuilder` that cannot
+  expose an `AppSandbox` or discard command metadata.
+- Kernel-owned command launching works with interpreter images and driverless
+  root filesystems, without a command-aware driver. All external drivers retain
+  their legacy APIs; command handling has been removed from the exec driver.
 - `Stdio::head(capacity)`, `tail(capacity)` and `unbounded()` output pipes let
   commands finish without concurrent output draining. Head/tail expose dropped
   byte counts; buffer policies and counts survive command snapshots.
@@ -33,12 +41,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   metadata is preserved across command snapshots. Each metadata entry can
   restore its parked child without driving it or keeping the sandbox alive.
   Its `parked()` and `completed()` methods read shared atomic lifecycle flags.
-- An opt-in `AppSandbox::into_commands()` API for concurrent compiled guest
+- A command API for concurrent compiled guest
   executables, with structured arguments, environment and cwd, cancellation-safe
   waits, root-scoped lifetimes, and bounded stdin/stdout/stderr pipes.
   Each command tree owns its host futures, sockets and timers; polling one
   handle runs only its own guest tree and host operations, plus shared supervisor
-  infrastructure. Requires rebuilt C, Rust, Go or .NET AOT exec driver images.
+  infrastructure. Requires a kernel with the command service enabled.
 - `Child::park(self)` consumes the handle and returns its execution ID so the
   command can be reacquired later. Dropping a child instead terminates its tree;
   termination during a busy VM entry or lifecycle operation is deferred until
@@ -75,14 +83,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Command protocol v7 removes per-command supervisor threads. The driver launches
-  and returns; kernel process-exit hooks reap roots and terminate descendants.
+- Removed `AppSandbox::into_commands()`. Create commands through
+  `SandboxBuilder::boot_commands()`; restore app snapshots through `.boot()`
+  and command snapshots through `.boot_commands()`. The two sandbox APIs
+  cannot be converted into one another.
+- Command service protocol v8 launches through a single init-owned kernel thread,
+  with no per-command supervisor. Kernel process-exit hooks reap roots and terminate descendants.
   Lifecycle and stream-close events are batched into the yield boundary, and
   execution selection and restore checks share one call.
 - Command stdio replaces guest pipes and forwarding threads with
   direct host-backed descriptors, preserving poll/epoll, nonblocking I/O,
-  descriptor lifetime and snapshot behavior. Exec drivers reuse their control
-  descriptor and cache `/dev/null`; compiled-runtime rootfs images must be rebuilt.
+  descriptor lifetime and snapshot behavior. The kernel launcher sets up these
+  descriptors directly in each child, independently of the runtime image.
 - Command pipe I/O completes synchronously when buffers are ready, retaining
   asynchronous backpressure otherwise. Buffered output is copied in bulk.
 - Linux guest scheduler timers use high-resolution `timerfd` readiness through

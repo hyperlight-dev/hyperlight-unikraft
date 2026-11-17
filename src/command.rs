@@ -32,6 +32,16 @@ use crate::{
 
 /// A sandbox dedicated to independently polled command trees.
 ///
+/// Create one with [`crate::SandboxBuilder::boot_commands`] to boot without an
+/// application entry. App sandboxes cannot be converted into command sandboxes:
+///
+/// ```compile_fail
+/// use hyperlight_unikraft::AppSandbox;
+/// fn convert(app: AppSandbox) {
+///     let commands = app.into_commands();
+/// }
+/// ```
+///
 /// There is no background executor. Poll a child's wait to drive that tree's
 /// host operations and guest threads. Pipes only access host-side buffers;
 /// poll their I/O concurrently with the wait. Other command trees do not run.
@@ -395,35 +405,36 @@ impl Drop for NotifyOnDrop<'_> {
     }
 }
 
-impl AppSandbox {
-    /// Consume an idle compiled-runtime sandbox, enabling concurrent commands.
-    pub fn into_commands(self) -> Result<CommandSandbox> {
-        self.check_ready()?;
-        self.ensure_running()?;
-        if self.config.call_in_flight() || self.async_calls.is_pending() || self.config.can_wake() {
+impl CommandSandbox {
+    pub(super) fn from_boot(sandbox: AppSandbox) -> Result<Self> {
+        sandbox.check_ready()?;
+        sandbox.ensure_running()?;
+        if sandbox.config.call_in_flight()
+            || sandbox.async_calls.is_pending()
+            || sandbox.config.can_wake()
+        {
             return Err(Error::CallInFlight);
         }
-        if !self
-            .config
-            .executions
-            .supported
-            .load(std::sync::atomic::Ordering::Relaxed)
+        if !sandbox.config.executions.supported.load(Ordering::Relaxed)
+            || !sandbox
+                .config
+                .executions
+                .command_only
+                .load(Ordering::Relaxed)
         {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "this rootfs does not support command protocol version 7",
+                "this kernel did not acknowledge command-only service protocol version 8",
             )));
         }
-        Ok(CommandSandbox(Arc::new(Coordinator {
+        Ok(Self(Arc::new(Coordinator {
             lifecycle: Mutex::new(()),
-            executions: self.config.executions.clone(),
-            sandbox: Mutex::new(self),
+            executions: sandbox.config.executions.clone(),
+            sandbox: Mutex::new(sandbox),
             state: Arc::default(),
         })))
     }
-}
 
-impl CommandSandbox {
     /// Capture every command and the shared guest VM without driving it.
     ///
     /// Children may be parked or have driving handles. Original handles, pipes,
@@ -716,7 +727,7 @@ impl Command {
             )));
         }
         let mut fields = vec![
-            "7".to_owned(),
+            "8".to_owned(),
             "0".to_owned(),
             self.args.len().to_string(),
             env.len().to_string(),

@@ -19,7 +19,6 @@ RUN apk add --no-cache gcc musl-dev
 COPY drivers/hl_fc.h /src/drivers/hl_fc.h
 COPY drivers/hl_env.h /src/drivers/hl_env.h
 COPY drivers/hl_driver.h /src/drivers/hl_driver.h
-COPY drivers/hl_command.h /src/drivers/hl_command.h
 COPY drivers/hl_execdriver.c /src/drivers/hl_execdriver.c
 RUN gcc -O2 -Wall -Wextra -Wno-unused-parameter \
         -static-pie -fPIE -pthread \

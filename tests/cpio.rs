@@ -8,6 +8,50 @@ mod common;
 use hyperlight_unikraft::{SandboxBuilder, cpio::from_tar};
 
 #[tokio::test]
+async fn command_only_boot_needs_no_driver_and_ignores_detected_drivers() {
+    let binary = std::fs::read(common::require_bins("c").join("command")).unwrap();
+    let dir = common::temp_dir("command-only-rootfs");
+    for with_driver in [false, true] {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut program = tar::Header::new_gnu();
+        program.set_mode(0o755);
+        program.set_size(binary.len() as u64);
+        tar.append_data(&mut program, "command", &binary[..])
+            .unwrap();
+        if with_driver {
+            for name in ["usr", "usr/local", "usr/local/bin"] {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_mode(0o755);
+                header.set_size(0);
+                tar.append_data(&mut header, name, &b""[..]).unwrap();
+            }
+            let mut driver = tar::Header::new_gnu();
+            driver.set_mode(0o755);
+            driver.set_size(3);
+            tar.append_data(&mut driver, "usr/local/bin/hl_cdriver", &b"ELF"[..])
+                .unwrap();
+        }
+        let tar = tar.into_inner().unwrap();
+        let path = dir.path().join(format!("rootfs-{with_driver}.cpio"));
+        from_tar(&tar[..], std::fs::File::create(&path).unwrap()).unwrap();
+        let sandbox = SandboxBuilder::from_initrd(&path)
+            .scratch_mb(64)
+            .echo_output(false)
+            .boot_commands()
+            .unwrap();
+        let output = sandbox
+            .command("/command")
+            .args(["sleep", "0", "without a driver"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"without a driver\n");
+    }
+}
+
+#[tokio::test]
 async fn the_library_finds_the_driver_in_the_result() {
     let mut tar = tar::Builder::new(Vec::new());
     for (name, kind, data) in [

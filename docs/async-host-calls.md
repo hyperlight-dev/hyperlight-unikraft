@@ -67,17 +67,18 @@ and exit summaries bold green for success or bold red for failure.
 Only the current line is collected,
 rather than the entire output (a very long line can still use unbounded memory).
 
-`AppSandbox::into_commands()` consumes an idle compiled-runtime sandbox and
-returns a `command::CommandSandbox`. This opt-in API runs executable paths,
-not interpreter snippets:
+`SandboxBuilder::boot_commands()` returns a `command::CommandSandbox` directly,
+booting only kernel infrastructure and the command service. It ignores `.entry()`
+and the rootfs's auto-detected driver; no boot application is started. The sandbox
+stays alive before its first command and after its last command exits.
+This API runs executable paths, not interpreter snippets:
 
 ```rust,no_run
 use hyperlight_unikraft::{SandboxBuilder, command::Stdio};
 
 # async fn example() -> hyperlight_unikraft::Result<()> {
 let sandbox = SandboxBuilder::from_initrd("build-elfloader/c-rootfs.cpio")
-    .boot()?
-    .into_commands()?;
+    .boot_commands()?;
 let first = sandbox.command("/usr/local/bin/first")
     .arg("one argument with spaces")
     .stdout(Stdio::piped())
@@ -309,11 +310,20 @@ there is no shell parsing or PATH search. Stdio defaults to `/dev/null`;
 `Stdio::piped()` opts into a host pipe. Independent roots do not inherit each
 other's command descriptors. Cross-tree socket sharing is not supported.
 
-Command protocol version 7 requires rebuilt C, Rust, Go, or .NET AOT exec
-driver images. Other runtimes and snapshots restored without the command
-handshake are rejected explicitly by `into_commands()`. Command sandboxes
-do not expose the legacy interpreter API. Existing `AppSandbox` driving and
-snapshot behavior remain unchanged.
+Command service protocol version 8 is provided by the kernel, not the runtime
+driver. Interpreter images can launch executables too: for example, a Python
+image can launch `/usr/local/bin/python3 -u -c ...` as a fresh process, not in
+the driver's existing interpreter. All external drivers retain their legacy
+APIs; the exec driver no longer implements command launching.
+
+For the unchanged `.boot()` path, `SandboxBuilder::entry()` still selects the boot
+application. App and command sandboxes cannot be converted into one another;
+choose `.boot()` for the legacy API or `.boot_commands()` for managed command trees.
+The former `into_commands()` conversion has been removed.
+No `/dev/hlcall` reader is required for command launching.
+Kernels without the service and snapshots without its handshake are rejected
+explicitly. Command sandboxes do not expose the legacy interpreter API.
+Existing `AppSandbox` driving and snapshot behavior remain unchanged.
 
 ### Command snapshots
 
@@ -341,9 +351,15 @@ sandbox.restore(&snapshot).await?;
 let child = sandbox.children()[id].restore().await?;
 ```
 
-`SandboxBuilder::from_command_snapshot(&snapshot)` boots an independent clone.
+`SandboxBuilder::from_command_snapshot(&snapshot)` returns a typed
+`CommandSandboxBuilder` for an independent clone.
 Supply host functions, mounts, network policy and listening ports on that builder,
-then call `boot()?.into_commands()?`. Boot and restore do not run command threads
+then call `boot_commands()`. Its type does not expose `.boot()`, preventing command
+state from being handed to an app sandbox whose snapshot API would omit command
+metadata. Ordinary app snapshots still restore through
+`SandboxBuilder::from_snapshot(...).boot()`; `.boot_commands()` rejects them
+before entering the guest.
+Boot and restore do not run command threads
 or invoke their async handlers. Use `children()` and its `by_id(id)` or
 `by_name(name)` methods to obtain metadata, then `info.restore().await` to reacquire them.
 In-place restore preserves execution-ID allocation high-water
@@ -363,12 +379,19 @@ cannot consume restored output.
 
 ### Attribution and control wire format
 
-The exec driver negotiates version 7 with `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6, `u64`).
-The kernel acknowledges a matching version with `CommandDriverReady() -> i32`;
-querying the version alone does not enable the Command API on an older kernel.
-The driver temporarily attaches with `HLCALL_IOC_EXECUTION` (ioctl 5, `u64`) while
-setting up descriptors and calling `vfork`/`execve`. The child inherits this
-identity; the driver detaches when it reports launch success or failure.
+The kernel service negotiates version 8 through `CommandServiceVersion() -> u64`
+and acknowledges support with `CommandServiceReady() -> i32` at boot and restore.
+At fresh boot, `CommandBootMode() -> i32` requests command-only mode (1 rather
+than 0). In that mode the kernel skips the boot application, keeps init alive
+when no children remain, and acknowledges with `CommandBootReady() -> i32`.
+The mode survives snapshots; restore repeats the acknowledgment without changing it.
+The old `HLCALL_IOC_COMMAND_DRIVER` (ioctl 6) returns `EOPNOTSUPP`, allowing old
+exec-driver images to continue serving legacy calls without command dispatch.
+The entry pump routes `CommandSpawn` and `CommandKill` directly to a single
+init-owned launcher thread. It temporarily attaches the execution identity while
+creating the child; the child configures its own descriptors and cwd and calls
+`execve`. Launch success is reported only after the new image is committed.
+The launcher detaches after reporting success or failure.
 There is no per-command supervisor thread or blocking `waitpid`: kernel
 process-exit hooks record root status, reap it, and terminate descendants.
 Before a host call whose owner changed,

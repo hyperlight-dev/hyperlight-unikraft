@@ -101,6 +101,7 @@ pub(crate) struct DrivingState {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionSnapshot {
+    pub command_only: bool,
     next: u64,
     next_request: u64,
     entries: Vec<ExecutionImage>,
@@ -121,6 +122,7 @@ struct ExecutionImage {
 #[derive(Default)]
 pub(crate) struct Executions {
     pub supported: AtomicBool,
+    pub command_only: AtomicBool,
     current: AtomicU64,
     active: AtomicU64,
     next: Mutex<u64>,
@@ -277,6 +279,7 @@ impl Executions {
             });
         }
         let executions = ExecutionSnapshot {
+            command_only: self.command_only.load(Ordering::Relaxed),
             next: *self.next.lock().unwrap(),
             next_request: inbox.lock().unwrap().next_id(),
             entries: images,
@@ -291,6 +294,8 @@ impl Executions {
         inbox: &Arc<Mutex<async_calls::Inbox>>,
         net: Option<&Arc<hostnet::Net>>,
     ) {
+        self.command_only
+            .store(snapshot.command_only, Ordering::Relaxed);
         let mut entries = BTreeMap::new();
         for image in &snapshot.entries {
             let mut entry =
@@ -498,14 +503,22 @@ impl Executions {
             },
         )?;
         target.register_host_function(
-            "CommandDriverVersion",
-            || -> hyperlight_host::Result<u64> { Ok(7) },
+            "CommandServiceVersion",
+            || -> hyperlight_host::Result<u64> { Ok(8) },
         )?;
         let registry = self.clone();
         target.register_host_function(
-            "CommandDriverReady",
+            "CommandServiceReady",
             move || -> hyperlight_host::Result<i32> {
                 registry.supported.store(true, Ordering::Relaxed);
+                Ok(0)
+            },
+        )?;
+        let registry = self.clone();
+        target.register_host_function(
+            "CommandBootReady",
+            move || -> hyperlight_host::Result<i32> {
+                registry.command_only.store(true, Ordering::Relaxed);
                 Ok(0)
             },
         )?;

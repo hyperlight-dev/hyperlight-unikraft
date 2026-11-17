@@ -32,7 +32,6 @@
 #include "hl_fc.h"
 #include "hl_env.h"
 #include "hl_driver.h"
-#include "hl_command.h"
 
 /* ── Dispatch callback ─────────────────────────────────────────── */
 
@@ -156,9 +155,6 @@ int main(int argc, char **argv)
 
 	if (hl_driver_init("hl_execdriver"))
 		return 1;
-	if (command_init())
-		return 1;
-
 	/* Serve named calls from the kernel's queue; never returns */
 	hl_driver_run(exec_dispatch);
 }

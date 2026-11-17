@@ -49,10 +49,14 @@ and bounded-step behavior. The CLI manages its own runtime.
 Snapshots include pending host calls, which are
 [interrupted on restore](docs/async-host-calls.md#restoring-pending-host-calls).
 
-For concurrent executable process trees, an idle compiled-runtime sandbox can
-opt into the [Command-style API](docs/async-host-calls.md#command-process-trees)
-with `into_commands()`. Each child's wait independently drives its
+For concurrent executable process trees, use `SandboxBuilder::boot_commands()`
+to enter the [Command-style API](docs/async-host-calls.md#command-process-trees)
+without starting a driver or boot application. It ignores `.entry()` and
+auto-detected drivers, and stays alive even with no commands.
+App and command sandboxes are separate APIs; there is no conversion between them.
+Each child's wait independently drives its
 tree's host futures, sockets and timers; command waits are cancellation-safe.
+Launching is a kernel service, independent of the runtime driver.
 Pipes are passive buffers: poll I/O concurrently with the wait, or use
 `wait_with_output()` to drive and capture output together.
 Command spawn, kill, child restoration and command snapshot operations are async,

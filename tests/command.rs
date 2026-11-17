@@ -41,7 +41,7 @@ async fn read_while_running(
 
 #[tokio::test]
 async fn output_modes_complete_without_readers_and_preserve_drop_counts() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     for mode in [
         Stdio::head(0),
         Stdio::tail(0),
@@ -81,7 +81,7 @@ async fn output_modes_complete_without_readers_and_preserve_drop_counts() {
 
 #[tokio::test]
 async fn output_preserves_configured_modes_and_rejects_output_only_stdin() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let output = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "0", "abcdef"])
@@ -108,9 +108,7 @@ async fn output_preserves_configured_modes_and_rejects_output_only_stdin() {
 async fn output_modes_and_loss_counters_survive_snapshot_restore() {
     let sandbox = builder()
         .host_function("gate", |_| Ok("abcdefgh".into()))
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     for (mode, expected, dropped) in [
         (Stdio::head(3), &b"abc"[..], 8),
@@ -166,7 +164,7 @@ async fn output_modes_and_loss_counters_survive_snapshot_restore() {
 async fn tokio_pipes_echo_with_backpressure_and_stdin_shutdown() {
     use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
 
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("echo")
@@ -211,7 +209,7 @@ async fn tokio_output_preserves_read_buf_contents_and_drains_both_streams() {
     use std::{mem::MaybeUninit, pin::Pin};
     use tokio::io::{AsyncRead, ReadBuf};
 
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("large")
@@ -255,7 +253,7 @@ async fn tokio_output_preserves_read_buf_contents_and_drains_both_streams() {
 
 #[tokio::test]
 async fn root_exit_from_another_thread_cleans_up_without_a_supervisor() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut other = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "60000", "other"])
@@ -292,7 +290,7 @@ async fn root_exit_from_another_thread_cleans_up_without_a_supervisor() {
 
 #[tokio::test]
 async fn guest_stdio_epoll_and_short_vectored_reads_preserve_input() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("stdio-poll")
@@ -314,7 +312,7 @@ async fn guest_stdio_epoll_and_short_vectored_reads_preserve_input() {
 
 #[tokio::test]
 async fn guest_stdio_nonblocking_backpressure_wakes_poll_without_committing_failed_writes() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("stdio-backpressure")
@@ -340,7 +338,7 @@ async fn guest_stdio_nonblocking_backpressure_wakes_poll_without_committing_fail
 
 #[tokio::test]
 async fn guest_stdio_eof_waits_for_last_duplicate_but_not_process_exit() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("stdio-dup")
@@ -384,7 +382,7 @@ async fn guest_stdio_eof_waits_for_last_duplicate_but_not_process_exit() {
 
 #[tokio::test]
 async fn closing_guest_stdio_cancels_its_pending_readiness_watch() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("stdio-close-poll")
@@ -409,7 +407,7 @@ async fn closing_guest_stdio_cancels_its_pending_readiness_watch() {
 
 #[tokio::test]
 async fn closing_host_output_returns_epipe_to_the_guest_writer() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("stdio-broken-output")
@@ -443,9 +441,7 @@ async fn passive_pipes_do_not_poll_host_calls_without_a_wait() {
                 observed.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok("reply".into()))
             })
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         let mut child = sandbox
             .command("/mnt/bin/command")
@@ -509,7 +505,7 @@ async fn passive_pipes_do_not_poll_host_calls_without_a_wait() {
 
 #[tokio::test]
 async fn passive_output_does_not_resume_an_expired_guest_timer() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "1", "done"])
@@ -558,9 +554,7 @@ async fn dropping_last_sandbox_wakes_children_and_pipes_and_cancels_host_work() 
             let receiver = receiver.lock().unwrap().take().unwrap();
             async move { receiver.await.map_err(|error| error.to_string()) }
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut command = sandbox.command("/mnt/bin/command");
     let mut child = command
@@ -661,7 +655,7 @@ async fn dropping_last_sandbox_wakes_children_and_pipes_and_cancels_host_work() 
 
 #[tokio::test]
 async fn sandbox_drop_preserves_completed_status_and_buffered_output() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "0", "retained"])
@@ -697,7 +691,7 @@ async fn pipe_wakeup_can_drop_the_sandbox_without_delaying_shutdown() {
         }
     }
 
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("echo")
@@ -748,9 +742,7 @@ async fn sandbox_drop_closes_sockets_even_with_taken_pipes_alive() {
     let port = listener.local_addr().unwrap().port().to_string();
     let sandbox = builder()
         .network(hyperlight_unikraft::NetworkPolicy::AllowAll)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -792,9 +784,7 @@ async fn host_future_can_drop_the_last_sandbox_owner() {
             let receiver = receiver.lock().unwrap().take().unwrap();
             async move { receiver.await.map_err(|error| error.to_string()) }
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let child = sandbox
         .command("/mnt/bin/command")
@@ -822,9 +812,7 @@ async fn dropping_a_child_kills_only_its_tree_and_cancels_pending_calls() {
             let receiver = receiver.lock().unwrap().take().unwrap();
             async move { receiver.await.map_err(|error| error.to_string()) }
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -857,9 +845,7 @@ fn dropping_a_tree_needs_no_runtime_and_does_not_drive_host_handlers() {
             .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
                 panic!("drop must not poll host handlers");
             })
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         for args in [vec!["host", "[]"], vec!["sleep-tree", "60000"]] {
             let child = sandbox
@@ -883,7 +869,7 @@ fn dropping_a_tree_needs_no_runtime_and_does_not_drive_host_handlers() {
 
 #[tokio::test]
 async fn cancelling_owned_output_kills_but_cancelling_borrowed_wait_does_not() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "60000", "done"])
@@ -909,9 +895,7 @@ async fn host_future_can_drop_another_child_and_terminate_without_deadlocking() 
             drop(owned.lock().unwrap().take());
             std::future::ready(Ok("not delivered".into()))
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -943,9 +927,7 @@ async fn host_callback_can_drop_another_tree_during_a_vm_entry() {
             drop(owned.lock().unwrap().take());
             Ok("done".into())
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let child = sandbox
         .command("/mnt/bin/command")
@@ -990,7 +972,7 @@ async fn drop_during_snapshot_wakeup_is_terminated_before_snapshot_returns() {
             }
         }
     }
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let victim = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "60000", "victim"])
@@ -1029,9 +1011,7 @@ async fn drop_during_snapshot_wakeup_is_terminated_before_snapshot_returns() {
     assert!(info.restore().await.is_err());
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     assert!(!fork.children()[0].completed());
 }
@@ -1041,7 +1021,7 @@ async fn named_children_restore_independently_and_release_names_on_completion() 
     use hyperlight_unikraft::Error;
     use std::io::ErrorKind;
 
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut command = sandbox.command("/mnt/bin/command");
     command
         .name("worker")
@@ -1075,9 +1055,7 @@ async fn named_children_restore_independently_and_release_names_on_completion() 
         if error.kind() == ErrorKind::AlreadyExists));
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     for source in [&sandbox, &fork] {
         assert!(source.children().by_name("Worker").is_none());
@@ -1120,7 +1098,7 @@ async fn named_children_restore_independently_and_release_names_on_completion() 
 async fn completion_and_kill_release_names_while_old_handles_remain_usable() {
     use hyperlight_unikraft::Error;
 
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     for kill in [false, true] {
         let mut child = sandbox
             .command("/mnt/bin/command")
@@ -1200,9 +1178,7 @@ async fn cancelling_a_contended_kill_keeps_the_child_registered() {
             assert!(victim.as_mut().unwrap().kill().now_or_never().is_none());
             Ok("done".into())
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let child = sandbox
         .command("/mnt/bin/command")
@@ -1256,9 +1232,7 @@ async fn lifecycle_operations_wait_without_spinning_and_cancel_before_mutation()
             barrier.wait();
             Ok("done".into())
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -1354,9 +1328,7 @@ async fn lifecycle_waiters_wake_when_a_driver_releases_the_vm() {
     }
     let sandbox = builder()
         .async_host_function("gate", |_| std::future::ready(Ok("done".into())))
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let victim = sandbox
         .command("/mnt/bin/command")
@@ -1421,9 +1393,7 @@ async fn pending_lifecycle_futures_do_not_keep_the_sandbox_alive() {
             barrier.wait();
             Ok("done".into())
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -1467,7 +1437,7 @@ async fn pending_lifecycle_futures_do_not_keep_the_sandbox_alive() {
 async fn invalid_names_do_not_register_children_and_unnamed_children_remain_supported() {
     use hyperlight_unikraft::Error;
     use std::io::ErrorKind;
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     for name in ["", "bad\0name"] {
         assert!(matches!(sandbox.command("/mnt/bin/command").name(name)
             .args(["sleep", "0", "done"]).spawn().await, Err(Error::Wait(error))
@@ -1502,7 +1472,7 @@ async fn invalid_names_do_not_register_children_and_unnamed_children_remain_supp
 
 #[tokio::test]
 async fn structured_command_and_distinct_streams() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let child = sandbox
         .command("/mnt/bin/command")
         .args(["args", "a b", "", "quoted\"text"])
@@ -1538,9 +1508,7 @@ async fn child_launch_metadata_survives_builder_reuse_and_snapshot_restore() {
         .env("INHERITED", "original")
         .env("OVERRIDE", "original")
         .env("REMOVE", "original")
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut command = sandbox.command("/mnt/bin/command");
     command
@@ -1581,9 +1549,7 @@ async fn child_launch_metadata_survives_builder_reuse_and_snapshot_restore() {
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .env("INHERITED", "different fork configuration")
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     // Neither builder reuse nor inspecting and mutating a listing rewrites launch data.
     let mut edited = sandbox.children().into_iter().next().unwrap();
@@ -1617,7 +1583,7 @@ async fn child_launch_metadata_survives_builder_reuse_and_snapshot_restore() {
 
 #[tokio::test]
 async fn children_capture_stable_membership_with_live_flags_and_read_only_lookups() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut first = sandbox
         .command("/mnt/bin/command")
         .name("worker")
@@ -1689,9 +1655,7 @@ async fn listing_children_observes_lifecycle_and_restores_from_the_originating_s
     };
     let sandbox = builder()
         .async_host_function("gate", gate)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     assert!(sandbox.children().is_empty());
     let pending = sandbox
@@ -1749,9 +1713,7 @@ async fn listing_children_observes_lifecycle_and_restores_from_the_originating_s
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .async_host_function("gate", gate)
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut pending = pending_info.restore().await.unwrap();
     assert!(!pending_info.parked() && !observer.parked());
@@ -1791,7 +1753,7 @@ async fn listing_children_observes_lifecycle_and_restores_from_the_originating_s
 
 #[tokio::test]
 async fn lifecycle_flags_belong_to_the_observed_snapshot_incarnation() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let child = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "60000", "done"])
@@ -1836,9 +1798,7 @@ async fn independent_host_futures_and_cancelled_wait() {
                 Ok(args)
             }
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut a = sandbox
         .command("/mnt/bin/command")
@@ -1876,7 +1836,7 @@ async fn independent_host_futures_and_cancelled_wait() {
 
 #[tokio::test]
 async fn driving_one_tree_does_not_schedule_another_trees_expired_timers() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     for mode in ["sleep", "sleep-tree"] {
         let mut a = sandbox
             .command("/mnt/bin/command")
@@ -1911,7 +1871,7 @@ async fn driving_one_tree_does_not_schedule_another_trees_expired_timers() {
 
 #[tokio::test]
 async fn root_exit_kills_the_descendant_and_closes_taken_output() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("tree")
@@ -1951,9 +1911,7 @@ async fn parking_a_child_cancels_calls_and_restoring_retries_with_eintr() {
                 }
             }
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -2022,7 +1980,7 @@ async fn parking_a_child_cancels_calls_and_restoring_retries_with_eintr() {
 
 #[tokio::test]
 async fn parking_preserves_backpressured_output_and_invalidates_taken_pipes() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("large")
@@ -2044,9 +2002,7 @@ async fn parking_preserves_backpressured_output_and_invalidates_taken_pipes() {
     let snapshot = sandbox.snapshot().await.unwrap();
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let child = sandbox
         .children()
@@ -2085,7 +2041,7 @@ async fn parking_preserves_backpressured_output_and_invalidates_taken_pipes() {
 
 #[tokio::test]
 async fn snapshot_keeps_taken_pipes_usable_and_forks_buffered_input() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("echo")
@@ -2109,9 +2065,7 @@ async fn snapshot_keeps_taken_pipes_usable_and_forks_buffered_input() {
 
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     assert!(fork.children()[0].parked());
     let copy = tokio::time::timeout(
@@ -2133,7 +2087,7 @@ async fn snapshot_keeps_taken_pipes_usable_and_forks_buffered_input() {
 
 #[tokio::test]
 async fn snapshot_of_unparked_backpressure_preserves_output_in_both_branches() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("large")
@@ -2163,9 +2117,7 @@ async fn snapshot_of_unparked_backpressure_preserves_output_in_both_branches() {
     assert_eq!(original.stderr, vec![b'x'; 80 * 4096]);
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let copy = tokio::time::timeout(
         Duration::from_secs(5),
@@ -2192,9 +2144,7 @@ async fn parking_closes_host_connections_without_entering_the_vm() {
     let port = listener.local_addr().unwrap().port().to_string();
     let sandbox = builder()
         .network(hyperlight_unikraft::NetworkPolicy::AllowAll)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -2232,9 +2182,7 @@ async fn parking_closes_host_connections_without_entering_the_vm() {
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .network(hyperlight_unikraft::NetworkPolicy::AllowAll)
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let child = sandbox
         .children()
@@ -2288,9 +2236,7 @@ async fn parking_releases_a_listener_and_restores_it_on_first_drive() {
                 }
             }
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -2336,9 +2282,7 @@ fn child_info_kills_parked_and_active_trees_without_a_runtime() {
             .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
                 panic!("metadata kill must not poll host handlers");
             })
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         for parked in [false, true] {
             let mut child = sandbox
@@ -2370,7 +2314,7 @@ fn child_info_kills_parked_and_active_trees_without_a_runtime() {
 
 #[tokio::test]
 async fn child_info_kill_preserves_taken_pipes_and_wakes_a_pending_wait() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("large")
@@ -2435,9 +2379,7 @@ async fn child_info_can_kill_while_its_host_future_is_being_polled() {
                 Ok("not delivered".into())
             }
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -2458,7 +2400,7 @@ async fn child_info_can_kill_while_its_host_future_is_being_polled() {
 async fn child_info_kill_never_targets_a_replacement_execution() {
     use hyperlight_unikraft::Error;
 
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let child = sandbox
         .command("/mnt/bin/command")
         .name("worker")
@@ -2490,9 +2432,7 @@ fn parked_child_can_be_restored_and_killed_without_a_runtime() {
             .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
                 panic!("an undriven call must never be polled");
             })
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         let child = sandbox
             .command("/mnt/bin/command")
@@ -2520,7 +2460,7 @@ fn parked_child_can_be_restored_and_killed_without_a_runtime() {
 
 #[tokio::test]
 async fn restoring_a_parked_timer_does_not_restart_its_duration() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let child = sandbox
         .command("/mnt/bin/command")
         .args(["sleep-tree", "200"])
@@ -2532,9 +2472,7 @@ async fn restoring_a_parked_timer_does_not_restart_its_duration() {
     let snapshot = sandbox.snapshot().await.unwrap();
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     for restored in [&sandbox, &fork] {
@@ -2555,9 +2493,7 @@ async fn restoring_a_parked_timer_does_not_restart_its_duration() {
 async fn parking_preserves_completed_host_replies() {
     let sandbox = builder()
         .async_host_function("gate", |_| std::future::ready(Ok("completed".into())))
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -2579,9 +2515,7 @@ async fn parking_preserves_completed_host_replies() {
             panic!("a completed reply must survive the snapshot");
         })
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let fork_output = tokio::time::timeout(
         Duration::from_secs(5),
@@ -2618,7 +2552,7 @@ async fn parking_preserves_completed_host_replies() {
 
 #[tokio::test]
 async fn snapshots_restore_parked_streams_but_exclude_completed_children() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut echo = sandbox
         .command("/mnt/bin/command")
         .arg("echo")
@@ -2647,9 +2581,7 @@ async fn snapshots_restore_parked_streams_but_exclude_completed_children() {
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .mount(Mount::ro(common::require_bins("c"), "/mnt/bin"))
         .echo_output(false)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     assert_eq!(
         fork.children()
@@ -2743,9 +2675,7 @@ async fn snapshot_forks_interrupt_pending_calls_without_starting_handlers_at_boo
             let receiver = receiver.lock().unwrap().take().unwrap();
             async move { receiver.await.map_err(|error| error.to_string()) }
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -2770,9 +2700,7 @@ async fn snapshot_forks_interrupt_pending_calls_without_starting_handlers_at_boo
                 std::future::ready(Ok("fork".into()))
             })
             .echo_output(false)
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
         let child = fork.children().by_id(id).unwrap().restore().await.unwrap();
@@ -2823,9 +2751,7 @@ async fn snapshot_and_child_restoration_wait_for_an_active_poll() {
             }
             std::future::ready(Ok("completed".into()))
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -2892,9 +2818,7 @@ async fn root_exit_cancels_descendant_host_calls_without_polling_them() {
             .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
                 panic!("a descendant must not be driven after root exit");
             })
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         let mut child = sandbox
             .command("/mnt/bin/command")
@@ -2924,7 +2848,7 @@ async fn root_exit_cancels_descendant_host_calls_without_polling_them() {
 
 #[tokio::test]
 async fn bidirectional_pipes_and_bounded_output() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("echo")
@@ -2958,9 +2882,18 @@ async fn bidirectional_pipes_and_bounded_output() {
 
 #[tokio::test]
 async fn missing_executable_is_an_error_not_an_exit_code() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     assert!(sandbox.command("/missing").spawn().await.is_err());
+    assert!(sandbox.command("/dev/null").spawn().await.is_err());
     assert!(sandbox.command("relative").spawn().await.is_err());
+    assert!(
+        sandbox
+            .command("/mnt/bin/command")
+            .current_dir("/missing")
+            .spawn()
+            .await
+            .is_err()
+    );
     assert!(
         sandbox
             .command("/mnt/bin/command")
@@ -2985,11 +2918,19 @@ async fn missing_executable_is_an_error_not_an_exit_code() {
             .await
             .is_err()
     );
+    let output = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "0", "after failed launches"])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"after failed launches\n");
 }
 
 #[tokio::test]
 async fn completed_contexts_do_not_exhaust_the_live_execution_limit() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut completed = Vec::new();
         for _ in 0..1030 {
@@ -3013,20 +2954,119 @@ async fn completed_contexts_do_not_exhaust_the_live_execution_limit() {
 }
 
 #[tokio::test]
-async fn interpreter_sandboxes_reject_the_command_api() {
+async fn command_only_boot_ignores_entry_and_survives_empty_intervals() {
+    let sandbox = builder().entry("/missing/entry").boot_commands().unwrap();
+    assert!(sandbox.children().is_empty());
+    assert!(sandbox.command("/missing").spawn().await.is_err());
+    for _ in 0..3 {
+        let output = sandbox
+            .command("/mnt/bin/command")
+            .args(["sleep", "0", "command-only"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"command-only\n");
+        assert!(sandbox.children().is_empty());
+
+        let mut child = sandbox
+            .command("/mnt/bin/command")
+            .args(["sleep", "60000", ""])
+            .spawn()
+            .await
+            .unwrap();
+        child.kill().await.unwrap();
+        assert_eq!(child.wait().await.unwrap().signal(), Some(9));
+        assert!(sandbox.children().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn command_only_boot_restores_parked_commands_and_empty_snapshots() {
+    let sandbox = builder().boot_commands().unwrap();
+    let child = sandbox
+        .command("/mnt/bin/command")
+        .args(["sleep", "10", "restored"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let id = child.execution_id();
+    let snapshot = sandbox.snapshot().await.unwrap();
+    let restored = SandboxBuilder::from_command_snapshot(&snapshot)
+        .entry("/also/ignored")
+        .mount(Mount::ro(common::require_bins("c"), "/mnt/bin"))
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    let output = restored.children()[id]
+        .restore()
+        .await
+        .unwrap()
+        .wait_with_output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"restored\n");
+    let empty = restored.snapshot().await.unwrap();
+    let restored = SandboxBuilder::from_command_snapshot(&empty)
+        .mount(Mount::ro(common::require_bins("c"), "/mnt/bin"))
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    assert!(restored.children().is_empty());
     assert!(
-        SandboxBuilder::from_initrd(common::require_rootfs("python"))
-            .scratch_mb(256)
-            .echo_output(false)
-            .boot()
+        restored
+            .command("/mnt/bin/command")
+            .args(["sleep", "0", ""])
+            .status()
+            .await
             .unwrap()
-            .into_commands()
-            .is_err()
+            .success()
     );
 }
 
 #[tokio::test]
-async fn compiled_runtime_drivers_launch_independent_executables() {
+async fn command_only_boot_rejects_snapshots_with_a_boot_process() {
+    let mut sandbox = builder().boot().unwrap();
+    let snapshot = sandbox.snapshot().unwrap();
+    let result = SandboxBuilder::from_snapshot(snapshot)
+        .on_interrupt_handle(|_| panic!("must reject before entering the guest"))
+        .boot_commands();
+    assert!(matches!(
+        result,
+        Err(hyperlight_unikraft::Error::Wait(error))
+            if error.kind() == std::io::ErrorKind::InvalidInput
+    ));
+}
+
+#[tokio::test]
+async fn python_rootfs_supports_separate_legacy_and_command_boots() {
+    let mut sandbox = SandboxBuilder::from_initrd(common::require_rootfs("python"))
+        .scratch_mb(256)
+        .echo_output(false)
+        .boot()
+        .unwrap();
+    sandbox.run("print('legacy still works')").await.unwrap();
+    assert!(sandbox.take_output().text.contains("legacy still works"));
+    drop(sandbox);
+    let sandbox = SandboxBuilder::from_initrd(common::require_rootfs("python"))
+        .scratch_mb(256)
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    let output = sandbox
+        .command("/usr/local/bin/python3")
+        .args(["-u", "-c", "print('kernel command')"])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"kernel command\n");
+}
+
+#[tokio::test]
+async fn compiled_runtime_images_launch_independent_commands() {
     for (runtime, program, greeting) in [
         ("rust", "hello", "Hello from Rust"),
         ("go", "hello", "Hello from Go"),
@@ -3037,9 +3077,7 @@ async fn compiled_runtime_drivers_launch_independent_executables() {
             .mounts(vec![Mount::ro(common::require_bins(runtime), "/mnt/bin")])
             .scratch_mb(256)
             .echo_output(false)
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         let path = format!("/mnt/bin/{program}");
         let a = sandbox
@@ -3073,7 +3111,7 @@ async fn compiled_runtime_drivers_launch_independent_executables() {
 
 #[tokio::test]
 async fn killing_one_root_preserves_other_commands_and_cancelled_waits() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .args(["sleep", "60000", "late"])
@@ -3113,9 +3151,7 @@ async fn killing_a_root_interrupts_and_drops_its_pending_host_call() {
                 Ok("[]".into())
             }
         })
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -3165,9 +3201,7 @@ async fn root_exit_and_kill_end_reparented_descendants_and_drop_their_host_calls
                     Ok("[]".into())
                 }
             })
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         let mut child = sandbox
             .command("/mnt/bin/command")
@@ -3239,7 +3273,7 @@ async fn synchronous_kill_preserves_only_host_buffered_output_in_one_entry() {
         }
     }
 
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("large")
@@ -3291,9 +3325,7 @@ fn kill_without_a_runtime_does_not_poll_queued_host_functions() {
             .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
                 panic!("kill must cancel, not poll, the host function");
             })
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         let mut child = sandbox
             .command("/mnt/bin/command")
@@ -3328,9 +3360,7 @@ async fn kill_closes_only_its_trees_inherited_socket() {
         let port = listener.local_addr().unwrap().port().to_string();
         let sandbox = builder()
             .network(hyperlight_unikraft::NetworkPolicy::AllowAll)
-            .boot()
-            .unwrap()
-            .into_commands()
+            .boot_commands()
             .unwrap();
         let mut a = sandbox
             .command("/mnt/bin/command")
@@ -3388,7 +3418,7 @@ async fn kill_closes_only_its_trees_inherited_socket() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_wait_and_pipe_tasks_do_not_overwrite_wakers() {
-    let sandbox = builder().boot().unwrap().into_commands().unwrap();
+    let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
         .arg("large")
@@ -3461,9 +3491,7 @@ async fn reparented_grandchildren_keep_their_trees_sockets() {
     });
     let sandbox = builder()
         .network(hyperlight_unikraft::NetworkPolicy::AllowAll)
-        .boot()
-        .unwrap()
-        .into_commands()
+        .boot_commands()
         .unwrap();
     let mut a = sandbox
         .command("/mnt/bin/command")

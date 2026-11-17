@@ -1274,6 +1274,7 @@ impl Default for Console {
 /// [`drain_output`](Self::drain_output)).
 pub(crate) struct GuestConfig {
     cmdline: String,
+    boot_commands: bool,
     /// The guest's memory in bytes; `None` for a guest restored from a
     /// snapshot that did not record its size, which the snapshot's own
     /// layout sizes.
@@ -1341,6 +1342,7 @@ impl GuestConfig {
         let net = network.map(|policy| Arc::new(hostnet::Net::new(policy, listen_ports)));
         Self {
             cmdline,
+            boot_commands: false,
             scratch_size,
             initrd_base,
             initrd_size,
@@ -1533,6 +1535,12 @@ impl GuestConfig {
                 let _profile = prof.host("GetCmdLine");
                 Ok(cmdline.clone())
             },
+        )?;
+
+        let boot_commands = self.boot_commands;
+        target.register_host_function(
+            "CommandBootMode",
+            move || -> hyperlight_host::Result<i32> { Ok(i32::from(boot_commands)) },
         )?;
 
         // The mount table this host serves.  A restored guest makes its own
@@ -2220,6 +2228,7 @@ fn assemble_sandbox(
     kernel: &Option<PathBuf>,
     initrd: &Option<PathBuf>,
     entry: &Option<String>,
+    boot_commands: bool,
     scratch_mb: usize,
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
@@ -2263,7 +2272,11 @@ fn assemble_sandbox(
         (0, 0)
     };
 
-    let entry = resolve_entry(entry, initrd);
+    let entry = if boot_commands {
+        None
+    } else {
+        resolve_entry(entry, initrd)
+    };
 
     // Build the kernel command line.
     //
@@ -2289,9 +2302,11 @@ fn assemble_sandbox(
         } else {
             write!(cmdline, " {e}").unwrap();
         }
+    } else if boot_commands && !mounts.is_empty() {
+        cmdline.push_str(" --");
     }
 
-    let config = GuestConfig::new(
+    let mut config = GuestConfig::new(
         cmdline,
         Some(scratch_size),
         initrd_base,
@@ -2303,6 +2318,7 @@ fn assemble_sandbox(
     .with_host_functions(host_functions)
     .with_host_write_err(host_write_err)
     .with_console(console);
+    config.boot_commands = boot_commands;
 
     config.register(&mut usandbox)?;
 
@@ -2313,15 +2329,18 @@ fn assemble_sandbox(
 
 /// Builds and boots a sandbox.
 ///
-/// Pick a source — [`from_initrd`](Self::from_initrd) (a CPIO rootfs on the
-/// embedded kernel, the usual case), [`from_kernel`](Self::from_kernel) (a
-/// self-contained external kernel), or [`from_snapshot`](Self::from_snapshot)
+/// Pick a source — [`from_initrd`](SandboxBuilder::from_initrd) (a CPIO rootfs on the
+/// embedded kernel, the usual case), [`from_kernel`](SandboxBuilder::from_kernel) (a
+/// self-contained external kernel), or [`from_snapshot`](SandboxBuilder::from_snapshot)
 /// (resume a saved guest) — chain the settings you need, then
-/// [`boot`](Self::boot).  Everything but the source has a default, so
+/// [`boot`](SandboxBuilder::boot).  Everything but the source has a default, so
 /// `SandboxBuilder::from_initrd(path).boot()` is a complete call.
 ///
-/// [`boot`](Self::boot) brings the guest to a running state (evolving a fresh
+/// [`boot`](SandboxBuilder::boot) brings the guest to a running state (evolving a fresh
 /// guest, or restoring a snapshot) and hands back a [`AppSandbox`].
+/// [`boot_commands`](Self::boot_commands) instead boots without an application
+/// entry and returns a [`command::CommandSandbox`]. Command snapshots use a
+/// distinct [`CommandSandboxBuilder`] that cannot return an app sandbox.
 ///
 /// ```no_run
 /// use hyperlight_unikraft::{SandboxBuilder, Mount, NetworkPolicy};
@@ -2338,12 +2357,13 @@ fn assemble_sandbox(
 /// # Ok(())
 /// # }
 /// ```
-pub struct SandboxBuilder {
+pub struct SandboxBuilder<Mode = AppSandbox> {
+    mode: std::marker::PhantomData<fn() -> Mode>,
     kernel: Option<PathBuf>,
     initrd: Option<PathBuf>,
     entry: Option<String>,
     scratch_mb: Option<usize>,
-    /// When set, [`boot`](Self::boot) restores this snapshot instead of
+    /// When set, booting restores this snapshot instead of
     /// booting a fresh guest; `kernel`/`initrd`/`entry`/`scratch_mb` are
     /// then an error (the snapshot carries them).
     snapshot: Option<Arc<Snapshot>>,
@@ -2363,17 +2383,26 @@ pub struct SandboxBuilder {
     on_interrupt_handle: Option<InterruptHandleHook>,
 }
 
+/// A builder that restores a command snapshot without exposing an [`AppSandbox`].
+///
+/// Created by [`SandboxBuilder::from_command_snapshot`]. It supports the same
+/// configuration methods, but finishes only with
+/// [`boot_commands`](Self::boot_commands), not `boot`.
+pub type CommandSandboxBuilder = SandboxBuilder<command::CommandSandbox>;
+
 // A builder is made on one thread and booted on another, or shared before
 // the boot.
 const _: () = {
     fn send_sync<T: Send + Sync>() {}
     let _ = send_sync::<SandboxBuilder>;
+    let _ = send_sync::<CommandSandboxBuilder>;
 };
 
-impl SandboxBuilder {
+impl<Mode> SandboxBuilder<Mode> {
     /// A builder with no source and every setting at its default.
     fn empty() -> Self {
         Self {
+            mode: std::marker::PhantomData,
             kernel: None,
             initrd: None,
             entry: None,
@@ -2395,7 +2424,9 @@ impl SandboxBuilder {
             on_interrupt_handle: None,
         }
     }
+}
 
+impl SandboxBuilder {
     /// Boot the embedded kernel with `path` — a CPIO archive — as the guest
     /// rootfs.  The usual entry point: the workload lives in the rootfs.
     pub fn from_initrd(path: impl Into<PathBuf>) -> Self {
@@ -2446,13 +2477,23 @@ impl SandboxBuilder {
 
     /// Restore a command sandbox, including its parked executions and pipe data.
     /// Configure host functions, mounts and network policy, then call
-    /// [`boot`](Self::boot) and [`AppSandbox::into_commands`].
+    /// [`CommandSandboxBuilder::boot_commands`].
     /// No command is driven until its child handle is reacquired and polled.
-    pub fn from_command_snapshot(snapshot: &command::CommandSnapshot) -> Self {
-        Self {
+    ///
+    /// The returned builder cannot expose an app sandbox, whose snapshot API
+    /// would omit the command metadata:
+    ///
+    /// ```compile_fail
+    /// use hyperlight_unikraft::{SandboxBuilder, command::CommandSnapshot};
+    /// fn restore(snapshot: &CommandSnapshot) {
+    ///     let app = SandboxBuilder::from_command_snapshot(snapshot).boot();
+    /// }
+    /// ```
+    pub fn from_command_snapshot(snapshot: &command::CommandSnapshot) -> CommandSandboxBuilder {
+        SandboxBuilder {
             snapshot: Some(snapshot.guest.clone()),
             command_state: Some(snapshot.executions.clone()),
-            ..Self::empty()
+            ..SandboxBuilder::empty()
         }
     }
 
@@ -2462,20 +2503,35 @@ impl SandboxBuilder {
         Ok(Self::from_snapshot(load_snapshot(dir)?))
     }
 
-    /// CPIO rootfs to map for the guest (see [`from_initrd`](Self::from_initrd)).
+    /// Register the host functions, bring the guest to a running state, and
+    /// return it as an [`AppSandbox`].
+    ///
+    /// A fresh guest ([`from_initrd`](Self::from_initrd) /
+    /// [`from_kernel`](Self::from_kernel)) is evolved (booted); a
+    /// [`from_snapshot`](Self::from_snapshot) source is restored.
+    /// The entry itself needs no executor. Host calls queued during boot
+    /// or resume are driven by subsequent async driving methods.
+    pub fn boot(self) -> Result<AppSandbox> {
+        self.boot_inner(false)
+    }
+}
+
+impl<Mode> SandboxBuilder<Mode> {
+    /// CPIO rootfs to map for the guest (see [`SandboxBuilder::from_initrd`]).
     pub fn initrd(mut self, path: impl Into<PathBuf>) -> Self {
         self.initrd = Some(path.into());
         self
     }
 
-    /// Swap in an external kernel (see [`from_kernel`](Self::from_kernel) for
+    /// Swap in an external kernel (see [`SandboxBuilder::from_kernel`] for
     /// the ABI caveats).
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {
         self.kernel = Some(path.into());
         self
     }
 
-    /// Override the auto-detected guest entry point.
+    /// Override the auto-detected guest entry point for [`SandboxBuilder::boot`].
+    /// Ignored by [`boot_commands`](Self::boot_commands).
     pub fn entry(mut self, entry: impl Into<String>) -> Self {
         self.entry = Some(entry.into());
         self
@@ -2680,7 +2736,8 @@ impl SandboxBuilder {
 
     /// Hand `f` the sandbox's interrupt handle (the one
     /// [`AppSandbox::interrupt_handle`] returns) as soon as the sandbox
-    /// exists, before [`boot`](Self::boot) returns.  From a snapshot, that
+    /// exists, before [`SandboxBuilder::boot`] or [`Self::boot_commands`] returns.
+    /// From a snapshot, that
     /// is before the `resume` entry, so a guest that spins there can be
     /// stopped: a kill that cancels the entry fails `boot` with
     /// `Error::Hyperlight(ExecutionCanceledByHost)` and frees the sandbox.
@@ -2726,16 +2783,38 @@ impl SandboxBuilder {
         self
     }
 
-    /// Register the host functions, bring the guest to a running state, and
-    /// return it as a [`AppSandbox`].
+    /// Boot directly into a [`command::CommandSandbox`], without an application entry.
     ///
-    /// A fresh guest ([`from_initrd`](Self::from_initrd) /
-    /// [`from_kernel`](Self::from_kernel)) is evolved (booted); a
-    /// [`from_snapshot`](Self::from_snapshot) source is restored.
-    /// The entry itself needs no executor. Host calls queued during boot
-    /// or resume are driven by subsequent async driving methods.
-    pub fn boot(self) -> Result<AppSandbox> {
+    /// Ignores [`entry`](Self::entry) and the rootfs's auto-detected driver.
+    /// Only kernel infrastructure and the command service start; applications
+    /// run when explicitly spawned as commands. The sandbox stays alive with
+    /// no commands, including after its last command exits. No executor is
+    /// needed for this boot.
+    ///
+    /// Restores command snapshots supplied by
+    /// [`SandboxBuilder::from_command_snapshot`]. App snapshots are rejected
+    /// before entering the guest; restore them with [`SandboxBuilder::boot`].
+    pub fn boot_commands(mut self) -> Result<command::CommandSandbox> {
+        if self.snapshot.is_some()
+            && !self
+                .command_state
+                .as_ref()
+                .is_some_and(|state| state.command_only)
+        {
+            return Err(Error::Wait(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "boot_commands requires a fresh boot or a command-only command snapshot; \
+                 restore other snapshots with boot",
+            )));
+        }
+        self.entry = None;
+        let app = self.boot_inner(true)?;
+        command::CommandSandbox::from_boot(app)
+    }
+
+    fn boot_inner(self, boot_commands: bool) -> Result<AppSandbox> {
         let Self {
+            mode: _,
             kernel,
             initrd,
             entry,
@@ -2829,6 +2908,9 @@ impl SandboxBuilder {
                         .unwrap_or(DEFAULT_SCRATCH_MB)
                 });
                 let entry = entry.or_else(|| {
+                    if boot_commands {
+                        return None;
+                    }
                     if let Some(ref d) = scan.entry {
                         info!(entry = %d, "auto-detected driver entry point");
                     }
@@ -2838,6 +2920,7 @@ impl SandboxBuilder {
                     &kernel,
                     &initrd,
                     &entry,
+                    boot_commands,
                     scratch,
                     mounts,
                     network,

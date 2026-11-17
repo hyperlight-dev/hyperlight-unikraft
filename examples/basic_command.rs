@@ -13,8 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox = SandboxBuilder::from_initrd("build-elfloader/c-rootfs.cpio")
         .mount(Mount::ro("build-elfloader/bins/c", "/mnt/bin"))
         .echo_output(false)
-        .boot()?
-        .into_commands()?;
+        .boot_commands()?;
 
     let mut child = sandbox
         .command("/mnt/bin/command")

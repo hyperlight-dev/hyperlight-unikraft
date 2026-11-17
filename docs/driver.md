@@ -4,11 +4,21 @@ A driver is the program the kernel starts in a runtime image.  It brings its run
 
 ## The device
 
+The [Command API](async-host-calls.md#command-process-trees) is separate:
+the kernel handles `CommandSpawn` and `CommandKill` in an init-owned service,
+without delivering them to `/dev/hlcall`. `SandboxBuilder::entry()`
+chooses the boot entry for the legacy `.boot()` API. Separately, `.boot_commands()`
+ignores both the configured entry and driver auto-detection, starting no boot
+application at all and returning a command sandbox directly.
+There is no conversion between app and command sandboxes.
+All drivers described here retain their legacy
+APIs; the exec driver no longer contains command-launching code.
+
 The whole contract is one character device, `/dev/hlcall`, and seven operations on it, listed in the order a driver uses them:
 
 | Operation | Meaning |
 |---|---|
-| `open()` | The driver is here.  The kernel tells the host `DriverReady`; a call that arrives before any open is refused with `CallRejected`, which is what an image without a driver produces. |
+| `open()` | The driver is here.  The kernel tells the host `DriverReady`; a legacy driver call that arrives before any open is refused with `CallRejected`, which is what an image without a driver produces. |
 | `ioctl(HLCALL_IOC_MAXLEN)` | How large a call can be, a `uint64_t` the kernel knows from the transport geometry the host published.  The driver allocates its read buffer from it, once. |
 | `read()` | Blocks until the host issues a call, then returns it whole: the Postcard FunctionCall control data followed by any external bytes, without the transport header. Reading again completes the previous call. |
 | `ioctl(HLCALL_IOC_GETENV)` | The variables the embedder set (`--env`, `set_env_vars`) as they are now, `KEY=VALUE` entries separated by NUL, into a buffer the driver provides.  Asked at the top of every call; the kernel answers from its own copy unless the embedder changed the variables since (each call carries the host's version of them), so an unchanged environment costs no host call. |
