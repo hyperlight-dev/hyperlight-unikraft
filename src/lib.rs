@@ -47,6 +47,7 @@ use tracing::{debug, info};
 mod async_calls;
 mod cgroup;
 pub mod command;
+mod command_snapshot;
 #[cfg(feature = "cpio")]
 pub mod cpio;
 mod errno;
@@ -58,6 +59,7 @@ mod profile;
 mod timer;
 
 pub use cgroup::{CONTAINER_SCRATCH_HEADROOM_MB, cgroup_memory_limit_mb, scratch_mb_within};
+pub use command_snapshot::{load_command_snapshot, save_command_snapshot};
 pub use hostfs::{DirEntry, FileStat, FsBackend, S_IFDIR, S_IFMT, S_IFREG};
 pub use net_policy::{
     AllowList, BlockList, Destination, Filter, ListenPorts, NetworkFilter, NetworkPolicy,
@@ -746,8 +748,22 @@ pub fn save_snapshot(snapshot: &Snapshot, dir: impl AsRef<Path>) -> Result<()> {
 /// ([`SandboxBuilder::from_snapshot`]) or restore ([`AppSandbox::restore`])
 /// any number of guests from one load.  The snapshot must have been saved
 /// with this build's [`SNAPSHOT_KEY`]; see [`save_snapshot`].
+/// Command snapshots are rejected; use [`load_command_snapshot`] for those.
 pub fn load_snapshot(dir: impl AsRef<Path>) -> Result<Arc<Snapshot>> {
-    let dir = dir.as_ref();
+    let snapshot = load_snapshot_image(dir.as_ref())?;
+    if snapshot
+        .metadata::<serde_json::Value>(command_snapshot::METADATA)?
+        .is_some()
+    {
+        return Err(hyperlight_host::new_error!(
+            "this is a command snapshot; use load_command_snapshot"
+        )
+        .into());
+    }
+    Ok(snapshot)
+}
+
+fn load_snapshot_image(dir: &Path) -> Result<Arc<Snapshot>> {
     // The index names every save by release and key.  Load the one with
     // this build's key, whichever release saved it; otherwise say which
     // releases did, and what to do.  With no index to read, the layout
@@ -2501,6 +2517,13 @@ impl SandboxBuilder {
     /// `dir`, where [`AppSandbox::snapshot_to`] or [`save_snapshot`] wrote it.
     pub fn from_snapshot_dir(dir: impl AsRef<Path>) -> Result<Self> {
         Ok(Self::from_snapshot(load_snapshot(dir)?))
+    }
+
+    /// [`from_command_snapshot`](Self::from_command_snapshot) with a snapshot
+    /// read from `dir` by [`load_command_snapshot`]. Configure host resources
+    /// again, then call [`CommandSandboxBuilder::boot_commands`].
+    pub fn from_command_snapshot_dir(dir: impl AsRef<Path>) -> Result<CommandSandboxBuilder> {
+        Ok(Self::from_command_snapshot(&load_command_snapshot(dir)?))
     }
 
     /// Register the host functions, bring the guest to a running state, and

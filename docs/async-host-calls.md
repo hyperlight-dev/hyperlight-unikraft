@@ -365,9 +365,39 @@ or invoke their async handlers. Use `children()` and its `by_id(id)` or
 In-place restore preserves execution-ID allocation high-water
 marks, so IDs from discarded branches are not reused for new commands.
 
-The `CommandSnapshot` object is an in-memory snapshot; it is not the raw
-`Snapshot` accepted by the legacy disk/OCI helpers. Its command metadata must not
-be omitted. Guest timer deadlines follow the existing snapshot clock policy;
+Persist a `CommandSnapshot` with `save_command_snapshot(&snapshot, dir)` and
+reload it with `load_command_snapshot(dir)`. The sandbox and builder also offer
+the same disk conveniences as the app API:
+
+```rust,ignore
+let snapshot = sandbox.snapshot_to("saved-commands").await?;
+let restored = SandboxBuilder::from_command_snapshot_dir("saved-commands")?
+    // Supply the required host functions, mounts and network policy again.
+    .boot_commands()?;
+let child = restored.children()["worker"].restore().await?;
+
+// Park or drop unfinished children before an in-place restore.
+sandbox.restore_from("saved-commands").await?;
+```
+
+The guest is saved as an OCI image with the same kernel/host compatibility key
+as app snapshots. Command metadata, buffers (including output policies and loss
+counts), ID counters and retained replies are stored in a checksummed,
+content-addressed `commands/` file referenced by the guest image. This avoids
+Hyperlight's 1 MiB metadata limit. The state file is published before the guest
+index, so a failed save cannot pair an older guest with newer command state.
+Repeated saves replace the current tag and retain old blobs.
+Copy the **entire directory**; OCI-only export tools omit the companion state.
+Both loading paths reject the other snapshot kind; command loads also reject
+unknown command format versions and missing or corrupt state.
+
+Disk I/O is synchronous, like the app helpers; async snapshot capture releases
+its locks before writing. Load only trusted snapshots, protect their contents
+(including environment values and pipe data), and keep guest blob files intact
+while loaded snapshots or sandboxes use them: guest memory remains memory-mapped.
+Checksums detect corruption, not authenticity.
+
+Guest timer deadlines follow the existing snapshot clock policy;
 live parking/child restoration does not restart their duration. Connections are not cloned,
 and pending resource-dependent operations are interrupted on first drive.
 

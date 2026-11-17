@@ -8,7 +8,9 @@ use futures::{
     FutureExt,
     io::{AsyncReadExt, AsyncWriteExt},
 };
-use hyperlight_unikraft::{Mount, SandboxBuilder, command::Stdio};
+use hyperlight_unikraft::{
+    Mount, SandboxBuilder, command::Stdio, load_command_snapshot, save_command_snapshot,
+};
 
 mod common;
 
@@ -106,6 +108,7 @@ async fn output_preserves_configured_modes_and_rejects_output_only_stdin() {
 
 #[tokio::test]
 async fn output_modes_and_loss_counters_survive_snapshot_restore() {
+    let dir = common::temp_dir("command-output-snapshot");
     let sandbox = builder()
         .host_function("gate", |_| Ok("abcdefgh".into()))
         .boot_commands()
@@ -130,8 +133,8 @@ async fn output_modes_and_loss_counters_survive_snapshot_restore() {
             initial_dropped
         );
         child.park();
-        let snapshot = sandbox.snapshot().await.unwrap();
-        sandbox.restore(&snapshot).await.unwrap();
+        sandbox.snapshot_to(dir.path()).await.unwrap();
+        sandbox.restore_from(dir.path()).await.unwrap();
         assert_eq!(sandbox.children().by_id(id).unwrap().stdio[1], mode);
         let mut child = sandbox
             .children()
@@ -2490,7 +2493,8 @@ async fn restoring_a_parked_timer_does_not_restart_its_duration() {
 }
 
 #[tokio::test]
-async fn parking_preserves_completed_host_replies() {
+async fn parking_and_disk_snapshots_preserve_completed_host_replies() {
+    let dir = common::temp_dir("command-reply-snapshot");
     let sandbox = builder()
         .async_host_function("gate", |_| std::future::ready(Ok("completed".into())))
         .boot_commands()
@@ -2510,6 +2514,9 @@ async fn parking_preserves_completed_host_replies() {
     child.park();
     assert!(stdout.read(&mut [0]).await.is_err());
     let snapshot = sandbox.snapshot().await.unwrap();
+    save_command_snapshot(&snapshot, dir.path()).unwrap();
+    drop(snapshot);
+    let snapshot = load_command_snapshot(dir.path()).unwrap();
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
             panic!("a completed reply must survive the snapshot");
@@ -3038,6 +3045,195 @@ async fn command_only_boot_rejects_snapshots_with_a_boot_process() {
         Err(hyperlight_unikraft::Error::Wait(error))
             if error.kind() == std::io::ErrorKind::InvalidInput
     ));
+}
+
+#[tokio::test]
+async fn command_disk_snapshots_preserve_large_buffers_metadata_and_live_handles() {
+    let dir = common::temp_dir("command-disk-roundtrip");
+    let sandbox = builder().boot_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .name("buffered")
+        .args(["echo", ""])
+        .env_clear()
+        .env("TEST", "a=b")
+        .current_dir("/tmp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::unbounded())
+        .stderr(Stdio::tail(3))
+        .spawn()
+        .await
+        .unwrap();
+    let id = child.execution_id();
+    let pid = child.id();
+    let mut stdin = child.stdin.take().unwrap();
+    let bytes: Vec<u8> = (0..=255).cycle().take(384 * 1024).collect();
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::select(Box::pin(stdin.write_all(&bytes)), Box::pin(child.wait())),
+    )
+    .await
+    .unwrap()
+    {
+        futures::future::Either::Left((write, _)) => write.unwrap(),
+        futures::future::Either::Right((status, _)) => panic!("early exit: {status:?}"),
+    }
+    sandbox.snapshot_to(dir.path()).await.unwrap();
+    let state_path = std::fs::read_dir(dir.path().join("commands"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(std::fs::metadata(state_path).unwrap().len() > 1024 * 1024);
+    assert!(!sandbox.children()[id].parked());
+    stdin.close().await.unwrap();
+    let original = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(original.status.success());
+    assert_eq!(original.stdout, bytes);
+    drop(stdin);
+    drop(sandbox);
+
+    let restored = SandboxBuilder::from_command_snapshot_dir(dir.path())
+        .unwrap()
+        .mount(Mount::ro(common::require_bins("c"), "/mnt/bin"))
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    let children = restored.children();
+    let info = &children["buffered"];
+    assert_eq!(info.execution_id, id);
+    assert_eq!(info.pid, pid);
+    assert_eq!(info.program, "/mnt/bin/command");
+    assert_eq!(info.args, ["echo", ""]);
+    assert_eq!(info.cwd.as_deref(), Some("/tmp"));
+    assert_eq!(info.env, [("TEST".into(), "a=b".into())].into());
+    assert_eq!(info.stdio, [Stdio::Piped, Stdio::Unbounded, Stdio::Tail(3)]);
+    assert!(info.parked());
+    let copy = tokio::time::timeout(
+        Duration::from_secs(5),
+        info.restore().await.unwrap().wait_with_output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(copy.status.success());
+    assert_eq!(copy.stdout, bytes);
+
+    restored.snapshot_to(dir.path()).await.unwrap();
+    drop(restored);
+    let restored = SandboxBuilder::from_command_snapshot_dir(dir.path())
+        .unwrap()
+        .mount(Mount::ro(common::require_bins("c"), "/mnt/bin"))
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    assert!(restored.children().is_empty());
+    let child = restored
+        .command("/mnt/bin/command")
+        .args(["sleep", "0", "new"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    assert!(child.execution_id() > id);
+    assert_eq!(child.wait_with_output().await.unwrap().stdout, b"new\n");
+}
+
+#[tokio::test]
+async fn command_disk_snapshots_reject_wrong_kind_missing_state_and_corruption() {
+    let app_dir = common::temp_dir("app-snapshot-kind");
+    let mut app = builder().boot().unwrap();
+    app.snapshot_to(app_dir.path()).unwrap();
+    assert!(
+        load_command_snapshot(app_dir.path())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("not a command snapshot")
+    );
+    drop(app);
+
+    let dir = common::temp_dir("command-snapshot-errors");
+    let sandbox = builder().boot_commands().unwrap();
+    let snapshot = sandbox.snapshot_to(dir.path()).await.unwrap();
+    assert!(
+        hyperlight_unikraft::load_snapshot(dir.path())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("use load_command_snapshot")
+    );
+    let path = std::fs::read_dir(dir.path().join("commands"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(
+        load_command_snapshot(dir.path())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("checksum mismatch")
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(load_command_snapshot(dir.path()).is_err());
+    save_command_snapshot(&snapshot, dir.path()).unwrap();
+    assert!(load_command_snapshot(dir.path()).is_ok());
+
+    let child = sandbox
+        .command("/mnt/bin/command")
+        .name("unsaved")
+        .arg("echo")
+        .stdin(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let index = std::fs::read(dir.path().join("index.json")).unwrap();
+    let marker_path = dir.path().join("oci-layout");
+    let marker = std::fs::read(&marker_path).unwrap();
+    std::fs::write(&marker_path, br#"{"imageLayoutVersion":"unsupported"}"#).unwrap();
+    assert!(sandbox.snapshot_to(dir.path()).await.is_err());
+    assert_eq!(std::fs::read(dir.path().join("index.json")).unwrap(), index);
+    std::fs::write(&marker_path, marker).unwrap();
+    let previous = SandboxBuilder::from_command_snapshot_dir(dir.path())
+        .unwrap()
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    assert!(previous.children().is_empty());
+    drop(previous);
+    drop(child);
+
+    let tag = format!(
+        "{}-{}",
+        env!("CARGO_PKG_VERSION"),
+        hyperlight_unikraft::SNAPSHOT_KEY
+    )
+    .parse::<hyperlight_unikraft::hyperlight_host::sandbox::snapshot::OciTag>()
+    .unwrap();
+    let guest = hyperlight_unikraft::Snapshot::load(dir.path(), tag).unwrap();
+    let mut metadata = guest
+        .metadata::<serde_json::Value>("hluk.commands")
+        .unwrap()
+        .unwrap();
+    metadata["version"] = serde_json::json!(999);
+    let guest = guest.with_metadata("hluk.commands", &metadata).unwrap();
+    hyperlight_unikraft::save_snapshot(&guest, dir.path()).unwrap();
+    assert!(
+        load_command_snapshot(dir.path())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unsupported command snapshot version")
+    );
 }
 
 #[tokio::test]

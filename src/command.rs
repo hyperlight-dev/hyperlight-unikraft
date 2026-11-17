@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::ops::{Deref, DerefMut, Index};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
@@ -289,6 +290,8 @@ impl ChildInfo {
 /// place with [`CommandSandbox::restore`] or boot a separate sandbox with
 /// [`crate::SandboxBuilder::from_command_snapshot`]. Host functions, mounts and
 /// networking policy must be supplied again when booting a separate sandbox.
+/// Persist it with [`crate::save_command_snapshot`] and reload it with
+/// [`crate::load_command_snapshot`], retaining the complete directory.
 #[derive(Clone)]
 pub struct CommandSnapshot {
     pub(crate) guest: Arc<crate::Snapshot>,
@@ -463,6 +466,17 @@ impl CommandSandbox {
         .await
     }
 
+    /// [`snapshot`](Self::snapshot), then [`crate::save_command_snapshot`] to
+    /// `dir`. Returns the same snapshot for use in this process.
+    ///
+    /// Disk I/O is synchronous, like the app snapshot helpers, and runs after
+    /// releasing the capture locks.
+    pub async fn snapshot_to(&self, dir: impl AsRef<Path>) -> Result<CommandSnapshot> {
+        let snapshot = self.snapshot().await?;
+        crate::save_command_snapshot(&snapshot, dir)?;
+        Ok(snapshot)
+    }
+
     /// Replace the guest and command state with a snapshot. All commands restore
     /// parked; use their saved execution IDs to reacquire handles.
     ///
@@ -486,6 +500,14 @@ impl CommandSandbox {
             result
         })
         .await
+    }
+
+    /// Load a snapshot saved by [`snapshot_to`](Self::snapshot_to) or
+    /// [`crate::save_command_snapshot`] and [`restore`](Self::restore) it.
+    /// Disk I/O is synchronous; unfinished children must be parked or dropped.
+    pub async fn restore_from(&self, dir: impl AsRef<Path>) -> Result<()> {
+        let snapshot = crate::load_command_snapshot(dir)?;
+        self.restore(&snapshot).await
     }
 
     /// Observe all retained commands in execution-ID order without driving them.
@@ -536,7 +558,7 @@ pub struct Command {
 }
 
 /// A command's standard stream configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Stdio {
     /// Connect to `/dev/null` (the default).
     Null,

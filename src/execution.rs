@@ -82,7 +82,7 @@ pub(crate) struct Execution {
     pub deadline: Mutex<Option<Instant>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CommandMetadata {
     pub name: Option<String>,
     pub program: String,
@@ -99,7 +99,7 @@ pub(crate) struct DrivingState {
     pub resume: Option<Vec<u8>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ExecutionSnapshot {
     pub command_only: bool,
     next: u64,
@@ -107,7 +107,7 @@ pub(crate) struct ExecutionSnapshot {
     entries: Vec<ExecutionImage>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ExecutionImage {
     id: u64,
     command: CommandMetadata,
@@ -117,6 +117,27 @@ struct ExecutionImage {
     pipes: [PipeState; 3],
     streams: [bool; 3],
     resume: Vec<u8>,
+}
+
+impl ExecutionSnapshot {
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
+        if !self.command_only {
+            return Err(hyperlight_host::new_error!("snapshot is not command-only").into());
+        }
+        for entry in &self.entries {
+            if entry.id == 0 || entry.id > self.next || !ids.insert(entry.id) {
+                return Err(hyperlight_host::new_error!("invalid snapshot execution ID").into());
+            }
+            if let Some(name) = &entry.command.name
+                && (name.is_empty() || name.contains('\0') || !names.insert(name))
+            {
+                return Err(hyperlight_host::new_error!("invalid snapshot command name").into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -617,7 +638,7 @@ impl Executions {
 const PIPE_CAPACITY: usize = 64 * 1024;
 const IO_CHUNK: usize = 4096;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PipeState {
     bytes: VecDeque<u8>,
     eof: bool,
@@ -791,7 +812,7 @@ impl Pipe {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProcessState {
     pub pid: Option<u32>,
     pub status: Option<i32>,

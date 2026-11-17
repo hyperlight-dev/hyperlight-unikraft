@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Command snapshots can be persisted with `save_command_snapshot` and
+  `load_command_snapshot`, or `CommandSandbox::snapshot_to` / `restore_from`
+  and `SandboxBuilder::from_command_snapshot_dir`. Versioned, checksummed state
+  preserves command metadata, pipe buffers and retained replies alongside the
+  OCI guest image without its metadata size limit. App and command loaders
+  reject each other's snapshot kind.
 - `SandboxBuilder::boot_commands()` boots directly into a `CommandSandbox`,
   ignoring explicit entries and auto-detected drivers. No boot application runs,
   and the sandbox stays alive with zero commands. Command snapshots restore
