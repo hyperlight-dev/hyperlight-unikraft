@@ -97,6 +97,7 @@ pub(crate) struct DrivingState {
     pub generation: u64,
     pub streams: [bool; 3],
     pub resume: Option<Vec<u8>>,
+    pub checkpoint_ready: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -116,7 +117,6 @@ struct ExecutionImage {
     process: ProcessState,
     pipes: [PipeState; 3],
     streams: [bool; 3],
-    resume: Vec<u8>,
 }
 
 impl ExecutionSnapshot {
@@ -134,6 +134,15 @@ impl ExecutionSnapshot {
                 && (name.is_empty() || name.contains('\0') || !names.insert(name))
             {
                 return Err(hyperlight_host::new_error!("invalid snapshot command name").into());
+            }
+            if entry.pipes.iter().any(|pipe| !pipe.bytes.is_empty())
+                || entry.pipes[0].guest_bytes > PIPE_CAPACITY
+                || (entry.pipes[0].guest_eof && !entry.pipes[0].eof && !entry.pipes[0].closed)
+                || entry.pipes[1..]
+                    .iter()
+                    .any(|pipe| pipe.guest_bytes != 0 || pipe.guest_received != 0 || pipe.guest_eof)
+            {
+                return Err(hyperlight_host::new_error!("invalid snapshot pipe state").into());
             }
         }
         Ok(())
@@ -245,11 +254,11 @@ impl Executions {
         Ok(())
     }
 
-    pub fn snapshot<T>(
+    pub fn snapshot(
         &self,
         inbox: &Arc<Mutex<async_calls::Inbox>>,
-        capture_guest: impl FnOnce() -> crate::Result<T>,
-    ) -> crate::Result<(ExecutionSnapshot, T)> {
+        sandbox: &mut crate::AppSandbox,
+    ) -> crate::Result<(ExecutionSnapshot, Arc<crate::Snapshot>)> {
         let entries = self.list();
         // Hold every engine and stream-access gate through the guest capture.
         // The caller holds the VM and lifecycle locks; never wait for an active poll.
@@ -277,8 +286,51 @@ impl Executions {
                 Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
             });
         }
+        if entries
+            .iter()
+            .any(|entry| entry.kill_requested.load(Ordering::Relaxed))
+        {
+            return Err(Error::Wait(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a dropped command is awaiting termination",
+            )));
+        }
+        let retained: Vec<_> = calls
+            .iter()
+            .zip(&driving)
+            .map(|(calls, state)| {
+                state
+                    .resume
+                    .clone()
+                    .unwrap_or_else(|| calls.snapshot_batch())
+            })
+            .collect();
+        let mut replies: Vec<_> = retained
+            .iter()
+            .flat_map(|batch| async_calls::batch_records(batch))
+            .collect();
+        replies.sort_unstable_by_key(|(id, _)| *id);
+        checkpoint_inputs(&entries, &replies, |batch, ids| {
+            sandbox.checkpoint_command_inputs(batch)?;
+            for (calls, state) in calls.iter_mut().zip(&mut driving) {
+                if calls.checkpoint_delivered(ids) {
+                    state.checkpoint_ready = true;
+                }
+                if let Some(resume) = &mut state.resume {
+                    async_calls::acknowledge_batch(resume, ids);
+                }
+            }
+            Ok(())
+        })?;
+        let guest = sandbox.snapshot()?;
         let mut images = Vec::with_capacity(entries.len());
-        for ((entry, calls), state) in entries.iter().zip(&calls).zip(&driving) {
+        for (entry, state) in entries.iter().zip(&driving) {
+            if !entry.pipes[0].state.lock().unwrap().bytes.is_empty() {
+                return Err(hyperlight_host::new_error!(
+                    "guest did not checkpoint all pending stdin"
+                )
+                .into());
+            }
             if entry.kill_requested.load(Ordering::Relaxed) {
                 return Err(Error::Wait(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -291,12 +343,21 @@ impl Executions {
                 done: entry.done.load(Ordering::Relaxed),
                 failure: entry.failure.lock().unwrap().clone(),
                 process: entry.process.lock().unwrap().clone(),
-                pipes: std::array::from_fn(|i| entry.pipes[i].state.lock().unwrap().clone()),
+                pipes: std::array::from_fn(|i| {
+                    let pipe = entry.pipes[i].state.lock().unwrap();
+                    PipeState {
+                        // Input is in guest memory; output belongs to the reader.
+                        bytes: VecDeque::new(),
+                        guest_bytes: pipe.guest_bytes,
+                        guest_received: pipe.guest_received,
+                        guest_eof: pipe.guest_eof,
+                        eof: pipe.eof,
+                        closed: pipe.closed,
+                        mode: pipe.mode,
+                        dropped: pipe.dropped,
+                    }
+                }),
                 streams: state.streams,
-                resume: state
-                    .resume
-                    .clone()
-                    .unwrap_or_else(|| calls.snapshot_batch()),
             });
         }
         let executions = ExecutionSnapshot {
@@ -305,7 +366,6 @@ impl Executions {
             next_request: inbox.lock().unwrap().next_id(),
             entries: images,
         };
-        let guest = capture_guest()?;
         Ok((executions, guest))
     }
 
@@ -332,7 +392,7 @@ impl Executions {
             });
             let state = entry.driving.get_mut().unwrap();
             state.parked.store(true, Ordering::Relaxed);
-            state.resume = Some(image.resume.clone());
+            state.resume = Some(async_calls::empty_batch());
             entry.needs_restore.store(true, Ordering::Relaxed);
             entries.insert(image.id, Arc::new(entry));
         }
@@ -493,6 +553,19 @@ impl Executions {
         )?;
         let registry = self.clone();
         target.register_host_function(
+            "CommandStdin",
+            move |id: u64, received: u64, unread: u64| -> hyperlight_host::Result<Vec<u8>> {
+                registry
+                    .get(id)
+                    .ok_or_else(|| {
+                        HyperlightError::Error("stdin consumption without execution".into())
+                    })?
+                    .pipes[0]
+                    .consume_stdin(received, unread)
+            },
+        )?;
+        let registry = self.clone();
+        target.register_host_function(
             "CommandRead",
             move |count: u64| -> hyperlight_host::Result<Vec<u8>> {
                 registry
@@ -525,7 +598,7 @@ impl Executions {
         )?;
         target.register_host_function(
             "CommandServiceVersion",
-            || -> hyperlight_host::Result<u64> { Ok(8) },
+            || -> hyperlight_host::Result<u64> { Ok(11) },
         )?;
         let registry = self.clone();
         target.register_host_function(
@@ -638,9 +711,91 @@ impl Executions {
 const PIPE_CAPACITY: usize = 64 * 1024;
 const IO_CHUNK: usize = 4096;
 
+fn checkpoint_inputs(
+    entries: &[Arc<Execution>],
+    replies: &[(u64, &[u8])],
+    mut send: impl FnMut(Vec<u8>, &[u64]) -> crate::Result<()>,
+) -> crate::Result<()> {
+    let mut next = 0;
+    let mut reply_next = 0;
+    while next < entries.len() || reply_next < replies.len() {
+        // Envelope version and stdin length, followed by two versioned batches.
+        let mut batch = vec![1, 0, 0, 0, 0, 0, 0, 0];
+        batch.extend(async_calls::empty_batch());
+        let mut committed = Vec::new();
+        while let Some(entry) = entries.get(next) {
+            let state = entry.pipes[0].state.lock().unwrap();
+            if state.closed
+                || state.mode == crate::command::Stdio::Null
+                || (state.bytes.is_empty() && (!state.eof || state.guest_eof))
+            {
+                next += 1;
+                continue;
+            }
+            if batch.len() + 24 + state.bytes.len() + 8 > async_calls::MAX_BATCH_BYTES {
+                if committed.is_empty() {
+                    return Err(hyperlight_host::new_error!(
+                        "stdin record exceeds checkpoint capacity"
+                    )
+                    .into());
+                }
+                break;
+            }
+            let received = state
+                .guest_received
+                .checked_add(state.bytes.len() as u64)
+                .ok_or_else(|| hyperlight_host::new_error!("stdin sequence exhausted"))?;
+            batch.extend(entry.id.to_le_bytes());
+            batch.extend(state.guest_received.to_le_bytes());
+            batch.extend((state.bytes.len() as u32).to_le_bytes());
+            batch.extend(u32::from(state.eof).to_le_bytes());
+            batch.extend(state.bytes.iter());
+            committed.push((entry, received, state.eof));
+            next += 1;
+        }
+        batch[12..16].copy_from_slice(&(committed.len() as u32).to_le_bytes());
+        let stdin_len = batch.len() - 8;
+        batch[4..8].copy_from_slice(&(stdin_len as u32).to_le_bytes());
+        let reply_offset = batch.len();
+        batch.extend(async_calls::empty_batch());
+        let mut ids = Vec::new();
+        while let Some(&(id, record)) = replies.get(reply_next) {
+            if batch.len() + record.len() > async_calls::MAX_BATCH_BYTES {
+                if committed.is_empty() && ids.is_empty() {
+                    return Err(
+                        hyperlight_host::new_error!("reply exceeds checkpoint capacity").into(),
+                    );
+                }
+                break;
+            }
+            batch.extend_from_slice(record);
+            ids.push(id);
+            reply_next += 1;
+        }
+        if committed.is_empty() && ids.is_empty() {
+            break;
+        }
+        batch[reply_offset + 4..reply_offset + 8]
+            .copy_from_slice(&(ids.len() as u32).to_le_bytes());
+        send(batch, &ids)?;
+        // Stream gates are held throughout; acknowledge only a successful batch.
+        for (entry, received, eof) in committed {
+            let mut state = entry.pipes[0].state.lock().unwrap();
+            state.guest_bytes += state.bytes.len();
+            state.bytes.clear();
+            state.guest_received = received;
+            state.guest_eof = eof;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PipeState {
     bytes: VecDeque<u8>,
+    guest_bytes: usize,
+    guest_received: u64,
+    guest_eof: bool,
     eof: bool,
     closed: bool,
     mode: crate::command::Stdio,
@@ -651,6 +806,9 @@ impl Default for PipeState {
     fn default() -> Self {
         Self {
             bytes: VecDeque::new(),
+            guest_bytes: 0,
+            guest_received: 0,
+            guest_eof: false,
             eof: false,
             closed: false,
             mode: crate::command::Stdio::Piped,
@@ -668,6 +826,30 @@ pub(crate) struct Pipe {
 }
 
 impl Pipe {
+    fn consume_stdin(&self, received: u64, unread: u64) -> hyperlight_host::Result<Vec<u8>> {
+        let mut state = self.state.lock().unwrap();
+        if received != state.guest_received
+            || unread > state.guest_bytes as u64
+            || unread > PIPE_CAPACITY as u64
+        {
+            return Err(hyperlight_host::new_error!(
+                "invalid stdin queue accounting"
+            ));
+        }
+        let consumed = state.guest_bytes - unread as usize;
+        state.guest_bytes = unread as usize;
+        let reply = vec![
+            0,
+            u8::from((state.eof || state.closed) && state.bytes.is_empty()),
+        ];
+        drop(state);
+        if consumed != 0 {
+            self.writer.wake();
+            self.readiness.wake();
+        }
+        Ok(reply)
+    }
+
     fn new(mode: crate::command::Stdio) -> Self {
         Self {
             state: Mutex::new(PipeState {
@@ -774,7 +956,9 @@ impl Pipe {
             }
             Stdio::Unbounded => state.bytes.extend(bytes),
             Stdio::Null | Stdio::Piped => {
-                let count = bytes.len().min(PIPE_CAPACITY - state.bytes.len());
+                let count = bytes
+                    .len()
+                    .min(PIPE_CAPACITY - state.bytes.len() - state.guest_bytes);
                 if count < minimum && !bytes.is_empty() {
                     return Poll::Pending;
                 }
@@ -868,7 +1052,7 @@ impl Execution {
             let events: u32 = if stream == 0 {
                 if state.eof || state.closed {
                     1 | 16
-                } else if !state.bytes.is_empty() {
+                } else if !state.bytes.is_empty() || state.guest_bytes != 0 {
                     1
                 } else {
                     0
@@ -952,6 +1136,7 @@ impl Execution {
                 generation: 1,
                 streams,
                 resume: None,
+                checkpoint_ready: false,
             }),
             needs_restore: AtomicBool::new(false),
             kill_requested: AtomicBool::new(false),
@@ -1102,6 +1287,66 @@ impl Execution {
 mod tests {
     use super::*;
 
+    fn checkpoint_stdin(
+        entries: &[Arc<Execution>],
+        mut send: impl FnMut(Vec<u8>) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        checkpoint_inputs(entries, &[], |batch, ids| {
+            assert!(ids.is_empty());
+            assert!(batch.len() <= async_calls::MAX_BATCH_BYTES);
+            let len = u32::from_le_bytes(batch[4..8].try_into().unwrap()) as usize;
+            send(batch[8..8 + len].to_vec())
+        })
+    }
+
+    #[test]
+    fn checkpoints_combine_input_and_replies_and_bound_large_reply_batches() {
+        let entry = execution();
+        entry.pipes[0].state.lock().unwrap().bytes.extend(b"stdin");
+        let records: Vec<_> = (1..=20u64)
+            .map(|id| {
+                [
+                    id.to_le_bytes().as_slice(),
+                    &65536u32.to_le_bytes(),
+                    &vec![0; 65536],
+                ]
+                .concat()
+            })
+            .collect();
+        let replies: Vec<_> = records
+            .iter()
+            .enumerate()
+            .map(|(i, record)| (i as u64 + 1, record.as_slice()))
+            .collect();
+        let mut calls = 0;
+        let mut received = Vec::new();
+        checkpoint_inputs(std::slice::from_ref(&entry), &replies[..1], |batch, ids| {
+            calls += 1;
+            assert_eq!(u32::from_le_bytes(batch[12..16].try_into().unwrap()), 1);
+            assert_eq!(ids, &[1]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        calls = 0;
+        checkpoint_inputs(&[entry], &replies[1..], |batch, ids| {
+            calls += 1;
+            assert!(batch.len() <= async_calls::MAX_BATCH_BYTES);
+            let offset = 8 + u32::from_le_bytes(batch[4..8].try_into().unwrap()) as usize;
+            let records: Vec<_> = async_calls::batch_records(&batch[offset..]).collect();
+            assert_eq!(records.len(), ids.len());
+            for ((id, record), expected_id) in records.iter().zip(ids) {
+                assert_eq!(id, expected_id);
+                assert_eq!(*record, replies[*id as usize - 1].1);
+            }
+            received.extend_from_slice(ids);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(received, (2..=20).collect::<Vec<_>>());
+    }
+
     fn execution() -> Arc<Execution> {
         let inbox = Arc::new(Mutex::new(async_calls::Inbox::default()));
         inbox.lock().unwrap().negotiated = true;
@@ -1119,6 +1364,152 @@ mod tests {
                 stdio: [crate::command::Stdio::piped(); 3],
             },
         ))
+    }
+
+    #[test]
+    fn stdin_batches_are_bounded_acknowledged_and_skip_unchanged_state() {
+        let entries: Vec<_> = (1..=20)
+            .map(|id| {
+                let mut entry = execution();
+                Arc::get_mut(&mut entry).unwrap().id = id;
+                entry.pipes[0].state.lock().unwrap().bytes = vec![id as u8; PIPE_CAPACITY].into();
+                entry
+            })
+            .collect();
+        let mut lengths = Vec::new();
+        let mut seen = Vec::new();
+        checkpoint_stdin(&entries, |batch| {
+            assert!(batch.len() <= crate::CALL_PAYLOAD_MAX);
+            lengths.push(batch.len());
+            let records = u32::from_le_bytes(batch[4..8].try_into().unwrap());
+            let mut offset = 8;
+            for _ in 0..records {
+                let id = u64::from_le_bytes(batch[offset..offset + 8].try_into().unwrap());
+                let len = u32::from_le_bytes(batch[offset + 16..offset + 20].try_into().unwrap())
+                    as usize;
+                assert_eq!(len, PIPE_CAPACITY);
+                assert!(
+                    batch[offset + 24..offset + 24 + len]
+                        .iter()
+                        .all(|&b| b == id as u8)
+                );
+                seen.push(id);
+                offset += 24 + len;
+            }
+            assert_eq!(offset, batch.len());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(lengths.len(), 2);
+        assert_eq!(seen, (1..=20).collect::<Vec<_>>());
+        checkpoint_stdin(&entries, |_| {
+            panic!("unchanged input must not enter the guest")
+        })
+        .unwrap();
+        entries[0].pipes[0].eof();
+        assert!(
+            checkpoint_stdin(&entries, |_| Err(
+                hyperlight_host::new_error!("rejected").into()
+            ))
+            .is_err()
+        );
+        assert!(!entries[0].pipes[0].state.lock().unwrap().guest_eof);
+        let mut calls = 0;
+        checkpoint_stdin(&entries, |batch| {
+            calls += 1;
+            assert_eq!(batch.len(), 32);
+            assert_eq!(&batch[28..32], &1u32.to_le_bytes());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        checkpoint_stdin(&entries, |_| panic!("EOF already committed")).unwrap();
+    }
+
+    #[test]
+    fn stdin_batch_retry_retains_only_unacknowledged_input() {
+        let entries: Vec<_> = (1..=20)
+            .map(|id| {
+                let mut entry = execution();
+                Arc::get_mut(&mut entry).unwrap().id = id;
+                entry.pipes[0].state.lock().unwrap().bytes = vec![id as u8; PIPE_CAPACITY].into();
+                entry
+            })
+            .collect();
+        let mut calls = 0;
+        let mut failed = Vec::new();
+        assert!(
+            checkpoint_stdin(&entries, |batch| {
+                calls += 1;
+                if calls == 2 {
+                    failed = batch;
+                    return Err(hyperlight_host::new_error!("second batch rejected").into());
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 2);
+        assert!(entries[0].pipes[0].state.lock().unwrap().bytes.is_empty());
+        assert_eq!(
+            entries.last().unwrap().pipes[0]
+                .state
+                .lock()
+                .unwrap()
+                .bytes
+                .len(),
+            PIPE_CAPACITY
+        );
+        checkpoint_stdin(&entries, |batch| {
+            assert_eq!(batch, failed);
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+        checkpoint_stdin(&entries, |_| panic!("all input was acknowledged")).unwrap();
+    }
+
+    #[test]
+    fn stdin_checkpoint_shares_capacity_and_preserves_eof_order() {
+        let entry = execution();
+        let pipe = &entry.pipes[0];
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let input = vec![b'a'; PIPE_CAPACITY];
+        assert!(matches!(
+            pipe.write(&mut cx, &input),
+            Poll::Ready(Ok(PIPE_CAPACITY))
+        ));
+        assert!(
+            checkpoint_stdin(std::slice::from_ref(&entry), |_| {
+                Err(hyperlight_host::new_error!("failed batch").into())
+            })
+            .is_err()
+        );
+        assert_eq!(pipe.state.lock().unwrap().bytes.len(), PIPE_CAPACITY);
+        checkpoint_stdin(std::slice::from_ref(&entry), |_| Ok(())).unwrap();
+        assert!(pipe.consume_stdin(PIPE_CAPACITY as u64 + 1, 0).is_err());
+        assert!(
+            pipe.consume_stdin(PIPE_CAPACITY as u64, PIPE_CAPACITY as u64 + 1)
+                .is_err()
+        );
+        assert!(pipe.state.lock().unwrap().bytes.is_empty());
+        assert!(pipe.write(&mut cx, b"z").is_pending());
+        // Consuming one guest byte, not staging it, restores one write credit.
+        pipe.consume_stdin(PIPE_CAPACITY as u64, (PIPE_CAPACITY - 1) as u64)
+            .unwrap();
+        assert!(matches!(pipe.write(&mut cx, b"z"), Poll::Ready(Ok(1))));
+        pipe.eof();
+        assert_eq!(pipe.consume_stdin(PIPE_CAPACITY as u64, 0).unwrap(), [0, 0]);
+        checkpoint_stdin(std::slice::from_ref(&entry), |_| Ok(())).unwrap();
+        assert_eq!(
+            pipe.consume_stdin(PIPE_CAPACITY as u64 + 1, 1).unwrap(),
+            [0, 1]
+        );
+        assert_eq!(
+            pipe.consume_stdin(PIPE_CAPACITY as u64 + 1, 0).unwrap(),
+            [0, 1]
+        );
     }
 
     #[test]

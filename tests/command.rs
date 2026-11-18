@@ -22,6 +22,37 @@ fn builder() -> SandboxBuilder {
         .echo_output(false)
 }
 
+fn command_manifest(dir: &std::path::Path) -> serde_json::Value {
+    let read = |path| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    };
+    let blob = |digest: &serde_json::Value| {
+        dir.join("blobs/sha256")
+            .join(digest.as_str().unwrap().strip_prefix("sha256:").unwrap())
+    };
+    let index = read(dir.join("index.json"));
+    read(blob(&index["manifests"][0]["digest"]))
+}
+
+fn command_state_path(dir: &std::path::Path) -> std::path::PathBuf {
+    let manifest = command_manifest(dir);
+    let state = manifest["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|layer| {
+            layer["mediaType"] == "application/vnd.hyperlight.unikraft.command-state.v1+json"
+        })
+        .unwrap();
+    dir.join("blobs/sha256").join(
+        state["digest"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap(),
+    )
+}
+
 async fn read_while_running(
     child: &mut hyperlight_unikraft::command::Child,
     stdout: &mut (impl futures::io::AsyncRead + Unpin),
@@ -39,6 +70,19 @@ async fn read_while_running(
             panic!("command exited before producing expected output: {status:?}")
         }
     }
+}
+
+async fn drain_buffered(reader: &mut (impl futures::io::AsyncRead + Unpin)) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 4096];
+    while let Some(read) = reader.read(&mut buffer).now_or_never() {
+        let count = read.unwrap();
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    bytes
 }
 
 #[tokio::test]
@@ -113,12 +157,12 @@ async fn output_modes_and_loss_counters_survive_snapshot_restore() {
         .host_function("gate", |_| Ok("abcdefgh".into()))
         .boot_commands()
         .unwrap();
-    for (mode, expected, dropped) in [
-        (Stdio::head(3), &b"abc"[..], 8),
-        (Stdio::tail(3), &b"XYZ"[..], 8),
-        (Stdio::unbounded(), &b"abcdefghXYZ"[..], 0),
+    for (mode, original, dropped) in [
+        (Stdio::head(3), &b"abc"[..], 5),
+        (Stdio::tail(3), &b"fgh"[..], 5),
+        (Stdio::unbounded(), &b"abcdefgh"[..], 0),
     ] {
-        let child = sandbox
+        let mut child = sandbox
             .command("/mnt/bin/command")
             .args(["host-echo", "gate"])
             .stdin(Stdio::piped())
@@ -132,8 +176,12 @@ async fn output_modes_and_loss_counters_survive_snapshot_restore() {
             child.stdout.as_ref().unwrap().dropped_bytes(),
             initial_dropped
         );
-        child.park();
         sandbox.snapshot_to(dir.path()).await.unwrap();
+        assert_eq!(
+            drain_buffered(child.stdout.as_mut().unwrap()).await,
+            original
+        );
+        child.park();
         sandbox.restore_from(dir.path()).await.unwrap();
         assert_eq!(sandbox.children().by_id(id).unwrap().stdio[1], mode);
         let mut child = sandbox
@@ -158,7 +206,7 @@ async fn output_modes_and_loss_counters_survive_snapshot_restore() {
                 .success()
         );
         let output = child.wait_with_output().await.unwrap();
-        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stdout, b"XYZ");
         assert_eq!(output.stdout_dropped, dropped);
     }
 }
@@ -2002,11 +2050,6 @@ async fn parking_preserves_backpressured_output_and_invalidates_taken_pipes() {
     assert!(child.wait().now_or_never().is_none());
     child.park();
     assert!(old_stdout.read(&mut first).await.is_err());
-    let snapshot = sandbox.snapshot().await.unwrap();
-    let fork = SandboxBuilder::from_command_snapshot(&snapshot)
-        .echo_output(false)
-        .boot_commands()
-        .unwrap();
     let child = sandbox
         .children()
         .by_id(id)
@@ -2024,22 +2067,209 @@ async fn parking_preserves_backpressured_output_and_invalidates_taken_pipes() {
     assert_eq!(first, [b'x']);
     assert_eq!(output.stdout, vec![b'x'; 80 * 4096 - 1]);
     assert_eq!(output.stderr, vec![b'x'; 80 * 4096]);
-    let fork_output = tokio::time::timeout(
-        Duration::from_secs(5),
-        fork.children()
-            .by_id(id)
+}
+
+#[tokio::test]
+async fn stdin_snapshot_batches_over_transport_limit_preserve_all_commands() {
+    let sandbox = builder().boot_commands().unwrap();
+    let mut children = Vec::new();
+    // Twenty full queues exceed one guest call's approximately 1 MiB capacity.
+    for i in 0..20u8 {
+        let mut child = sandbox
+            .command("/mnt/bin/command")
+            .arg("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .await
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
             .unwrap()
+            .write_all(&vec![i; 64 * 1024])
+            .await
+            .unwrap();
+        if i % 2 == 0 {
+            child.stdin.as_mut().unwrap().close().await.unwrap();
+        }
+        children.push(child);
+    }
+    let snapshot = sandbox.snapshot().await.unwrap();
+    let restored = SandboxBuilder::from_command_snapshot(&snapshot)
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    for (i, child) in children.into_iter().enumerate() {
+        let copy = restored.children()[child.execution_id()]
             .restore()
             .await
+            .unwrap();
+        for child in [child, copy] {
+            let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, vec![i as u8; 64 * 1024]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn stdin_snapshot_commits_eof_only_after_previously_checkpointed_bytes() {
+    let sandbox = builder().boot_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("echo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"before")
+        .await
+        .unwrap();
+    sandbox.snapshot().await.unwrap();
+    child.stdin.as_mut().unwrap().close().await.unwrap();
+    let snapshot = sandbox.snapshot().await.unwrap();
+    let restored = SandboxBuilder::from_command_snapshot(&snapshot)
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    let mut copy = restored.children()[child.execution_id()]
+        .restore()
+        .await
+        .unwrap();
+    // Keep the new writer alive: EOF must come from the snapshot, not its drop.
+    let _stdin = copy.stdin.take().unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), copy.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"before");
+}
+
+#[tokio::test]
+async fn stdin_snapshots_commit_without_driving_or_releasing_backpressure() {
+    let dir = common::temp_dir("guest-stdin-snapshot");
+    let sandbox = builder().boot_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("echo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let id = child.execution_id();
+    let input: Vec<u8> = (0..=255).cycle().take(64 * 1024).collect();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&input)
+        .await
+        .unwrap();
+    assert!(
+        child
+            .stdin
+            .as_mut()
             .unwrap()
-            .wait_with_output(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(fork_output.status.success());
-    assert_eq!(fork_output.stdout, output.stdout);
-    assert_eq!(fork_output.stderr, output.stderr);
+            .write(b"x")
+            .now_or_never()
+            .is_none()
+    );
+    // Neither repeated checkpointing nor moving input to the guest frees space.
+    sandbox.snapshot().await.unwrap();
+    sandbox.snapshot_to(dir.path()).await.unwrap();
+    assert!(
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write(b"x")
+            .now_or_never()
+            .is_none()
+    );
+    assert!(
+        drain_buffered(child.stdout.as_mut().unwrap())
+            .await
+            .is_empty()
+    );
+    let restored = SandboxBuilder::from_command_snapshot_dir(dir.path())
+        .unwrap()
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    let copy = restored.children()[id].restore().await.unwrap();
+    for mut child in [child, copy] {
+        let mut stdin = child.stdin.take().unwrap();
+        assert!(stdin.write(b"x").now_or_never().is_none());
+        let ((), output) = tokio::time::timeout(Duration::from_secs(5), async {
+            futures::join!(
+                async {
+                    stdin.write_all(b"after").await.unwrap();
+                    stdin.close().await.unwrap();
+                },
+                child.wait_with_output()
+            )
+        })
+        .await
+        .unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, [input.as_slice(), b"after"].concat());
+    }
+}
+
+#[tokio::test]
+async fn checkpointed_stdin_wakes_guest_epoll_and_preserves_short_vectored_reads() {
+    let sandbox = builder().boot_commands().unwrap();
+    let mut child = sandbox
+        .command("/mnt/bin/command")
+        .arg("stdio-poll")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .await
+        .unwrap();
+    let mut ready = [0; 6];
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .await
+        .unwrap();
+    assert_eq!(&ready, b"ready\n");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"abcdefghijk")
+        .await
+        .unwrap();
+    child.stdin.as_mut().unwrap().close().await.unwrap();
+    let id = child.execution_id();
+    let snapshot = sandbox.snapshot().await.unwrap();
+    let restored = SandboxBuilder::from_command_snapshot(&snapshot)
+        .echo_output(false)
+        .boot_commands()
+        .unwrap();
+    for child in [child, restored.children()[id].restore().await.unwrap()] {
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"abcdefghijk");
+    }
 }
 
 #[tokio::test]
@@ -2089,7 +2319,7 @@ async fn snapshot_keeps_taken_pipes_usable_and_forks_buffered_input() {
 }
 
 #[tokio::test]
-async fn snapshot_of_unparked_backpressure_preserves_output_in_both_branches() {
+async fn snapshot_of_unparked_backpressure_keeps_host_output_only_in_original() {
     let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
         .command("/mnt/bin/command")
@@ -2110,14 +2340,24 @@ async fn snapshot_of_unparked_backpressure_preserves_output_in_both_branches() {
     assert!(child.wait().now_or_never().is_none());
     let snapshot = sandbox.snapshot().await.unwrap();
     assert!(!sandbox.children()[0].parked());
+    let buffered_stdout = drain_buffered(&mut stdout).await;
+    let buffered_stderr = drain_buffered(child.stderr.as_mut().unwrap()).await;
+    assert!(!buffered_stdout.is_empty());
+    assert!(!buffered_stderr.is_empty());
     child.stdout = Some(stdout);
     let original = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
         .unwrap()
         .unwrap();
     assert!(original.status.success());
-    assert_eq!(original.stdout, vec![b'x'; 80 * 4096 - 1]);
-    assert_eq!(original.stderr, vec![b'x'; 80 * 4096]);
+    assert_eq!(
+        [buffered_stdout, original.stdout.clone()].concat(),
+        vec![b'x'; 80 * 4096 - 1]
+    );
+    assert_eq!(
+        [buffered_stderr, original.stderr.clone()].concat(),
+        vec![b'x'; 80 * 4096]
+    );
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .echo_output(false)
         .boot_commands()
@@ -2493,7 +2733,7 @@ async fn restoring_a_parked_timer_does_not_restart_its_duration() {
 }
 
 #[tokio::test]
-async fn parking_and_disk_snapshots_preserve_completed_host_replies() {
+async fn parked_disk_snapshot_does_not_replay_delivered_host_output_or_completed_calls() {
     let dir = common::temp_dir("command-reply-snapshot");
     let sandbox = builder()
         .async_host_function("gate", |_| std::future::ready(Ok("completed".into())))
@@ -2519,7 +2759,7 @@ async fn parking_and_disk_snapshots_preserve_completed_host_replies() {
     let snapshot = load_command_snapshot(dir.path()).unwrap();
     let fork = SandboxBuilder::from_command_snapshot(&snapshot)
         .async_host_function("gate", |_| -> std::future::Ready<Result<String, String>> {
-            panic!("a completed reply must survive the snapshot");
+            panic!("a completed call must not run again after restoring");
         })
         .echo_output(false)
         .boot_commands()
@@ -2538,7 +2778,7 @@ async fn parking_and_disk_snapshots_preserve_completed_host_replies() {
     .unwrap()
     .unwrap();
     assert!(fork_output.status.success());
-    assert_eq!(fork_output.stdout, b"completed");
+    assert!(fork_output.stdout.is_empty());
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         sandbox
@@ -3048,7 +3288,7 @@ async fn command_only_boot_rejects_snapshots_with_a_boot_process() {
 }
 
 #[tokio::test]
-async fn command_disk_snapshots_preserve_large_buffers_metadata_and_live_handles() {
+async fn command_disk_snapshots_exclude_host_output_but_preserve_input_and_metadata() {
     let dir = common::temp_dir("command-disk-roundtrip");
     let sandbox = builder().boot_commands().unwrap();
     let mut child = sandbox
@@ -3079,25 +3319,50 @@ async fn command_disk_snapshots_preserve_large_buffers_metadata_and_live_handles
         futures::future::Either::Right((status, _)) => panic!("early exit: {status:?}"),
     }
     sandbox.snapshot_to(dir.path()).await.unwrap();
-    let state_path = std::fs::read_dir(dir.path().join("commands"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    assert!(std::fs::metadata(state_path).unwrap().len() > 1024 * 1024);
+    assert!(!dir.path().join("commands").exists());
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(command_state_path(dir.path())).unwrap()).unwrap();
+    let state = &state["executions"];
+    for stream in [0, 1, 2] {
+        assert_eq!(
+            state["entries"][0]["pipes"][stream]["bytes"],
+            serde_json::json!([])
+        );
+    }
     assert!(!sandbox.children()[id].parked());
+    let buffered = drain_buffered(child.stdout.as_mut().unwrap()).await;
+    assert!(!buffered.is_empty());
     stdin.close().await.unwrap();
     let original = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
         .unwrap()
         .unwrap();
     assert!(original.status.success());
-    assert_eq!(original.stdout, bytes);
+    assert_eq!([buffered, original.stdout.clone()].concat(), bytes);
     drop(stdin);
     drop(sandbox);
 
-    let restored = SandboxBuilder::from_command_snapshot_dir(dir.path())
+    let copied = common::temp_dir("command-oci-only-copy");
+    for file in ["index.json", "oci-layout"] {
+        std::fs::copy(dir.path().join(file), copied.path().join(file)).unwrap();
+    }
+    let blobs = copied.path().join("blobs/sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("index.json")).unwrap()).unwrap();
+    let manifest = command_manifest(dir.path());
+    for descriptor in [&index["manifests"][0], &manifest["config"]]
+        .into_iter()
+        .chain(manifest["layers"].as_array().unwrap())
+    {
+        let hex = descriptor["digest"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        std::fs::copy(dir.path().join("blobs/sha256").join(hex), blobs.join(hex)).unwrap();
+    }
+    let restored = SandboxBuilder::from_command_snapshot_dir(copied.path())
         .unwrap()
         .mount(Mount::ro(common::require_bins("c"), "/mnt/bin"))
         .echo_output(false)
@@ -3121,7 +3386,7 @@ async fn command_disk_snapshots_preserve_large_buffers_metadata_and_live_handles
     .unwrap()
     .unwrap();
     assert!(copy.status.success());
-    assert_eq!(copy.stdout, bytes);
+    assert_eq!(copy.stdout, original.stdout);
 
     restored.snapshot_to(dir.path()).await.unwrap();
     drop(restored);
@@ -3167,15 +3432,11 @@ async fn command_disk_snapshots_reject_wrong_kind_missing_state_and_corruption()
             .to_string()
             .contains("use load_command_snapshot")
     );
-    let path = std::fs::read_dir(dir.path().join("commands"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let mut bytes = std::fs::read(&path).unwrap();
-    bytes[0] ^= 1;
-    std::fs::write(&path, &bytes).unwrap();
+    let path = command_state_path(dir.path());
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    state["executions"]["next"] = serde_json::json!(1);
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
     assert!(
         load_command_snapshot(dir.path())
             .err()
@@ -3211,29 +3472,6 @@ async fn command_disk_snapshots_reject_wrong_kind_missing_state_and_corruption()
     assert!(previous.children().is_empty());
     drop(previous);
     drop(child);
-
-    let tag = format!(
-        "{}-{}",
-        env!("CARGO_PKG_VERSION"),
-        hyperlight_unikraft::SNAPSHOT_KEY
-    )
-    .parse::<hyperlight_unikraft::hyperlight_host::sandbox::snapshot::OciTag>()
-    .unwrap();
-    let guest = hyperlight_unikraft::Snapshot::load(dir.path(), tag).unwrap();
-    let mut metadata = guest
-        .metadata::<serde_json::Value>("hluk.commands")
-        .unwrap()
-        .unwrap();
-    metadata["version"] = serde_json::json!(999);
-    let guest = guest.with_metadata("hluk.commands", &metadata).unwrap();
-    hyperlight_unikraft::save_snapshot(&guest, dir.path()).unwrap();
-    assert!(
-        load_command_snapshot(dir.path())
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("unsupported command snapshot version")
-    );
 }
 
 #[tokio::test]

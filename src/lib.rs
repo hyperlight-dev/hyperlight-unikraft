@@ -764,6 +764,17 @@ pub fn load_snapshot(dir: impl AsRef<Path>) -> Result<Arc<Snapshot>> {
 }
 
 fn load_snapshot_image(dir: &Path) -> Result<Arc<Snapshot>> {
+    let tag = snapshot_reference(dir)?;
+    if command_snapshot::is_layered(dir, tag.as_str())? {
+        return Err(hyperlight_host::new_error!(
+            "this is a command snapshot; use load_command_snapshot"
+        )
+        .into());
+    }
+    Ok(Arc::new(Snapshot::load(dir, tag)?))
+}
+
+fn snapshot_reference(dir: &Path) -> Result<OciTag> {
     // The index names every save by release and key.  Load the one with
     // this build's key, whichever release saved it; otherwise say which
     // releases did, and what to do.  With no index to read, the layout
@@ -793,7 +804,7 @@ fn load_snapshot_image(dir: &Path) -> Result<Arc<Snapshot>> {
         },
         None => snapshot_tag(),
     };
-    Ok(Arc::new(Snapshot::load(dir, tag)?))
+    Ok(tag)
 }
 
 /// The tags of the OCI index in `dir`, one per save.  `None` when there
@@ -2383,6 +2394,7 @@ pub struct SandboxBuilder<Mode = AppSandbox> {
     /// booting a fresh guest; `kernel`/`initrd`/`entry`/`scratch_mb` are
     /// then an error (the snapshot carries them).
     snapshot: Option<Arc<Snapshot>>,
+    snapshot_files: Vec<Arc<tempfile::TempDir>>,
     command_state: Option<execution::ExecutionSnapshot>,
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
@@ -2424,6 +2436,7 @@ impl<Mode> SandboxBuilder<Mode> {
             entry: None,
             scratch_mb: None,
             snapshot: None,
+            snapshot_files: Vec::new(),
             command_state: None,
             mounts: Vec::new(),
             network: None,
@@ -2491,7 +2504,8 @@ impl SandboxBuilder {
         }
     }
 
-    /// Restore a command sandbox, including its parked executions and pipe data.
+    /// Restore a command sandbox, including its parked executions and pending
+    /// stdin, but not output already delivered to host pipes.
     /// Configure host functions, mounts and network policy, then call
     /// [`CommandSandboxBuilder::boot_commands`].
     /// No command is driven until its child handle is reacquired and polled.
@@ -2508,6 +2522,7 @@ impl SandboxBuilder {
     pub fn from_command_snapshot(snapshot: &command::CommandSnapshot) -> CommandSandboxBuilder {
         SandboxBuilder {
             snapshot: Some(snapshot.guest.clone()),
+            snapshot_files: snapshot.files.clone(),
             command_state: Some(snapshot.executions.clone()),
             ..SandboxBuilder::empty()
         }
@@ -2843,6 +2858,7 @@ impl<Mode> SandboxBuilder<Mode> {
             entry,
             scratch_mb,
             snapshot,
+            snapshot_files,
             command_state,
             mounts,
             network,
@@ -3019,6 +3035,7 @@ impl<Mode> SandboxBuilder<Mode> {
             pending: None,
             clean_scratch_bytes: 0,
             async_poisoned: false,
+            snapshot_files,
         };
         if let Some(state) = command_state {
             app.config
@@ -3167,6 +3184,7 @@ pub struct AppSandbox {
     clean_scratch_bytes: u64,
     async_calls: async_calls::PendingCalls,
     async_poisoned: bool,
+    snapshot_files: Vec<Arc<tempfile::TempDir>>,
 }
 
 struct AsyncDriveDropGuard<'a> {
@@ -3556,6 +3574,12 @@ impl AppSandbox {
         let snapshot = self.sandbox.snapshot()?;
         self.mark_clean()?;
         record_scratch_mb(snapshot, self.config.scratch_size.map(|size| size / MIB))
+    }
+
+    pub(crate) fn checkpoint_command_inputs(&mut self, batch: Vec<u8>) -> Result<()> {
+        self.check_snapshot()?;
+        self.sandbox.call::<()>("CommandCheckpoint", (batch,))?;
+        Ok(())
     }
 
     fn check_snapshot(&self) -> Result<()> {

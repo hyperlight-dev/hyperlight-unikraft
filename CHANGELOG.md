@@ -9,9 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Command snapshots can be persisted with `save_command_snapshot` and
   `load_command_snapshot`, or `CommandSandbox::snapshot_to` / `restore_from`
   and `SandboxBuilder::from_command_snapshot_dir`. Versioned, checksummed state
-  preserves command metadata, pipe buffers and retained replies alongside the
-  OCI guest image without its metadata size limit. App and command loaders
-  reject each other's snapshot kind.
+  preserves command metadata and pipe accounting in an added OCI layer, with no
+  companion files. The command-state layer has no fixed size cap; saving and
+  loading require memory proportional to its size. Hyperlight's 1 MiB limits
+  on the config, manifests and index remain. App and command loaders reject each
+  other's snapshot kind. The saver post-processes Hyperlight's manifest and
+  atomically publishes the extended image; the loader uses a private index
+  without modifying the source layout. An original-manifest layer keeps the
+  image self-contained for OCI-aware copying.
 - `SandboxBuilder::boot_commands()` boots directly into a `CommandSandbox`,
   ignoring explicit entries and auto-detected drivers. No boot application runs,
   and the sandbox stays alive with zero commands. Command snapshots restore
@@ -70,7 +75,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `CommandSandbox` is non-cloneable. Command builders also hold weak references
   and return `NotFound` when spawned after their sandbox is dropped.
 - In-memory command snapshots capture the whole guest plus execution
-  metadata, pipe buffers and retained replies. Restore in place with
+  metadata, pending stdin and retained replies. Restore in place with
   `CommandSandbox::restore`, or boot an independent clone with
   `SandboxBuilder::from_command_snapshot`. Snapshot capture also accepts unparked
   children without changing their handles, pipes, sockets or pending host calls.
@@ -89,6 +94,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Piped command stdin uses a preallocated 64 KiB guest queue at snapshot time.
+  Host-staged and guest-unread bytes share the same 64 KiB backpressure budget:
+  moving input does not free capacity; guest consumption does. Snapshot capture
+  commits pending input and EOF without scheduling application threads, preserving
+  input ordering across repeated snapshots and restore. Input bytes now live in
+  guest memory, not the command-state metadata. Pending input and EOF are
+  pushed in one guest call when they fit, bounded batches otherwise; unchanged
+  snapshots skip guest entry and retain the cached snapshot fast path.
+  Retained completed host replies share those batches and are delivered to the
+  guest's normal waiting-thread buffers without running applications or polling
+  host futures. Command metadata contains no stdin or reply payloads.
+  Command protocol v11, command disk format v7 and snapshot contract 22 require
+  fresh snapshots.
+- Command snapshots no longer include bytes already delivered to host
+  stdout/stderr pipes. Original readers retain that output; restored copies start
+  with empty output buffers. Pending stdin, retained replies, stream settings and
+  loss counters are unchanged, as is live parking.
 - Removed `AppSandbox::into_commands()`. Create commands through
   `SandboxBuilder::boot_commands()`; restore app snapshots through `.boot()`
   and command snapshots through `.boot_commands()`. The two sandbox APIs

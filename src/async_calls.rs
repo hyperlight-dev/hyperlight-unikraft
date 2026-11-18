@@ -13,6 +13,37 @@ use crate::{CALL_PAYLOAD_MAX, H2G_BUFFER_SIZE, HOST_CALL_MAX, encode_host_reply}
 
 pub(crate) const VERSION: u64 = 1;
 
+pub(crate) fn empty_batch() -> Vec<u8> {
+    [(VERSION as u32).to_le_bytes(), 0u32.to_le_bytes()].concat()
+}
+
+pub(crate) fn batch_records(batch: &[u8]) -> impl Iterator<Item = (u64, &[u8])> {
+    let mut remaining = &batch[8..];
+    std::iter::from_fn(move || {
+        if remaining.is_empty() {
+            return None;
+        }
+        let id = u64::from_le_bytes(remaining[..8].try_into().unwrap());
+        let len = u32::from_le_bytes(remaining[8..12].try_into().unwrap()) as usize;
+        let record = &remaining[..12 + len];
+        remaining = &remaining[12 + len..];
+        Some((id, record))
+    })
+}
+
+pub(crate) fn acknowledge_batch(batch: &mut Vec<u8>, ids: &[u64]) {
+    let mut kept = empty_batch();
+    let mut count = 0u32;
+    for (id, record) in batch_records(batch) {
+        if ids.binary_search(&id).is_err() {
+            kept.extend_from_slice(record);
+            count += 1;
+        }
+    }
+    kept[4..8].copy_from_slice(&count.to_le_bytes());
+    *batch = kept;
+}
+
 pub(crate) fn pending_reply(id: u64) -> Vec<u8> {
     let mut reply = vec![2];
     reply.extend_from_slice(&id.to_le_bytes());
@@ -22,7 +53,7 @@ pub(crate) fn pending_reply(id: u64) -> Vec<u8> {
 const MAX_PENDING: usize = 1024;
 const MAX_BATCH_COUNT: usize = 64;
 // Leave a receive buffer for control traffic as well as the framing reserve.
-const MAX_BATCH_BYTES: usize = CALL_PAYLOAD_MAX - H2G_BUFFER_SIZE;
+pub(crate) const MAX_BATCH_BYTES: usize = CALL_PAYLOAD_MAX - H2G_BUFFER_SIZE;
 const _: () = assert!(8 + 12 + HOST_CALL_MAX <= MAX_BATCH_BYTES);
 enum CompletionEvent {
     Call(u64, Vec<u8>),
@@ -304,6 +335,24 @@ impl PendingCalls {
             inbox.delivered(id);
         }
         self.batch.clear();
+    }
+
+    pub fn checkpoint_delivered(&mut self, ids: &[u64]) -> bool {
+        let mut inbox = self.inbox.lock().unwrap();
+        let before = self.batch_ids.len();
+        self.batch_ids.retain(|id| {
+            if ids.binary_search(id).is_ok() {
+                inbox.delivered(*id);
+                false
+            } else {
+                true
+            }
+        });
+        let changed = before != self.batch_ids.len();
+        if changed {
+            acknowledge_batch(&mut self.batch, ids);
+        }
+        changed
     }
 
     pub fn clear(&mut self) {
@@ -976,6 +1025,49 @@ mod tests {
         inbox.cancel(id);
         assert!(inbox.queued.is_empty());
         assert!(!inbox.is_pending());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_acknowledges_only_selected_data_and_leaves_other_work() {
+        let mut engine = engine();
+        let first = submit(&engine, "first");
+        let second = submit(&engine, "second");
+        let resource = engine
+            .inbox
+            .lock()
+            .unwrap()
+            .submit_resource_reply(async { Ok(vec![0, 0, 0, 0, 0]) })
+            .unwrap();
+        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
+        engine
+            .inbox
+            .lock()
+            .unwrap()
+            .submit_reply(async move {
+                receiver.await.unwrap();
+                vec![0]
+            })
+            .unwrap();
+        assert_eq!(
+            poll_fn(|cx| engine.poll_batch(cx)).await.unwrap(),
+            Wake::Calls
+        );
+        assert!(engine.checkpoint_delivered(&[first]));
+        assert!(!engine.checkpoint_delivered(&[first]));
+        let retained = engine.snapshot_batch();
+        assert_eq!(
+            batch_records(&retained)
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            [second]
+        );
+        assert!(engine.checkpoint_delivered(&[second]));
+        assert_eq!(engine.batch_ids, [resource]);
+        assert_eq!(engine.snapshot_batch(), empty_batch());
+        assert!(!sender.is_canceled());
+        assert!(engine.is_pending());
+        engine.delivered();
+        assert!(engine.is_pending());
     }
 
     #[tokio::test]

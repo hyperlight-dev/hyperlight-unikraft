@@ -290,12 +290,373 @@ impl ChildInfo {
 /// place with [`CommandSandbox::restore`] or boot a separate sandbox with
 /// [`crate::SandboxBuilder::from_command_snapshot`]. Host functions, mounts and
 /// networking policy must be supplied again when booting a separate sandbox.
+/// Pending stdin is retained; output already in host pipes belongs to the
+/// original readers and is not included.
+/// Stdin and retained reply bytes reside in the guest snapshot; only bookkeeping
+/// and command metadata remain outside it.
 /// Persist it with [`crate::save_command_snapshot`] and reload it with
-/// [`crate::load_command_snapshot`], retaining the complete directory.
+/// [`crate::load_command_snapshot`]. Disk saves put command metadata in a separate
+/// OCI layer with no fixed size cap; saving and loading require memory proportional
+/// to the metadata size.
 #[derive(Clone)]
 pub struct CommandSnapshot {
     pub(crate) guest: Arc<crate::Snapshot>,
     pub(crate) executions: crate::execution::ExecutionSnapshot,
+    // Drop private blob links only after all mapped guest state is released.
+    pub(crate) files: Vec<Arc<tempfile::TempDir>>,
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use futures::{
+        FutureExt,
+        io::{AsyncReadExt, AsyncWriteExt},
+    };
+
+    fn checkpoint_batch(stdin: &[u8], replies: &[u8]) -> Vec<u8> {
+        [
+            1u32.to_le_bytes().as_slice(),
+            &(stdin.len() as u32).to_le_bytes(),
+            stdin,
+            replies,
+        ]
+        .concat()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a hypervisor and build-elfloader C fixtures"]
+    async fn retained_replies_checkpoint_live_and_parked_without_running_applications() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("build-elfloader");
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = polls.clone();
+        let sandbox = crate::SandboxBuilder::from_initrd(root.join("c-rootfs.cpio"))
+            .mount(crate::Mount::ro(root.join("bins/c"), "/mnt/bin"))
+            .scratch_mb(128)
+            .echo_output(false)
+            .async_host_function("gate", move |arg| {
+                let polls = observed.clone();
+                async move {
+                    polls.fetch_add(1, Ordering::Relaxed);
+                    Ok(format!("reply-{arg}:"))
+                }
+            })
+            .boot_commands()
+            .unwrap();
+        let mut children = Vec::new();
+        // Combined input exceeds one checkpoint call; replies span executions.
+        for i in 0..70 {
+            let mut child = sandbox
+                .command("/mnt/bin/command")
+                .args(["host-echo", &i.to_string()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .await
+                .unwrap();
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(&vec![i as u8; 16384])
+                .await
+                .unwrap();
+            let id = child.execution_id();
+            let entry = sandbox.0.executions.get(id.0).unwrap();
+            let mut calls = entry.calls.lock().unwrap();
+            assert_eq!(
+                poll_fn(|cx| calls.poll_batch(cx))
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap(),
+                async_calls::Wake::Calls
+            );
+            drop(calls);
+            if i % 2 == 0 {
+                child.park();
+                children.push((id, None));
+            } else {
+                children.push((id, Some(child)));
+            }
+        }
+        assert_eq!(polls.load(Ordering::Relaxed), 70);
+        let snapshot = sandbox.snapshot().await.unwrap();
+        for (_, child) in &mut children {
+            if let Some(child) = child {
+                assert!(
+                    child
+                        .stdout
+                        .as_mut()
+                        .unwrap()
+                        .read(&mut [0])
+                        .now_or_never()
+                        .is_none()
+                );
+                assert!(child.try_wait().unwrap().is_none());
+            }
+        }
+        let state = serde_json::to_value(&snapshot.executions).unwrap();
+        for entry in state["entries"].as_array().unwrap() {
+            assert!(entry.get("resume").is_none());
+            for pipe in entry["pipes"].as_array().unwrap() {
+                assert_eq!(pipe["bytes"], serde_json::json!([]));
+            }
+        }
+        let cached = sandbox
+            .0
+            .sandbox
+            .lock()
+            .unwrap()
+            .sandbox
+            .snapshot()
+            .unwrap();
+        sandbox.snapshot().await.unwrap();
+        assert!(Arc::ptr_eq(
+            &cached,
+            &sandbox
+                .0
+                .sandbox
+                .lock()
+                .unwrap()
+                .sandbox
+                .snapshot()
+                .unwrap()
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        crate::save_command_snapshot(&snapshot, dir.path()).unwrap();
+        let loaded = crate::load_command_snapshot(dir.path()).unwrap();
+        let fork = crate::SandboxBuilder::from_command_snapshot(&loaded)
+            .echo_output(false)
+            .async_host_function("gate", |_| async { panic!("completed reply was lost") })
+            .boot_commands()
+            .unwrap();
+        for (i, (id, child)) in children.into_iter().enumerate() {
+            let original = match child {
+                Some(child) => child,
+                None => sandbox.children()[id].restore().await.unwrap(),
+            };
+            let copy = fork.children()[id].restore().await.unwrap();
+            for child in [original, copy] {
+                let output = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    child.wait_with_output(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(output.status.success());
+                let expected = [format!("reply-{i}:").as_bytes(), &vec![i as u8; 16384]].concat();
+                assert_eq!(output.stdout, expected);
+            }
+        }
+        assert_eq!(polls.load(Ordering::Relaxed), 70);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a hypervisor and build-elfloader C fixtures"]
+    async fn reply_checkpoint_rejects_whole_batch_and_accepts_identical_replay() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("build-elfloader");
+        let sandbox = crate::SandboxBuilder::from_initrd(root.join("c-rootfs.cpio"))
+            .mount(crate::Mount::ro(root.join("bins/c"), "/mnt/bin"))
+            .scratch_mb(128)
+            .echo_output(false)
+            .async_host_function("gate", |_| async { Ok("kept".into()) })
+            .boot_commands()
+            .unwrap();
+        let mut child = sandbox
+            .command("/mnt/bin/command")
+            .args(["host-echo", "[]"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .await
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"input")
+            .await
+            .unwrap();
+        let entry = sandbox.0.executions.get(child.execution_id().0).unwrap();
+        let replies = {
+            let mut calls = entry.calls.lock().unwrap();
+            assert!(
+                poll_fn(|cx| calls.poll_batch(cx))
+                    .now_or_never()
+                    .unwrap()
+                    .is_ok()
+            );
+            calls.snapshot_batch()
+        };
+        let stdin = [
+            1u32.to_le_bytes().as_slice(),
+            &1u32.to_le_bytes(),
+            &entry.id.to_le_bytes(),
+            &0u64.to_le_bytes(),
+            &5u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            b"input",
+        ]
+        .concat();
+        let mut bad_stdin = stdin.clone();
+        *bad_stdin.last_mut().unwrap() = b'X';
+        let mut bad_replies = replies.clone();
+        bad_replies[4..8].copy_from_slice(&2u32.to_le_bytes());
+        *bad_replies.last_mut().unwrap() = b'X';
+        bad_replies.extend([u64::MAX.to_le_bytes().as_slice(), &1u32.to_le_bytes(), &[0]].concat());
+        assert!(
+            sandbox
+                .0
+                .sandbox
+                .lock()
+                .unwrap()
+                .checkpoint_command_inputs(checkpoint_batch(&bad_stdin, &bad_replies))
+                .is_err()
+        );
+        let valid = checkpoint_batch(&stdin, &replies);
+        sandbox
+            .0
+            .sandbox
+            .lock()
+            .unwrap()
+            .checkpoint_command_inputs(valid.clone())
+            .unwrap();
+        sandbox
+            .0
+            .sandbox
+            .lock()
+            .unwrap()
+            .checkpoint_command_inputs(valid)
+            .unwrap();
+        // Host acknowledgment was deliberately withheld: snapshot retries delivery.
+        sandbox.snapshot().await.unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"keptinput");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a hypervisor and build-elfloader C fixtures"]
+    async fn stdin_batch_validation_replay_and_snapshot_cache() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("build-elfloader");
+        let sandbox = crate::SandboxBuilder::from_initrd(root.join("c-rootfs.cpio"))
+            .mount(crate::Mount::ro(root.join("bins/c"), "/mnt/bin"))
+            .scratch_mb(128)
+            .echo_output(false)
+            .boot_commands()
+            .unwrap();
+        let mut child = sandbox
+            .command("/mnt/bin/command")
+            .arg("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .await
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"abc")
+            .await
+            .unwrap();
+        let record = |id: u64, bytes: &[u8]| {
+            [
+                id.to_le_bytes().as_slice(),
+                &0u64.to_le_bytes(),
+                &(bytes.len() as u32).to_le_bytes(),
+                &0u32.to_le_bytes(),
+                bytes,
+            ]
+            .concat()
+        };
+        let valid = record(child.execution_id().0, b"abc");
+        let mut malformed = [
+            1u32.to_le_bytes().as_slice(),
+            &2u32.to_le_bytes(),
+            &record(child.execution_id().0, b"BAD"),
+            &record(u64::MAX, b"bad"),
+        ]
+        .concat();
+        assert!(
+            sandbox
+                .0
+                .sandbox
+                .lock()
+                .unwrap()
+                .checkpoint_command_inputs(checkpoint_batch(
+                    &malformed,
+                    &async_calls::empty_batch()
+                ))
+                .is_err()
+        );
+        // A valid first record followed by a truncated record must not be applied.
+        malformed.pop();
+        assert!(
+            sandbox
+                .0
+                .sandbox
+                .lock()
+                .unwrap()
+                .checkpoint_command_inputs(checkpoint_batch(
+                    &malformed,
+                    &async_calls::empty_batch()
+                ))
+                .is_err()
+        );
+        sandbox.snapshot().await.unwrap();
+        let replay = [1u32.to_le_bytes().as_slice(), &1u32.to_le_bytes(), &valid].concat();
+        sandbox
+            .0
+            .sandbox
+            .lock()
+            .unwrap()
+            .checkpoint_command_inputs(checkpoint_batch(&replay, &async_calls::empty_batch()))
+            .unwrap();
+        let cached = sandbox
+            .0
+            .sandbox
+            .lock()
+            .unwrap()
+            .sandbox
+            .snapshot()
+            .unwrap();
+        sandbox.snapshot().await.unwrap();
+        let unchanged = sandbox
+            .0
+            .sandbox
+            .lock()
+            .unwrap()
+            .sandbox
+            .snapshot()
+            .unwrap();
+        assert!(Arc::ptr_eq(&cached, &unchanged));
+        child.stdin.as_mut().unwrap().close().await.unwrap();
+        sandbox.snapshot().await.unwrap();
+        let eof = sandbox
+            .0
+            .sandbox
+            .lock()
+            .unwrap()
+            .sandbox
+            .snapshot()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&cached, &eof));
+        sandbox.snapshot().await.unwrap();
+        let unchanged = sandbox
+            .0
+            .sandbox
+            .lock()
+            .unwrap()
+            .sandbox
+            .snapshot()
+            .unwrap();
+        assert!(Arc::ptr_eq(&eof, &unchanged));
+        let output = child.wait_with_output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"abc");
+    }
 }
 
 struct Coordinator {
@@ -427,7 +788,7 @@ impl CommandSandbox {
         {
             return Err(Error::Wait(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "this kernel did not acknowledge command-only service protocol version 8",
+                "this kernel did not acknowledge command-only service protocol version 11",
             )));
         }
         Ok(Self(Arc::new(Coordinator {
@@ -444,24 +805,38 @@ impl CommandSandbox {
     /// sockets and pending host calls are unchanged. Restored copies start parked;
     /// unfinished calls there are interrupted when driven. Completed data replies
     /// are retained, but replies tied to reset sockets are not.
+    /// Host-buffered stdout/stderr is excluded: restored output buffers start
+    /// empty. Pending stdin, stream configuration, closure state and cumulative
+    /// loss counters are preserved. Original readers keep their buffered output.
+    /// A kernel-only checkpoint moves pending stdin into its preallocated guest
+    /// queue and retained replies into the waiting threads' usual reply buffers,
+    /// without scheduling commands, polling host futures or freeing stdin capacity.
+    /// It uses one guest call when the batch fits, bounded batches otherwise,
+    /// and no guest call when no input, EOF or retained replies need committing.
     /// Waits until concurrent VM entries, child polls and handle/pipe operations
     /// permit a consistent capture, without driving command futures.
     pub async fn snapshot(&self) -> Result<CommandSnapshot> {
         Coordinator::retry(&Arc::downgrade(&self.0), |_, attempt| {
             let _transition = self.0.transition(attempt)?;
             self.0.failure()?;
-            let result = {
+            let (result, files) = {
                 let mut sandbox = self.0.try_sandbox(attempt)?;
                 let inbox = sandbox.config.async_inbox.clone();
                 attempt.watch(&self.0.state.activity);
-                self.0.executions.snapshot(&inbox, || sandbox.snapshot())
+                let result = self.0.executions.snapshot(&inbox, &mut sandbox);
+                (result, sandbox.snapshot_files.clone())
             };
             // Polls that encountered our locks must get another chance to run.
             for execution in self.0.executions.list() {
+                execution.pipes[0].notify();
                 execution.wake.notify();
             }
             let (executions, guest) = result?;
-            Ok(CommandSnapshot { guest, executions })
+            Ok(CommandSnapshot {
+                guest,
+                executions,
+                files,
+            })
         })
         .await
     }
@@ -494,7 +869,12 @@ impl CommandSandbox {
             self.0
                 .executions
                 .restore(&snapshot.executions, &inbox, sandbox.config.net.as_ref());
+            let previous_files =
+                std::mem::replace(&mut sandbox.snapshot_files, snapshot.files.clone());
             let result = sandbox.restore(snapshot.guest.clone());
+            if result.is_err() {
+                sandbox.snapshot_files.extend(previous_files);
+            }
             self.0.executions.negotiate(&inbox);
             *self.0.state.failure.lock().unwrap() = result.as_ref().err().map(ToString::to_string);
             result
@@ -663,6 +1043,8 @@ impl Command {
     }
     /// Configure stdin. Only [`Stdio::null`] and [`Stdio::piped`] are supported.
     /// Other modes are rejected by [`Self::spawn`].
+    /// Piped stdin has a shared 64 KiB budget across host staging and guest
+    /// buffering. Only guest reads release capacity, including after snapshots.
     pub fn stdin(&mut self, stdio: Stdio) -> &mut Self {
         self.stdio[0] = stdio;
         self
@@ -1116,7 +1498,10 @@ impl Coordinator {
             calls.clear();
             return Poll::Pending;
         }
-        let resuming = execution.driving.lock().unwrap().resume.is_some();
+        let (resuming, checkpoint_ready) = {
+            let state = execution.driving.lock().unwrap();
+            (state.resume.is_some(), state.checkpoint_ready)
+        };
         let polled = if resuming {
             Poll::Ready(Ok(async_calls::Wake::Calls))
         } else {
@@ -1132,6 +1517,7 @@ impl Coordinator {
             return Poll::Pending;
         }
         let wake = match polled {
+            Poll::Pending if checkpoint_ready => async_calls::Wake::Timer,
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => {
                 *execution.failure.lock().unwrap() = Some(error.to_string());
@@ -1176,6 +1562,9 @@ impl Coordinator {
             config.enter(vm, "step", ())
         };
         let result = self.entered(result);
+        if result.is_ok() {
+            execution.driving.lock().unwrap().checkpoint_ready = false;
+        }
         if result.is_ok() && wake == async_calls::Wake::Calls {
             calls.delivered();
         }

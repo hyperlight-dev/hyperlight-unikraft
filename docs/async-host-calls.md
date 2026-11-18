@@ -288,8 +288,9 @@ configuring them for stdin makes `spawn()` return `InvalidInput`.
 
 `ChildStdout::dropped_bytes()` and `ChildStderr::dropped_bytes()` report cumulative
 bytes discarded by head/tail policies (saturating at `u64::MAX`). Reads do not
-reset the counters. Modes, unread bytes and counters survive parking and command
-snapshots. `Output::stdout_dropped` and `Output::stderr_dropped` report the same
+reset the counters. Modes, unread bytes and counters survive parking.
+Command snapshots retain modes and counters, but exclude unread output bytes.
+`Output::stdout_dropped` and `Output::stderr_dropped` report the same
 counts when using the collection helpers.
 
 > **Warning:** `Stdio::unbounded()` allows guest output to exhaust host memory.
@@ -310,7 +311,7 @@ there is no shell parsing or PATH search. Stdio defaults to `/dev/null`;
 `Stdio::piped()` opts into a host pipe. Independent roots do not inherit each
 other's command descriptors. Cross-tree socket sharing is not supported.
 
-Command service protocol version 8 is provided by the kernel, not the runtime
+Command service protocol version 11 is provided by the kernel, not the runtime
 driver. Interpreter images can launch executables too: for example, a Python
 image can launch `/usr/local/bin/python3 -u -c ...` as a fresh process, not in
 the driver's existing interpreter. All external drivers retain their legacy
@@ -329,11 +330,30 @@ Existing `AppSandbox` driving and snapshot behavior remain unchanged.
 
 `CommandSandbox::snapshot()` accepts parked children and live driving handles. It captures
 the whole VM and the host-side command registry: execution IDs, root statuses,
-stream states and buffered bytes, and retained completion records. It contains
+stream states and retained completion records. Pending stdin is committed to
+guest memory before capture. It contains
 no futures or live host I/O resources. Taking a snapshot does not drive or park
 the original commands, cancel their host calls, close sockets, or invalidate
 child and pipe handles. Original commands continue normally. All commands in a
 restored copy start parked; unfinished calls receive `EINTR` when first driven.
+Output belongs to the caller as soon as it enters a host stdout/stderr pipe,
+whether or not its reader handle has been taken. Snapshot capture leaves those
+bytes available to the original readers, but does not copy them into the snapshot.
+Restored output buffers start empty; output still in the guest can arrive later.
+This applies to piped, head, tail and unbounded output, for both in-memory and
+disk snapshots. Stream configuration, closure state and cumulative loss counters
+are preserved; excluding previously delivered output does not count as loss.
+Live parking and child restoration still retain output in the original buffers.
+
+Each piped stdin reserves a 64 KiB guest queue when the command opens its stdin.
+The host staging buffer and unread guest bytes share one 64 KiB backpressure
+budget. Transfers into guest memory do not release write capacity; guest reads
+do. Before capture, a kernel-only checkpoint commits pending input in 4 KiB
+chunks, acknowledges it before removing host bytes, and places EOF after the
+last byte. It runs with stream accesses excluded, without scheduling application
+threads or polling host futures. Repeated checkpoints cannot duplicate input.
+The guest queue is preallocated; checkpointing needs no new queue allocation.
+Input bytes are saved in the guest memory layers, not the command-state file.
 Completed data replies are preserved, except replies tied to sockets that cannot
 survive restoration. Cancellation or retry in the copy does not undo external effects.
 Commands that have finished cleanup are excluded, even if their child handles
@@ -381,15 +401,36 @@ sandbox.restore_from("saved-commands").await?;
 ```
 
 The guest is saved as an OCI image with the same kernel/host compatibility key
-as app snapshots. Command metadata, buffers (including output policies and loss
-counts), ID counters and retained replies are stored in a checksummed,
-content-addressed `commands/` file referenced by the guest image. This avoids
-Hyperlight's 1 MiB metadata limit. The state file is published before the guest
-index, so a failed save cannot pair an older guest with newer command state.
+as app snapshots. Command metadata, stdin queue accounting, output policies and loss
+counts and ID counters are stored in a versioned **command-state OCI layer**.
+After Hyperlight saves its image, the command saver extends its manifest with
+that layer and an opaque layer containing the original Hyperlight manifest.
+The config contains only a small command-format marker. All ordinary memory,
+transport and config blobs remain directly referenced, so OCI-aware copying of
+one tagged image carries every required blob. There are no companion files.
 Repeated saves replace the current tag and retain old blobs.
-Copy the **entire directory**; OCI-only export tools omit the companion state.
+
+Hyperlight rejects unfamiliar layers. The command loader verifies the added
+layers' sizes and SHA-256 digests, checks that the original manifest agrees with
+the published one, then loads through a private index pointing to the original.
+It does not modify the source layout and supports read-only imports.
+Temporary views share the blob directory on Unix; other platforms use hard
+links with a copy fallback. Their lifetime follows loaded snapshots and sandboxes.
+Raw Hyperlight loaders cannot load the extended manifest directly.
+
+The command-state layer has **no fixed size cap**. Saving and loading require
+memory proportional to its size; only load trusted snapshots.
+Hyperlight's **1 MiB** limits on the config, manifests and index still apply.
+The loader checks the state blob's declared size and SHA-256 digest.
+The final index is published atomically only after
+all layers and the extended manifest are ready; failures may leave unreferenced
+blobs but do not replace the previous tag.
 Both loading paths reject the other snapshot kind; command loads also reject
 unknown command format versions and missing or corrupt state.
+Command format version 7 stores command metadata and bookkeeping in the added layer;
+stdin and retained reply payloads stay entirely in the guest memory image.
+Earlier command snapshots must be recreated. The updated kernel and snapshot
+contract 22 also require recreating app snapshots.
 
 Disk I/O is synchronous, like the app helpers; async snapshot capture releases
 its locks before writing. Load only trusted snapshots, protect their contents
@@ -409,7 +450,7 @@ cannot consume restored output.
 
 ### Attribution and control wire format
 
-The kernel service negotiates version 8 through `CommandServiceVersion() -> u64`
+The kernel service negotiates version 11 through `CommandServiceVersion() -> u64`
 and acknowledges support with `CommandServiceReady() -> i32` at boot and restore.
 At fresh boot, `CommandBootMode() -> i32` requests command-only mode (1 rather
 than 0). In that mode the kernel skips the boot application, keeps init alive
@@ -489,7 +530,45 @@ metadata without guest POSIX pipes or per-stream forwarding threads.
 Duplicated/inherited descriptors share the file lifetime; only the last close
 reports stream EOF or closes host stdin.
 
-`CommandRead(u64 count) -> bytes` reads at most the requested count from stdin.
+`CommandCheckpoint(bytes)` is a kernel-only guest entry. It commits pending
+stdin and retained host replies without entering the scheduler, applying an
+environment, polling host futures, or running application callbacks.
+While host engine and stream gates are held, the host pushes one
+unchunked external byte vector per batch, bounded by the call payload limit
+(approximately 1 MiB, reserving one receive buffer for control traffic as normal
+completion batches do). The little-endian envelope starts with `u32 version = 1,
+u32 stdin_batch_length`, followed by a stdin batch and an async reply batch:
+
+- Stdin: `u32 version = 1, u32 record_count`, then records containing
+  `u64 execution_id, u64 starting_received, u32 byte_count, u32 eof` and bytes.
+  Execution IDs are strictly increasing.
+- Replies: the usual completion format, `u32 version = 1, u32 record_count`,
+  then `u64 request_id, u32 byte_count` and the tagged reply bytes.
+  Request IDs are strictly increasing and may span multiple executions.
+
+The kernel validates both sub-batches before publishing either. Stdin goes into
+preallocated queues. Replies use normal async completion delivery: copy to the
+waiting thread's existing reply buffer, mark its wait complete and wake it,
+without scheduling it. Already-completed waits survive restore; unresolved
+waits still receive `EINTR` on first drive. Socket-dependent replies remain
+excluded, and checkpoint delivery refuses callback-based resource waits.
+Stdin sequence numbers and already-completed reply checks make retries
+idempotent. A successful return acknowledges the entire batch; the host then
+discards those retained reply bytes. Earlier successful batches remain committed
+if a later one fails. No host calls are made while committing a batch.
+
+All pending input, EOF and retained replies use one call when they fit, bounded
+batches otherwise. No new data means no checkpoint entry, preserving
+Hyperlight's cached snapshot fast path. Transferring stdin does not release write capacity.
+Reads from the guest queue report consumption through
+`CommandStdin(u64 execution, u64 received, u64 unread) -> bytes`.
+The host validates the cumulative committed count and occupancy, and wakes
+writers only when occupancy decreases. The response is tag 0 and an EOF byte,
+set only when no later host bytes remain.
+
+Guest reads drain this queue first.
+`CommandRead(u64 count) -> bytes` reads at most the requested count from host stdin
+once the guest queue is empty.
 `CommandWrite(u64 stream, bytes) -> bytes` writes one atomic output chunk.
 Both use tag 0 for success (followed by input bytes for reads), or tag 1 plus
 a little-endian Linux errno. Empty/full buffers return internal `EAGAIN`
@@ -738,6 +817,15 @@ Build the kernels and Python runtime with `just build-kernel` and
 tests, including fresh-process pending-call interruption, and `cargo test --lib --
 --ignored` for guest parser and restore tests (which need a hypervisor and rootfs, unlike
 the ordinary library unit tests).
+
+With the C rootfs and command fixture built, run
+`cargo test --lib command::checkpoint_tests -- --ignored --test-threads=1`
+for combined stdin/reply capture, live and parked command disk restore,
+malformed-batch atomicity, replay safety and cached-snapshot checks.
+Run `cargo test --lib command_snapshot::tests -- --include-ignored` for the exact
+round-tripping state larger than 16 MiB, failed-save atomicity, extension validation,
+read-only imports and backing-file lifetime checks. The command integration
+tests also restore a copy containing only blobs reachable from the published image.
 
 ### Driving performance baseline
 
