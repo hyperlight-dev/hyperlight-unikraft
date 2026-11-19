@@ -173,6 +173,31 @@ Listen ports need no outbound policy: without `.network(...)`, the guest may ser
 
 Without `ListenPorts`, every bind but an ephemeral one is refused with `EACCES`, a bind that only picks a source port for an outbound connection (`source_address`, `Dialer.LocalAddr`) included: a guest given a policy and no ports can serve only on a port the host picks.  Ephemeral binds (port 0 — "assign any port") are always allowed.  `ListenPorts::all()` permits every port, and `with_range(8000..=8010)` a range; on the command line these are `--port all` and `--port 8000-8010`, next to `--port 80`.  `all` is for an embedder whose own boundary already scopes what the guest exposes, such as a container runtime, where the guest binds inside the container's network namespace the way any container process does.
 
+### Listen redirect
+
+A guest's listener is a host socket, bound where the guest asks: a guest that binds `0.0.0.0` is reachable on every host interface, and a restored guest binds the port it had when the snapshot was taken, which another sandbox restored from it, or another process, may hold by then.  An embedder that runs many sandboxes and puts its own front end before each binds their listeners itself, with `SandboxBuilder::redirect_listeners`:
+
+```rust,no_run
+use std::net::Ipv4Addr;
+use hyperlight_unikraft::{ListenPorts, SandboxBuilder};
+
+let mut guest = SandboxBuilder::from_initrd("rootfs/python.cpio")
+    .listen_ports(ListenPorts::from_ports([8080]))
+    .redirect_listeners(Ipv4Addr::LOCALHOST)
+    .boot()?;
+guest.submit("import socket; s = socket.socket(); s.bind(('0.0.0.0', 8080)); s.listen(); s.accept()")?;
+let addr = guest.listen_addr(8080); // Some(127.0.0.1:<a port the host picked>)
+# Ok::<(), hyperlight_unikraft::Error>(())
+```
+
+Whatever address and port a guest's TCP listener asks for, its host socket is bound at the redirect address, on a port the host picks.  `AppSandbox::listen_addr(port)` gives where the host listens for the guest's `port` (`None` until the guest listens on it), and the guest still sees the address it bound, through `getsockname()`, for the listener and the connections it accepts (with the address a connection arrived on where the guest bound the unspecified address).  `ListenPorts` still decides which ports the guest may bind.  A restore binds the listeners again through the redirect, on new ports, so every sandbox restored from one snapshot listens on a port of its own, and a port taken on the host is no obstacle; `listen_addr` gives the new address once `restore` returns.
+
+The host cannot tell a listener from a client choosing its source address until the socket listens or connects, so a stream socket bound to a port of the guest's choosing is bound on the host at its `listen` (at the redirect address) or its `connect` (where the guest asked), so an error the host would have given a client at its bind, such as `EADDRNOTAVAIL`, comes at its connect.  Two of the guest's sockets cannot be bound to one guest port (`EADDRINUSE`), whatever their addresses or `SO_REUSEPORT`, since the port names the listener.  A socket bound to port 0 is how a server asks for any port, and it may ask which before it listens, so it is bound at the redirect address at once; the guest is told the port the host picked, and `listen_addr` knows the listener by it.  A restore binds such a listener to port 0 again, so it is given another port, as without a redirect; a connect from such a socket comes from the redirect address.  A socket that listens without a bind is bound at `listen`, the same way.  Datagram sockets are bound where the guest asks.
+
+An IPv4 redirect address serves the guest's IPv6 sockets as its IPv4-mapped form (`::ffff:127.0.0.1`, which a socket with `IPV6_V6ONLY` cannot bind), and `listen_addr` gives it as IPv4.  An IPv6 address serves IPv4 sockets only if it has an IPv4 counterpart: IPv4-mapped, `::1` (as `127.0.0.1`) or `::` (as `0.0.0.0`); otherwise their `listen` fails with `EAFNOSUPPORT`.
+
+Without a redirect, `listen_addr(port)` gives the address of the guest's listener on `port` too: the one the guest bound.
+
 ### Resolver configuration
 
 The rootfs images ship an `/etc/resolv.conf` naming public resolvers, which is right on a laptop and wrong in a pod, where names resolve through the cluster's resolver and a search list that includes the pod's namespace.  That file belongs to the place the guest runs, so it is handed over at run time: `hluk run --resolv-conf FILE`, or `SandboxBuilder::resolv_conf(content)` in the library.  The kernel fetches it through the `GetResolvConf` host function once the rootfs is mounted and writes it as `/etc/resolv.conf`, and does so again on every restore, so a snapshot taken on one machine resolves names where it is resumed.  Without it the rootfs's file stands.  `options single-request` is added unless the file has it: glibc's parallel A and AAAA queries do not work through the socket layer.  Under an allow list, the file's nameservers are exempt on port 53 like the host's own, so a guest that may only reach listed names can still ask the resolver it was given.
