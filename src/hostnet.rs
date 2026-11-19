@@ -186,6 +186,23 @@ struct SockMeta {
     origin: Option<(AddressFamily, Option<Protocol>)>,
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     bound: Option<SocketAddr>,
+    /// Under a listen redirect, the address the guest takes a stream
+    /// socket to be bound to (see [`Net::bind`]).
+    guest: Option<GuestBind>,
+}
+
+/// Where the guest takes a stream socket to be bound, under a listen
+/// redirect: what `getsockname` tells it, and which guest port
+/// [`Net::listen_addr`] knows the listener by.
+#[derive(Clone, Copy, Debug)]
+struct GuestBind {
+    /// The address the guest bound, with the port the host gave a socket
+    /// bound to port 0; for an accepted connection, its local address as
+    /// the guest sees it.
+    addr: SocketAddr,
+    /// Whether the host socket is bound yet: at the redirect address, or,
+    /// for an accepted connection, wherever the host accepted it.
+    host_bound: bool,
 }
 
 /// Guest fd → host socket.  Dropping the fd closes the socket.
@@ -248,6 +265,7 @@ impl SocketTable {
                 listening: false,
                 origin,
                 bound: None,
+                guest: None,
             },
         );
         Ok(fd)
@@ -279,6 +297,31 @@ impl SocketTable {
         if let Some(m) = self.meta.get_mut(&fd) {
             m.bound = Some(addr);
         }
+    }
+
+    fn set_guest(&mut self, fd: i32, guest: Option<GuestBind>) {
+        if let Some(m) = self.meta.get_mut(&fd) {
+            m.guest = guest;
+        }
+    }
+
+    /// Whether a socket of the guest's other than `fd` is bound, under a
+    /// listen redirect, to guest port `port`: two would leave
+    /// [`Net::listen_addr`] unable to tell which one the port names.
+    /// Accepted connections share their listener's port and do not count.
+    fn guest_port_taken(&self, fd: i32, port: u16) -> bool {
+        self.meta.iter().any(|(&other, m)| {
+            other != fd && m.origin.is_some() && m.guest.is_some_and(|g| g.addr.port() == port)
+        })
+    }
+
+    /// Bind the host socket of stream socket `fd` (of family `af`) at the
+    /// redirect address, on a port the host picks, and return that port.
+    fn bind_at_redirect(&self, fd: i32, af: AddressFamily, redirect: IpAddr) -> Res<u16> {
+        let sock = self.get(fd)?;
+        let at = SocketAddr::new(redirect_ip(redirect, af)?, 0);
+        net::bind(sock, &at).map_err(from_rustix)?;
+        Ok(local_port(sock))
     }
 
     /// A fresh datagram socket like `fd`'s, with the options the guest can
@@ -413,6 +456,34 @@ fn copy_dgram_options(old: &OwnedFd, new: &OwnedFd, af: AddressFamily) {
     }
 }
 
+/// The port the host socket `sock` is bound to: 0 while it is unbound,
+/// where Linux and macOS give port 0 and Windows fails (`WSAEINVAL`).
+fn local_port(sock: &OwnedFd) -> u16 {
+    net::getsockname(sock)
+        .ok()
+        .and_then(|a| SocketAddr::try_from(a).ok())
+        .map_or(0, |a| a.port())
+}
+
+/// The redirect address for a socket of family `af`: an IPv4 address
+/// serves an IPv6 socket as its IPv4-mapped form, and an IPv6 one serves
+/// an IPv4 socket only if it has an IPv4 counterpart (IPv4-mapped,
+/// loopback or unspecified).
+fn redirect_ip(redirect: IpAddr, af: AddressFamily) -> Res<IpAddr> {
+    let v6 = af == AddressFamily::INET6;
+    match redirect {
+        IpAddr::V4(v4) if v6 => Ok(v4.to_ipv6_mapped().into()),
+        IpAddr::V4(v4) => Ok(v4.into()),
+        IpAddr::V6(v6addr) if v6 => Ok(v6addr.into()),
+        IpAddr::V6(v6addr) => match v6addr.to_ipv4_mapped() {
+            Some(v4) => Ok(v4.into()),
+            None if v6addr.is_loopback() => Ok(Ipv4Addr::LOCALHOST.into()),
+            None if v6addr.is_unspecified() => Ok(Ipv4Addr::UNSPECIFIED.into()),
+            None => Err(errno::EAFNOSUPPORT),
+        },
+    }
+}
+
 // ── Net ─────────────────────────────────────────────────────────────
 
 pub(crate) struct Net {
@@ -428,6 +499,9 @@ pub(crate) struct Net {
     /// guest can call.
     policy: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    /// Where the guest's TCP listeners are bound, whatever address it
+    /// asks for (see [`Self::bind`]); `None` binds them where it asks.
+    listen_redirect: Option<IpAddr>,
 }
 
 impl Net {
@@ -445,7 +519,15 @@ impl Net {
             table: Mutex::new(SocketTable::new()),
             policy: Some(policy),
             listen_ports,
+            listen_redirect: None,
         }
+    }
+
+    /// Bind the guest's TCP listeners at `ip`, on ports the host picks
+    /// (see [`Self::bind`]); `None` binds them where the guest asks.
+    pub(crate) fn with_listen_redirect(mut self, ip: Option<IpAddr>) -> Self {
+        self.listen_redirect = ip;
+        self
     }
 
     /// The network of a guest with no policy: every `socket()` is refused
@@ -455,6 +537,7 @@ impl Net {
             table: Mutex::new(SocketTable::new()),
             policy: None,
             listen_ports: None,
+            listen_redirect: None,
         }
     }
 
@@ -523,18 +606,120 @@ impl Net {
             .insert(sock, ty == SocketType::DGRAM, Some((af, proto)))
     }
 
+    /// Under a listen redirect, a stream socket is not bound where the
+    /// guest asks: the host cannot tell a listener from a client choosing
+    /// its source address until `listen` or `connect`, so the address is
+    /// only recorded (and `ListenPorts` checked) here.  `listen` binds the
+    /// host socket at the redirect address, on a port the host picks;
+    /// `connect` binds it where the guest asked.  A bind to port 0 is how
+    /// a server asks for any port, and the guest may ask which before it
+    /// listens, so it is bound at the redirect address at once, and the
+    /// guest is told the port the host got.  `getsockname` gives the guest
+    /// the address it bound, and [`Self::listen_addr`] the embedder the
+    /// host's.  Datagram sockets are bound where the guest asks.
     fn bind(&self, fd: i32, addr: SocketAddr) -> Res<()> {
         self.allow_bind(&addr)?;
         let mut tbl = self.table();
+        if let Some(redirect) = self.listen_redirect
+            && !tbl.meta(fd)?.udp
+        {
+            return Self::bind_redirected(&mut tbl, fd, addr, redirect);
+        }
         net::bind(tbl.get(fd)?, &addr).map_err(from_rustix)?;
         tbl.set_bound(fd, addr);
         Ok(())
     }
 
+    /// [`Self::bind`] of a stream socket under a listen redirect.
+    fn bind_redirected(
+        tbl: &mut SocketTable,
+        fd: i32,
+        addr: SocketAddr,
+        redirect: IpAddr,
+    ) -> Res<()> {
+        let meta = tbl.meta(fd)?;
+        // An accepted connection, or a socket bound already (by an earlier
+        // bind, or by a connect): Linux refuses to bind it again.
+        let Some((af, _)) = meta.origin else {
+            return Err(errno::EINVAL);
+        };
+        if meta.guest.is_some() || local_port(tbl.get(fd)?) != 0 {
+            return Err(errno::EINVAL);
+        }
+        // What the host would refuse at a bind that is not made yet.
+        match (af == AddressFamily::INET6, addr) {
+            (false, SocketAddr::V6(_)) => return Err(errno::EAFNOSUPPORT),
+            (true, SocketAddr::V4(_)) => return Err(errno::EINVAL),
+            _ => {}
+        }
+        let guest = if addr.port() == 0 {
+            let port = tbl.bind_at_redirect(fd, af, redirect)?;
+            GuestBind {
+                addr: SocketAddr::new(addr.ip(), port),
+                host_bound: true,
+            }
+        } else {
+            if tbl.guest_port_taken(fd, addr.port()) {
+                return Err(errno::EADDRINUSE);
+            }
+            GuestBind {
+                addr,
+                host_bound: false,
+            }
+        };
+        tbl.set_guest(fd, Some(guest));
+        Ok(())
+    }
+
     fn listen(&self, fd: i32, backlog: i32) -> Res<()> {
         let mut tbl = self.table();
+        if let Some(redirect) = self.listen_redirect {
+            Self::redirect_listener(&mut tbl, fd, redirect)?;
+        }
         net::listen(tbl.get(fd)?, backlog).map_err(from_rustix)?;
         tbl.set_listening(fd);
+        Ok(())
+    }
+
+    /// Under a listen redirect, bind a stream socket about to listen at
+    /// the redirect address, if it is not bound yet: one the guest bound
+    /// to a port of its choosing (which the guest keeps seeing), or one
+    /// it never bound, which Linux gives a port of its own at `listen`
+    /// (the port the host picks).
+    fn redirect_listener(tbl: &mut SocketTable, fd: i32, redirect: IpAddr) -> Res<()> {
+        let meta = tbl.meta(fd)?;
+        // A datagram socket or an accepted connection: the host's listen
+        // refuses it.
+        let (false, Some((af, _))) = (meta.udp, meta.origin) else {
+            return Ok(());
+        };
+        let guest = match meta.guest {
+            Some(g) if g.host_bound => return Ok(()),
+            Some(g) => {
+                tbl.bind_at_redirect(fd, af, redirect)?;
+                g.addr
+            }
+            None => {
+                // Bound or connected already, unredirected: listen as is.
+                if local_port(tbl.get(fd)?) != 0 {
+                    return Ok(());
+                }
+                let port = tbl.bind_at_redirect(fd, af, redirect)?;
+                let any: IpAddr = if af == AddressFamily::INET6 {
+                    Ipv6Addr::UNSPECIFIED.into()
+                } else {
+                    Ipv4Addr::UNSPECIFIED.into()
+                };
+                SocketAddr::new(any, port)
+            }
+        };
+        tbl.set_guest(
+            fd,
+            Some(GuestBind {
+                addr: guest,
+                host_bound: true,
+            }),
+        );
         Ok(())
     }
 
@@ -546,10 +731,31 @@ impl Net {
         apple_socket_setup(&conn)?;
         rustix::io::ioctl_fionbio(&conn, true).map_err(from_rustix)?;
         let peer = peer.and_then(|a| SocketAddr::try_from(a).ok());
+        // A connection to a redirected listener is on the guest's port, at
+        // the address the guest bound, or, if it bound the unspecified
+        // address, at the one the host accepted it on, as on Linux.
+        let guest = match tbl.meta(fd)?.guest {
+            Some(g) => {
+                let local = net::getsockname(&conn).map_err(from_rustix)?;
+                let local = SocketAddr::try_from(local).map_err(|_| errno::EAFNOSUPPORT)?;
+                let ip = if g.addr.ip().is_unspecified() {
+                    local.ip()
+                } else {
+                    g.addr.ip()
+                };
+                Some(GuestBind {
+                    addr: SocketAddr::new(ip, g.addr.port()),
+                    host_bound: true,
+                })
+            }
+            None => None,
+        };
         // No peer is recorded: only a socket the guest itself aimed at port
         // 53 carries its DNS questions, and a remote client may pick any
         // source port, 53 included.
-        Ok((tbl.insert(conn, false, None)?, peer))
+        let conn = tbl.insert(conn, false, None)?;
+        tbl.set_guest(conn, guest);
+        Ok((conn, peer))
     }
 
     /// Starts the handshake and returns at once: `EINPROGRESS` while it
@@ -578,6 +784,15 @@ impl Net {
             {
                 return Err(errno::EISCONN);
             }
+        }
+        // A client that chose its source address under a listen redirect
+        // (see `bind`): it is bound now, where it asked.
+        if let Some(g) = tbl.meta(fd)?.guest
+            && !g.host_bound
+        {
+            net::bind(tbl.get(fd)?, &g.addr).map_err(from_rustix)?;
+            tbl.set_guest(fd, None);
+            tbl.set_bound(fd, g.addr);
         }
         // Linux lets a datagram socket be connected again, to a new peer;
         // macOS answers EISCONN, so a fresh socket takes the new peer.
@@ -740,9 +955,37 @@ impl Net {
             .ok_or(errno::ENOTCONN)
     }
 
+    /// The socket's address: under a listen redirect, the one the guest
+    /// bound rather than the host's.
     fn local_addr(&self, fd: i32) -> Res<SocketAddr> {
-        let addr = net::getsockname(self.table().get(fd)?).map_err(from_rustix)?;
+        let tbl = self.table();
+        if let Some(g) = tbl.meta(fd)?.guest {
+            return Ok(g.addr);
+        }
+        let addr = net::getsockname(tbl.get(fd)?).map_err(from_rustix)?;
         SocketAddr::try_from(addr).map_err(|_| errno::EAFNOSUPPORT)
+    }
+
+    /// Where the host listens for the guest's TCP listener on guest port
+    /// `port`: under a listen redirect, the redirect address and the port
+    /// the host picked; otherwise the address the guest bound.  A guest
+    /// that bound port 0 got the host's port, and is known by it.  `None`
+    /// if no socket of the guest's listens on `port`.  Of two that do (no
+    /// redirect, `SO_REUSEPORT` or different addresses), the first made.
+    pub(crate) fn listen_addr(&self, port: u16) -> Option<SocketAddr> {
+        let tbl = self.table();
+        let (_, host) = tbl
+            .meta
+            .iter()
+            .filter(|(_, m)| m.listening)
+            .filter_map(|(&fd, m)| {
+                let host = net::getsockname(tbl.get(fd).ok()?).ok()?;
+                let host = SocketAddr::try_from(host).ok()?;
+                let guest_port = m.guest.map_or(host.port(), |g| g.addr.port());
+                (guest_port == port).then_some((fd, host))
+            })
+            .min_by_key(|&(fd, _)| fd)?;
+        Some(SocketAddr::new(host.ip().to_canonical(), host.port()))
     }
 
     /// `getsockopt` for the int-valued options guests actually use.
@@ -2053,6 +2296,223 @@ mod tests {
         assert_eq!(net.bind(s, loopback(19_999)), Err(errno::EACCES));
         // Ephemeral binds are always allowed.
         net.bind(s, loopback(0)).unwrap();
+    }
+
+    /// A sandbox whose TCP listeners the host binds at 127.0.0.1.
+    fn redirected_net() -> Net {
+        Net::new(NetworkPolicy::AllowAll, Some(ListenPorts::all()))
+            .with_listen_redirect(Some(Ipv4Addr::LOCALHOST.into()))
+    }
+
+    fn unspecified(port: u16) -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)
+    }
+
+    /// A port free on the host when this returns.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(loopback(0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Under a listen redirect a guest listener is bound at the redirect
+    /// address, on a port the host picks, even where its own port is
+    /// taken on the host; the guest sees the address it bound, for the
+    /// listener and for the connections it accepts.
+    #[test]
+    fn listen_redirect_binds_at_the_redirect_address() {
+        let taken = std::net::TcpListener::bind(unspecified(0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let net = redirected_net();
+        let srv = tcp(&net);
+        net.bind(srv, unspecified(port)).unwrap();
+        assert_eq!(net.local_addr(srv), Ok(unspecified(port)));
+        // Nothing listens until the guest does.
+        assert_eq!(net.listen_addr(port), None);
+        net.listen(srv, 4).unwrap();
+        assert_eq!(net.local_addr(srv), Ok(unspecified(port)));
+        let host = net.listen_addr(port).unwrap();
+        assert_eq!(host.ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_ne!(host.port(), port);
+
+        let mut client = std::net::TcpStream::connect(host).unwrap();
+        assert_ne!(wait(&net, srv, POLLIN) & POLLIN, 0);
+        let (conn, peer) = net.accept(srv).unwrap();
+        assert_eq!(peer, Some(client.local_addr().unwrap()));
+        assert_eq!(net.local_addr(conn), Ok(loopback(port)));
+        std::io::Write::write_all(&mut client, b"ping").unwrap();
+        assert_eq!(recv(&net, conn), b"ping");
+
+        // A guest that bound a specific address sees it on its connections.
+        let srv = tcp(&net);
+        let other = free_port();
+        net.bind(srv, loopback(other)).unwrap();
+        net.listen(srv, 4).unwrap();
+        let _client = std::net::TcpStream::connect(net.listen_addr(other).unwrap()).unwrap();
+        assert_ne!(wait(&net, srv, POLLIN) & POLLIN, 0);
+        let (conn, _) = net.accept(srv).unwrap();
+        assert_eq!(net.local_addr(conn), Ok(loopback(other)));
+    }
+
+    /// Two sandboxes (or one restored twice) listen on one guest port, each
+    /// on a host port of its own; within one, a guest port names one
+    /// listener.
+    #[test]
+    fn listen_redirect_gives_each_sandbox_its_own_port() {
+        let port = free_port();
+        let (a, b) = (redirected_net(), redirected_net());
+        for net in [&a, &b] {
+            let srv = tcp(net);
+            net.bind(srv, unspecified(port)).unwrap();
+            net.listen(srv, 4).unwrap();
+        }
+        let (at_a, at_b) = (a.listen_addr(port).unwrap(), b.listen_addr(port).unwrap());
+        assert_ne!(at_a, at_b);
+        std::net::TcpStream::connect(at_a).unwrap();
+        std::net::TcpStream::connect(at_b).unwrap();
+
+        let second = tcp(&a);
+        assert_eq!(a.bind(second, unspecified(port)), Err(errno::EADDRINUSE));
+        // What the guest gets back after a restore: no sockets, then its
+        // listener again, on another host port.
+        a.reset();
+        assert_eq!(a.listen_addr(port), None);
+        let srv = tcp(&a);
+        bind_and_listen(&a, srv, unspecified(port));
+        assert!(a.listen_addr(port).is_some());
+    }
+
+    fn bind_and_listen(net: &Net, fd: i32, addr: SocketAddr) {
+        net.bind(fd, addr).unwrap();
+        net.listen(fd, 4).unwrap();
+    }
+
+    /// A bind to port 0 is redirected at once, so the guest learns its port
+    /// before it listens, and the listener is known by it; so is one the
+    /// guest never bound, which `listen` gives a port.
+    #[test]
+    fn listen_redirect_names_port_zero_listeners_by_their_port() {
+        let net = redirected_net();
+        let srv = tcp(&net);
+        net.bind(srv, unspecified(0)).unwrap();
+        let port = net.local_addr(srv).unwrap().port();
+        assert_ne!(port, 0);
+        net.listen(srv, 4).unwrap();
+        assert_eq!(net.listen_addr(port), Some(loopback(port)));
+
+        let unbound = tcp(&net);
+        net.listen(unbound, 4).unwrap();
+        let local = net.local_addr(unbound).unwrap();
+        assert_eq!(local.ip(), IpAddr::from(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(net.listen_addr(local.port()), Some(loopback(local.port())));
+        std::net::TcpStream::connect(loopback(local.port())).unwrap();
+    }
+
+    /// A client that chose its source port is bound where it asked, at
+    /// its connect; a datagram socket at its bind.
+    #[test]
+    fn listen_redirect_leaves_clients_and_datagrams_alone() {
+        let net = redirected_net();
+        let peer = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let cli = tcp(&net);
+        let source = loopback(free_port());
+        net.bind(cli, source).unwrap();
+        connect_blocking(&net, cli, peer.local_addr().unwrap()).unwrap();
+        let (_, from) = peer.accept().unwrap();
+        assert_eq!(from, source);
+        assert_eq!(net.local_addr(cli), Ok(source));
+        // Bound now: a second bind is refused, as on Linux.
+        assert_eq!(net.bind(cli, loopback(0)), Err(errno::EINVAL));
+
+        let u = udp(&net);
+        let at = loopback(free_port());
+        net.bind(u, at).unwrap();
+        assert_eq!(net.local_addr(u), Ok(at));
+        let probe = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        probe.send_to(b"x", at).unwrap();
+        assert_eq!(recv(&net, u), b"x");
+    }
+
+    /// What a redirect leaves to the rules a bind already follows: the
+    /// guest's port must be listed, a socket binds once, and an address
+    /// must match the socket's family.
+    #[test]
+    fn listen_redirect_keeps_the_bind_rules() {
+        let net = Net::new(NetworkPolicy::AllowAll, Some(ListenPorts::from_ports([80])))
+            .with_listen_redirect(Some(Ipv4Addr::LOCALHOST.into()));
+        let s = tcp(&net);
+        assert_eq!(net.bind(s, unspecified(8080)), Err(errno::EACCES));
+        let v6 = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 80);
+        assert_eq!(net.bind(s, v6), Err(errno::EAFNOSUPPORT));
+        net.bind(s, unspecified(80)).unwrap();
+        assert_eq!(net.bind(s, unspecified(80)), Err(errno::EINVAL));
+        // The socket was never bound on the host: closing it frees the
+        // guest port.
+        net.close(s).unwrap();
+        bind_and_listen(&net, tcp(&net), unspecified(80));
+        assert!(net.listen_addr(80).is_some());
+    }
+
+    /// An IPv6 listener under an IPv4 redirect listens at the IPv4-mapped
+    /// address, which the embedder is told as plain IPv4.
+    #[test]
+    fn listen_redirect_serves_ipv6_sockets_mapped() {
+        let net = redirected_net();
+        let Ok(srv) = net.socket(AF_INET6, SOCK_STREAM, 0) else {
+            eprintln!("SKIP: no IPv6");
+            return;
+        };
+        let port = free_port();
+        let any6 = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
+        net.bind(srv, any6).unwrap();
+        if net.listen(srv, 4) == Err(errno::EADDRNOTAVAIL) {
+            eprintln!("SKIP: no IPv4-mapped IPv6");
+            return;
+        }
+        assert_eq!(net.local_addr(srv), Ok(any6));
+        let host = net.listen_addr(port).unwrap();
+        assert_eq!(host.ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
+        std::net::TcpStream::connect(host).unwrap();
+    }
+
+    #[test]
+    fn redirect_ip_per_family() {
+        let (v4, v6) = (AddressFamily::INET, AddressFamily::INET6);
+        let lo4 = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let lo6 = IpAddr::from(Ipv6Addr::LOCALHOST);
+        assert_eq!(redirect_ip(lo4, v4), Ok(lo4));
+        assert_eq!(
+            redirect_ip(lo4, v6),
+            Ok(Ipv4Addr::LOCALHOST.to_ipv6_mapped().into())
+        );
+        assert_eq!(redirect_ip(lo6, v6), Ok(lo6));
+        assert_eq!(redirect_ip(lo6, v4), Ok(lo4));
+        assert_eq!(
+            redirect_ip(Ipv6Addr::UNSPECIFIED.into(), v4),
+            Ok(Ipv4Addr::UNSPECIFIED.into())
+        );
+        let mapped = Ipv4Addr::new(10, 0, 0, 5).to_ipv6_mapped();
+        assert_eq!(
+            redirect_ip(mapped.into(), v4),
+            Ok(Ipv4Addr::new(10, 0, 0, 5).into())
+        );
+        let global: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(redirect_ip(global, v4), Err(errno::EAFNOSUPPORT));
+    }
+
+    /// Without a redirect the embedder is told where the guest bound.
+    #[test]
+    fn listen_addr_without_a_redirect_is_the_guests() {
+        let net = Net::new(NetworkPolicy::AllowAll, Some(ListenPorts::all()));
+        let srv = tcp(&net);
+        net.bind(srv, loopback(0)).unwrap();
+        let addr = net.local_addr(srv).unwrap();
+        assert_eq!(net.listen_addr(addr.port()), None);
+        net.listen(srv, 4).unwrap();
+        assert_eq!(net.listen_addr(addr.port()), Some(addr));
+        assert_eq!(net.listen_addr(addr.port().wrapping_add(1)), None);
     }
 
     #[test]
