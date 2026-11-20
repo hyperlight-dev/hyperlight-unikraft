@@ -206,7 +206,7 @@ static inline void hl_driver_serve_calls(void)
  * call's status once the callback returns, and read there as the call's
  * result.  -1 if it exceeds the buffer (a call's size, HLCALL_IOC_MAXLEN)
  * or the buffer cannot be allocated;
- * the kernel takes at most what a host call carries (69,620 bytes in hluk),
+ * the kernel takes at most what a host call carries (69,616 bytes in hluk),
  * and refuses a larger one, which hl_driver_run then reports as a failed
  * call.
  */

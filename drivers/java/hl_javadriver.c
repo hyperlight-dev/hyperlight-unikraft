@@ -216,7 +216,7 @@ static int java_spawn(void)
 
 static int java_dispatch(const uint8_t *fc, size_t fc_len)
 {
-	/* Extract the Java source from the FunctionCall FlatBuffer. */
+	/* Extract the Java source from the Postcard FunctionCall. */
 	size_t code_len;
 	const char *code = fc_arg0_string(fc, fc_len, &code_len);
 	if (!code)

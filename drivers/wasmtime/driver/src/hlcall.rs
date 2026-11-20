@@ -213,84 +213,9 @@ fn host_env(fd: libc::c_int, buf: &mut [u8]) -> Env {
         .collect()
 }
 
-/// A FunctionCall as the host encoded it: its name and string parameters.
-/// Hyperlight's schema (src/schema/function_call.fbs): FunctionCall is
-/// function_name, parameters; Parameter is a union whose seventh member
-/// is hlstring, a table holding one string.  Size-prefixed.
-pub struct Call<'a> {
-    buf: &'a [u8],
-    root: usize,
-}
-
-impl<'a> Call<'a> {
-    pub fn parse(buf: &'a [u8]) -> Option<Call<'a>> {
-        let root = 4 + u32_at(buf, 4)? as usize;
-        u32_at(buf, root)?;
-        Some(Call { buf, root })
-    }
-
-    pub fn name(&self) -> Option<&'a str> {
-        let s = follow(self.buf, self.root, 4)?;
-        string_at(self.buf, s)
-    }
-
-    /// Parameter `i` when it is a string.
-    pub fn string_arg(&self, i: usize) -> Option<&'a str> {
-        let params = follow(self.buf, self.root, 6)?;
-        let count = u32_at(self.buf, params)? as usize;
-        if i >= count {
-            return None;
-        }
-        let pos = params + 4 + 4 * i;
-        let param = pos + u32_at(self.buf, pos)? as usize;
-        let tag = field(self.buf, param, 4)?;
-        if *self.buf.get(param + tag)? != 7 {
-            return None;
-        }
-        let hlstring = follow(self.buf, param, 6)?;
-        let s = follow(self.buf, hlstring, 4)?;
-        string_at(self.buf, s)
-    }
-}
-
-fn u32_at(b: &[u8], o: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        b.get(o..o.checked_add(4)?)?.try_into().ok()?,
-    ))
-}
-
-fn u16_at(b: &[u8], o: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        b.get(o..o.checked_add(2)?)?.try_into().ok()?,
-    ))
-}
-
-/// The offset of field `vt` in the table at `tbl`, `None` when absent.
-fn field(b: &[u8], tbl: usize, vt: usize) -> Option<usize> {
-    let vtable = (tbl as i64).checked_sub(u32_at(b, tbl)? as i32 as i64)?;
-    let vtable = usize::try_from(vtable).ok()?;
-    let vsize = u16_at(b, vtable)? as usize;
-    if vt >= vsize {
-        return None;
-    }
-    match u16_at(b, vtable + vt)? {
-        0 => None,
-        f => Some(f as usize),
-    }
-}
-
-/// Follow the offset field `vt` of the table at `tbl`.
-fn follow(b: &[u8], tbl: usize, vt: usize) -> Option<usize> {
-    let p = tbl + field(b, tbl, vt)?;
-    let target = p.checked_add(u32_at(b, p)? as usize)?;
-    u32_at(b, target)?;
-    Some(target)
-}
-
-fn string_at(b: &[u8], s: usize) -> Option<&str> {
-    let len = u32_at(b, s)? as usize;
-    std::str::from_utf8(b.get(s + 4..s + 4 + len)?).ok()
-}
+#[path = "call.rs"]
+mod call;
+pub use call::Call;
 
 /// Split a guest command line on whitespace, as `hl_split_ws` does
 /// (urunc's `strings.Fields`).

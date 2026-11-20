@@ -39,7 +39,7 @@ static int pwsh_dispatch(const uint8_t *fc, size_t fc_len)
 	/* Refresh glibc environ so the exec'd pwsh child inherits host vars. */
 	hl_env_refresh(NULL, NULL);
 
-	/* Extract the PS1 code from the FunctionCall FlatBuffer */
+	/* Extract the PS1 code from the Postcard FunctionCall. */
 	size_t code_len;
 	const char *code = fc_arg0_string(fc, fc_len, &code_len);
 	if (!code)

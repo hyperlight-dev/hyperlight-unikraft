@@ -154,7 +154,7 @@ static int dotnet_spawn(void)
 
 static int dotnet_dispatch(const uint8_t *fc, size_t fc_len)
 {
-	/* Extract the C# source code from the FunctionCall FlatBuffer. */
+	/* Extract the C# source code from the Postcard FunctionCall. */
 	size_t code_len;
 	const char *code = fc_arg0_string(fc, fc_len, &code_len);
 	if (!code)

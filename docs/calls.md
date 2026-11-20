@@ -84,7 +84,7 @@ The CLI registers no host functions, so a host function call fails there. Use th
 
 - **Host function calls are synchronous.** The guest waits while your function runs on the thread driving the sandbox. In Python, only the thread running the code or guest function can make a host function call; others get a `RuntimeError`.
 - **Snapshots.** Functions belong to the sandbox, not the guest. A restored guest calls the functions of the builder that restored it, so different hosts can serve the same snapshot with different functions. One catch: a quickjs `host:` module is built the first time it is imported, so a snapshot taken after `import ... from "host:db"` keeps that module's exports.
-- **Limits.** A host function call's name and arguments together are at most 69,620 bytes (the 64 KiB the transport's pool is sized for, plus what rounding the pool up to whole pages leaves over), as is a guest function's result; what your function returns, at most 69,619, since the reply also says whether it succeeded. A longer reply reaches the guest as an error saying so. The empty name is reserved: it lists the registered functions.
+- **Limits.** A host function call's name and arguments together are at most 69,616 bytes (the 64 KiB the transport's pool is sized for, plus what rounding the pool up to whole pages leaves over), as is a guest function's result; what your function returns, at most 69,615, since the reply also says whether it succeeded. A longer reply reaches the guest as an error saying so. The empty name is reserved: it lists the registered functions.
 
 ### WebAssembly imports
 

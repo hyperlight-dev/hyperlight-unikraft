@@ -587,7 +587,7 @@ static int hl_py_run(const uint8_t *fc, size_t fc_len)
 		Py_XDECREF(r);
 	}
 
-	/* Extract the code string from the FunctionCall FlatBuffer */
+	/* Extract the code string from the Postcard FunctionCall. */
 	size_t code_len;
 	const char *code = fc_arg0_string(fc, fc_len, &code_len);
 	if (!code)
