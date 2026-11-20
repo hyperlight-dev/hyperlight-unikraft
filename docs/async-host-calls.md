@@ -430,7 +430,7 @@ unknown command format versions and missing or corrupt state.
 Command format version 7 stores command metadata and bookkeeping in the added layer;
 stdin and retained reply payloads stay entirely in the guest memory image.
 Earlier command snapshots must be recreated. The updated kernel and snapshot
-contract 22 also require recreating app snapshots.
+contract 23 also require recreating app snapshots.
 
 Disk I/O is synchronous, like the app helpers; async snapshot capture releases
 its locks before writing. Load only trusted snapshots, protect their contents
@@ -688,7 +688,7 @@ libraries may independently retry interrupted operations. The kernel's readiness
 waiter retries its idempotent wait after interruption, using the restored sockets;
 it never replays a send or connect. Timers and resource restoration remain separate.
 
-Updated kernels and snapshot contract 11 require fresh snapshots. Async handler
+Updated kernels and snapshot contract 23 require fresh snapshots. Async handler
 registration rejects kernels without interruption-capability negotiation. This
 change needs no additional rootfs rebuild beyond the existing Python GIL fix.
 

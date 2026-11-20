@@ -1,8 +1,8 @@
 [submodule "kernel/unikraft"]
 	path = kernel/unikraft
-	# Async host calls on top of the Postcard transport.
+	# Command API support on top of async host calls and Postcard.
 	url = https://github.com/jprendes/unikraft.git
-	branch = feat/async-host-calls
+	branch = feat/sandbox-command
 [submodule "kernel/app-elfloader"]
 	path = kernel/app-elfloader
 	# The fork, for fixes: arm64 AT_HWCAP (upstream has it in another

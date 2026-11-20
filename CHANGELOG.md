@@ -105,7 +105,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Retained completed host replies share those batches and are delivered to the
   guest's normal waiting-thread buffers without running applications or polling
   host futures. Command metadata contains no stdin or reply payloads.
-  Command protocol v11, command disk format v7 and snapshot contract 22 require
+  Command protocol v11, command disk format v7 and snapshot contract 23 require
   fresh snapshots.
 - Command snapshots no longer include bytes already delivered to host
   stdout/stderr pipes. Original readers retain that output; restored copies start
@@ -169,7 +169,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The kernel and runtime drivers use Postcard calls, replies and logs with the
   16-byte transport header. Rebuild runtime images with the updated drivers;
   FlatBuffer-based images are incompatible. Both embedded kernels and the native
-  test fixture are rebuilt, and snapshot contract 11 requires fresh snapshots.
+  test fixture are rebuilt, and snapshot contract 23 requires fresh snapshots.
 
 ### Fixed
 
