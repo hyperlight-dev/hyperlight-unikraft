@@ -260,8 +260,8 @@ fn quickjs_rejections_and_oversized_results_fail_the_call() {
     assert_eq!(sandbox.call("big", "10").unwrap().len(), 12);
     // Past the call buffer (the driver refuses it), and between what a
     // host call carries and the buffer (the kernel does).  With hluk's
-    // virtqueue pools: a host call carries 69,620 bytes (half the G2H
-    // pool less the framing), a call buffer holds 1,048,564 (the H2G pool
+    // virtqueue pools: a host call carries 69,616 bytes (half the G2H
+    // pool less the framing), a call buffer holds 1,048,560 (the H2G pool
     // less a message header).
     for n in ["1100000", "71000"] {
         assert!(

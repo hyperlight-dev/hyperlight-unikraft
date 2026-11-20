@@ -38,7 +38,7 @@ mshv = ["hyperlight-host/mshv3"]
 cpio = ["dep:tar"]
 
 [dependencies]
-hyperlight-common = "0.19"
+hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight.git", branch = "main" }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -85,12 +85,12 @@ sha2 = { version = "0.11", optional = true }
 #   Windows — WHP, compiled in unconditionally for the target (no feature).
 #   macOS   — Hypervisor.framework via the default `hvf` feature.
 [target.'cfg(target_os = "linux")'.dependencies]
-hyperlight-host = { version = "0.19", default-features = false, features = ["kvm", "build-metadata"] }
+hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight.git", branch = "main", default-features = false, features = ["kvm", "build-metadata"] }
 
 # Non-Linux keeps hyperlight's defaults: HVF (macOS) is on, WHP (Windows) is
 # unconditional, and the Linux-only kvm/mshv3 features are inert here.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-hyperlight-host = "0.19"
+hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight.git", branch = "main" }
 
 [target.'cfg(windows)'.dependencies]
 # Private working set for the bench RSS line (already in the tree via clap).
@@ -100,6 +100,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win
 tempfile = "3"
 # To read the guest kernel's messages, Hyperlight's guest log, in tests.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
-# The FlatBuffer decoder's external-value source, mirrored in the tests.
+# The Postcard codec tests' external-value source.
 anyhow = "1"
 bytes = "1"

@@ -83,7 +83,7 @@ fn python_long_line_is_printed_whole() {
     sandbox
         .run("import sys; sys.stdout.write('x' + 'é' * 100000 + 'end\\n'); sys.stdout.flush()")
         .unwrap();
-    // The leading 'x' puts the 69,620-byte marks inside an 'é', so the
+    // The leading 'x' puts the 69,616-byte marks inside an 'é', so the
     // kernel has to back the cuts off to where a character starts.
     let output = sandbox.drain_output();
     let line = output

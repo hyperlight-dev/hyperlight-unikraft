@@ -39,7 +39,7 @@ static int exec_dispatch(const uint8_t *fc, size_t fc_len)
 	/* Refresh glibc environ so the exec'd child inherits host vars. */
 	hl_env_refresh(NULL, NULL);
 
-	/* Extract the command from the FunctionCall FlatBuffer */
+	/* Extract the command from the Postcard FunctionCall. */
 	size_t cmd_len;
 	const char *cmd = fc_arg0_string(fc, fc_len, &cmd_len);
 

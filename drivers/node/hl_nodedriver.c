@@ -445,7 +445,7 @@ static int node_dispatch(const uint8_t *fc, size_t fc_len)
 	if (g_node_pid < 0 && node_spawn() < 0)
 		return -1;
 
-	/* Extract the code string from the FunctionCall FlatBuffer */
+	/* Extract the code string from the Postcard FunctionCall. */
 	size_t code_len;
 	const char *code = fc_arg0_string(fc, fc_len, &code_len);
 	if (!code)

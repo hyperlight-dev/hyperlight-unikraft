@@ -4,6 +4,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Changed
+
+- Hyperlight host and common dependencies now track upstream `main` through Git.
+  The kernel and runtime drivers use Postcard calls, replies and logs with the
+  16-byte transport header. Rebuild runtime images with the updated drivers;
+  FlatBuffer-based images are incompatible. Both embedded kernels and the native
+  test fixture are rebuilt, and snapshot contract 9 requires fresh snapshots.
+
 ### Added
 
 - Code coverage (#123): `coverage.yml` measures how much of the library and `hluk` the Rust tests cover, weekly on `main`, running them as tier 1's Linux test job does; `hluk` is measured where the integration tests run it as a program too. The run's page has the summary, per file, and its artifacts an HTML report, per line, and an LCOV file. `ci-report.yml` reports a failed run as it does a failed CI run on `main`. Locally, `just coverage-run` runs the tests instrumented, and `just coverage`, `just coverage-html` or `just coverage-lcov` reports on them (see [`docs/ci.md`](docs/ci.md)).
