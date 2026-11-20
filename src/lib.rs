@@ -2321,7 +2321,7 @@ impl SandboxBuilder {
     ///
     /// **Advanced.** The embedded kernel is the only combination this crate is
     /// tested against; an external kernel must match the ABI the host expects
-    /// (PEB layout, load/base address, and the host-function set the drivers
+    /// (entry ABI, load/base address, and the host-function set the drivers
     /// rely on) or the guest faults at boot.  Add an [`initrd`](Self::initrd)
     /// if the external kernel also wants a rootfs.
     pub fn from_kernel(path: impl Into<PathBuf>) -> Self {
