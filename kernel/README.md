@@ -1,6 +1,6 @@
 # Kernel
 
-The embedded kernel is a Unikraft app-elfloader built against `jprendes/unikraft`'s `feat/async-host-calls` branch, based on `unikraft/unikraft`'s `plat-hyperlight-v2` branch. Its `plat/hyperlight` carries the cooperative step model (`step.c`, `/dev/hlcall`) and async host-call protocol that let the host drive long-running guests and snapshot them mid-run. There is one binary per architecture:
+The embedded kernel is a Unikraft app-elfloader built against `jprendes/unikraft`'s `feat/sandbox-command` branch, based on `unikraft/unikraft`'s `plat-hyperlight-v2` branch. Its `plat/hyperlight` carries the cooperative step model (`step.c`, `/dev/hlcall`) and async host-call protocol that let the host drive long-running guests and snapshot them mid-run. Command execution identity, scheduler policy, and service lifecycle stay in the platform, using generic library hooks. There is one binary per architecture:
 
 | Binary | Hosts |
 |--------|-------|
@@ -19,7 +19,7 @@ The kernel is built from three git submodules pinned under `kernel/`:
 
 | Submodule | Source | Branch |
 |-----------|--------|--------|
-| `unikraft` | [jprendes/unikraft](https://github.com/jprendes/unikraft) | `feat/async-host-calls` |
+| `unikraft` | [jprendes/unikraft](https://github.com/jprendes/unikraft) | `feat/sandbox-command` |
 | `app-elfloader` | [danbugs/app-elfloader](https://github.com/danbugs/app-elfloader): `staging` plus five fixes, one commit each, until they are upstream: arm64 `AT_HWCAP` (upstream has it in another form, which needs a Unikraft change this kernel lacks), `AT_RANDOM` and `AT_EXECFN` on the program's stack, empty argument and environment strings, and freeing the ELF program record after exec | `plat-hyperlight-v2` |
 | `libs/libelf` | [unikraft/lib-libelf](https://github.com/unikraft/lib-libelf) | `staging` |
 

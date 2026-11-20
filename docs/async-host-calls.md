@@ -465,6 +465,11 @@ creating the child; the child configures its own descriptors and cwd and calls
 The launcher detaches after reporting success or failure.
 There is no per-command supervisor thread or blocking `waitpid`: kernel
 process-exit hooks record root status, reap it, and terminate descendants.
+Execution identity and command policy live in `plat/hyperlight`: ordinary
+threads use platform UKTLS state, while TLS-less socket readiness workers have
+platform-owned metadata without inheriting POSIX descriptor tables. Generic
+libraries expose init-service lifecycle events, a scheduler eligibility event,
+and predicate-based process termination rather than depending on Hyperlight.
 Before a host call whose owner changed,
 the transport sends `ExecutionContext(u64) -> i32` under the same transport
 lock as the following call. Socket rescans and resource destruction use the
