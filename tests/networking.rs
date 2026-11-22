@@ -4,7 +4,8 @@ mod common;
 
 use common::{UNUSED_PORT, host_ip, net_probe, require_rootfs};
 use hyperlight_unikraft::{
-    AllowList, BlockList, Destination, Filter, NetworkFilter, NetworkPolicy, SandboxBuilder,
+    AllowList, AppSandbox, BlockList, Destination, Filter, ListenPorts, NetworkFilter,
+    NetworkPolicy, SandboxBuilder,
 };
 
 /// Networking disabled by default — guest socket calls fail because
@@ -526,4 +527,80 @@ fn net_recv_wakes_for_data_after_a_short_read() {
         output.starts_with("read 8192 in") && secs < 5.0,
         "expected both parts well before the 10 s timeout, got: {output:?}",
     );
+}
+
+/// Under `redirect_listeners` a guest serving on `0.0.0.0:PORT` listens at
+/// the redirect address, on a port of the host's, though `PORT` is taken
+/// on the host, and sees the address it bound; every sandbox restored from
+/// its snapshot binds the listener again on a port of its own and serves.
+#[test]
+fn redirected_listener_serves_from_every_restore() {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+
+    let taken = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let builder = |b: SandboxBuilder| {
+        b.listen_ports(ListenPorts::from_ports([port]))
+            .redirect_listeners(Ipv4Addr::LOCALHOST)
+    };
+    let mut sandbox = builder(SandboxBuilder::from_initrd(require_rootfs("python")))
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    let listen = format!(
+        "import socket\n\
+         s = socket.socket()\n\
+         s.bind(('0.0.0.0', {port}))\n\
+         s.listen(4)\n\
+         print('listening', s.getsockname())\n"
+    );
+    sandbox.run(listen.as_str()).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains(&format!("listening ('0.0.0.0', {port})")),
+        "expected the guest to see the address it bound, got: {output:?}",
+    );
+    let snapshot = sandbox.snapshot().unwrap();
+
+    // Accept one connection, and say where the guest thinks it is.
+    let serve = |sandbox: &mut AppSandbox| -> SocketAddr {
+        let at = sandbox
+            .listen_addr(port)
+            .expect("the guest listens on its port");
+        assert_eq!(at.ip(), Ipv4Addr::LOCALHOST);
+        assert_ne!(at.port(), port);
+        let mut client = TcpStream::connect(at).unwrap();
+        client.write_all(b"ping").unwrap();
+        sandbox
+            .run(
+                "c, _ = s.accept()\n\
+                 c.sendall(c.recv(4) + b' at ' + repr(c.getsockname()).encode())\n\
+                 c.close()\n",
+            )
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, format!("ping at ('127.0.0.1', {port})"));
+        at
+    };
+    let first = serve(&mut sandbox);
+    // Both restored sandboxes are alive at once, on one guest port.
+    let restored: Vec<_> = (0..2)
+        .map(|_| {
+            let mut sandbox = builder(SandboxBuilder::from_snapshot(snapshot.clone()))
+                .boot()
+                .unwrap();
+            (serve(&mut sandbox), sandbox)
+        })
+        .collect();
+    let (a, b) = (restored[0].0, restored[1].0);
+    assert!(
+        first != a && first != b && a != b,
+        "expected a port per sandbox, got {first}, {a} and {b}",
+    );
+    // An in-place restore binds the listener again too.
+    sandbox.restore(snapshot).unwrap();
+    serve(&mut sandbox);
+    drop(taken);
 }

@@ -19,6 +19,7 @@
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read as _, Seek, SeekFrom};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1274,6 +1275,7 @@ impl GuestConfig {
         mounts: Vec<Mount>,
         network: Option<NetworkPolicy>,
         listen_ports: Option<ListenPorts>,
+        listen_redirect: Option<IpAddr>,
     ) -> Self {
         // Networking is opt-in: no policy, no host sockets and nothing for
         // the inter-step wait to watch (the `net_*` functions still exist,
@@ -1285,7 +1287,9 @@ impl GuestConfig {
                 .as_ref()
                 .map(|_| NetworkPolicy::AllowList(AllowList::empty()))
         });
-        let net = network.map(|policy| Arc::new(hostnet::Net::new(policy, listen_ports)));
+        let net = network.map(|policy| {
+            Arc::new(hostnet::Net::new(policy, listen_ports).with_listen_redirect(listen_redirect))
+        });
         Self {
             cmdline,
             scratch_size,
@@ -2139,6 +2143,7 @@ fn assemble_sandbox(
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    listen_redirect: Option<IpAddr>,
     host_functions: HostFunctionTable,
     host_write_err: bool,
     guest_log_level: Option<tracing::level_filters::LevelFilter>,
@@ -2214,6 +2219,7 @@ fn assemble_sandbox(
         mounts,
         network,
         listen_ports,
+        listen_redirect,
     )
     .with_host_functions(host_functions)
     .with_host_write_err(host_write_err)
@@ -2262,6 +2268,7 @@ pub struct SandboxBuilder {
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    listen_redirect: Option<IpAddr>,
     env_vars: Vec<(String, String)>,
     resolv_conf: Option<String>,
     host_functions: std::collections::BTreeMap<String, HostFunction>,
@@ -2293,6 +2300,7 @@ impl SandboxBuilder {
             mounts: Vec::new(),
             network: None,
             listen_ports: None,
+            listen_redirect: None,
             env_vars: Vec::new(),
             resolv_conf: None,
             host_functions: std::collections::BTreeMap::new(),
@@ -2337,7 +2345,9 @@ impl SandboxBuilder {
     ///
     /// The guest re-establishes its own host sockets on its first step: a
     /// listener is bound again (its port must be in this sandbox's
-    /// [`listen_ports`](Self::listen_ports)), and connections whose peers
+    /// [`listen_ports`](Self::listen_ports); under
+    /// [`redirect_listeners`](Self::redirect_listeners), on a new port of
+    /// the host's), and connections whose peers
     /// died with the old host read as closed.  Nothing needs to be saved
     /// beside the snapshot.
     ///
@@ -2409,6 +2419,47 @@ impl SandboxBuilder {
     /// it may open no connection of its own.
     pub fn listen_ports(mut self, ports: ListenPorts) -> Self {
         self.listen_ports = Some(ports);
+        self
+    }
+
+    /// Bind the guest's TCP listeners at `ip`, on ports the host picks,
+    /// whatever address and port the guest asks for: a guest that binds
+    /// `0.0.0.0:80` is reachable at `ip` only, and two sandboxes restored
+    /// from one snapshot each get a port of their own.
+    /// [`AppSandbox::listen_addr`] says where the guest's port is.  The
+    /// guest still sees the address it bound (`getsockname`), for the
+    /// listener and the connections it accepts, and its port must still
+    /// be in [`listen_ports`](Self::listen_ports).  Applies only with a
+    /// [`network`](Self::network) policy or listen ports.
+    ///
+    /// The host cannot tell a listener from a client choosing its source
+    /// address before `listen` or `connect`, so a stream socket bound to a
+    /// port of the guest's choosing is bound at `listen` (at `ip`) or at
+    /// `connect` (where the guest asked); two may not have one guest port
+    /// (`EADDRINUSE`).  One bound to port 0 is bound at `ip` at once, so
+    /// the guest can ask which port it got before it listens, and is known
+    /// by that port; a connect from it comes from `ip`.  Datagram sockets
+    /// are bound where the guest asks.
+    ///
+    /// An IPv4 `ip` serves the guest's IPv6 sockets as its IPv4-mapped
+    /// form; an IPv6 one serves IPv4 sockets only if it has an IPv4
+    /// counterpart (IPv4-mapped, `::1` or `::`), and their `listen` fails
+    /// with `EAFNOSUPPORT` otherwise.
+    ///
+    /// ```no_run
+    /// # use std::net::Ipv4Addr;
+    /// # use hyperlight_unikraft::{ListenPorts, SandboxBuilder};
+    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
+    ///     .listen_ports(ListenPorts::from_ports([8080]))
+    ///     .redirect_listeners(Ipv4Addr::LOCALHOST)
+    ///     .boot()?;
+    /// sandbox.submit("import socket; s = socket.socket(); s.bind(('0.0.0.0', 8080)); s.listen(); s.accept()")?;
+    /// // 127.0.0.1 and a port of the host's.
+    /// let addr = sandbox.listen_addr(8080).expect("the guest listens on 8080");
+    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// ```
+    pub fn redirect_listeners(mut self, ip: impl Into<IpAddr>) -> Self {
+        self.listen_redirect = Some(ip.into());
         self
     }
 
@@ -2595,6 +2646,7 @@ impl SandboxBuilder {
             mounts,
             network,
             listen_ports,
+            listen_redirect,
             env_vars,
             resolv_conf,
             host_functions,
@@ -2639,6 +2691,7 @@ impl SandboxBuilder {
                     mounts,
                     network,
                     listen_ports,
+                    listen_redirect,
                     host_functions,
                     host_write_err,
                     guest_log_level,
@@ -2692,6 +2745,7 @@ impl SandboxBuilder {
                     mounts,
                     network,
                     listen_ports,
+                    listen_redirect,
                     host_functions,
                     host_write_err,
                     guest_log_level,
@@ -3394,6 +3448,20 @@ impl AppSandbox {
     pub fn interrupt_handle(&self) -> Arc<dyn hyperlight_host::hypervisor::InterruptHandle> {
         self.sandbox.interrupt_handle()
     }
+
+    /// Where the host listens for the guest's TCP listener on `port`, the
+    /// port the guest bound: under
+    /// [`SandboxBuilder::redirect_listeners`], the redirect address and the
+    /// port the host picked; otherwise the address the guest bound.  A
+    /// listener the guest bound to port 0 is known by the port it was
+    /// given.  `None` if the guest does not listen on `port`.  A restore
+    /// binds the listeners again ([`restore`](Self::restore) and
+    /// [`restore_from`](Self::restore_from) return once they are), under a
+    /// redirect on new ports; one the guest bound to port 0 is given a new
+    /// guest port too.
+    pub fn listen_addr(&self, port: u16) -> Option<SocketAddr> {
+        self.config.net.as_ref()?.listen_addr(port)
+    }
 }
 
 /// Restore a sandbox from a saved snapshot — the [`SandboxBuilder::from_snapshot`]
@@ -3410,6 +3478,7 @@ fn restore_snapshot(
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    listen_redirect: Option<IpAddr>,
     host_functions: HostFunctionTable,
     host_write_err: bool,
     guest_log_level: Option<tracing::level_filters::LevelFilter>,
@@ -3425,6 +3494,7 @@ fn restore_snapshot(
         mounts,
         network,
         listen_ports,
+        listen_redirect,
     )
     .with_host_functions(host_functions)
     .with_host_write_err(host_write_err)
@@ -3591,7 +3661,7 @@ mod tests {
     /// A name given twice reaches the guest once, with the last value.
     #[test]
     fn env_names_given_twice_keep_the_last() {
-        let config = GuestConfig::new(String::new(), None, 0, 0, Vec::new(), None, None);
+        let config = GuestConfig::new(String::new(), None, 0, 0, Vec::new(), None, None, None);
         config.set_env_vars(&[("A", "1"), ("B", "2"), ("A", "3")]);
         assert_eq!(*config.env_str.lock().unwrap(), "B=2\0A=3\0");
     }
@@ -3601,7 +3671,8 @@ mod tests {
     /// leaves it off.
     #[test]
     fn listen_ports_alone_enable_networking() {
-        let config = |ports| GuestConfig::new(String::new(), None, 0, 0, Vec::new(), None, ports);
+        let config =
+            |ports| GuestConfig::new(String::new(), None, 0, 0, Vec::new(), None, ports, None);
         assert!(config(None).net.is_none());
         assert!(config(Some(ListenPorts::from_ports([8080]))).net.is_some());
     }
@@ -3674,6 +3745,7 @@ mod tests {
             0,
             0,
             Vec::new(),
+            None,
             None,
             None,
         );
