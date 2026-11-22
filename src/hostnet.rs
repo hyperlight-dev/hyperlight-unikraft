@@ -700,9 +700,11 @@ impl Net {
                 g.addr
             }
             None => {
-                // Bound or connected already, unredirected: listen as is.
+                // Bound by a connect, even one that failed, at the address
+                // the guest chose for its source: not where a listener may
+                // be, and not movable.
                 if local_port(tbl.get(fd)?) != 0 {
-                    return Ok(());
+                    return Err(errno::EINVAL);
                 }
                 let port = tbl.bind_at_redirect(fd, af, redirect)?;
                 let any: IpAddr = if af == AddressFamily::INET6 {
@@ -810,6 +812,9 @@ impl Net {
         // connect that failed leaves the socket's association as it was.
         if r.is_ok() || r == Err(errno::EINPROGRESS) {
             tbl.set_peer(fd, addr);
+            // An outbound connection's source address is the host's, not
+            // the wildcard the guest bound before it.
+            tbl.set_guest(fd, None);
         }
         r
     }
@@ -2433,6 +2438,32 @@ mod tests {
         let probe = std::net::UdpSocket::bind(loopback(0)).unwrap();
         probe.send_to(b"x", at).unwrap();
         assert_eq!(recv(&net, u), b"x");
+    }
+
+    /// A socket a connect bound on the host, even a failed one, is not
+    /// moved to the redirect address by `listen`, and cannot listen where
+    /// the guest chose its source address.
+    #[test]
+    fn listen_redirect_refuses_listen_after_a_failed_connect() {
+        let net = redirected_net();
+        let s = tcp(&net);
+        net.bind(s, unspecified(free_port())).unwrap();
+        let v6 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 9);
+        assert!(connect_blocking(&net, s, v6).is_err());
+        assert_eq!(net.listen(s, 4), Err(errno::EINVAL));
+    }
+
+    /// A client that bound the wildcard with port 0 is told, once it
+    /// connects, the source address the host gave it.
+    #[test]
+    fn listen_redirect_reports_a_connected_clients_source() {
+        let net = redirected_net();
+        let peer = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let cli = tcp(&net);
+        net.bind(cli, unspecified(0)).unwrap();
+        connect_blocking(&net, cli, peer.local_addr().unwrap()).unwrap();
+        let (_, from) = peer.accept().unwrap();
+        assert_eq!(net.local_addr(cli), Ok(from));
     }
 
     /// What a redirect leaves to the rules a bind already follows: the
