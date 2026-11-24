@@ -430,6 +430,115 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a hypervisor and build-elfloader C fixtures"]
+    async fn compaction_preserves_pending_input_and_loaded_lifetimes() {
+        use futures::io::AsyncWriteExt;
+
+        let sandbox = builder().boot_commands().unwrap();
+        let base = sandbox.snapshot().await.unwrap();
+        let base_dir = tempfile::tempdir().unwrap();
+        save_command_snapshot(&base, base_dir.path()).unwrap();
+        let base = load_command_snapshot(base_dir.path()).unwrap();
+        let mut child = sandbox
+            .command("/mnt/bin/command")
+            .name("compact-echo")
+            .arg("echo")
+            .stdin(crate::command::Stdio::piped())
+            .stdout(crate::command::Stdio::piped())
+            .spawn()
+            .await
+            .unwrap();
+        let id = child.execution_id();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"preserved input\n").await.unwrap();
+        let snapshot = sandbox.snapshot().await.unwrap();
+        let input = tempfile::tempdir().unwrap();
+        save_command_snapshot(&snapshot, input.path()).unwrap();
+        let expected = serde_json::to_value(&snapshot.executions).unwrap();
+        drop(snapshot);
+
+        for preserve in [false, true] {
+            let loaded = load_command_snapshot(input.path()).unwrap();
+            let private_path = loaded.files[0].path().to_path_buf();
+            let compacted = loaded.compact(preserve.then_some(&base)).unwrap();
+            assert_eq!(
+                serde_json::to_value(&compacted.executions).unwrap(),
+                expected
+            );
+            drop(loaded);
+            assert!(private_path.exists());
+            let output = tempfile::tempdir().unwrap();
+            save_command_snapshot(&compacted, output.path()).unwrap();
+            let index = read_index(output.path()).unwrap();
+            let manifest = read_manifest(output.path(), &index["manifests"][0]).unwrap();
+            let memory_layers = manifest["layers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|layer| {
+                    layer["mediaType"] == "application/vnd.hyperlight.snapshot.memory.v2"
+                })
+                .count();
+            if preserve {
+                let base_index = read_index(base_dir.path()).unwrap();
+                let base_manifest =
+                    read_manifest(base_dir.path(), &base_index["manifests"][0]).unwrap();
+                let base_layers: Vec<_> = base_manifest["layers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|layer| {
+                        layer["mediaType"] == "application/vnd.hyperlight.snapshot.memory.v2"
+                    })
+                    .collect();
+                assert!(memory_layers <= base_layers.len() + 1);
+                assert!(base_layers.iter().any(|base| {
+                    manifest["layers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|layer| layer["digest"] == base["digest"])
+                }));
+            } else {
+                assert_eq!(memory_layers, 1);
+            }
+            drop(compacted);
+            assert!(!private_path.exists());
+            let reloaded = load_command_snapshot(output.path()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&reloaded.executions).unwrap(),
+                expected
+            );
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("build-elfloader");
+            let restored = crate::SandboxBuilder::from_command_snapshot(&reloaded)
+                .mount(crate::Mount::ro(root.join("bins/c"), "/mnt/bin"))
+                .echo_output(false)
+                .boot_commands()
+                .unwrap();
+            let restored_child = restored
+                .children()
+                .by_id(id)
+                .unwrap()
+                .restore()
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                restored_child.wait_with_output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(result.status.success());
+            assert_eq!(result.stdout, b"preserved input\n");
+        }
+        drop(stdin);
+        let result = child.wait_with_output().await.unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"preserved input\n");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a hypervisor and build-elfloader C fixtures"]
     async fn layered_state_exceeds_former_limit_and_preserves_failed_save() {
         let sandbox = builder().boot_commands().unwrap();
         let _child = sandbox

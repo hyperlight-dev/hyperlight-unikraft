@@ -36,7 +36,7 @@ mshv = ["hyperlight-host/mshv3"]
 cpio = ["dep:tar"]
 
 [dependencies]
-hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight.git", branch = "main" }
+hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight.git", rev = "70771a2210063d508723d7fbd3fe03ac8f03208a" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
@@ -86,13 +86,13 @@ flate2 = { version = "1", optional = true }
 #   Windows — WHP, compiled in unconditionally for the target (no feature).
 #   macOS   — Hypervisor.framework via the default `hvf` feature.
 [target.'cfg(target_os = "linux")'.dependencies]
-hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight.git", branch = "main", default-features = false, features = ["kvm", "build-metadata"] }
+hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight.git", rev = "70771a2210063d508723d7fbd3fe03ac8f03208a", default-features = false, features = ["kvm", "build-metadata"] }
 rustix = { version = "1", features = ["time"] }
 
 # Non-Linux keeps hyperlight's defaults: HVF (macOS) is on, WHP (Windows) is
 # unconditional, and the Linux-only kvm/mshv3 features are inert here.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight.git", branch = "main" }
+hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight.git", rev = "70771a2210063d508723d7fbd3fe03ac8f03208a" }
 
 [target.'cfg(windows)'.dependencies]
 # Private working set for the bench RSS line (already in the tree via clap).

@@ -306,6 +306,30 @@ pub struct CommandSnapshot {
     pub(crate) files: Vec<Arc<tempfile::TempDir>>,
 }
 
+impl CommandSnapshot {
+    /// Compacts guest memory while preserving this snapshot's command state.
+    ///
+    /// With no `base`, live memory is packed into a single layer. With a base,
+    /// identical referenced base layers are retained and other live pages are
+    /// merged. A separately loaded base can be used. Both inputs remain unchanged.
+    ///
+    /// Execution IDs, command metadata, stream bookkeeping, pending stdin, and
+    /// retained replies are preserved. Save and restore the result normally.
+    /// This operation is synchronous and does not run guest commands or host calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`crate::Snapshot::compact`] error, including when
+    /// the base has an incompatible memory layout.
+    pub fn compact(&self, base: Option<&CommandSnapshot>) -> Result<Self> {
+        Ok(Self {
+            guest: self.guest.compact(base.map(|base| base.guest.as_ref()))?,
+            executions: self.executions.clone(),
+            files: self.files.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;

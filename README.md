@@ -59,11 +59,13 @@ tree's host futures, sockets and timers; command waits are cancellation-safe.
 Launching is a kernel service, independent of the runtime driver.
 Pipes are passive buffers: poll I/O concurrently with the wait, or use
 `wait_with_output()` to drive and capture output together.
-Command spawn, kill, child restoration and command snapshot operations are async,
+Command spawn, kill, child restoration and snapshot capture/restore are async,
 awaiting internal lock contention rather than exposing retry errors.
 Command snapshots also persist to disk: use `snapshot_to(dir).await`,
 `SandboxBuilder::from_command_snapshot_dir(dir)?.boot_commands()`, or
-`restore_from(dir).await`. Keep the whole directory, including command state;
+`restore_from(dir).await`. Use synchronous `snapshot.compact(None)` to merge live
+memory, or `snapshot.compact(Some(&base))` to preserve immutable base layers.
+Keep the whole directory, including command state;
 see [command snapshots](docs/async-host-calls.md#command-snapshots).
 
 hyperlight-unikraft runs on **Linux** (KVM, or MSHV with `cargo build --features mshv`), **Windows** (WHP), and **macOS** on Apple silicon (HVF). On an arm64 host it embeds an arm64 kernel and runs arm64 guests; every published runtime image carries both architectures. On macOS the `hluk` binary needs the hypervisor entitlement: `codesign -f -s - --entitlements dev/macos-entitlements.plist target/release/hluk` (`cargo run` and `cargo test` do it for you, `install.sh` signs the one it installs, and an unsigned `hluk` prints a command that signs it). Hypervisor.framework allows one VM per process, so the sandboxes of one process take turns: run them from separate processes to run them side by side. A guest waiting on a timer while another sandbox runs sees its deadline pass.
@@ -113,6 +115,11 @@ Larger, self-contained demos live under `demos/`, each with its own `Justfile` a
 More details are in [`docs/`](docs/): projects, the manifest and the published images ([`manifest.md`](docs/manifest.md)), how a guest is driven and the ways to run one ([`execution.md`](docs/execution.md)), the contract between a runtime driver and the kernel ([`driver.md`](docs/driver.md)), the host filesystem sandbox ([`fs.md`](docs/fs.md)), guest networking ([`net.md`](docs/net.md)), guest concurrency and snapshot restore ([`concurrency.md`](docs/concurrency.md)), the guest's clocks ([`clock.md`](docs/clock.md)), its random source ([`random.md`](docs/random.md)), where a sandbox's time goes ([`profiling.md`](docs/profiling.md)) and what CI runs where ([`ci.md`](docs/ci.md)).
 
 ## Development
+
+This checkout pins `hyperlight-host` and `hyperlight-common` to
+[Hyperlight commit `70771a22`](https://github.com/hyperlight-dev/hyperlight/commit/70771a2210063d508723d7fbd3fe03ac8f03208a),
+the reviewed compaction commit from hyperlight-dev/hyperlight#2097.
+No sibling Hyperlight checkout is required.
 
 ```bash
 just build-all-rootfs      # build every guest rootfs

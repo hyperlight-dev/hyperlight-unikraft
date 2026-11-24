@@ -400,6 +400,24 @@ let child = restored.children()["worker"].restore().await?;
 sandbox.restore_from("saved-commands").await?;
 ```
 
+`CommandSnapshot::compact(None)` packs live guest memory into a single layer.
+`snapshot.compact(Some(&base))` preserves referenced immutable base layers and
+merges other live pages into at most one new layer. A separately loaded base
+works too; it must have the same guest memory layout. Compaction leaves both
+inputs unchanged and preserves execution IDs, command metadata, pending stdin,
+retained replies, and stream bookkeeping. It is synchronous, does not drive
+commands or host calls, and is not automatically performed during capture.
+
+```rust,ignore
+let snapshot = sandbox.snapshot().await?;
+let compacted = snapshot.compact(Some(&prepared_base))?;
+save_command_snapshot(&compacted, "compacted-commands")?;
+```
+
+Save and restore compacted command snapshots with the existing APIs and format.
+Saving still includes preserved base blobs; omitting or sharing those blobs
+during transport is the caller's responsibility.
+
 The guest is saved as an OCI image with the same kernel/host compatibility key
 as app snapshots. Command metadata, stdin queue accounting, output policies and loss
 counts and ID counters are stored in a versioned **command-state OCI layer**.
